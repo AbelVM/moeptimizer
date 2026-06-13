@@ -1,0 +1,198 @@
+"""AgentStateStore — KV graph: Goal -> Subtask -> Tool -> Outcome.
+
+Indexes context by structural relationships rather than flat embeddings,
+replacing semantic RAG with graph traversal for agentic workflows.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections import defaultdict
+from typing import Any
+
+from moeptimizer.config import get_config
+from moeptimizer.models import AgentStep, GoalNode
+
+
+class AgentStateStore:
+    """
+    Key-Value graph state store for agentic workflows.
+
+    Indexes context by Goal -> Subtask -> Tool Used -> Outcome.
+    Replaces flat embedding RAG with structural graph traversal.
+    """
+
+    def __init__(self) -> None:
+        self.steps: list[AgentStep] = []
+        self.goals: dict[str, GoalNode] = {}
+        self.subtask_index: dict[str, list[str]] = defaultdict(list)
+        self.tool_index: dict[str, list[str]] = defaultdict(list)
+        self._step_index: dict[str, int] = {}
+        self._goal_id: str | None = None
+        self._config = get_config().agentic
+
+    def add_step(self, step: AgentStep) -> str:
+        """Register a step and index it by role, tool, and subtask."""
+        idx = len(self.steps)
+        step.step_index = idx
+        self.steps.append(step)
+        self._step_index[step.step_id] = idx
+
+        if step.tool_name:
+            self.tool_index[step.tool_name].append(step.step_id)
+
+        subtask = step.metadata.get("subtask") or self._infer_subtask(step)
+        if subtask:
+            self.subtask_index[subtask].append(step.step_id)
+
+        return step.step_id
+
+    def set_goal(self, original_prompt: str) -> str:
+        """Set the root goal for this agent session."""
+        goal = GoalNode(original_prompt=original_prompt)
+        self.goals[goal.goal_id] = goal
+        self._goal_id = goal.goal_id
+        return goal.goal_id
+
+    def get_goal(self) -> GoalNode | None:
+        """Get the root goal node."""
+        if self._goal_id:
+            return self.goals.get(self._goal_id)
+        return None
+
+    def get_recent_steps(self, n: int | None = None) -> list[AgentStep]:
+        """Get the last N steps in full detail."""
+        n = n or self._config.keep_full_steps
+        return self.steps[-n:] if len(self.steps) >= n else list(self.steps)
+
+    def get_archived_steps(self) -> list[AgentStep]:
+        """Get steps older than the keep threshold."""
+        threshold = len(self.steps) - self._config.archive_threshold
+        return self.steps[:threshold] if threshold > 0 else []
+
+    def get_related_context(self, current_step: AgentStep) -> list[AgentStep]:
+        """
+        Retrieve structurally related steps based on:
+        1. Same subtask
+        2. Same tool used
+        3. Same role type (for pattern matching)
+        """
+        related: set[str] = set()
+
+        subtask = current_step.metadata.get("subtask", "")
+        if subtask and subtask in self.subtask_index:
+            related.update(self.subtask_index[subtask])
+
+        if current_step.tool_name and current_step.tool_name in self.tool_index:
+            related.update(self.tool_index[current_step.tool_name])
+
+        result = [
+            s for s in self.steps
+            if s.step_id in related and s.step_id != current_step.step_id
+        ]
+        return result[: self._config.keep_full_steps * 2]
+
+    def get_compacted_history(self) -> list[dict[str, Any]]:
+        """
+        Return the full history in compacted form:
+        - Recent steps: full content
+        - Archived steps: summary only
+        """
+        recent = self.get_recent_steps()
+        archived = self.get_archived_steps()
+
+        result: list[dict[str, Any]] = []
+
+        for step in archived:
+            summary = step.outcome_summary or self._generate_summary(step)
+            result.append({
+                "role": step.role,
+                "summary": summary,
+                "step_id": step.step_id,
+                "tool_name": step.tool_name,
+                "step_index": step.step_index,
+                "archived": True,
+            })
+
+        for step in recent:
+            result.append({
+                "role": step.role,
+                "content": step.content,
+                "tool_name": step.tool_name,
+                "step_id": step.step_id,
+                "step_index": step.step_index,
+                "archived": False,
+            })
+
+        return result
+
+    def _generate_summary(self, step: AgentStep) -> str:
+        """Generate a single-sentence summary for an archived step."""
+        role = step.role
+        tool = step.tool_name or ""
+
+        if role == "tool":
+            content = step.content
+            lines = content.split("\n")
+            if len(lines) > 3:
+                return f"Tool '{tool}': returned {len(lines)} lines of output (truncated)"
+            return f"Tool '{tool}': {content[:200]}"
+
+        elif role == "assistant":
+            if tool:
+                return f"Assistant: called tool '{tool}'"
+            return f"Assistant: {step.content[:200]}"
+
+        elif role == "thinking":
+            return f"Thinking: {step.content[:150]}..."
+
+        elif role == "user":
+            return f"User: {step.content[:150]}"
+
+        return f"{role}: {step.content[:150]}"
+
+    def _infer_subtask(self, step: AgentStep) -> str | None:
+        """Infer subtask from step content when not explicitly provided."""
+        match = re.search(r"# Subtask: (.+)", step.content, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+        if step.tool_name:
+            return step.tool_name
+
+        return None
+
+    def serialize(self) -> str:
+        """Serialize state store to JSON for persistence."""
+        return json.dumps({
+            "steps": [s.to_dict() for s in self.steps],
+            "goals": {k: v.to_dict() for k, v in self.goals.items()},
+            "subtask_index": dict(self.subtask_index),
+            "tool_index": dict(self.tool_index),
+        })
+
+    @classmethod
+    def deserialize(cls, data: str) -> AgentStateStore:
+        """Deserialize state store from JSON."""
+        store = cls()
+        parsed = json.loads(data)
+        for s in parsed.get("steps", []):
+            step = AgentStep.from_dict(s)
+            idx = len(store.steps)
+            step.step_index = idx
+            store.steps.append(step)
+            store._step_index[step.step_id] = idx
+            if step.tool_name:
+                store.tool_index[step.tool_name].append(step.step_id)
+            subtask = step.metadata.get("subtask") or store._infer_subtask(step)
+            if subtask:
+                store.subtask_index[subtask].append(step.step_id)
+        for k, v in parsed.get("goals", {}).items():
+            store.goals[k] = GoalNode(**v)
+            store._goal_id = k  # Restore goal reference
+        for k, v in parsed.get("subtask_index", {}).items():
+            store.subtask_index[k] = v
+        for k, v in parsed.get("tool_index", {}).items():
+            store.tool_index[k] = v
+        return store

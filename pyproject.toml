@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moeptimizer"
+version = "0.1.0"
+description = "Agentic MOE middleware: transparent OpenAI API proxy that optimizes context for Qwen3.6-35B-A3B-MTP + Lemonade NPU"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Abel", email = "abel@example.com" },
+]
+keywords = ["moe", "agentic", "llm", "middleware", "fastapi", "rag", "lancedb"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "httpx>=0.28.0",
+    "numpy>=1.26.0",
+    "tree-sitter>=0.23.0",
+    "pygments>=2.19.0",
+    "lancedb>=0.16.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "python-dotenv>=1.0.0",
+    "structlog>=24.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.9.0",
+    "mypy>=1.14.0",
+    "httpx>=0.28.0",
+    "requests>=2.32.0",
+]
+tree-sitter-langs = [
+    "tree-sitter-language-pack>=1.8.0",
+]
+
+[project.scripts]
+moeptimizer = "moeptimizer.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moeptimizer"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = ""
+# Custom options for e2e benchmarking
+# Usage: pytest tests/test_e2e.py -v --live --rounds 3
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true

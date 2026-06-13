@@ -1,0 +1,57 @@
+"""Tests for TokenCounter."""
+
+
+from moeptimizer.token_counter import TokenCounter
+
+
+class TestTokenCounter:
+    def test_count_empty(self) -> None:
+        counter = TokenCounter()
+        assert counter.count("") == 0
+
+    def test_count_whitespace_only(self) -> None:
+        counter = TokenCounter()
+        assert counter.count("   \n  ") == 0
+
+    def test_count_generic(self) -> None:
+        counter = TokenCounter()
+        # ~3.5 chars per token for generic
+        text = "a" * 35
+        tokens = counter.count(text, "generic")
+        assert tokens == 10
+
+    def test_count_python(self) -> None:
+        counter = TokenCounter()
+        # ~4.0 chars per token for python
+        text = "def foo():\n    pass\n"
+        tokens = counter.count(text, "python")
+        assert tokens >= 1
+
+    def test_count_messages(self) -> None:
+        counter = TokenCounter()
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+        total = counter.count_messages(messages)
+        # 3 messages * 5 overhead + content tokens
+        assert total > 15
+
+    def test_count_messages_with_content_list(self) -> None:
+        counter = TokenCounter()
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Hello world"},
+                ],
+            },
+        ]
+        total = counter.count_messages(messages)
+        assert total > 5
+
+    def test_estimate_kv_cache_usage(self) -> None:
+        counter = TokenCounter()
+        assert "KV slots" in counter.estimate_kv_cache_usage(100)
+        assert "near context limit" in counter.estimate_kv_cache_usage(50000)
