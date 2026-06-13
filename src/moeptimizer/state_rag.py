@@ -5,6 +5,7 @@ Uses the AgentStateStore graph to retrieve context by:
   2. Subtask affinity — steps from the same subtask
   3. Tool lineage — steps that used the same tools
   4. Temporal decay — older related steps get lower priority
+  5. Dependency graph — related files and symbols
 
 MOE context integrity:
   - RAG context is injected as a SEPARATE user message (never into assistant)
@@ -16,9 +17,11 @@ MOE context integrity:
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from moeptimizer.models import AgentStep
 from moeptimizer.state_store import AgentStateStore
+from moeptimizer.symbol_index import SymbolIndex
 
 
 class StateBasedRAG:
@@ -35,8 +38,56 @@ class StateBasedRAG:
 
     def __init__(self, store: AgentStateStore) -> None:
         self.store = store
+        self._symbol_index = SymbolIndex()
+        self._dependency_graph: dict[str, set[str]] = {}
 
-    def get_context_for_step(self, current_step: AgentStep) -> str:
+    def build_dependency_graph(
+        self,
+        file_contents: dict[str, str],
+    ) -> None:
+        """Build dependency graph from file contents.
+
+        Maps file → imported/required files for context prefetching.
+        """
+        for file_path, content in file_contents.items():
+            imports = self._extract_imports(content, file_path)
+            self._dependency_graph[file_path] = imports
+            # Also index symbols in this file
+            self._symbol_index.add_file(file_path, content)
+
+    def _extract_imports(
+        self,
+        content: str,
+        file_path: str,
+    ) -> set[str]:
+        """Extract import statements to build dependency graph."""
+        imports: set[str] = set()
+
+        # Python imports
+        for match in re.finditer(r"^from\s+(\S+)\s+import", content, re.MULTILINE):
+            module = match.group(1)
+            # Convert module to file path
+            imports.add(module.replace(".", "/") + ".py")
+
+        for match in re.finditer(r"^import\s+(\S+)", content, re.MULTILINE):
+            module = match.group(1)
+            imports.add(module.replace(".", "/") + ".py")
+
+        # JavaScript/TypeScript imports
+        for match in re.finditer(r"^import\s+.*from\s+['\"]([^'\"]+)['\"]", content, re.MULTILINE):
+            module = match.group(1)
+            if not module.startswith("."):
+                continue
+            # Relative import
+            base = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
+            imports.add(base + "/" + module.lstrip("./") + ".ts")
+
+        return imports
+
+    def get_context_for_step(
+        self,
+        current_step: AgentStep,
+    ) -> str:
         """
         Build a context injection string from structurally related steps.
 
@@ -82,6 +133,38 @@ class StateBasedRAG:
                 lines.append(f"step {step.step_index}: {step.role} - {step.content[:100]}")
 
         return "\n".join(lines)
+
+    def get_dependency_context(
+        self,
+        file_path: str,
+        max_files: int = 3,
+    ) -> str:
+        """Get context for files that the given file depends on.
+
+        Uses dependency graph to prefetch related files.
+        """
+        if file_path not in self._dependency_graph:
+            return ""
+
+        deps = list(self._dependency_graph[file_path])[:max_files]
+        if not deps:
+            return ""
+
+        lines = [f"# Dependencies of {file_path}:"]
+        for dep in deps:
+            symbols = self._symbol_index.get_symbols_in_file(dep)
+            if symbols:
+                lines.append(f"  {dep}: {', '.join(s['name'] for s in symbols[:5])}")
+
+        return "\n".join(lines)
+
+    def find_related_symbols(
+        self,
+        query: str,
+        max_results: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Find symbols related to query using fuzzy matching."""
+        return self._symbol_index.find_symbol(query, fuzzy=True, max_results=max_results)
 
 
 def _strip_reasoning(text: str) -> str:

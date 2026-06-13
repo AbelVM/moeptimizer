@@ -4,17 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "moeptimizer"
-version = "0.1.0"
-description = "Agentic MOE middleware: transparent OpenAI API proxy that optimizes context for Qwen3.6-35B-A3B-MTP + Lemonade NPU"
+version = "0.2.0"
+description = "Transparent OpenAI API proxy that optimizes context for MoE + MTP models in multi-turns agentic tasks."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [
     { name = "Abel", email = "abel@example.com" },
 ]
-keywords = ["moe", "agentic", "llm", "middleware", "fastapi", "rag", "lancedb"]
+keywords = ["moe", "agentic", "llm", "middleware", "fastapi", "rag", "lancedb", "mtp", "speculative-decoding"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",

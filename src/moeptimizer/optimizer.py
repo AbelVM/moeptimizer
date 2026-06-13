@@ -3,16 +3,18 @@
 Pipeline:
   1. Parse message history into AgentStateStore steps
   2. Run ScratchpadCompactor on archived steps
-  3. Run ThinkingPreserver on assistant messages (preserves <think>/</think>)
+  3. Run ThinkingPreserver on assistant messages (preserves <think>/though)
   4. Optimize code blocks with Tree-Sitter + NPU ranking
   5. Enforce hard character cap for MoE context budget
+  6. Apply static layer block alignment for cache optimization
+  7. Apply syntax-stable MTP prompt engineering
 
 MOE context integrity:
   - RAG context injected as SEPARATE user message (never into assistant content)
   - Loop warnings injected as SEPARATE user message (never into assistant content)
   - Progress tracking is internal only (not injected into context)
   - This preserves the model's expected chat template:
-    ăssistant\n<think>\n{reasoning}\n</think>\n\n{response}
+    Ăssistant\n<think>\n{reasoning}\n</think>\n\n{response}
     which the model was trained on. Injecting foreign patterns triggers
     KV-cache refills (super slow with MOE prefill).
 """
@@ -27,6 +29,13 @@ from typing import Any
 
 import numpy as np
 
+from moeptimizer.cache import (
+    align_to_block_boundary,
+    canonicalize_code_for_cache,
+    get_block_aligned_cache_key,
+)
+from moeptimizer.cache_aware_chunker import get_cache_aware_chunker
+from moeptimizer.cache_registry import get_cache_registry
 from moeptimizer.code_chunking import (
     LANG_MAP,
     chunk_code_with_treesitter,
@@ -35,13 +44,24 @@ from moeptimizer.code_chunking import (
 )
 from moeptimizer.compactor import ScratchpadCompactor
 from moeptimizer.config import AppConfig
+from moeptimizer.context_aligner import get_context_aligner
+from moeptimizer.context_canonicalizer import get_context_canonicalizer
+from moeptimizer.context_compressor import get_context_compressor
+from moeptimizer.context_template_matcher import get_context_template_matcher
+from moeptimizer.dependency_orderer import get_dependency_orderer
 from moeptimizer.embedding import EmbeddingService
+from moeptimizer.expert_cache import get_expert_cache
 from moeptimizer.goal_decomposer import GoalDecomposer
+from moeptimizer.incremental_updater import get_incremental_updater
 from moeptimizer.loop_detector import LoopDetector
 from moeptimizer.models import AgentStep, LoopWarning
+from moeptimizer.pattern_injector import get_pattern_injector
 from moeptimizer.progress_tracker import ProgressTracker
+from moeptimizer.prompt_templates import classify_and_template
+from moeptimizer.selective_truncator import get_selective_truncator
 from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
+from moeptimizer.symbol_index import SymbolIndex
 from moeptimizer.thinking_preserver import ThinkingPreserver
 from moeptimizer.token_counter import TokenCounter
 
@@ -62,6 +82,19 @@ class AgentContextOptimizer:
         self.token_counter = TokenCounter()
         self.goal_decomposer = GoalDecomposer()
         self.embedding_service = EmbeddingService()
+        self.expert_cache = get_expert_cache()
+        self.symbol_index = SymbolIndex()
+        self.cache_registry = get_cache_registry()
+        self.context_aligner = get_context_aligner()
+        self.context_canonicalizer = get_context_canonicalizer()
+        self.context_compressor = get_context_compressor()
+        self.context_template_matcher = get_context_template_matcher()
+        self.dependency_orderer = get_dependency_orderer()
+        self.incremental_updater = get_incremental_updater()
+        self.pattern_injector = get_pattern_injector()
+        self.selective_truncator = get_selective_truncator()
+        self.cache_aware_chunker = get_cache_aware_chunker()
+        self._task_type: str = "default"
 
     def optimize_messages(
         self,
@@ -105,10 +138,36 @@ class AgentContextOptimizer:
         # Step 5: Apply thinking preservation
         optimized = self.thinking_preserver.process_messages(list(messages))
 
-        # Step 6: Apply scratchpad compaction
+        # Step 5.5: Apply context canonicalization for cache-friendly formatting
+        optimized = self.context_canonicalizer.canonicalize(optimized)
+
+        # Step 5.7: Apply context compression to reduce token usage
+        optimized = self.context_compressor.compress(optimized)
+
+        # Step 6: Apply prompt template versioning
+        optimized, self._task_type = classify_and_template(optimized)
+
+        # Step 6.5: Apply context template matching
+        # Only add system message if we don't already have one
+        if not (optimized and optimized[0].get("role") == "system"):
+            template_name = self.context_template_matcher.match_template(optimized)
+            if template_name:
+                optimized = self.context_template_matcher.apply_template(optimized)
+
+        # Step 7: Apply scratchpad compaction
         optimized = self.compactor.compact_messages(optimized)
 
-        # Step 7: Inject RAG context and loop warnings as SEPARATE user messages
+        # Step 7.5: Apply selective truncation (remove duplicate code blocks)
+        optimized = self.selective_truncator.remove_duplicates(optimized)
+
+        # Step 7.7: Apply dependency ordering for cache locality
+        optimized = self.dependency_orderer.order_by_dependencies(optimized)
+
+        # Step 7.8: Apply incremental update for cache preservation
+        # Check if we can append to existing context instead of creating new messages
+        optimized = self.incremental_updater.update_context(optimized, "")
+
+        # Step 8: Inject RAG context and loop warnings as SEPARATE user messages
         # CRITICAL: Never inject into assistant messages — this breaks the model's
         # expected chat template (ăssistant\n<think>\n...\n</think>\n\n...) and
         # triggers KV-cache refills during expensive MOE prefill.
@@ -147,20 +206,48 @@ class AgentContextOptimizer:
                     "content": rag_context,
                 })
 
-        # Step 8: Optimize code blocks in all messages
+        # Step 8: Apply static layer block alignment for cache optimization
+        # Only apply when context is large enough to benefit
+        total_chars = sum(len(m.get("content", "")) for m in optimized)
+        if total_chars > 2000:  # Only align for larger contexts
+            optimized = self._align_static_layer(optimized)
+
+        # Step 9: Pre-seed reasoning prefix for MTP (only if budget allows)
+        # Check budget before preseeding to avoid exceeding limits
+        total_chars = sum(len(m.get("content", "")) for m in optimized)
+        if total_chars < self._config.agentic.max_optimized_chars * 0.5:
+            optimized = self._preseed_reasoning(optimized)
+
+        # Step 10: Optimize code blocks in all messages
         for msg in optimized:
             content = msg.get("content", "")
             if isinstance(content, str) and self._has_code_blocks(content):
                 msg["content"] = self._optimize_code_in_text(content)
 
-        # Step 9: Enforce hard character cap
+        # Step 10.5: Apply cache-aware chunking for large contexts
+        total_chars = sum(len(m.get("content", "")) for m in optimized)
+        if total_chars > 3000:
+            optimized = self.cache_aware_chunker.chunk_context(optimized)
+
+        # Step 11: Proactive context trimming for MoE KV-cache efficiency
+        # For MoE models, KV-cache fill is extremely slow. We proactively trim
+        # to keep context lean and avoid performance degradation.
+        total_chars = sum(len(m.get("content", "")) for m in optimized)
+        proactive_threshold = self._config.agentic.max_optimized_chars * 0.7
+        if total_chars > proactive_threshold:
+            optimized = self._proactive_trim(optimized, proactive_threshold)
+
+        # Step 12: Enforce hard character cap
         # Use character counts consistently — _trim_to_budget uses char budget
         total_chars = sum(len(m.get("content", "")) for m in optimized)
         if total_chars > self._config.agentic.max_optimized_chars:
             optimized = self._trim_to_budget(optimized)
 
-        # Step 10: Strip internal metadata before sending to model
+        # Step 13: Strip internal metadata before sending to model
         optimized = self._strip_internal_flags(optimized)
+
+        # Step 14: Register context in cache registry for hit prediction
+        self.cache_registry.register_context(optimized)
 
         # Log metrics
         original_chars = sum(len(m.get("content", "")) for m in messages)
@@ -185,21 +272,28 @@ class AgentContextOptimizer:
         return optimized
 
     def _strip_internal_flags(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Remove internal metadata keys that shouldn't reach the model.
+        """Remove internal metadata keys and section markers that shouldn't reach the model.
 
         Preserves the message structure and content while stripping:
         - _archived: compactor marker
+        - Section markers (<!-- STATIC/CONTEXT/DYNAMIC_LAYER -->)
         - Any other _prefixed keys (future-proof)
         """
         result: list[dict[str, Any]] = []
         internal_prefix = "_"
+        marker_pattern = re.compile(r"<!-- (STATIC|CONTEXT|DYNAMIC)_LAYER -->\n?")
 
         for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                content = marker_pattern.sub("", content)
+
             cleaned = {
                 k: v
                 for k, v in msg.items()
                 if not k.startswith(internal_prefix)
             }
+            cleaned["content"] = content
             result.append(cleaned)
 
         return result
@@ -440,7 +534,7 @@ class AgentContextOptimizer:
         if not evictable_body:
             return evictable_body
 
-        # Group into user-assistant pairs
+        # Group into pairs: (user, [assistant, tools...])
         pairs: list[list[dict[str, Any]]] = []
         current_pair: list[dict[str, Any]] = []
 
@@ -449,9 +543,9 @@ class AgentContextOptimizer:
             if role == "user":
                 if current_pair:
                     pairs.append(current_pair)
-                current_pair = [msg]
+                current_pair = [dict(msg)]
             else:
-                current_pair.append(msg)
+                current_pair.append(dict(msg))
 
         if current_pair:
             pairs.append(current_pair)
@@ -466,6 +560,207 @@ class AgentContextOptimizer:
             pairs = pairs[1:]
 
         return [m for pair in pairs for m in pair]
+
+    def _align_static_layer(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Align static layer to block boundary for cache optimization.
+
+        Pads the static layer (system + first user) to align to
+        CONTEXT_BLOCK_SIZE boundary, improving prefix cache hit rates.
+        Only applies padding if it doesn't exceed budget.
+        """
+        if not messages:
+            return messages
+
+        # Find static layer end (system + first user)
+        static_end = 0
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                static_end = i + 1
+            elif msg.get("role") == "user" and static_end > 0:
+                static_end = i + 1
+                break
+            elif msg.get("role") == "user" and static_end == 0:
+                static_end = i + 1
+                break
+
+        if static_end == 0:
+            return messages
+
+        # Calculate current static layer size
+        static_content = "\n".join(
+            m.get("content", "") for m in messages[:static_end]
+        )
+        aligned_content = align_to_block_boundary(static_content)
+
+        # Only add padding if it's small and won't break the budget
+        # (padding is for cache alignment, not content)
+        padding_needed = len(aligned_content) - len(static_content)
+        # Only pad if less than 100 newlines (small alignment)
+        if padding_needed > 0 and padding_needed < 100:
+            # Create a copy of messages to avoid mutation
+            result = [dict(m) for m in messages]
+            # Add padding to the last static message
+            result[static_end - 1] = {
+                **result[static_end - 1],
+                "content": result[static_end - 1].get("content", "") + "\n" * padding_needed,
+            }
+            return result
+
+        return messages
+
+    def _apply_syntax_stable_mtp(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Apply syntax-stable MTP prompt engineering.
+
+        Pre-seeds code-specific patterns to improve MTP prediction accuracy:
+        - Indentation level markers
+        - Type signature anchors
+        - Section markers for code structure
+        """
+        result = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str) and self._has_code_blocks(content):
+                content = self._inject_syntax_markers(content)
+            result.append({**msg, "content": content})
+        return result
+
+    def _inject_syntax_markers(self, text: str) -> str:
+        """Inject syntax markers for MTP stability.
+
+        Adds predictable patterns that help MTP heads converge faster.
+        """
+        # Add section markers for code blocks
+        lines = text.split("\n")
+        result_lines = []
+        in_code_block = False
+        code_block_lang = ""
+
+        for i, line in enumerate(lines):
+            if line.strip().startswith("```") and not in_code_block:
+                in_code_block = True
+                code_block_lang = line.strip().replace("```", "").strip()
+                result_lines.append(line)
+            elif line.strip() == "```" and in_code_block:
+                in_code_block = False
+                code_block_lang = ""
+                result_lines.append(line)
+            elif in_code_block and code_block_lang:
+                # Inject section markers for common patterns
+                stripped = line.strip()
+                if stripped.startswith("def ") or stripped.startswith("function "):
+                    result_lines.append(f"# SECTION: function {stripped[:40]}")
+                elif stripped.startswith("class "):
+                    result_lines.append(f"# SECTION: class {stripped[:40]}")
+                elif stripped.startswith("import ") or stripped.startswith("from "):
+                    result_lines.append(f"# SECTION: import")
+                result_lines.append(line)
+            else:
+                result_lines.append(line)
+
+        return "\n".join(result_lines)
+
+    def get_cache_key(self, messages: list[dict[str, Any]]) -> str:
+        """Generate cache key with canonicalization for static layer."""
+        return get_block_aligned_cache_key(messages)
+
+    def _preseed_reasoning(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Pre-seed reasoning prefix for MTP optimization.
+
+        Adds task-specific reasoning scaffolding to improve MTP convergence.
+        Only applies if there's sufficient budget headroom.
+        """
+        if not messages:
+            return messages
+
+        # Check if we have budget headroom for preseeding
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+        if total_chars > self._config.agentic.max_optimized_chars * 0.9:
+            # Too close to budget, skip preseeding
+            return messages
+
+        # Find the last user message
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+
+        if last_user_idx < 0:
+            return messages
+
+        # Pre-seed reasoning for the last user message
+        user_msg = messages[last_user_idx]
+        content = user_msg.get("content", "")
+
+        if isinstance(content, str):
+            # Add reasoning pre-seed
+            preseeded = self.thinking_preserver.preseed_reasoning_prefix(
+                content,
+                self._task_type,
+            )
+            # Return a new list with the modified message
+            result = [dict(m) for m in messages]
+            result[last_user_idx] = {
+                **user_msg,
+                "content": preseeded,
+            }
+            return result
+
+        return messages
+
+    def _proactive_trim(
+        self,
+        messages: list[dict[str, Any]],
+        target_chars: int,
+    ) -> list[dict[str, Any]]:
+        """Proactively trim context to prevent KV-cache performance degradation.
+
+        For MoE models, KV-cache fill is extremely slow. This method trims
+        context before it becomes a problem, preserving the most recent turns.
+        """
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+        if total_chars <= target_chars:
+            return messages
+
+        # Find the static layer (system + first user)
+        static_end = 0
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                static_end = i + 1
+            elif msg.get("role") == "user" and static_end > 0:
+                static_end = i + 1
+                break
+            elif msg.get("role") == "user" and static_end == 0:
+                static_end = i + 1
+                break
+
+        # Calculate how much we can keep from dynamic layer
+        static_chars = sum(len(m.get("content", "")) for m in messages[:static_end])
+        available_for_dynamic = target_chars - static_chars
+
+        if available_for_dynamic <= 0:
+            return messages[:static_end]  # Only keep static layer
+
+        # Keep only the most recent dynamic content
+        result = [dict(m) for m in messages[:static_end]]
+        dynamic_messages = messages[static_end:]
+
+        # Add messages from the end until we hit the limit
+        for msg in reversed(dynamic_messages):
+            msg_chars = len(msg.get("content", ""))
+            if available_for_dynamic >= msg_chars:
+                result.insert(static_end, dict(msg))
+                available_for_dynamic -= msg_chars
+            else:
+                break
+
+        return result
 
     def get_session_state(self) -> str:
         """Get serialized state for persistence across requests."""

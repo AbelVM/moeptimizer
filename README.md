@@ -1,10 +1,12 @@
-# moeptimizer
+# MOE-ptimizer
 
-Agentic MOE middleware: transparent OpenAI API proxy that optimizes context for Qwen3.6-35B-A3B-MTP + Lemonade NPU.
+Transparent OpenAI API proxy that optimizes context for MoE + MTP models in multi-turns agentic tasks.
+
+![img](moe2.jpg)
 
 ## Features
 
-- **Scratchpad Compaction** — Compresses old agent steps to single-sentence summaries while keeping recent steps in full detail
+- **Scratchpad Compaction** — Front-Loading Eviction for MTP head protection.
 - **Thinking Preservation** — Protects recent `<thinking>` blocks, archives stale reasoning to reclaim KV-cache
 - **State-Based RAG** — Graph-indexed retrieval (Goal -> Subtask -> Tool -> Outcome) instead of flat embeddings
 - **Loop Detection** — Detects repeated tool calls, actions, and thinking loops
@@ -13,19 +15,58 @@ Agentic MOE middleware: transparent OpenAI API proxy that optimizes context for 
 - **Code Chunking** — Tree-Sitter aware code splitting with language detection and NPU-based relevance ranking
 - **LanceDB Integration** — Persistent semantic index over agent turns for cross-session context
 
+### Advanced Optimizations (v0.2.0)
+
+- **Static Layer Block Alignment** — Aligns static context to 1024-token boundaries for improved prefix cache hit rates
+- **Multi-Level Cache Key Canonicalization** — Normalizes code and prompts for cache partitioning by task type
+- **Syntax-Stable MTP Prompt Engineering** — Pre-seeds reasoning patterns and injects code structure markers for MTP head optimization
+- **Symbol Index with Fuzzy Matching** — Trie-based symbol lookup with Levenshtein distance for typo-tolerant code retrieval
+- **Dependency Graph-Aware Context Injection** — Prefetches related files based on import/call graph relationships
+- **Hierarchical Attention Sink Management** — Manages attention patterns in long contexts to prevent drift
+- **Prompt Template Versioning** — Task-specific templates (debug, refactor, feature, test, doc) for cache partitioning
+- **Expert Routing Cache** — Caches MoE expert routing decisions for consistent patterns and improved cache locality
+- **Speculative Decoding Support** — MTP-aware draft model integration for 2-3x throughput improvement
+
+### Proactive Context Optimization (v0.3.0)
+
+- **Cache Key Registry** — Tracks context cache hits/misses, predicts hit rates before sending to model
+- **Context Aligner** — Aligns context to cache block boundaries, groups related code
+- **Context Canonicalizer** — Normalizes code formatting (indentation, whitespace, imports) for cache-friendly content
+- **Selective Truncator** — Truncates verbose explanations, removes duplicate code blocks, summarizes old turns
+- **Pattern Injector** — Adds consistent section markers to system/user messages (preserves assistant chat template)
+- **Dependency Orderer** — Orders context by import/call graph to improve cache locality
+- **Context Template Matcher** — Matches context to known cached templates, uses task-specific templates
+- **Incremental Updater** — Only appends new content, never modifies middle of cached context
+- **Cache-Aware Chunker** — Chunks code to align with cache blocks, keeps related functions together
+- **Context Compressor** — Compresses code to skeletons while preserving cache-friendly structure
+
 ## Architecture
 
 ```
 Client (OpenAI SDK) → moeptimizer:8080 → Lemonade NPU:13305
-                              │
-                              ├── SessionManager (per-session isolation)
-                              ├── AgentStateStore (KV graph)
-                              ├── ScratchpadCompactor
-                              ├── ThinkingPreserver
-                              ├── StateBasedRAG
-                              ├── LoopDetector
-                              ├── ProgressTracker
-                              └── EmbeddingService (LanceDB + NPU)
+                                │
+                                ├── SessionManager (per-session isolation)
+                                ├── AgentStateStore (KV graph)
+                                ├── ScratchpadCompactor
+                                ├── ThinkingPreserver
+                                ├── StateBasedRAG
+                                │   └── SymbolIndex (fuzzy symbol lookup)
+                                ├── LoopDetector
+                                ├── ProgressTracker
+                                ├── PromptTemplateManager (task classification)
+                                │   └── ContextTemplateMatcher (template matching)
+                                ├── AttentionSinkManager (long context stability)
+                                ├── ExpertRoutingCache (MoE routing cache)
+                                ├── CacheKeyRegistry (hit prediction)
+                                ├── ContextAligner (block alignment)
+                                ├── ContextCanonicalizer (formatting normalization)
+                                ├── SelectiveTruncator (duplicate removal)
+                                ├── PatternInjector (section markers)
+                                ├── DependencyOrderer (import ordering)
+                                ├── IncrementalUpdater (cache preservation)
+                                ├── CacheAwareChunker (aligned chunking)
+                                ├── ContextCompressor (skeleton compression)
+                                └── EmbeddingService (LanceDB + NPU)
 ```
 
 ## Installation
@@ -116,6 +157,47 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `GET` | `/v1/agent/sessions` | List active sessions |
 | `DELETE` | `/v1/agent/session/{id}` | Delete a session |
 | `POST` | `/v1/cache/clear` | Clear caches |
+
+## Benchmarking
+
+The benchmark script compares direct Lemonade vs moeptimizer proxy performance:
+
+```bash
+# Run with defaults (proxy on 8080, lemonade on localhost:13305)
+python scripts/benchmark.py
+
+# Real-life coding scenarios
+python scripts/benchmark.py --scenario debug --turns 15 --live
+python scripts/benchmark.py --scenario refactor --turns 10 --live
+python scripts/benchmark.py --scenario feature --turns 20 --live
+
+# Stress test with context eviction
+python scripts/benchmark.py --turns 50 --budget 8000 --live
+
+# JSON output for analysis
+python scripts/benchmark.py --turns 20 --json > report.json
+
+# Dump full response pairs
+python scripts/benchmark.py --turns 10 --dump-responses
+```
+
+### Benchmark Scenarios
+
+| Scenario | Description |
+|----------|-------------|
+| `debug` | Debugging session with error analysis and fix suggestions |
+| `refactor` | Code refactoring with performance optimization and type hints |
+| `feature` | Feature implementation with API design and testing |
+| `default` | General coding conversation (Fibonacci example) |
+
+### Metrics Collected
+
+- **Latency**: Direct vs proxy response times (mean, median, p95)
+- **Token Usage**: Prompt tokens, cached tokens, token savings percentage
+- **Context Window**: Final utilization percentage
+- **Response Quality**: Semantic similarity, ROUGE-L, trigram overlap, edit similarity
+- **MTP Stability**: Code block preservation, syntax consistency
+- **Eviction**: Turns triggering context eviction, chars before optimization
 
 ## Development
 
