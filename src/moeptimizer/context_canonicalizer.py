@@ -55,46 +55,67 @@ class ContextCanonicalizer:
         self,
         content: str,
     ) -> str:
-        """Canonicalize a single content string."""
+        """Canonicalize a single content string.
+
+        CRITICAL: Does NOT modify content inside code blocks to preserve
+        MTP prediction patterns. Only normalizes non-code content.
+        """
+        # Extract code blocks to preserve them
+        code_pattern = re.compile(
+            r"(```[\w]*\n.*?```)",
+            re.DOTALL,
+        )
+
+        # Split into code and non-code sections
+        parts = []
+        last_end = 0
+
+        for match in code_pattern.finditer(content):
+            # Add text before (canonicalize this part)
+            if match.start() > last_end:
+                before = content[last_end : match.start()]
+                parts.append(self._canonicalize_text(before))
+
+            # Add code block unchanged (preserve MTP patterns)
+            parts.append(match.group(1))
+            last_end = match.end()
+
+        # Add remaining text
+        if last_end < len(content):
+            parts.append(self._canonicalize_text(content[last_end:]))
+
+        return "".join(parts)
+
+    def _canonicalize_text(self, text: str) -> str:
+        """Canonicalize non-code text only.
+
+        Does NOT modify indentation or structure - only normalizes
+        line endings and removes trailing whitespace.
+        """
         # Normalize line endings
-        content = content.replace("\r\n", "\n").replace("\r", "\n")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-        # Normalize indentation (4 spaces)
-        content = self._normalize_indentation(content)
-
-        # Remove trailing whitespace
-        content = "\n".join(
-            line.rstrip() for line in content.split("\n")
+        # Remove trailing whitespace only
+        text = "\n".join(
+            line.rstrip() for line in text.split("\n")
         )
 
         # Normalize multiple blank lines to single
-        content = re.sub(r"\n{3,}", "\n\n", content)
+        text = re.sub(r"\n{3,}", "\n\n", text)
 
-        return content
+        return text
 
     def _normalize_indentation(
         self,
         content: str,
     ) -> str:
-        """Normalize indentation to 4 spaces."""
-        lines = content.split("\n")
-        result = []
-        for line in lines:
-            if not line.strip():
-                result.append("")
-                continue
-            # Convert tabs to spaces
-            line = line.replace("\t", "    ")
-            # Find minimum indentation
-            stripped = line.lstrip(" ")
-            if stripped:
-                indent = len(line) - len(stripped)
-                # Normalize to multiples of 4
-                normalized_indent = (indent // 4) * 4
-                result.append(" " * normalized_indent + stripped)
-            else:
-                result.append(line)
-        return "\n".join(result)
+        """Normalize indentation to 4 spaces.
+
+        DEPRECATED: This method is kept for API compatibility but
+        should NOT be used as it breaks MTP prediction patterns.
+        """
+        # Return content unchanged to preserve MTP patterns
+        return content
 
     def sort_imports(
         self,

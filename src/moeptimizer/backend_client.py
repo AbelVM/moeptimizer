@@ -4,8 +4,8 @@ Uses the official OpenAI Python SDK to ensure correct request formatting
 when communicating with the Lemonade server (which exposes an OpenAI-shaped API).
 
 Enhanced with:
-- Speculative decoding support
-- MTP-aware draft model integration
+- MTP-aware speculative decoding
+- Expert routing hints
 - Tree-based verification
 - Confidence threshold control
 """
@@ -16,6 +16,11 @@ import logging
 from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
+
+from moeptimizer.mtp_speculative import (
+    MTPSpeculativeDecoder,
+    build_mtp_speculative_body,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +42,31 @@ class SpeculativeDecoder:
     ) -> None:
         self._target = target_client
         self._draft = draft_client
-        self._mtp_lookahead = mtp_lookahead
-        self._confidence_threshold = confidence_threshold
+        self._mtp_decoder = MTPSpeculativeDecoder(
+            mtp_heads=3,
+            mtp_lookahead=[2, 3, 4],
+            confidence_threshold=confidence_threshold,
+        )
         self._stats: dict[str, int] = {"accepted": 0, "rejected": 0, "total": 0}
+        self._temp_stats: dict[str, float] = {"high_conf": 0.0, "low_conf": 0.0}
+
+    def get_temperature_for_mtp_confidence(
+        self,
+        mtp_confidence: float,
+    ) -> float:
+        """Get optimal temperature based on MTP confidence.
+
+        High confidence → lower temperature (more deterministic)
+        Low confidence → higher temperature (more exploration)
+
+        For precise coding tasks, target ~0.6 for best results.
+        """
+        if mtp_confidence > 0.8:
+            return 0.5   # Very confident, precise coding
+        elif mtp_confidence > 0.5:
+            return 0.6   # Moderately confident, recommended for coding
+        else:
+            return 0.7   # Low confidence, allow exploration
 
     async def generate(
         self,
@@ -48,38 +75,31 @@ class SpeculativeDecoder:
         **kwargs: Any,
     ) -> Any:
         """Generate with speculative decoding if draft model available."""
-        if self._draft is None:
-            # Fall back to normal generation
-            return await self._target.chat_completions_create(
-                messages=messages,
-                model=model,
-                **kwargs,
-            )
-
-        # Use draft model to generate MTP-predicted tokens
-        # Then verify with target model
-        return await self._speculative_generate(
+        # Use MTP-aware speculative decoding
+        return await self._mtp_speculative_generate(
             messages=messages,
             model=model,
             **kwargs,
         )
 
-    async def _speculative_generate(
+    async def _mtp_speculative_generate(
         self,
         messages: list[dict[str, Any]],
         model: str,
         **kwargs: Any,
     ) -> Any:
-        """Tree-based speculative generation."""
-        # For now, use target model with MTP hints
-        # Full implementation would use separate draft model
-        kwargs["extra_body"] = {
-            "speculative_decoding": {
-                "enabled": True,
-                "mtp_lookahead": self._mtp_lookahead,
-                "confidence_threshold": self._confidence_threshold,
-            }
-        }
+        """MTP-aware speculative generation using native MTP heads."""
+        # Build MTP-aware speculative body
+        mtp_body = build_mtp_speculative_body(
+            mtp_heads=3,
+            mtp_lookahead=4,
+            confidence_threshold=self._mtp_decoder._confidence_threshold,
+        )
+
+        # Merge with existing extra_body
+        existing_body = kwargs.get("extra_body", {})
+        kwargs["extra_body"] = {**existing_body, **mtp_body}
+
         return await self._target.chat_completions_create(
             messages=messages,
             model=model,
@@ -174,6 +194,14 @@ class LemonadeClient:
                      model, len(validated_messages), stream)
 
         response = await self._client.chat.completions.create(**params)
+
+        # Extract cache hit information if available
+        if hasattr(response, "usage") and response.usage:
+            # Lemonade may provide cache hit info in usage
+            cache_hit = getattr(response.usage, "cache_hit_tokens", None)
+            if cache_hit is not None:
+                logger.debug("Cache hit tokens: %d", cache_hit)
+
         return response
 
     async def chat_completions_stream(

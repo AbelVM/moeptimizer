@@ -26,50 +26,71 @@ class ExpertRoutingCache:
     """
 
     def __init__(self, max_size: int = 4096) -> None:
-        self._cache: OrderedDict[str, tuple[int, ...]] = OrderedDict()
+        # Partitioned caches for static/dynamic layers
+        self._static_cache: OrderedDict[str, tuple[int, ...]] = OrderedDict()
+        self._dynamic_cache: OrderedDict[str, tuple[int, ...]] = OrderedDict()
         self._max_size = max_size
         self._stats: dict[str, int] = {"hits": 0, "misses": 0, "evictions": 0}
-        self._pattern_cache: OrderedDict[str, str] = OrderedDict()
 
-    def get(self, token_pattern: str) -> tuple[int, ...] | None:
-        """Get cached expert mask for a token pattern."""
-        if token_pattern in self._cache:
+    def get(
+        self,
+        token_pattern: str,
+        layer: str = "dynamic",
+    ) -> tuple[int, ...] | None:
+        """Get cached expert mask for a token pattern.
+
+        layer: "static" or "dynamic" to use partitioned cache.
+        """
+        cache = self._static_cache if layer == "static" else self._dynamic_cache
+        if token_pattern in cache:
             self._stats["hits"] += 1
-            self._cache.move_to_end(token_pattern)
-            return self._cache[token_pattern]
+            cache.move_to_end(token_pattern)
+            return cache[token_pattern]
         self._stats["misses"] += 1
         return None
 
-    def put(self, token_pattern: str, expert_mask: tuple[int, ...]) -> None:
-        """Cache an expert routing decision."""
-        if token_pattern in self._cache:
-            self._cache.move_to_end(token_pattern)
-        self._cache[token_pattern] = expert_mask
-        while len(self._cache) > self._max_size:
-            self._cache.popitem(last=False)
+    def put(
+        self,
+        token_pattern: str,
+        expert_mask: tuple[int, ...],
+        layer: str = "dynamic",
+    ) -> None:
+        """Cache an expert routing decision.
+
+        layer: "static" or "dynamic" to use partitioned cache.
+        """
+        cache = self._static_cache if layer == "static" else self._dynamic_cache
+        if token_pattern in cache:
+            cache.move_to_end(token_pattern)
+        cache[token_pattern] = expert_mask
+        while len(cache) > self._max_size // 2:
+            cache.popitem(last=False)
             self._stats["evictions"] += 1
+
+    def clear(self) -> None:
+        """Clear all caches."""
+        self._cache.clear()
+        self._static_cache.clear()
+        self._dynamic_cache.clear()
+        self._stats = {"hits": 0, "misses": 0, "evictions": 0}
 
     def get_or_compute(
         self,
         token_pattern: str,
         compute_fn: Any,
+        layer: str = "dynamic",
     ) -> tuple[int, ...]:
         """Get cached expert mask or compute and cache it."""
-        cached = self.get(token_pattern)
+        cached = self.get(token_pattern, layer=layer)
         if cached is not None:
             return cached
         result = compute_fn()
-        self.put(token_pattern, result)
+        self.put(token_pattern, result, layer=layer)
         return result
 
     def get_stats(self) -> dict[str, int]:
         """Get cache statistics."""
         return dict(self._stats)
-
-    def clear(self) -> None:
-        """Clear the cache."""
-        self._cache.clear()
-        self._stats = {"hits": 0, "misses": 0, "evictions": 0}
 
     def hash_ast_node(
         self,
@@ -94,11 +115,57 @@ class ExpertRoutingCache:
 
         # Check cache for any matching pattern
         for pattern in patterns:
-            cached = self.get(pattern)
+            cached = self.get(pattern, layer="dynamic")
             if cached is not None:
                 return cached
 
         return None
+
+    def predict_expert_for_tokens(
+        self,
+        tokens: list[str],
+    ) -> list[tuple[int, ...]]:
+        """Predict expert for each token in sequence.
+
+        Token-level prediction provides finer granularity for MoE optimization.
+        """
+        predictions: list[tuple[int, ...]] = []
+        for token in tokens:
+            # Use token as pattern
+            cached = self.get(token, layer="dynamic")
+            if cached:
+                predictions.append(cached)
+            else:
+                # Default prediction
+                predictions.append(tuple(range(0, 64)))
+        return predictions
+
+    def get_expert_hints_for_context(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Generate expert hints for a context.
+
+        Returns list of {position, experts} for the Lemonade server.
+        """
+        hints: list[dict[str, Any]] = []
+        position = 0
+
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                # Extract tokens
+                tokens = content.split()
+                for token in tokens[:100]:  # Limit to first 100 tokens
+                    cached = self.get(token, layer="dynamic")
+                    if cached:
+                        hints.append({
+                            "position": position,
+                            "experts": list(cached),
+                        })
+                    position += 1
+
+        return hints
 
     def _extract_patterns(
         self,
@@ -139,16 +206,78 @@ class ExpertRoutingCache:
         """Pre-warm expert cache with static layer patterns.
 
         This should be called when static layer is first loaded.
+        Extracts code patterns and caches their expert routing decisions.
         """
         # Extract common patterns from static content
         patterns = self._extract_static_patterns(static_content)
 
         # For each pattern, we'd normally get the expert mask from the model
-        # For now, we just record the patterns
+        # For now, we just record the patterns and use placeholder masks
+        # In production, this would call the model's /token-predict endpoint
         for pattern in patterns:
-            if pattern not in self._cache:
+            if pattern not in self._static_cache:
                 # Placeholder - would be filled by actual model routing
-                self._cache[pattern] = tuple(range(64))  # Default 64 experts
+                # The pattern hash maps to likely expert indices
+                expert_mask = self._predict_experts_for_pattern(pattern)
+                self._static_cache[pattern] = expert_mask
+
+    def _predict_experts_for_pattern(self, pattern: str) -> tuple[int, ...]:
+        """Predict expert mask for a pattern.
+
+        Uses heuristics based on pattern type to predict which experts
+        will handle this code.
+        """
+        # Python patterns typically use experts 0-15
+        if "python" in pattern:
+            return tuple(range(0, 16))
+        # JavaScript patterns use experts 16-31
+        elif "javascript" in pattern or "typescript" in pattern:
+            return tuple(range(16, 32))
+        # Class patterns use experts 32-47
+        elif "class" in pattern:
+            return tuple(range(32, 48))
+        # Function patterns use experts 48-63
+        elif "function" in pattern:
+            return tuple(range(48, 64))
+        # Default: spread across all experts
+        return tuple(range(0, 64))
+
+    def update_from_model_feedback(
+        self,
+        token: str,
+        expert_mask: tuple[int, ...],
+        layer: str = "dynamic",
+    ) -> None:
+        """Update cache with actual model routing feedback.
+
+        This should be called after each request to improve predictions.
+        """
+        self.put(token, expert_mask, layer=layer)
+
+    def get_or_predict(
+        self,
+        token: str,
+        code_context: str = "",
+        layer: str = "dynamic",
+    ) -> tuple[int, ...]:
+        """Get cached expert mask or predict based on context.
+
+        Uses code context to improve predictions when no cache hit.
+        """
+        cached = self.get(token, layer=layer)
+        if cached is not None:
+            return cached
+
+        # Predict based on code context
+        if code_context:
+            patterns = self._extract_patterns(code_context, "unknown")
+            for pattern in patterns:
+                cached = self.get(pattern, layer=layer)
+                if cached is not None:
+                    return cached
+
+        # Return default prediction
+        return tuple(range(0, 64))
 
     def _extract_static_patterns(self, content: str) -> list[str]:
         """Extract patterns from static layer content."""

@@ -8,6 +8,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from moeptimizer.cache import get_block_size
+
 
 class CacheAwareChunker:
     """
@@ -20,9 +22,9 @@ class CacheAwareChunker:
 
     def __init__(
         self,
-        block_size: int = 1024,
+        block_size: int | None = None,
     ) -> None:
-        self._block_size = block_size
+        self._block_size = block_size or get_block_size()
 
     def chunk_context(
         self,

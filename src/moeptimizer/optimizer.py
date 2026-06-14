@@ -29,10 +29,12 @@ from typing import Any
 
 import numpy as np
 
+from moeptimizer.attention_sink import apply_attention_sinks
 from moeptimizer.cache import (
     align_to_block_boundary,
     canonicalize_code_for_cache,
     get_block_aligned_cache_key,
+    set_block_size,
 )
 from moeptimizer.cache_aware_chunker import get_cache_aware_chunker
 from moeptimizer.cache_registry import get_cache_registry
@@ -63,7 +65,10 @@ from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
 from moeptimizer.symbol_index import SymbolIndex
 from moeptimizer.thinking_preserver import ThinkingPreserver
+from moeptimizer.hierarchical_index import get_hierarchical_index
+from moeptimizer.mtp_state import get_mtp_state_manager
 from moeptimizer.token_counter import TokenCounter
+from moeptimizer.tool_streamer import get_tool_streamer
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +99,11 @@ class AgentContextOptimizer:
         self.pattern_injector = get_pattern_injector()
         self.selective_truncator = get_selective_truncator()
         self.cache_aware_chunker = get_cache_aware_chunker()
+        self.hierarchical_index = get_hierarchical_index()
+        self.mtp_state_manager = get_mtp_state_manager()
+        self.tool_streamer = get_tool_streamer()
         self._task_type: str = "default"
+        self._last_mtp_state_key: str | None = None
 
     def optimize_messages(
         self,
@@ -135,8 +144,25 @@ class AgentContextOptimizer:
             self.progress_tracker.record_step(step)
         progress = self.progress_tracker.get_progress()
 
-        # Step 5: Apply thinking preservation
+        # Step 5: Apply thinking preservation (pass-through)
         optimized = self.thinking_preserver.process_messages(list(messages))
+
+        # Step 5.1: Check cache hit rate - skip heavy optimization if high
+        cache_hit_rate = self.cache_registry.predict_hit_rate(optimized)
+        if cache_hit_rate > 0.9:
+            logger.info(
+                "[AgentOptimizer] High cache hit rate (%.2f), skipping heavy optimization",
+                cache_hit_rate,
+            )
+            # Still need to strip internal flags and register context
+            optimized = self._strip_internal_flags(optimized)
+            self.cache_registry.register_context(optimized)
+            self.cache_registry.save_to_disk()
+            return optimized
+
+        # Calculate static layer end once (used by multiple steps)
+        static_end = self._find_static_layer_end(optimized)
+        total_chars = sum(len(m.get("content", "")) for m in optimized)
 
         # Step 5.5: Apply context canonicalization for cache-friendly formatting
         optimized = self.context_canonicalizer.canonicalize(optimized)
@@ -144,11 +170,23 @@ class AgentContextOptimizer:
         # Step 5.7: Apply context compression to reduce token usage
         optimized = self.context_compressor.compress(optimized)
 
+        # Step 5.8: Apply attention sink management for long-context stability
+        if total_chars > 4000:
+            optimized = apply_attention_sinks(optimized, static_end)
+
+        # Step 5.9: Warm expert cache for static layer patterns
+        if total_chars > 1000:
+            static_content = self._get_static_layer_content(optimized)
+            if static_content:
+                self.expert_cache.warm_cache_for_static_layer(static_content)
+
+        # Step 5.10: Prefetch dependencies for files in context
+        self._prefetch_dependencies(optimized)
+
         # Step 6: Apply prompt template versioning
         optimized, self._task_type = classify_and_template(optimized)
 
         # Step 6.5: Apply context template matching
-        # Only add system message if we don't already have one
         if not (optimized and optimized[0].get("role") == "system"):
             template_name = self.context_template_matcher.match_template(optimized)
             if template_name:
@@ -164,18 +202,10 @@ class AgentContextOptimizer:
         optimized = self.dependency_orderer.order_by_dependencies(optimized)
 
         # Step 7.8: Apply incremental update for cache preservation
-        # Check if we can append to existing context instead of creating new messages
         optimized = self.incremental_updater.update_context(optimized, "")
 
         # Step 8: Inject RAG context and loop warnings as SEPARATE user messages
-        # CRITICAL: Never inject into assistant messages — this breaks the model's
-        # expected chat template (ăssistant\n<think>\n...\n</think>\n\n...) and
-        # triggers KV-cache refills during expensive MOE prefill.
-        #
-        # Instead, append user messages AFTER the last assistant turn. The model
-        # was trained on user→assistant turn pairs, so this pattern is safe.
         if loop_warnings:
-            # Build a compact loop warning for the model
             warning_lines: list[str] = []
             for w in loop_warnings:
                 warning_lines.append(self.loop_detector.get_warning_message(w))
@@ -185,7 +215,7 @@ class AgentContextOptimizer:
                     "content": "\n".join(warning_lines),
                 })
 
-        # RAG context: append as a separate user message (not injected into assistant)
+        # RAG context: append as a separate user message
         last_assistant = None
         for msg in reversed(optimized):
             if msg.get("role") == "assistant" and not msg.get("_archived"):
@@ -207,14 +237,10 @@ class AgentContextOptimizer:
                 })
 
         # Step 8: Apply static layer block alignment for cache optimization
-        # Only apply when context is large enough to benefit
-        total_chars = sum(len(m.get("content", "")) for m in optimized)
-        if total_chars > 2000:  # Only align for larger contexts
+        if total_chars > 2000:
             optimized = self._align_static_layer(optimized)
 
         # Step 9: Pre-seed reasoning prefix for MTP (only if budget allows)
-        # Check budget before preseeding to avoid exceeding limits
-        total_chars = sum(len(m.get("content", "")) for m in optimized)
         if total_chars < self._config.agentic.max_optimized_chars * 0.5:
             optimized = self._preseed_reasoning(optimized)
 
@@ -225,20 +251,32 @@ class AgentContextOptimizer:
                 msg["content"] = self._optimize_code_in_text(content)
 
         # Step 10.5: Apply cache-aware chunking for large contexts
-        total_chars = sum(len(m.get("content", "")) for m in optimized)
         if total_chars > 3000:
             optimized = self.cache_aware_chunker.chunk_context(optimized)
 
         # Step 11: Proactive context trimming for MoE KV-cache efficiency
-        # For MoE models, KV-cache fill is extremely slow. We proactively trim
-        # to keep context lean and avoid performance degradation.
-        total_chars = sum(len(m.get("content", "")) for m in optimized)
         proactive_threshold = self._config.agentic.max_optimized_chars * 0.7
         if total_chars > proactive_threshold:
             optimized = self._proactive_trim(optimized, proactive_threshold)
 
+        # Step 11.5: Entropy-guided trimming for MTP-friendly content
+        optimized = self._entropy_guided_trim(optimized)
+
+        # Step 11.6: Stream large tool outputs for better context management
+        optimized = self._stream_large_tool_outputs(optimized)
+
+        # Step 11.7: Save MTP state before trimming for context switching
+        # This preserves prediction quality across evictions
+        state_key = self.mtp_state_manager.get_state_key(optimized)
+        # Store the state key in the optimizer for potential restoration
+        self._last_mtp_state_key = state_key
+
+        # Step 11.8: Apply sliding window for long contexts
+        # This is the preferred method for context management with MTP state preservation
+        if total_chars > self._config.agentic.max_optimized_chars * 0.8:
+            optimized = self._sliding_window_trim(optimized)
+
         # Step 12: Enforce hard character cap
-        # Use character counts consistently — _trim_to_budget uses char budget
         total_chars = sum(len(m.get("content", "")) for m in optimized)
         if total_chars > self._config.agentic.max_optimized_chars:
             optimized = self._trim_to_budget(optimized)
@@ -248,6 +286,9 @@ class AgentContextOptimizer:
 
         # Step 14: Register context in cache registry for hit prediction
         self.cache_registry.register_context(optimized)
+
+        # Step 14.5: Persist cache registry for cross-session reuse
+        self.cache_registry.save_to_disk()
 
         # Log metrics
         original_chars = sum(len(m.get("content", "")) for m in messages)
@@ -277,11 +318,15 @@ class AgentContextOptimizer:
         Preserves the message structure and content while stripping:
         - _archived: compactor marker
         - Section markers (<!-- STATIC/CONTEXT/DYNAMIC_LAYER -->)
+        - Attention sink markers (# CONTEXT_ANCHOR, STATIC_LAYER_END)
         - Any other _prefixed keys (future-proof)
         """
         result: list[dict[str, Any]] = []
         internal_prefix = "_"
-        marker_pattern = re.compile(r"<!-- (STATIC|CONTEXT|DYNAMIC)_LAYER -->\n?")
+        # Include attention sink markers in the pattern
+        marker_pattern = re.compile(
+            r"<!-- (STATIC|CONTEXT|DYNAMIC)_LAYER -->\n?|# (CONTEXT_ANCHOR|STATIC_LAYER_END).*\n?",
+        )
 
         for msg in messages:
             content = msg.get("content", "")
@@ -666,6 +711,61 @@ class AgentContextOptimizer:
         """Generate cache key with canonicalization for static layer."""
         return get_block_aligned_cache_key(messages)
 
+    def _find_static_layer_end(self, messages: list[dict[str, Any]]) -> int:
+        """Find the end index of the static layer (system + first user)."""
+        static_end = 0
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                static_end = i + 1
+            elif msg.get("role") == "user" and static_end > 0:
+                static_end = i + 1
+                break
+            elif msg.get("role") == "user" and static_end == 0:
+                static_end = i + 1
+                break
+        return static_end
+
+    def _get_static_layer_content(self, messages: list[dict[str, Any]]) -> str:
+        """Extract the static layer content for expert cache warming."""
+        static_end = self._find_static_layer_end(messages)
+        if static_end == 0:
+            return ""
+        return "\n".join(m.get("content", "") for m in messages[:static_end])
+
+    def _prefetch_dependencies(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Prefetch dependencies for files in context.
+
+        Warms the expert cache for related code to avoid cold starts.
+        """
+        # Extract file references from context
+        file_refs = self._extract_file_references(messages)
+
+        for file_path in file_refs:
+            # Get dependency context
+            dep_context = self.state_rag.get_dependency_context(file_path)
+            if dep_context:
+                # Warm expert cache for dependency patterns
+                self.expert_cache.warm_cache_for_static_layer(dep_context)
+
+    def _extract_file_references(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[str]:
+        """Extract file references from messages."""
+        file_refs: list[str] = []
+        file_pattern = re.compile(r"[\w/]+\.(py|js|ts|go|rs|cpp|h|java)")
+
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                matches = file_pattern.findall(content)
+                file_refs.extend(matches)
+
+        return file_refs
+
     def _preseed_reasoning(
         self,
         messages: list[dict[str, Any]],
@@ -762,6 +862,204 @@ class AgentContextOptimizer:
 
         return result
 
+    def _sliding_window_trim(
+        self,
+        messages: list[dict[str, Any]],
+        window_size: int = 4096,
+        overlap_size: int = 128,
+    ) -> list[dict[str, Any]]:
+        """Apply sliding window with MTP state preservation.
+
+        Uses a sliding window approach that preserves MTP state in the overlap region.
+        This maintains prediction quality across context switches.
+        """
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+
+        if total_chars <= window_size:
+            return messages
+
+        # Find static layer
+        static_end = self._find_static_layer_end(messages)
+        static_chars = sum(len(m.get("content", "")) for m in messages[:static_end])
+
+        # If static layer alone exceeds window, only keep static
+        if static_chars >= window_size:
+            return messages[:static_end]
+
+        # Calculate available space for dynamic content
+        available = window_size - static_chars
+
+        # Keep overlap at the end for MTP state preservation
+        # The overlap region maintains hidden state continuity
+        result = [dict(m) for m in messages[:static_end]]
+        dynamic_messages = messages[static_end:]
+
+        # Add messages from end, keeping overlap
+        current_size = 0
+        overlap_chars = 0
+
+        for msg in reversed(dynamic_messages):
+            msg_chars = len(msg.get("content", ""))
+            if current_size + msg_chars <= available:
+                result.insert(static_end, dict(msg))
+                current_size += msg_chars
+            else:
+                # This message would exceed the window
+                # Keep it as overlap for MTP state
+                if overlap_chars < overlap_size:
+                    result.insert(static_end, dict(msg))
+                    overlap_chars += msg_chars
+
+        return result
+
+    def _entropy_guided_trim(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Trim high-entropy content while preserving low-entropy code structures.
+
+        MTP heads perform better with low-entropy contexts. This method:
+        - Identifies high-entropy "noise" messages (tool logs, errors)
+        - Trims them first while preserving code structures
+        - Never modifies assistant content to avoid KV-cache refill
+        - Never removes assistant messages (they're part of the chat template)
+        """
+        if not messages:
+            return messages
+
+        # Find static layer (system + first user)
+        static_end = self._find_static_layer_end(messages)
+
+        # Separate static and dynamic
+        static_messages = messages[:static_end]
+        dynamic_messages = messages[static_end:]
+
+        # Only trim tool messages with high entropy
+        # Never trim assistant messages (they're part of the chat template)
+        trimmed_dynamic = []
+        for msg in dynamic_messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            # Always keep assistant messages (chat template integrity)
+            if role == "assistant":
+                trimmed_dynamic.append(msg)
+                continue
+
+            # For tool messages, check entropy
+            if role == "tool" and isinstance(content, str):
+                entropy = self._calculate_message_entropy(content)
+                # High entropy tool output - can be trimmed
+                if entropy > 0.7 and len(content) > 500:
+                    # Replace with summary instead of removing
+                    # This preserves the turn structure
+                    trimmed_dynamic.append({
+                        **msg,
+                        "content": f"[Tool output truncated - {len(content)} chars]",
+                    })
+                else:
+                    trimmed_dynamic.append(msg)
+            else:
+                trimmed_dynamic.append(msg)
+
+        return static_messages + trimmed_dynamic
+
+    def _calculate_message_entropy(self, content: str) -> float:
+        """Calculate entropy of a message.
+
+        High entropy = unpredictable content (logs, errors)
+        Low entropy = predictable patterns (code, structure)
+        """
+        if not content:
+            return 0.0
+
+        # Count unique symbols vs total tokens
+        import re
+        symbols = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", content))
+        tokens = content.split()
+
+        if not tokens:
+            return 0.0
+
+        # Symbol diversity ratio
+        ratio = len(symbols) / len(tokens)
+        return min(1.0, ratio)
+
+    def _stream_large_tool_outputs(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Stream large tool outputs as separate user messages.
+
+        Large tool outputs are split into chunks to avoid context bloat
+        while maintaining MTP prediction patterns.
+
+        CRITICAL: Tool messages are kept as tool role to preserve turn structure.
+        The model expects user→assistant→tool turn patterns.
+        """
+        result = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "tool" and isinstance(content, str):
+                if self.tool_streamer.should_stream(content):
+                    # Stream as separate tool messages (not user!)
+                    # This preserves the turn structure for the model
+                    tool_name = msg.get("metadata", {}).get("name", "unknown")
+                    streamed = self.tool_streamer.stream_output(content, tool_name)
+                    for i, chunk in enumerate(streamed):
+                        # Keep as tool role, add chunk index for tracking
+                        result.append({
+                            **msg,
+                            "content": chunk,
+                            "chunk_index": i,
+                        })
+                else:
+                    result.append(msg)
+            else:
+                result.append(msg)
+
+        return result
+
+    def get_optimal_temperature(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> float:
+        """Get optimal temperature based on context characteristics.
+
+        For MoE models, lower temperature = more predictable patterns =
+        better MTP predictions and cache hits.
+
+        For precise coding tasks, recommended temperature is ~0.6.
+        This optimizer adjusts based on context entropy:
+        - Low entropy (code): 0.5-0.6 for precision
+        - Medium entropy: 0.3-0.5 for balance
+        - High entropy (explanations): 0.1-0.3 for exploration
+        """
+        # Calculate context entropy
+        total_entropy = 0.0
+        msg_count = 0
+
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str) and len(content) > 100:
+                entropy = self._calculate_message_entropy(content)
+                total_entropy += entropy
+                msg_count += 1
+
+        avg_entropy = total_entropy / max(1, msg_count)
+
+        # High entropy = unpredictable = need higher temperature
+        # Low entropy = predictable = can use lower temperature
+        # For coding tasks, target ~0.6 for precision
+        if avg_entropy > 0.6:
+            return 0.3  # High entropy, allow exploration
+        elif avg_entropy > 0.3:
+            return 0.5  # Medium entropy, balanced for coding
+        else:
+            return 0.6  # Low entropy, deterministic coding
+
     def get_session_state(self) -> str:
         """Get serialized state for persistence across requests."""
         progress = self.progress_tracker.get_progress()
@@ -772,6 +1070,7 @@ class AgentContextOptimizer:
             "goal_subtasks": self.goal_decomposer.decompose(
                 goal.original_prompt if goal else ""
             ),
+            "mtp_state_key": self._last_mtp_state_key,
         })
 
     def load_session_state(self, state_json: str) -> None:
@@ -789,5 +1088,11 @@ class AgentContextOptimizer:
             for st in pdata.get("active_subtasks", []):
                 self.progress_tracker._tracked_subtasks[st] = "active"
 
+        # Restore MTP state key for potential state restoration
+        self._last_mtp_state_key = data.get("mtp_state_key")
+
         if "goal_subtasks" in data:
             self.progress_tracker.set_subtasks(data["goal_subtasks"])
+
+        # Load cache registry for cross-session persistence
+        self.cache_registry.load_from_disk()

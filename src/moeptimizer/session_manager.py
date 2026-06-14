@@ -96,3 +96,21 @@ class SessionManager:
         for sid in expired:
             self._sessions.pop(sid, None)
             self._session_timestamps.pop(sid, None)
+
+    def get_mtp_state_key(self, session_id: str) -> str | None:
+        """Get the MTP state key for a session."""
+        optimizer = self._sessions.get(session_id)
+        if optimizer:
+            return getattr(optimizer, "_last_mtp_state_key", None)
+        return None
+
+    def restore_mtp_state(self, session_id: str) -> Any | None:
+        """Restore MTP state for a session if available."""
+        optimizer = self._sessions.get(session_id)
+        if optimizer:
+            state_key = getattr(optimizer, "_last_mtp_state_key", None)
+            if state_key:
+                from moeptimizer.mtp_state import get_mtp_state_manager
+                mtp_manager = get_mtp_state_manager()
+                return mtp_manager.load_state(state_key)
+        return None

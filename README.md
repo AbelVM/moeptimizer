@@ -17,7 +17,7 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 
 ### Advanced Optimizations (v0.2.0)
 
-- **Static Layer Block Alignment** — Aligns static context to 1024-token boundaries for improved prefix cache hit rates
+- **Static Layer Block Alignment** — Aligns static context to 128-token boundaries for improved prefix cache hit rates
 - **Multi-Level Cache Key Canonicalization** — Normalizes code and prompts for cache partitioning by task type
 - **Syntax-Stable MTP Prompt Engineering** — Pre-seeds reasoning patterns and injects code structure markers for MTP head optimization
 - **Symbol Index with Fuzzy Matching** — Trie-based symbol lookup with Levenshtein distance for typo-tolerant code retrieval
@@ -39,6 +39,26 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 - **Incremental Updater** — Only appends new content, never modifies middle of cached context
 - **Cache-Aware Chunker** — Chunks code to align with cache blocks, keeps related functions together
 - **Context Compressor** — Compresses code to skeletons while preserving cache-friendly structure
+
+### MoE-Specific Optimizations (v0.4.0)
+
+- **MTP-Aware Speculative Decoding** — Native MTP head outputs used as draft tokens
+- **Expert Cache Partitioning** — Separate caches for static/dynamic layers to prevent thrashing
+- **Token-Level Expert Routing** — Finer-grained expert prediction per token
+- **Entropy-Guided Trimming** — Removes high-entropy noise while preserving code structures
+- **Tool Output Streaming** — Large tool outputs split into MTP-friendly chunks
+- **Cross-Session Cache Persistence** — Cache registry saved to disk for reuse
+- **Temperature Calibration** — Entropy-based temperature for optimal MTP predictions
+- **MTP State Management** — Infrastructure for state serialization across evictions
+
+### Architecture Fixes (v0.4.1)
+
+- **Cache Hit Monitoring** — Real backend cache hit tracking for optimization feedback
+- **Sliding Window Context** — Context management with MTP state preservation for long sessions
+- **Tool Streaming Fix** — Preserves turn structure (tool role maintained, not converted to user)
+- **Attention Sink Stripping** — Properly removes attention sink markers before model input
+- **Cache Key Collision Resistance** — 128-bit keys (32 hex chars) to minimize collisions
+- **Pipeline Optimization** — Removed redundant static layer calculations, early return on high cache hit rate
 
 ## Architecture
 

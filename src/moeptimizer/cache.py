@@ -16,7 +16,24 @@ from typing import Any, TypeVar
 T = TypeVar("T")
 
 # Block alignment constant (Qwen context block size)
-CONTEXT_BLOCK_SIZE = 1024
+# Note: llama.cpp uses 128-token blocks, not 1024
+# This can be overridden by querying the model
+DEFAULT_CONTEXT_BLOCK_SIZE = 128
+CONTEXT_BLOCK_SIZE = DEFAULT_CONTEXT_BLOCK_SIZE
+
+# Global block size that can be updated from model config
+_block_size: int = DEFAULT_CONTEXT_BLOCK_SIZE
+
+
+def set_block_size(size: int) -> None:
+    """Set the context block size from model configuration."""
+    global _block_size
+    _block_size = size
+
+
+def get_block_size() -> int:
+    """Get the current context block size."""
+    return _block_size
 
 _md5 = hashlib.md5
 
@@ -87,12 +104,14 @@ def canonicalize_prompt_for_cache(messages: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def align_to_block_boundary(text: str, block_size: int = CONTEXT_BLOCK_SIZE) -> str:
+def align_to_block_boundary(text: str, block_size: int | None = None) -> str:
     """Align text to block boundary for prefix cache optimization.
 
     Pads with whitespace to fill complete blocks, improving
     cache hit rates when static layer size is consistent.
     """
+    if block_size is None:
+        block_size = get_block_size()
     current_len = len(text)
     remainder = current_len % block_size
     if remainder == 0:
@@ -103,14 +122,17 @@ def align_to_block_boundary(text: str, block_size: int = CONTEXT_BLOCK_SIZE) -> 
 
 def get_block_aligned_cache_key(
     messages: list[dict[str, Any]],
-    block_size: int = CONTEXT_BLOCK_SIZE,
+    block_size: int | None = None,
 ) -> str:
     """Generate cache key with block alignment for static layer.
 
     Returns a tuple of (key, aligned_length) for cache partitioning.
+    Uses 32 hex chars (128 bits) to minimize collision risk.
     """
+    if block_size is None:
+        block_size = get_block_size()
     canonical = canonicalize_prompt_for_cache(messages)
-    key = _md5(canonical.encode("utf8")).hexdigest()
+    key = _md5(canonical.encode("utf8")).hexdigest()[:32]
     return key
 
 
@@ -130,72 +152,6 @@ def cache_put(cache: OrderedDict[str, T], key: str, value: T, max_size: int) -> 
     while len(cache) > max_size:
         cache.popitem(last=False)
     return value
-
-
-class ExpertRoutingCache:
-    """Cache for MoE expert routing decisions.
-
-    Qwen3.6-35B-A3B-MTP uses token-level expert routing.
-    This cache stores (token_pattern → expert_mask) mappings
-    to reduce routing overhead and improve expert cache locality.
-    """
-
-    def __init__(self, max_size: int = 4096) -> None:
-        self._cache: OrderedDict[str, tuple[int, ...]] = OrderedDict()
-        self._max_size = max_size
-        self._stats = {"hits": 0, "misses": 0, "evictions": 0}
-
-    def get(self, token_pattern: str) -> tuple[int, ...] | None:
-        """Get cached expert mask for a token pattern."""
-        if token_pattern in self._cache:
-            self._stats["hits"] += 1
-            self._cache.move_to_end(token_pattern)
-            return self._cache[token_pattern]
-        self._stats["misses"] += 1
-        return None
-
-    def put(self, token_pattern: str, expert_mask: tuple[int, ...]) -> None:
-        """Cache an expert routing decision."""
-        if token_pattern in self._cache:
-            self._cache.move_to_end(token_pattern)
-        self._cache[token_pattern] = expert_mask
-        while len(self._cache) > self._max_size:
-            self._cache.popitem(last=False)
-            self._stats["evictions"] += 1
-
-    def get_or_compute(
-        self,
-        token_pattern: str,
-        compute_fn: Any,
-    ) -> tuple[int, ...]:
-        """Get cached expert mask or compute and cache it."""
-        cached = self.get(token_pattern)
-        if cached is not None:
-            return cached
-        result = compute_fn()
-        self.put(token_pattern, result)
-        return result
-
-    def get_stats(self) -> dict[str, int]:
-        """Get cache statistics."""
-        return dict(self._stats)
-
-    def clear(self) -> None:
-        """Clear the cache."""
-        self._cache.clear()
-        self._stats = {"hits": 0, "misses": 0, "evictions": 0}
-
-
-# Global expert routing cache instance
-_expert_cache: ExpertRoutingCache | None = None
-
-
-def get_expert_cache() -> ExpertRoutingCache:
-    """Get or create the global expert routing cache."""
-    global _expert_cache
-    if _expert_cache is None:
-        _expert_cache = ExpertRoutingCache()
-    return _expert_cache
 
 
 def hash_ast_node(node_text: str, node_type: str) -> str:

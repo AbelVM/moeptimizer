@@ -7,8 +7,10 @@ from __future__ import annotations
 
 from typing import Any
 
-# Cache block size for Qwen models
-CACHE_BLOCK_SIZE = 1024
+from moeptimizer.cache import get_block_size
+
+# Cache block size for Qwen models (default, can be overridden)
+CACHE_BLOCK_SIZE = 128
 
 
 class ContextAligner:
@@ -21,9 +23,9 @@ class ContextAligner:
 
     def __init__(
         self,
-        block_size: int = CACHE_BLOCK_SIZE,
+        block_size: int | None = None,
     ) -> None:
-        self._block_size = block_size
+        self._block_size = block_size or get_block_size()
 
     def align_context(
         self,

@@ -6,13 +6,18 @@ Predicts cache hit rate before sending context to the model.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Any
 
 # Cache block size for Qwen models
-CACHE_BLOCK_SIZE = 1024
+CACHE_BLOCK_SIZE = 128
+
+# Persistence path
+PERSISTENCE_PATH = Path.home() / ".moeptimizer" / "cache_registry.json"
 
 
 @dataclass
@@ -39,6 +44,40 @@ class CacheKeyRegistry:
         self._entries: OrderedDict[str, CacheEntry] = OrderedDict()
         self._max_size = max_size
 
+    def record_cache_hit(
+        self,
+        context: str | list[dict[str, Any]],
+        hit_tokens: int,
+    ) -> None:
+        """Record actual cache hit from backend response.
+
+        This should be called after each request to track real cache performance.
+        """
+        if isinstance(context, list):
+            context = "".join(m.get("content", "") for m in context)
+        key = self._hash_context(context)
+
+        if key in self._entries:
+            entry = self._entries[key]
+            entry.hit_count += 1
+            entry.context_size = len(context)
+            self._entries.move_to_end(key)
+        else:
+            # Record the hit for future prediction
+            now = time.time()
+            entry = CacheEntry(
+                key=key,
+                timestamp=now,
+                hit_count=1,
+                miss_count=0,
+                context_size=len(context),
+                context_hash=self._hash_content(context),
+            )
+            self._entries[key] = entry
+
+        while len(self._entries) > self._max_size:
+            self._entries.popitem(last=False)
+
     def register_context(
         self,
         context: str | list[dict[str, Any]],
@@ -49,7 +88,6 @@ class CacheKeyRegistry:
         Accepts either a string or a list of message dicts.
         """
         if isinstance(context, list):
-            # Convert messages to string for hashing
             context = "".join(m.get("content", "") for m in context)
         key = self._hash_context(context)
         now = time.time()
@@ -117,8 +155,11 @@ class CacheKeyRegistry:
         self,
         context: str,
     ) -> str:
-        """Hash context for cache key lookup."""
-        return hashlib.md5(context.encode("utf8")).hexdigest()[:16]
+        """Hash context for cache key lookup.
+
+        Uses 32 hex chars (128 bits) to minimize collision risk.
+        """
+        return hashlib.md5(context.encode("utf8")).hexdigest()[:32]
 
     def _hash_content(
         self,
@@ -132,6 +173,27 @@ class CacheKeyRegistry:
     ) -> None:
         """Clear the registry."""
         self._entries.clear()
+
+    def save_to_disk(self) -> None:
+        """Persist cache registry to disk for cross-session reuse."""
+        PERSISTENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "entries": {
+                k: asdict(v) for k, v in self._entries.items()
+            },
+        }
+        PERSISTENCE_PATH.write_text(json.dumps(data))
+
+    def load_from_disk(self) -> None:
+        """Load cache registry from disk."""
+        if not PERSISTENCE_PATH.exists():
+            return
+        try:
+            data = json.loads(PERSISTENCE_PATH.read_text())
+            for k, v in data.get("entries", {}).items():
+                self._entries[k] = CacheEntry(**v)
+        except Exception:
+            pass  # Ignore errors, start fresh
 
 
 # Global registry instance

@@ -190,6 +190,15 @@ async def _do_non_streaming(
 
         usage = backend_data.get("usage", {})
 
+        # Record cache hit for cache registry
+        # Extract cache hit tokens if available
+        cache_hit_tokens = getattr(usage, "cache_hit_tokens", None) if hasattr(usage, "cache_hit_tokens") else usage.get("cache_hit_tokens", None)
+        if cache_hit_tokens is not None and cache_hit_tokens > 0:
+            # We have cache hits - record them
+            from moeptimizer.cache_registry import get_cache_registry
+            registry = get_cache_registry()
+            registry.record_cache_hit(messages, cache_hit_tokens)
+
         return JSONResponse(
             content={
                 "id": completion_id,

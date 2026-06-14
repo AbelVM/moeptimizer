@@ -117,9 +117,12 @@ class AttentionSinkManager:
     def should_inject_sinks(
         self,
         messages: list[dict[str, Any]],
-        threshold: float = 0.8,
+        threshold: float = 0.5,
     ) -> bool:
-        """Determine if attention sinks should be injected."""
+        """Determine if attention sinks should be injected.
+
+        Lower threshold (0.5) for more aggressive sink injection.
+        """
         return self.calculate_attention_entropy(messages) > threshold
 
     def get_sink_positions(self) -> list[int]:

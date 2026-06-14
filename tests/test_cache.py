@@ -1,46 +1,52 @@
 """Tests for cache module."""
 
-from collections import OrderedDict
+import pytest
 
-from moeptimizer.cache import cache_get, cache_key, cache_put
-
-
-class TestCacheKey:
-    def test_deterministic(self) -> None:
-        assert cache_key("hello") == cache_key("hello")
-
-    def test_different_inputs(self) -> None:
-        assert cache_key("hello") != cache_key("world")
+from moeptimizer.cache import (
+    align_to_block_boundary,
+    canonicalize_code_for_cache,
+    get_block_aligned_cache_key,
+    get_block_size,
+    set_block_size,
+)
 
 
-class TestCacheGetPut:
-    def test_put_and_get(self) -> None:
-        cache: OrderedDict = OrderedDict()
-        cache_put(cache, "key1", "value1", 10)
-        result = cache_get(cache, "key1")
-        assert result == "value1"
+class TestCache:
+    def test_get_block_size(self) -> None:
+        """Get default block size."""
+        size = get_block_size()
+        assert size == 128
 
-    def test_get_missing_key(self) -> None:
-        cache: OrderedDict = OrderedDict()
-        result = cache_get(cache, "missing")
-        assert result is None
+    def test_set_block_size(self) -> None:
+        """Set block size changes the value."""
+        original = get_block_size()
+        set_block_size(256)
+        assert get_block_size() == 256
+        # Reset to original
+        set_block_size(original)
 
-    def test_lru_eviction(self) -> None:
-        cache: OrderedDict = OrderedDict()
-        for i in range(5):
-            cache_put(cache, f"key{i}", f"value{i}", 3)
-        assert len(cache) == 3
-        assert "key0" not in cache
-        assert "key2" in cache
+    def test_align_to_block_boundary(self) -> None:
+        """Align text to block boundary."""
+        # Already aligned
+        result = align_to_block_boundary("x" * 128)
+        assert len(result) == 128
 
-    def test_lru_update_on_hit(self) -> None:
-        cache: OrderedDict = OrderedDict()
-        cache_put(cache, "key1", "value1", 3)
-        cache_put(cache, "key2", "value2", 3)
-        cache_put(cache, "key3", "value3", 3)
-        # Access key1 to move it to end
-        cache_get(cache, "key1")
-        # Add one more to trigger eviction
-        cache_put(cache, "key4", "value4", 3)
-        # key2 should be evicted (it was least recently used after key1 was accessed)
-        assert "key2" not in cache
+        # Needs padding
+        result = align_to_block_boundary("x" * 100)
+        assert len(result) == 128
+
+    def test_canonicalize_code_for_cache(self) -> None:
+        """Canonicalize code for cache key generation."""
+        code = "def foo():\n    pass\n"
+        result = canonicalize_code_for_cache(code)
+        assert isinstance(result, str)
+
+    def test_get_block_aligned_cache_key(self) -> None:
+        """Get cache key for messages."""
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "User"},
+        ]
+        key = get_block_aligned_cache_key(messages)
+        assert isinstance(key, str)
+        assert len(key) > 0

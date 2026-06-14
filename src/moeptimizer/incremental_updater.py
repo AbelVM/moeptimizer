@@ -94,15 +94,19 @@ class IncrementalUpdater:
         old_messages: list[dict[str, Any]],
         new_messages: list[dict[str, Any]],
     ) -> bool:
-        """Check if cache should be preserved."""
+        """Check if cache should be preserved.
+
+        Uses proper prefix detection: old context must be a prefix of new context.
+        """
         old_key = self._get_context_key(old_messages)
         new_key = self._get_context_key(new_messages)
 
-        # If old context is prefix of new, preserve cache
-        if new_key.startswith(old_key):
-            return True
+        # Check if old context is a prefix of new context
+        # by comparing the actual content, not the hash
+        old_content = "".join(m.get("content", "") for m in old_messages)
+        new_content = "".join(m.get("content", "") for m in new_messages)
 
-        return False
+        return new_content.startswith(old_content)
 
 
 def get_incremental_updater() -> IncrementalUpdater:
