@@ -1,16 +1,30 @@
-"""TokenCounter — Estimate token usage for context budget management."""
+"""TokenCounter — Estimate token usage for context budget management.
+
+Uses the model's actual tokenizer when available, with character-based
+estimation as a fallback.
+"""
 
 from __future__ import annotations
 
+import logging
 from typing import Any, ClassVar
+
+logger = logging.getLogger(__name__)
+
+# Try to import tiktoken for accurate token counting
+try:
+    import tiktoken
+    _HAS_TIKTOKEN = True
+except ImportError:
+    _HAS_TIKTOKEN = False
 
 
 class TokenCounter:
     """
-    Lightweight token counter for context budget management.
+    Token counter for context budget management.
 
-    Uses character-based estimation with language-aware adjustments.
-    For code: ~4 chars/token. For prose: ~3.5 chars/token.
+    Uses the model's actual tokenizer when available, with character-based
+    estimation as a fallback.
     """
 
     CHARS_PER_TOKEN: ClassVar[dict[str, float]] = {
@@ -30,6 +44,21 @@ class TokenCounter:
         "generic": 3.5,
     }
 
+    def __init__(self, model_name: str = "gpt-4") -> None:
+        """Initialize with optional model name for tokenizer selection."""
+        self._model_name = model_name
+        self._encoder: Any = None
+        if _HAS_TIKTOKEN:
+            try:
+                # Use a tokenizer close to Qwen's (GPT-4 is a reasonable approximation)
+                self._encoder = tiktoken.encoding_for_model(model_name)
+            except Exception:
+                # Fall back to cl100k_base (GPT-4 tokenizer)
+                try:
+                    self._encoder = tiktoken.get_encoding("cl100k_base")
+                except Exception:
+                    logger.debug("tiktoken available but encoder init failed")
+
     def count(self, text: str, lang: str = "generic") -> int:
         """Estimate token count for the given text."""
         if not text:
@@ -39,6 +68,14 @@ class TokenCounter:
         if non_ws == 0:
             return 0
 
+        # Use actual tokenizer if available
+        if self._encoder is not None:
+            try:
+                return len(self._encoder.encode(text))
+            except Exception:
+                pass
+
+        # Fallback to character-based estimation
         cpt = self.CHARS_PER_TOKEN.get(lang, 3.5)
         return max(1, int(len(text) / cpt))
 
@@ -55,6 +92,16 @@ class TokenCounter:
                         total += self.count(part.get("text", ""))
             total += 5  # Per-message overhead
         return total
+
+    def count_tokens_precise(self, text: str) -> int:
+        """Get precise token count using the model tokenizer."""
+        if self._encoder is not None:
+            try:
+                return len(self._encoder.encode(text))
+            except Exception:
+                pass
+        # Fallback
+        return self.count(text)
 
     def estimate_kv_cache_usage(self, token_count: int) -> str:
         """Convert token count to a human-readable KV-cache estimate."""

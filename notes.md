@@ -2,7 +2,7 @@
 
 ## Completed Work
 
-### Proactive Context Optimization Modules (10 total)
+### Proactive Context Optimization Modules (11 total)
 - `cache_registry.py` - Cache hit tracking and prediction
 - `context_aligner.py` - Block boundary alignment for cache
 - `context_canonicalizer.py` - Code formatting normalization
@@ -13,15 +13,19 @@
 - `incremental_updater.py` - Cache preservation across turns
 - `cache_aware_chunker.py` - Cache-aware context chunking
 - `context_compressor.py` - Tree-sitter code skeleton compression
+- `semantic_dedup.py` - Semantic deduplication for near-duplicate context
 
 ### MoE-Specific Optimizations (v0.4.0)
-- `mtp_speculative.py` - MTP-aware speculative decoding
-- `mtp_state.py` - MTP state serialization infrastructure
+- `mtp_speculative.py` - MTP-aware speculative decoding with per-head temperature scheduling
+- `mtp_state.py` - MTP state serialization infrastructure (32-bit hash keys)
 - `hierarchical_index.py` - Hierarchical repository indexing
 - `tool_streamer.py` - Tool output streaming for large outputs
+- `kv_slot_tracker.py` - KV-slot tracking for explicit cache control
+- `code_block_optimizer.py` - Tree-sitter based code block optimization
 
 ### Pipeline Integration
 - Step 5.1: Cache hit rate check (skip heavy optimization if high)
+- Step 5.2: KV slot map building for cache control
 - Step 5.5: Context canonicalization
 - Step 5.7: Context compression (tree-sitter skeletons)
 - Step 5.8: Attention sink management (long contexts)
@@ -29,14 +33,18 @@
 - Step 5.10: Dependency prefetching
 - Step 6.5: Context template matching (only if no system message)
 - Step 7.5: Selective truncation (duplicate code blocks)
+- Step 7.6: Semantic deduplication (near-duplicate context)
 - Step 7.7: Dependency ordering
 - Step 7.8: Incremental update for cache preservation
 - Step 8: Static layer block alignment
 - Step 10.5: Cache-aware chunking
+- Step 11: Proactive context trimming (token-based)
 - Step 11.5: Entropy-guided trimming
 - Step 11.6: Tool output streaming (preserves turn structure)
 - Step 11.7: MTP state management
 - Step 11.8: Sliding window context (MTP state preservation)
+- Step 11.9: MTP prediction boundary alignment
+- Step 12: Token-based budget enforcement
 - Step 14: Cache registry registration
 - Step 14.5: Cache registry persistence
 
@@ -101,6 +109,12 @@
 10. Added `timeout` field to `ServerConfig` (default 300s) for long context conversations
 11. Pass timeout to `LemonadeClient` in `create_app()`
 12. Fixed sliding window overlap to always add at least one overlap message for state continuity
+13. **Fixed hash collision risk**: All cache keys now use 32 hex chars (128-bit) instead of 16
+14. **Added KV-slot tracking**: New `kv_slot_tracker.py` for explicit cache control hints
+15. **Token-based budget enforcement**: `token_counter.py` now uses tiktoken for accurate counting
+16. **Semantic deduplication**: New `semantic_dedup.py` for near-duplicate context removal
+17. **Per-MTP-head temperature scheduling**: `mtp_speculative.py` now supports head-specific temperatures
+18. **Tree-sitter code block optimization**: New `code_block_optimizer.py` for proper AST parsing
 
 ## Completed Architecture Fixes
 

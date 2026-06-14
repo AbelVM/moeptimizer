@@ -96,8 +96,11 @@ class ExpertRoutingCache:
         node_text: str,
         node_type: str,
     ) -> str:
-        """Hash an AST node for expert routing prediction."""
-        return hashlib.md5(f"{node_type}:{node_text}".encode()).hexdigest()[:16]
+        """Hash an AST node for expert routing prediction.
+
+        Uses 32 hex chars (128 bits) to minimize collision risk.
+        """
+        return hashlib.md5(f"{node_type}:{node_text}".encode()).hexdigest()[:32]
 
     def predict_expert_for_code(
         self,

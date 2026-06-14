@@ -6,6 +6,8 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 
 ## Features
 
+### First version (v0.1.0)
+
 - **Scratchpad Compaction** — Front-Loading Eviction for MTP head protection.
 - **Thinking Preservation** — Protects recent `<thinking>` blocks, archives stale reasoning to reclaim KV-cache
 - **State-Based RAG** — Graph-indexed retrieval (Goal -> Subtask -> Tool -> Outcome) instead of flat embeddings
@@ -39,6 +41,7 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 - **Incremental Updater** — Only appends new content, never modifies middle of cached context
 - **Cache-Aware Chunker** — Chunks code to align with cache blocks, keeps related functions together
 - **Context Compressor** — Compresses code to skeletons while preserving cache-friendly structure
+- **Semantic Deduplicator** — Removes near-duplicate context using embedding similarity
 
 ### MoE-Specific Optimizations (v0.4.0)
 
@@ -60,10 +63,18 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 - **Cache Key Collision Resistance** — 128-bit keys (32 hex chars) to minimize collisions
 - **Pipeline Optimization** — Removed redundant static layer calculations, early return on high cache hit rate
 
+### Performance Enhancements (v0.4.2)
+
+- **KV-Slot Tracking** — Explicit cache control hints for llama.cpp integration
+- **Token-Based Budget** — Accurate token counting with tiktoken for precise context management
+- **Semantic Deduplication** — Removes near-duplicate context using embedding similarity
+- **Per-MTP-Head Temperature** — Head-specific temperature scheduling for optimal MTP accuracy
+- **Tree-Sitter Code Optimization** — Proper AST-based code block detection and optimization
+
 ## Architecture
 
 ```
-Client (OpenAI SDK) → moeptimizer:8080 → Lemonade NPU:13305
+Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
                                 │
                                 ├── SessionManager (per-session isolation)
                                 ├── AgentStateStore (KV graph)
@@ -78,14 +89,17 @@ Client (OpenAI SDK) → moeptimizer:8080 → Lemonade NPU:13305
                                 ├── AttentionSinkManager (long context stability)
                                 ├── ExpertRoutingCache (MoE routing cache)
                                 ├── CacheKeyRegistry (hit prediction)
+                                ├── KVSlotTracker (explicit cache control)
                                 ├── ContextAligner (block alignment)
                                 ├── ContextCanonicalizer (formatting normalization)
                                 ├── SelectiveTruncator (duplicate removal)
+                                ├── SemanticDeduplicator (near-duplicate removal)
                                 ├── PatternInjector (section markers)
                                 ├── DependencyOrderer (import ordering)
                                 ├── IncrementalUpdater (cache preservation)
                                 ├── CacheAwareChunker (aligned chunking)
                                 ├── ContextCompressor (skeleton compression)
+                                ├── CodeBlockOptimizer (tree-sitter code optimization)
                                 └── EmbeddingService (LanceDB + NPU)
 ```
 
@@ -126,6 +140,8 @@ Environment variables use the `MOEPT_` prefix with `__` for nested config:
 | `MOEPT_AGENTIC__KEEP_FULL_STEPS` | `3` | Last N steps kept in full detail |
 | `MOEPT_AGENTIC__ARCHIVE_THRESHOLD` | `3` | Steps before this index get compressed |
 | `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` | `12000` | Hard cap on optimized context window (chars) |
+| `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS` | `3000` | Hard cap on optimized context window (tokens) |
+| `MOEPT_AGENTIC__USE_TOKEN_BUDGET` | `true` | Use token-based budget enforcement |
 | `MOEPT_AGENTIC__THINKING_PROTECT_RECENT` | `2` | Keep full thinking for last N steps |
 | `MOEPT_AGENTIC__SESSION_TIMEOUT` | `3600` | Session inactivity timeout (seconds) |
 
@@ -215,7 +231,18 @@ python scripts/benchmark.py --turns 10 --dump-responses
 - **Latency**: Direct vs proxy response times (mean, median, p95)
 - **Token Usage**: Prompt tokens, cached tokens, token savings percentage
 - **Context Window**: Final utilization percentage
-- **Response Quality**: Semantic similarity, ROUGE-L, trigram overlap, edit similarity
+- **Response Quality**: Compares proxy-optimized responses against the direct Lemonade baseline. Similarity metrics are reported on a 0–1 scale, where `1.0` is the perfect score; they are not percentages, so `0.99` means near-perfect alignment against the 1.0 top score. Exceptions are called out below.
+  - **Semantic similarity**: Embedding cosine similarity. Higher is better; it means the proxy response preserves the same meaning even if wording differs.
+  - **Token Jaccard**: Word-set overlap between proxy and baseline responses. Higher is better; it indicates shared vocabulary/content coverage.
+  - **ROUGE-L F1**: Longest common subsequence overlap between proxy and baseline text. Higher is better; it rewards shared wording and ordering.
+  - **Trigram overlap**: Shared three-character sequence overlap. Higher is better; it indicates surface-level similarity in wording and local structure.
+  - **Edit similarity**: Normalized longest-common-subsequence edit similarity. Higher is better; it means fewer insertions, deletions, or rewrites are needed to transform one response into the other.
+  - **Code block ratio**: Fraction of baseline code blocks preserved by the proxy response. Higher is better; 1.0 means all baseline code blocks were preserved or no baseline code blocks existed.
+  - **Markdown structure similarity**: Jaccard similarity of markdown structural elements such as headings, lists, code fences, and blockquotes. Higher is better.
+  - **Length ratio**: Proxy response length divided by baseline response length. Closer to 1.0 is better; `<0.5` flags severe truncation and `>2.0` flags verbosity inflation.
+  - **Vocabulary richness delta**: Absolute difference in type-token ratio between proxy and baseline. Lower is better; 0 means identical vocabulary diversity.
+  - **MTP stability**: Proxy preservation of baseline code-block and thinking-tag structure. Higher is better; it indicates stable MTP-style response structure.
+  - **Syntax consistency**: Similarity of code-structure keywords preserved in code blocks. Higher is better; it indicates the proxy kept similar code constructs when code was present.
 - **MTP Stability**: Code block preservation, syntax consistency
 - **Eviction**: Turns triggering context eviction, chars before optimization
 

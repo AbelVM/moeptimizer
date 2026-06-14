@@ -57,7 +57,11 @@ class AgenticConfig(BaseModel):
     )
     max_optimized_chars: int = Field(
         default=12000,
-        description="Hard cap on optimized context window",
+        description="Hard cap on optimized context window (characters, converted to ~3000 tokens)",
+    )
+    max_optimized_tokens: int = Field(
+        default=3000,
+        description="Hard cap on optimized context window (tokens). Takes precedence over max_optimized_chars if set.",
     )
     thinking_protect_recent: int = Field(
         default=2,
@@ -66,6 +70,10 @@ class AgenticConfig(BaseModel):
     session_timeout: int = Field(
         default=3600,
         description="Session inactivity timeout in seconds",
+    )
+    use_token_budget: bool = Field(
+        default=True,
+        description="Use token-based budget enforcement instead of character-based",
     )
 
 

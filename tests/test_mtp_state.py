@@ -38,7 +38,7 @@ class TestMTPStateManager:
         key1 = manager.get_state_key(messages)
         key2 = manager.get_state_key(messages)
         assert key1 == key2
-        assert len(key1) == 16  # MD5 truncated to 16 chars
+        assert len(key1) == 32  # MD5 truncated to 32 chars (128-bit) for collision resistance
 
     def test_stats_tracking(self) -> None:
         """Stats are tracked correctly."""

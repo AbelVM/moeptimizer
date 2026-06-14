@@ -157,6 +157,6 @@ def cache_put(cache: OrderedDict[str, T], key: str, value: T, max_size: int) -> 
 def hash_ast_node(node_text: str, node_type: str) -> str:
     """Hash an AST node for expert routing prediction.
 
-    Uses node type + content hash to predict expert routing.
+    Uses 32 hex chars (128 bits) to minimize collision risk.
     """
-    return _md5(f"{node_type}:{node_text}".encode("utf8")).hexdigest()[:16]
+    return hashlib.md5(f"{node_type}:{node_text}".encode("utf8")).hexdigest()[:32]

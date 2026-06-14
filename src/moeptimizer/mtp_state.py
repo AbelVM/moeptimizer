@@ -80,11 +80,12 @@ class MTPStateManager:
         """Generate state key for context.
 
         Uses the overlap region to ensure state continuity.
+        Uses 32 hex chars (128 bits) to minimize collision risk.
         """
         # Get the last N tokens of context for state key
         content = "".join(m.get("content", "") for m in messages)
         overlap = content[-overlap_tokens:] if len(content) > overlap_tokens else content
-        return hashlib.md5(overlap.encode()).hexdigest()[:16]
+        return hashlib.md5(overlap.encode()).hexdigest()[:32]
 
     def align_prediction_boundary(
         self,

@@ -3,9 +3,9 @@
 Pipeline:
   1. Parse message history into AgentStateStore steps
   2. Run ScratchpadCompactor on archived steps
-  3. Run ThinkingPreserver on assistant messages (preserves <think>/though)
+  3. Run ThinkingPreserver on assistant messages (preserves <thinking>)
   4. Optimize code blocks with Tree-Sitter + NPU ranking
-  5. Enforce hard character cap for MoE context budget
+  5. Enforce hard token cap for MoE context budget
   6. Apply static layer block alignment for cache optimization
   7. Apply syntax-stable MTP prompt engineering
 
@@ -14,7 +14,11 @@ MOE context integrity:
   - Loop warnings injected as SEPARATE user message (never into assistant content)
   - Progress tracking is internal only (not injected into context)
   - This preserves the model's expected chat template:
-    Ăssistant\n<think>\n{reasoning}\n</think>\n\n{response}
+    Ăssistant
+<think>
+{reasoning}
+
+{response}
     which the model was trained on. Injecting foreign patterns triggers
     KV-cache refills (super slow with MOE prefill).
 """
@@ -38,6 +42,11 @@ from moeptimizer.cache import (
 )
 from moeptimizer.cache_aware_chunker import get_cache_aware_chunker
 from moeptimizer.cache_registry import get_cache_registry
+from moeptimizer.code_block_optimizer import (
+    extract_code_blocks,
+    has_code_blocks,
+    optimize_code_in_text,
+)
 from moeptimizer.code_chunking import (
     LANG_MAP,
     chunk_code_with_treesitter,
@@ -55,12 +64,14 @@ from moeptimizer.embedding import EmbeddingService
 from moeptimizer.expert_cache import get_expert_cache
 from moeptimizer.goal_decomposer import GoalDecomposer
 from moeptimizer.incremental_updater import get_incremental_updater
+from moeptimizer.kv_slot_tracker import get_kv_slot_tracker
 from moeptimizer.loop_detector import LoopDetector
 from moeptimizer.models import AgentStep, LoopWarning
 from moeptimizer.pattern_injector import get_pattern_injector
 from moeptimizer.progress_tracker import ProgressTracker
 from moeptimizer.prompt_templates import classify_and_template
 from moeptimizer.selective_truncator import get_selective_truncator
+from moeptimizer.semantic_dedup import get_semantic_deduplicator
 from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
 from moeptimizer.symbol_index import SymbolIndex
@@ -102,6 +113,7 @@ class AgentContextOptimizer:
         self.hierarchical_index = get_hierarchical_index()
         self.mtp_state_manager = get_mtp_state_manager()
         self.tool_streamer = get_tool_streamer()
+        self.semantic_deduplicator = get_semantic_deduplicator()
         self._task_type: str = "default"
         self._last_mtp_state_key: str | None = None
 
@@ -163,6 +175,11 @@ class AgentContextOptimizer:
         # Calculate static layer end once (used by multiple steps)
         static_end = self._find_static_layer_end(optimized)
         total_chars = sum(len(m.get("content", "")) for m in optimized)
+        total_tokens = self.token_counter.count_messages(optimized)
+
+        # Step 5.2: Build KV slot map for cache control
+        slot_tracker = get_kv_slot_tracker()
+        slot_map = slot_tracker.build_slot_map(optimized)
 
         # Step 5.5: Apply context canonicalization for cache-friendly formatting
         optimized = self.context_canonicalizer.canonicalize(optimized)
@@ -197,6 +214,13 @@ class AgentContextOptimizer:
 
         # Step 7.5: Apply selective truncation (remove duplicate code blocks)
         optimized = self.selective_truncator.remove_duplicates(optimized)
+
+        # Step 7.6: Apply semantic deduplication for near-duplicate context
+        if total_tokens > 1000:  # Only for larger contexts
+            optimized = self.semantic_deduplicator.deduplicate(
+                optimized,
+                self.embedding_service,
+            )
 
         # Step 7.7: Apply dependency ordering for cache locality
         optimized = self.dependency_orderer.order_by_dependencies(optimized)
@@ -237,27 +261,33 @@ class AgentContextOptimizer:
                 })
 
         # Step 8: Apply static layer block alignment for cache optimization
-        if total_chars > 2000:
+        if total_tokens > 500:  # ~2000 chars
             optimized = self._align_static_layer(optimized)
 
         # Step 9: Pre-seed reasoning prefix for MTP (only if budget allows)
-        if total_chars < self._config.agentic.max_optimized_chars * 0.5:
+        max_tokens = self._config.agentic.max_optimized_chars // 4
+        if total_tokens < max_tokens * 0.5:
             optimized = self._preseed_reasoning(optimized)
 
         # Step 10: Optimize code blocks in all messages
         for msg in optimized:
             content = msg.get("content", "")
-            if isinstance(content, str) and self._has_code_blocks(content):
-                msg["content"] = self._optimize_code_in_text(content)
+            if isinstance(content, str) and has_code_blocks(content):
+                msg["content"] = optimize_code_in_text(
+                    content,
+                    self._config,
+                    self.embedding_service,
+                )
 
         # Step 10.5: Apply cache-aware chunking for large contexts
-        if total_chars > 3000:
+        if total_tokens > 750:  # ~3000 chars
             optimized = self.cache_aware_chunker.chunk_context(optimized)
 
         # Step 11: Proactive context trimming for MoE KV-cache efficiency
-        proactive_threshold = self._config.agentic.max_optimized_chars * 0.7
-        if total_chars > proactive_threshold:
-            optimized = self._proactive_trim(optimized, proactive_threshold)
+        # Use token-based threshold for more accurate budget enforcement
+        proactive_threshold_tokens = int(max_tokens * 0.7)
+        if total_tokens > proactive_threshold_tokens:
+            optimized = self._proactive_trim(optimized, proactive_threshold_tokens, use_tokens=True)
 
         # Step 11.5: Entropy-guided trimming for MTP-friendly content
         optimized = self._entropy_guided_trim(optimized)
@@ -265,8 +295,8 @@ class AgentContextOptimizer:
         # Step 11.6: Stream large tool outputs for better context management
         optimized = self._stream_large_tool_outputs(optimized)
 
-        # Recalculate total_chars after entropy trim
-        total_chars = sum(len(m.get("content", "")) for m in optimized)
+        # Recalculate total_tokens after entropy trim
+        total_tokens = self.token_counter.count_messages(optimized)
 
         # Step 11.7: Save MTP state before trimming for context switching
         # This preserves prediction quality across evictions
@@ -276,17 +306,17 @@ class AgentContextOptimizer:
 
         # Step 11.8: Apply sliding window for long contexts
         # This is the preferred method for context management with MTP state preservation
-        if total_chars > self._config.agentic.max_optimized_chars * 0.8:
-            optimized = self._sliding_window_trim(optimized)
+        if total_tokens > int(max_tokens * 0.8):
+            optimized = self._sliding_window_trim(optimized, use_tokens=True)
 
         # Step 11.9: Align to MTP prediction boundary for better MTP accuracy
         # This ensures context length is a multiple of 128 tokens
         optimized = self.mtp_state_manager.align_prediction_boundary(optimized)
 
-        # Step 12: Enforce hard character cap
-        total_chars = sum(len(m.get("content", "")) for m in optimized)
-        if total_chars > self._config.agentic.max_optimized_chars:
-            optimized = self._trim_to_budget(optimized)
+        # Step 12: Enforce hard token cap
+        total_tokens = self.token_counter.count_messages(optimized)
+        if total_tokens > max_tokens:
+            optimized = self._trim_to_budget(optimized, use_tokens=True)
 
         # Step 13: Strip internal metadata before sending to model
         optimized = self._strip_internal_flags(optimized)
@@ -306,9 +336,11 @@ class AgentContextOptimizer:
         saved_tokens = max(0, original_tokens - optimized_tokens)
 
         logger.info(
-            "[AgentOptimizer] %d -> %d chars (%d tokens saved, %.3fs, %d -> %d msgs, progress: %.0%%, loops: %d detected)",
+            "[AgentOptimizer] %d -> %d chars (%d -> %d tokens, %d saved, %.3fs, %d -> %d msgs, progress: %.0%%, loops: %d detected)",
             original_chars,
             optimized_chars,
+            original_tokens,
+            optimized_tokens,
             saved_tokens,
             duration,
             len(messages),
@@ -330,15 +362,15 @@ class AgentContextOptimizer:
         """
         result: list[dict[str, Any]] = []
         internal_prefix = "_"
-        # Include attention sink markers in the pattern
-        marker_pattern = re.compile(
+        # Pre-compiled pattern for performance
+        _MARKER_PATTERN = re.compile(
             r"<!-- (STATIC|CONTEXT|DYNAMIC)_LAYER -->\n?|# (CONTEXT_ANCHOR|STATIC_LAYER_END).*\n?",
         )
 
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                content = marker_pattern.sub("", content)
+                content = _MARKER_PATTERN.sub("", content)
 
             cleaned = {
                 k: v
@@ -487,8 +519,12 @@ class AgentContextOptimizer:
             for i in np.argsort(scores)[::-1][: self._config.code_chunking.top_k_chunks]
         ]
 
-    def _trim_to_budget(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Trim messages to stay within the character budget.
+    def _trim_to_budget(
+        self,
+        messages: list[dict[str, Any]],
+        use_tokens: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Trim messages to stay within the budget.
 
         Uses front-loading eviction: drops complete user-assistant pairs from
         the front of the evictable body. No content modification or truncation.
@@ -499,19 +535,31 @@ class AgentContextOptimizer:
           3. Protected Tail: last N turns (never modified)
 
         This preserves token offsets and sequence patterns for MTP heads.
+
+        Args:
+            messages: The message list to trim
+            use_tokens: If True, use token-based budget; if False, use character-based
         """
-        max_chars = self._config.agentic.max_optimized_chars
+        if use_tokens:
+            max_tokens = self._config.agentic.max_optimized_chars // 4
+        else:
+            max_chars = self._config.agentic.max_optimized_chars
 
         # Partition into zones
         system_anchor, evictable_body, protected_tail = self._partition_for_budget(messages)
 
         # Reserve space for non-evictable zones; remaining budget is what's available
-        reserved = (sum(len(m.get("content", "")) for m in system_anchor)
-                    + sum(len(m.get("content", "")) for m in protected_tail))
-        evictable_budget = max(0, max_chars - reserved)
+        if use_tokens:
+            reserved = (self.token_counter.count_messages(system_anchor)
+                        + self.token_counter.count_messages(protected_tail))
+            evictable_budget = max(0, max_tokens - reserved)
+        else:
+            reserved = (sum(len(m.get("content", "")) for m in system_anchor)
+                        + sum(len(m.get("content", "")) for m in protected_tail))
+            evictable_budget = max(0, max_chars - reserved)
 
         # Evict from front of evictable body until under remaining budget
-        evictable_body = self._evict_for_budget(evictable_body, evictable_budget)
+        evictable_body = self._evict_for_budget(evictable_body, evictable_budget, use_tokens)
 
         return system_anchor + evictable_body + protected_tail
 
@@ -589,8 +637,15 @@ class AgentContextOptimizer:
         self,
         evictable_body: list[dict[str, Any]],
         budget: int,
+        use_tokens: bool = False,
     ) -> list[dict[str, Any]]:
-        """Drop pairs from front of evictable body until under budget."""
+        """Drop pairs from front of evictable body until under budget.
+
+        Args:
+            evictable_body: Messages to potentially evict
+            budget: Target budget (tokens or chars depending on use_tokens)
+            use_tokens: If True, use token-based budget; if False, use character-based
+        """
         if not evictable_body:
             return evictable_body
 
@@ -611,12 +666,22 @@ class AgentContextOptimizer:
             pairs.append(current_pair)
 
         # Drop from front until under budget.
-        total_chars = sum(len(m.get("content", "")) for p in pairs for m in p)
-        while total_chars > budget:
+        if use_tokens:
+            total_tokens = sum(
+                self.token_counter.count_messages(pair) for pair in pairs
+            )
+        else:
+            total_chars = sum(len(m.get("content", "")) for p in pairs for m in p)
+
+        while (use_tokens and total_tokens > budget) or (not use_tokens and total_chars > budget):
             if not pairs:
                 break
-            pair_size = sum(len(m.get("content", "")) for m in pairs[0])
-            total_chars -= pair_size
+            if use_tokens:
+                pair_tokens = self.token_counter.count_messages(pairs[0])
+                total_tokens -= pair_tokens
+            else:
+                pair_size = sum(len(m.get("content", "")) for m in pairs[0])
+                total_chars -= pair_size
             pairs = pairs[1:]
 
         return [m for pair in pairs for m in pair]
@@ -794,8 +859,9 @@ class AgentContextOptimizer:
             return messages
 
         # Check if we have budget headroom for preseeding
-        total_chars = sum(len(m.get("content", "")) for m in messages)
-        if total_chars > self._config.agentic.max_optimized_chars * 0.9:
+        total_tokens = self.token_counter.count_messages(messages)
+        max_tokens = self._config.agentic.max_optimized_chars // 4
+        if total_tokens > int(max_tokens * 0.9):
             # Too close to budget, skip preseeding
             return messages
 
@@ -832,16 +898,27 @@ class AgentContextOptimizer:
     def _proactive_trim(
         self,
         messages: list[dict[str, Any]],
-        target_chars: int,
+        target: int,
+        use_tokens: bool = False,
     ) -> list[dict[str, Any]]:
         """Proactively trim context to prevent KV-cache performance degradation.
 
         For MoE models, KV-cache fill is extremely slow. This method trims
         context before it becomes a problem, preserving the most recent turns.
+
+        Args:
+            messages: The message list to trim
+            target: Target size (chars or tokens depending on use_tokens)
+            use_tokens: If True, target is in tokens; if False, in characters
         """
-        total_chars = sum(len(m.get("content", "")) for m in messages)
-        if total_chars <= target_chars:
-            return messages
+        if use_tokens:
+            total_tokens = self.token_counter.count_messages(messages)
+            if total_tokens <= target:
+                return messages
+        else:
+            total_chars = sum(len(m.get("content", "")) for m in messages)
+            if total_chars <= target:
+                return messages
 
         # Find the static layer (system + first user)
         static_end = 0
@@ -856,8 +933,12 @@ class AgentContextOptimizer:
                 break
 
         # Calculate how much we can keep from dynamic layer
-        static_chars = sum(len(m.get("content", "")) for m in messages[:static_end])
-        available_for_dynamic = target_chars - static_chars
+        if use_tokens:
+            static_tokens = self.token_counter.count_messages(messages[:static_end])
+            available_for_dynamic = target - static_tokens
+        else:
+            static_chars = sum(len(m.get("content", "")) for m in messages[:static_end])
+            available_for_dynamic = target - static_chars
 
         if available_for_dynamic <= 0:
             return messages[:static_end]  # Only keep static layer
@@ -868,12 +949,20 @@ class AgentContextOptimizer:
 
         # Add messages from the end until we hit the limit
         for msg in reversed(dynamic_messages):
-            msg_chars = len(msg.get("content", ""))
-            if available_for_dynamic >= msg_chars:
-                result.insert(static_end, dict(msg))
-                available_for_dynamic -= msg_chars
+            if use_tokens:
+                msg_tokens = self.token_counter.count_messages([msg])
+                if available_for_dynamic >= msg_tokens:
+                    result.insert(static_end, dict(msg))
+                    available_for_dynamic -= msg_tokens
+                else:
+                    break
             else:
-                break
+                msg_chars = len(msg.get("content", ""))
+                if available_for_dynamic >= msg_chars:
+                    result.insert(static_end, dict(msg))
+                    available_for_dynamic -= msg_chars
+                else:
+                    break
 
         return result
 
@@ -882,30 +971,52 @@ class AgentContextOptimizer:
         messages: list[dict[str, Any]],
         window_size: int | None = None,
         overlap_size: int = 256,
+        use_tokens: bool = False,
     ) -> list[dict[str, Any]]:
         """Apply sliding window with MTP state preservation.
 
         Uses a sliding window approach that preserves MTP state in the overlap region.
         This maintains prediction quality across context switches.
+
+        Args:
+            messages: The message list to trim
+            window_size: Target size (chars or tokens depending on use_tokens)
+            overlap_size: Size of overlap region for state continuity
+            use_tokens: If True, window_size is in tokens; if False, in characters
         """
         if window_size is None:
             window_size = self._config.agentic.max_optimized_chars
 
-        total_chars = sum(len(m.get("content", "")) for m in messages)
-
-        if total_chars <= window_size:
-            return messages
+        if use_tokens:
+            total_tokens = self.token_counter.count_messages(messages)
+            if total_tokens <= window_size:
+                return messages
+        else:
+            total_chars = sum(len(m.get("content", "")) for m in messages)
+            if total_chars <= window_size:
+                return messages
 
         # Find static layer
         static_end = self._find_static_layer_end(messages)
-        static_chars = sum(len(m.get("content", "")) for m in messages[:static_end])
+        if use_tokens:
+            static_tokens = self.token_counter.count_messages(messages[:static_end])
+        else:
+            static_chars = sum(len(m.get("content", "")) for m in messages[:static_end])
+            static_tokens = static_chars // 4  # Convert to tokens for comparison
 
         # If static layer alone exceeds window, only keep static
-        if static_chars >= window_size:
-            return messages[:static_end]
+        if use_tokens:
+            if static_tokens >= window_size:
+                return messages[:static_end]
+        else:
+            if static_chars >= window_size:
+                return messages[:static_end]
 
         # Calculate available space for dynamic content
-        available = window_size - static_chars
+        if use_tokens:
+            available = window_size - static_tokens
+        else:
+            available = window_size - static_chars
 
         # Keep overlap at the end for MTP state preservation
         # The overlap region maintains hidden state continuity
@@ -917,14 +1028,24 @@ class AgentContextOptimizer:
         kept_for_overlap: list[dict[str, Any]] = []
 
         for msg in reversed(dynamic_messages):
-            msg_chars = len(msg.get("content", ""))
-            if current_size + msg_chars <= available:
-                result.insert(static_end, dict(msg))
-                current_size += msg_chars
+            if use_tokens:
+                msg_tokens = self.token_counter.count_messages([msg])
+                if current_size + msg_tokens <= available:
+                    result.insert(static_end, dict(msg))
+                    current_size += msg_tokens
+                else:
+                    # This message would exceed the window
+                    # Keep it for overlap (will be added at the end)
+                    kept_for_overlap.insert(0, dict(msg))
             else:
-                # This message would exceed the window
-                # Keep it for overlap (will be added at the end)
-                kept_for_overlap.insert(0, dict(msg))
+                msg_chars = len(msg.get("content", ""))
+                if current_size + msg_chars <= available:
+                    result.insert(static_end, dict(msg))
+                    current_size += msg_chars
+                else:
+                    # This message would exceed the window
+                    # Keep it for overlap (will be added at the end)
+                    kept_for_overlap.insert(0, dict(msg))
 
         # Add overlap messages at the end (after the kept content)
         # This preserves MTP state continuity
@@ -997,7 +1118,6 @@ class AgentContextOptimizer:
             return 0.0
 
         # Count unique symbols vs total tokens
-        import re
         symbols = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", content))
         tokens = content.split()
 
