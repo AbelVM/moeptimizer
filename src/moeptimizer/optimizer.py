@@ -265,6 +265,9 @@ class AgentContextOptimizer:
         # Step 11.6: Stream large tool outputs for better context management
         optimized = self._stream_large_tool_outputs(optimized)
 
+        # Recalculate total_chars after entropy trim
+        total_chars = sum(len(m.get("content", "")) for m in optimized)
+
         # Step 11.7: Save MTP state before trimming for context switching
         # This preserves prediction quality across evictions
         state_key = self.mtp_state_manager.get_state_key(optimized)
@@ -275,6 +278,10 @@ class AgentContextOptimizer:
         # This is the preferred method for context management with MTP state preservation
         if total_chars > self._config.agentic.max_optimized_chars * 0.8:
             optimized = self._sliding_window_trim(optimized)
+
+        # Step 11.9: Align to MTP prediction boundary for better MTP accuracy
+        # This ensures context length is a multiple of 128 tokens
+        optimized = self.mtp_state_manager.align_prediction_boundary(optimized)
 
         # Step 12: Enforce hard character cap
         total_chars = sum(len(m.get("content", "")) for m in optimized)
@@ -374,7 +381,10 @@ class AgentContextOptimizer:
         return bool(re.search(r"```[\s\S]*?```", text))
 
     def _optimize_code_in_text(self, text: str) -> str:
-        """Optimize code blocks within a text string using Tree-Sitter + NPU."""
+        """Optimize code blocks within a text string using Tree-Sitter + NPU.
+
+        Returns the original text if optimization would reduce code block count.
+        """
         regex_pattern = r"(```[\s\S]*?```)"
         blocks = re.findall(regex_pattern, text)
         base_text = re.sub(regex_pattern, "", text).strip()
@@ -382,8 +392,12 @@ class AgentContextOptimizer:
         if not blocks:
             return text
 
+        # Store original blocks for fallback
+        original_blocks = list(blocks)
+
         detected_langs: set[str] = set()
         all_chunks: list[str] = []
+        block_langs: list[str] = []  # Track language per block
 
         for block in blocks:
             clean = block.replace("```", "").strip()
@@ -399,6 +413,7 @@ class AgentContextOptimizer:
                 lang_id = detect_language_and_id(clean)
 
             detected_langs.add(lang_id if lang_id != "generic" else "unknown-text")
+            block_langs.append(first_line if first_line in LANG_MAP else (lang_id if lang_id != "generic" else ""))
 
             chunks = chunk_code_with_treesitter(code, lang_id or "generic", self._config.code_chunking.chunk_max_chars)
             all_chunks.extend(chunks)
@@ -407,6 +422,11 @@ class AgentContextOptimizer:
             return text
 
         all_chunks = deduplicate_chunks(all_chunks)
+
+        # If we have fewer chunks than original blocks, we'd lose code
+        # Return original text to preserve all code blocks
+        if len(all_chunks) < len(blocks):
+            return text
 
         if len(all_chunks) >= 2 and len(base_text) > 100:
             try:
@@ -423,15 +443,10 @@ class AgentContextOptimizer:
         for i, chunk in enumerate(all_chunks):
             placeholder_str = placeholder.format(i) if i < len(blocks) else ""
             if i < len(blocks):
-                replacement = f"```{next(iter(detected_langs)) if detected_langs else ''}\n{chunk}\n```"
+                # Preserve original language from the block
+                original_lang = block_langs[i] if i < len(block_langs) else ""
+                replacement = f"```{original_lang}\n{chunk}\n```"
                 text = text.replace(placeholder_str, replacement)
-
-        if len(all_chunks) > len(blocks):
-            extra = "\n\n".join(
-                f"```{next(iter(detected_langs)) if detected_langs else ''}\n{c}\n```"
-                for c in all_chunks[len(blocks):]
-            )
-            text = text.rstrip() + "\n\n" + extra
 
         return text
 
@@ -865,14 +880,17 @@ class AgentContextOptimizer:
     def _sliding_window_trim(
         self,
         messages: list[dict[str, Any]],
-        window_size: int = 4096,
-        overlap_size: int = 128,
+        window_size: int | None = None,
+        overlap_size: int = 256,
     ) -> list[dict[str, Any]]:
         """Apply sliding window with MTP state preservation.
 
         Uses a sliding window approach that preserves MTP state in the overlap region.
         This maintains prediction quality across context switches.
         """
+        if window_size is None:
+            window_size = self._config.agentic.max_optimized_chars
+
         total_chars = sum(len(m.get("content", "")) for m in messages)
 
         if total_chars <= window_size:
@@ -896,7 +914,7 @@ class AgentContextOptimizer:
 
         # Add messages from end, keeping overlap
         current_size = 0
-        overlap_chars = 0
+        kept_for_overlap: list[dict[str, Any]] = []
 
         for msg in reversed(dynamic_messages):
             msg_chars = len(msg.get("content", ""))
@@ -905,10 +923,15 @@ class AgentContextOptimizer:
                 current_size += msg_chars
             else:
                 # This message would exceed the window
-                # Keep it as overlap for MTP state
-                if overlap_chars < overlap_size:
-                    result.insert(static_end, dict(msg))
-                    overlap_chars += msg_chars
+                # Keep it for overlap (will be added at the end)
+                kept_for_overlap.insert(0, dict(msg))
+
+        # Add overlap messages at the end (after the kept content)
+        # This preserves MTP state continuity
+        # Always add at least one overlap message for state continuity
+        if kept_for_overlap:
+            # Add the most recent overlap message (the one closest to the current turn)
+            result.append(kept_for_overlap[0])
 
         return result
 

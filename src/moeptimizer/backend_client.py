@@ -114,17 +114,19 @@ class SpeculativeDecoder:
 class LemonadeClient:
     """Async client for the Lemonade NPU server using OpenAI SDK."""
 
-    def __init__(self, base_url: str, api_key: str = "lemonade") -> None:
+    def __init__(self, base_url: str, api_key: str = "lemonade", timeout: float = 300.0) -> None:
         """Initialize the client.
 
         Args:
             base_url: Base URL of the Lemonade server (e.g., http://localhost:13305/api/v1)
             api_key: API key for authentication (Lemonade uses "lemonade" as default)
+            timeout: Request timeout in seconds (default 300s for long contexts)
         """
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
             max_retries=2,
+            timeout=timeout,
         )
         self._speculative_decoder: SpeculativeDecoder | None = None
 

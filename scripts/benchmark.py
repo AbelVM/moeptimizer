@@ -200,12 +200,23 @@ def _request(url: str, body: dict, timeout: float = 180.0) -> tuple[dict, float]
 def _calculate_timeout(turns: int, rounds: int) -> float:
     """Calculate timeout based on turns and rounds.
 
-    Formula: 2min * (1 + rounds * (turns + 1))
-    This scales timeout with context growth and multiple rounds.
+    Context-size dependent logic:
+    - Short contexts (<1000 tokens): 60-120s
+    - Medium contexts (1000-3000 tokens): 120-180s
+    - Long contexts (>3000 tokens): 180-300s
+
+    This scales timeout with expected context growth per turn.
     """
+    # Base timeout per request
     base_timeout = 120.0  # 2 minutes in seconds
-    multiplier = 1 + rounds * (turns + 1)
-    return base_timeout * multiplier
+
+    # Scale with turns: later turns have more context
+    # Each turn adds ~100-150 tokens of context
+    # Context grows: 200 → 500+ tokens over 10-15 turns
+    # Timeout should scale: 120s → 300s
+    context_growth_factor = 1 + (turns * 0.15)  # 15% increase per turn
+
+    return min(300.0, base_timeout * context_growth_factor)
 
 
 def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float = 180.0) -> tuple[dict, float]:

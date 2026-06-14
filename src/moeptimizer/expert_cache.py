@@ -69,7 +69,6 @@ class ExpertRoutingCache:
 
     def clear(self) -> None:
         """Clear all caches."""
-        self._cache.clear()
         self._static_cache.clear()
         self._dynamic_cache.clear()
         self._stats = {"hits": 0, "misses": 0, "evictions": 0}
@@ -300,6 +299,51 @@ class ExpertRoutingCache:
             patterns.append("import")
 
         return patterns
+
+    def extract_hints_from_response(
+        self,
+        response: Any,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Extract expert routing hints from a model response.
+
+        Uses the response to update the cache and generate hints for future requests.
+        This provides token-level expert routing feedback integration.
+        """
+        hints: list[dict[str, Any]] = []
+
+        # Get the assistant response content
+        if hasattr(response, "choices") and response.choices:
+            choice = response.choices[0]
+            if hasattr(choice, "message"):
+                content = choice.message.content or ""
+            elif hasattr(choice, "delta"):
+                content = choice.delta.content or ""
+            else:
+                content = ""
+        elif isinstance(response, dict):
+            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+        else:
+            return hints
+
+        # Extract tokens and update cache
+        tokens = content.split()
+        for i, token in enumerate(tokens[:100]):  # Limit to first 100 tokens
+            # Get context from surrounding messages
+            context = ""
+            for msg in messages[-3:]:  # Last 3 messages for context
+                if msg.get("role") == "user":
+                    context = msg.get("content", "")
+                    break
+
+            # Predict or get cached expert mask
+            expert_mask = self.get_or_predict(token, context)
+            hints.append({
+                "position": i,
+                "experts": list(expert_mask),
+            })
+
+        return hints
 
 
 # Global expert cache instance

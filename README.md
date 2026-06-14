@@ -111,7 +111,7 @@ Environment variables use the `MOEPT_` prefix with `__` for nested config:
 |---|---|---|
 | `MOEPT_PORT` | `8080` | Proxy listen port |
 
-### Lemonade NPU Server
+### Lemonade Server
 
 | Variable | Default | Description |
 |---|---|---|

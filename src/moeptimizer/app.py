@@ -234,7 +234,17 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     backend_client = LemonadeClient(
         base_url=cfg.server.url,
         api_key="lemonade",
+        timeout=cfg.server.timeout,
     )
+
+    # Enable speculative decoding if configured
+    if cfg.speculative.enabled:
+        backend_client.enable_speculative_decoding(
+            mtp_lookahead=cfg.speculative.mtp_lookahead,
+            confidence_threshold=cfg.speculative.confidence_threshold,
+        )
+        logger.info("Speculative decoding enabled: mtp_lookahead=%d, confidence_threshold=%.2f",
+                    cfg.speculative.mtp_lookahead, cfg.speculative.confidence_threshold)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

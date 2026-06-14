@@ -37,6 +37,10 @@ class ServerConfig(BaseModel):
     url: str = Field(default="http://localhost:13305/api/v1")
     llm_model: str = Field(default="Qwen3.6-35B-A3B-MTP-GGUF")
     embed_model: str = Field(default="embed-gemma-300m-FLM")
+    timeout: float = Field(
+        default=300.0,
+        description="Request timeout in seconds for long context conversations",
+    )
 
 
 class AgenticConfig(BaseModel):
@@ -84,6 +88,23 @@ class CacheConfig(BaseModel):
     )
 
 
+class SpeculativeConfig(BaseModel):
+    """Speculative decoding settings for MTP models."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable MTP-aware speculative decoding",
+    )
+    mtp_lookahead: int = Field(
+        default=4,
+        description="Number of tokens to predict ahead with MTP heads",
+    )
+    confidence_threshold: float = Field(
+        default=0.7,
+        description="Minimum confidence for accepting speculative tokens",
+    )
+
+
 class AppConfig(BaseSettings):
     """Top-level application configuration."""
 
@@ -92,6 +113,7 @@ class AppConfig(BaseSettings):
     agentic: AgenticConfig = Field(default_factory=AgenticConfig)
     code_chunking: CodeChunkingConfig = Field(default_factory=CodeChunkingConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
+    speculative: SpeculativeConfig = Field(default_factory=SpeculativeConfig)
 
     model_config = SettingsConfigDict(
         env_prefix="MOEPT_",
