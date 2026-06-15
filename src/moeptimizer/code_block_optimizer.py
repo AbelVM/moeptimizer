@@ -69,16 +69,14 @@ def optimize_code_in_text(
     if not blocks:
         return text
 
-    detected_langs: set[str] = set()
-    all_chunks: list[str] = []
+    # Group chunks by block to preserve structure
+    block_chunks: list[list[str]] = []
     block_langs: list[str] = []  # Track language per block
 
     for lang, code, start, end in blocks:
+        block_langs.append(lang)
         # Detect language if not specified
         lang_id = detect_language_and_id(code) if not lang else LANG_MAP.get(lang, lang)
-
-        detected_langs.add(lang_id if lang_id != "generic" else "unknown-text")
-        block_langs.append(lang)
 
         # Chunk the code
         chunks = chunk_code_with_treesitter(
@@ -86,25 +84,40 @@ def optimize_code_in_text(
             lang_id or "generic",
             config.code_chunking.chunk_max_chars,
         )
-        all_chunks.extend(chunks)
+        block_chunks.append(chunks)
 
-    if not all_chunks:
+    # Check if any block has no chunks (would lose code)
+    if any(not chunks for chunks in block_chunks):
         return text
 
-    all_chunks = deduplicate_chunks(all_chunks)
+    # Deduplicate within each block's chunks, not across all blocks
+    deduped_block_chunks: list[list[str]] = []
+    for chunks in block_chunks:
+        deduped_block_chunks.append(deduplicate_chunks(chunks))
 
-    # If we have fewer chunks than original blocks, we'd lose code
+    # If any block has fewer chunks after dedup, we'd lose code
     # Return original text to preserve all code blocks
-    if len(all_chunks) < len(blocks):
-        return text
+    for i, (original, deduped) in enumerate(zip(block_chunks, deduped_block_chunks)):
+        if len(deduped) < len(original):
+            return text
 
     # Reassemble text with optimized code blocks
+    # Build result by processing from end to start to preserve positions
     result = text
-    for i, (lang, code, start, end) in enumerate(blocks):
-        if i < len(all_chunks):
+    offset = 0
+    for i in range(len(blocks) - 1, -1, -1):
+        lang, code, start, end = blocks[i]
+        chunks = deduped_block_chunks[i]
+        if chunks:
+            # Join all chunks for this block with newlines
+            optimized_code = "\n".join(chunks)
             # Preserve original language from the block
             original_lang = block_langs[i] if i < len(block_langs) else ""
-            replacement = f"```{original_lang}\n{all_chunks[i]}\n```"
-            result = result[:start] + replacement + result[end:]
+            replacement = f"```{original_lang}\n{optimized_code}\n```"
+            # Adjust positions for previous replacements
+            actual_start = start + offset
+            actual_end = end + offset
+            result = result[:actual_start] + replacement + result[actual_end:]
+            offset += len(replacement) - (end - start)
 
     return result
