@@ -185,15 +185,15 @@ def _stop_proxy() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _request(url: str, body: dict, timeout: float = 180.0) -> tuple[dict, float]:
-    """Send a POST request and return (response_json, elapsed_ms)."""
+def _request(url: str, body: dict, timeout: float = 180.0) -> tuple[dict, float, dict[str, str]]:
+    """Send a POST request and return (response_json, elapsed_ms, headers)."""
     import requests
 
     t0 = time.monotonic()
     resp = requests.post(url, json=body, timeout=timeout)
     resp.raise_for_status()
     elapsed_ms = (time.monotonic() - t0) * 1000
-    return resp.json(), elapsed_ms
+    return resp.json(), elapsed_ms, dict(resp.headers)
 
 
 def _message_text(content: Any) -> str:
@@ -257,6 +257,7 @@ def _resolve_prompt_tokens(
     raw_prompt_tokens: int,
     messages: list[dict],
     usage: dict[str, Any] | None = None,
+    optimized_prompt_tokens: int = 0,
 ) -> tuple[int, str, bool]:
     """Return (effective_prompt_tokens, source, cached_response).
 
@@ -267,6 +268,8 @@ def _resolve_prompt_tokens(
     """
     if raw_prompt_tokens > 0:
         return raw_prompt_tokens, "usage", _looks_like_cached_response(usage or {})
+    if optimized_prompt_tokens > 0:
+        return optimized_prompt_tokens, "estimated_optimized", _looks_like_cached_response(usage or {})
     if messages:
         return _estimate_prompt_tokens(messages), "estimated_missing_usage", _looks_like_cached_response(usage or {})
     return 0, "missing_messages", False
@@ -294,7 +297,7 @@ def _calculate_timeout(turns: int, rounds: int) -> float:
     return min(300.0, base_timeout * context_growth_factor)
 
 
-def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float = 180.0) -> tuple[dict, float]:
+def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float = 180.0) -> tuple[dict, float, dict[str, str]]:
     url = f"{LEMONADE_URL}/chat/completions"
     body = {
         "model": MODEL_ID,
@@ -308,7 +311,7 @@ def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float 
 
 def _proxy_request(
     messages: list[dict], session_id: str | None = None, max_tokens: int = 256, timeout: float = 180.0
-) -> tuple[dict, float]:
+) -> tuple[dict, float, dict[str, str]]:
     url = f"http://127.0.0.1:{MOEPT_PORT}/v1/chat/completions"
     body = {
         "model": MODEL_ID,
@@ -1123,7 +1126,7 @@ def run_benchmark(
             p_content = ""
 
             try:
-                direct_resp, direct_latency = _direct_request(
+                direct_resp, direct_latency, direct_headers = _direct_request(
                     direct_messages, max_tokens=max_tokens, timeout=request_timeout
                 )
                 d_usage = direct_resp.get("usage", {}) or {}
@@ -1163,7 +1166,7 @@ def run_benchmark(
 
             # --- Proxy request ---
             try:
-                proxy_resp, proxy_latency = _proxy_request(
+                proxy_resp, proxy_latency, proxy_headers = _proxy_request(
                     proxy_messages, session_id=session_id, max_tokens=max_tokens, timeout=request_timeout
                 )
                 p_usage = proxy_resp.get("usage", {}) or {}
@@ -1172,8 +1175,16 @@ def run_benchmark(
 
                 _p_prompt_raw = int(p_usage.get("prompt_tokens", 0) or 0)
                 _p_cached = int((p_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
+                _p_optimized_prompt_tokens = int(
+                    proxy_headers.get("X-Optimized-Prompt-Tokens")
+                    or proxy_headers.get("x-optimized-prompt-tokens")
+                    or 0
+                )
                 _p_prompt, _p_prompt_source, _p_cached_response = _resolve_prompt_tokens(
-                    _p_prompt_raw, proxy_messages, p_usage
+                    _p_prompt_raw,
+                    proxy_messages,
+                    p_usage,
+                    optimized_prompt_tokens=_p_optimized_prompt_tokens,
                 )
                 # Measure total chars before proxy optimization (for eviction tracking)
                 _chars_before = sum(len(_message_text(m.get("content", ""))) for m in proxy_messages)
@@ -1207,6 +1218,11 @@ def run_benchmark(
                     latency_ms=0.0,
                     error=str(e)[:200],
                 )
+                # Try to extract optimization error from response headers if available
+                if hasattr(e, "response") and hasattr(e.response, "headers"):
+                    opt_error = e.response.headers.get("X-Optimization-Error")
+                    if opt_error:
+                        proxy_metrics.error = f"{proxy_metrics.error} | optimization: {opt_error}"
 
             # Append each side's assistant response to its own context for the next turn.
             if d_content:
@@ -1498,6 +1514,7 @@ def print_report(report: BenchmarkReport) -> None:
         "Length Ratio",
         "Semantic Sim",
         "Code Block",
+        "Error",
     ]
     detail_rows: list[list[str]] = []
     for idx in show_turns:
@@ -1542,6 +1559,7 @@ def print_report(report: BenchmarkReport) -> None:
             str(ctx_turns),
             d_tok, p_tok, cached, f"{tok_delta:+}",
             d_lat, p_lat, lat_delta, chars_in, eviction_flag, lr, sim, cb,
+            t.proxy.error or "",
         ])
 
     print(_fmt_table(detail_headers, detail_rows))

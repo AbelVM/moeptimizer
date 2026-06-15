@@ -195,14 +195,31 @@ class LemonadeClient:
         logger.debug("Sending request to Lemonade: model=%s, messages=%d, stream=%s",
                      model, len(validated_messages), stream)
 
+        # Log message summary for debugging
+        if len(validated_messages) > 5:
+            logger.debug(
+                "Lemonade request message summary: %d messages, first role=%s, last role=%s",
+                len(validated_messages),
+                validated_messages[0].get("role") if validated_messages else "none",
+                validated_messages[-1].get("role") if validated_messages else "none",
+            )
+
         response = await self._client.chat.completions.create(**params)
 
-        # Extract cache hit information if available
+        # Log response summary
         if hasattr(response, "usage") and response.usage:
-            # Lemonade may provide cache hit info in usage
-            cache_hit = getattr(response.usage, "cache_hit_tokens", None)
-            if cache_hit is not None:
-                logger.debug("Cache hit tokens: %d", cache_hit)
+            logger.debug(
+                "Lemonade response: completion_tokens=%s, prompt_tokens=%s",
+                getattr(response.usage, "completion_tokens", None),
+                getattr(response.usage, "prompt_tokens", None),
+            )
+            # Check for empty or suspicious usage
+            prompt_tokens = getattr(response.usage, "prompt_tokens", None)
+            if prompt_tokens == 0:
+                logger.warning(
+                    "Lemonade returned prompt_tokens=0 for %d messages - possible rejection or error",
+                    len(validated_messages),
+                )
 
         return response
 

@@ -42,3 +42,6 @@ IMPORTANT:
 - In terms of speed, both TTFT and TPS are important
 - Both speed and responses quality degrades with the context size, so we need to keep it lean
 - Target model is MoE: cache fill is expensive so we want to keep the context lean and avoid triggering cache refills
+
+
+Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.

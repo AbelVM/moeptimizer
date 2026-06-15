@@ -55,6 +55,38 @@ class TestAgentContextOptimizer:
         assistant_msgs = [m for m in result if m["role"] == "assistant"]
         assert len(assistant_msgs) <= 2, f"Expected ≤2 assistant msgs, got {len(assistant_msgs)}"
 
+    def test_static_prefix_cache_hit_still_enforces_budget(self) -> None:
+        """Static prefix cache hits must not bypass context compaction."""
+        from moeptimizer.static_prefix_kv import get_static_prefix_kv_cache
+
+        kv_cache = get_static_prefix_kv_cache()
+        kv_cache.clear()
+
+        self.optimizer._config.agentic.keep_full_steps = 1
+        self.optimizer._config.agentic.max_optimized_chars = 200
+
+        first_messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Remember this task"},
+            {"role": "assistant", "content": "I will keep it in mind."},
+        ]
+        self.optimizer.optimize_messages(first_messages)
+
+        long_messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Remember this task"},
+            {"role": "assistant", "content": "word " * 500},
+            {"role": "user", "content": "Now continue."},
+            {"role": "assistant", "content": "Recent response."},
+        ]
+
+        result = self.optimizer.optimize_messages(long_messages)
+
+        assert len(result) < len(long_messages)
+        assert result[0]["role"] == "system"
+        assert result[-1]["role"] == "assistant"
+        assert result[-2]["role"] == "user"
+
     def test_no_content_truncation(self) -> None:
         """Front-loading eviction drops whole turns — no content is truncated."""
         long_content = "This is a very detailed response with important information"

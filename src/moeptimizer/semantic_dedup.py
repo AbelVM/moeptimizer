@@ -98,7 +98,8 @@ class SemanticDeduplicator:
             for msg in messages:
                 content = msg.get("content", "")
                 if isinstance(content, str) and content:
-                    emb = embedding_service.get_embedding(content)
+                    # Use sync embedding method to avoid async issues in sync pipeline
+                    emb = embedding_service._sync_get_embedding(content)
                     if emb is not None:
                         embeddings.append(emb)
             return embeddings if len(embeddings) == len(messages) else None

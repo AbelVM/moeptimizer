@@ -160,6 +160,8 @@ async def _do_non_streaming(
     session_state: str,
     cfg: AppConfig,
     backend_client: LemonadeClient,
+    response_headers: dict[str, str] | None = None,
+    optimization_error: str | None = None,
 ) -> JSONResponse:
     """Execute non-streaming backend call using LemonadeClient (OpenAI SDK)."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -190,6 +192,24 @@ async def _do_non_streaming(
 
         usage = backend_data.get("usage", {})
 
+        # Log response details
+        choices = backend_data.get("choices", [])
+        if choices:
+            content = choices[0].get("message", {}).get("content", "")
+            finish_reason = choices[0].get("finish_reason", "")
+            logger.debug(
+                "Lemonade non-streaming response: content_len=%d, finish_reason=%s, usage=%s",
+                len(content),
+                finish_reason,
+                usage,
+            )
+            if not content and finish_reason != "length":
+                logger.warning(
+                    "Lemonade returned empty content for %d messages (finish_reason=%s)",
+                    len(messages),
+                    finish_reason,
+                )
+
         # Record cache hit for cache registry
         # Extract cache hit tokens if available
         cache_hit_tokens = getattr(usage, "cache_hit_tokens", None) if hasattr(usage, "cache_hit_tokens") else usage.get("cache_hit_tokens", None)
@@ -208,11 +228,17 @@ async def _do_non_streaming(
                 "choices": backend_data.get("choices", []),
                 "usage": usage,
             },
-            headers={"_session_state": session_state},
+            headers={
+                **dict(response_headers or {}),
+                "_session_state": session_state[:64000] if session_state and len(session_state) > 64000 else (session_state or ""),
+            },
         )
 
     except Exception as e:
         logger.exception("Non-streaming chat completion error")
+        response_headers = {}
+        if optimization_error:
+            response_headers["X-Optimization-Error"] = optimization_error
         return JSONResponse(
             status_code=500,
             content={
@@ -223,6 +249,7 @@ async def _do_non_streaming(
                     "code": None,
                 }
             },
+            headers=response_headers,
         )
 
 
@@ -337,35 +364,79 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 with suppress(Exception):
                     optimizer.load_session_state(session_state)
 
-        optimized_messages = optimizer.optimize_messages(messages)
+        optimized_messages = messages
+        optimization_error: str | None = None
+        try:
+            optimized_messages = optimizer.optimize_messages(messages)
+        except Exception as e:
+            logger.exception("Context optimization failed, falling back to raw messages")
+            optimization_error = f"{type(e).__name__}: {e}"
+            optimized_messages = messages
+
+        # Debug logging for long contexts
+        if len(optimized_messages) > 10:
+            logger.info(
+                "[Proxy] Turn with %d messages (original: %d), optimization_error=%s",
+                len(optimized_messages),
+                len(messages),
+                optimization_error,
+            )
+            # Log message roles and content lengths
+            for i, msg in enumerate(optimized_messages[:5]):
+                logger.info(
+                    "[Proxy] Message %d: role=%s, content_len=%d, preview=%s",
+                    i,
+                    msg.get("role"),
+                    len(msg.get("content", "")),
+                    (msg.get("content", "") or "")[:100],
+                )
+            if len(optimized_messages) > 5:
+                logger.info(
+                    "[Proxy] ... and %d more messages",
+                    len(optimized_messages) - 5,
+                )
 
         # Ensure all non-assistant messages have 'content' for Lemonade compatibility.
         # The optimizer/compactor may produce tool_result or other non-assistant
         # messages that lack a content field from the original request.
         _ensure_content(optimized_messages)
 
+        response_headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-Optimized-Prompt-Tokens": str(optimizer.token_counter.count_messages(optimized_messages)),
+        }
+
         session_state = optimizer.get_session_state()
+        if optimization_error:
+            response_headers["X-Optimization-Error"] = optimization_error
 
         body["model"] = cfg.server.llm_model
         body["messages"] = optimized_messages
         body.setdefault("temperature", 0.1)
         body.setdefault("stream", True)
-
         is_streaming = body.get("stream", True)
+
+        # Only include session state in header if it's reasonably sized
+        # (full state is maintained server-side via session_id)
+        if session_state and len(session_state) <= 64000:
+            response_headers["_session_state"] = session_state
+        elif session_state:
+            logger.warning(
+                "Session state too large for header (%d bytes), omitting from response",
+                len(session_state),
+            )
 
         if is_streaming:
             return StreamingResponse(
                 _make_streaming_generator(body, cfg, backend_client),
                 media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
+                headers=response_headers,
             )
         else:
             return await _do_non_streaming(
-                body, session_state, cfg, backend_client
+                body, session_state, cfg, backend_client, response_headers, optimization_error
             )
 
     @app.get("/v1/models")

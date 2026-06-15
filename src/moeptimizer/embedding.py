@@ -18,15 +18,18 @@ logger = logging.getLogger(__name__)
 
 # Shared event loop for synchronous embedding calls (avoids creating new loops)
 _sync_loop: asyncio.AbstractEventLoop | None = None
-_sync_loop_lock = asyncio.Lock()
+_sync_loop_lock: asyncio.Lock | None = None  # Created lazily to avoid import-time event loop requirement
 
 
 def _get_sync_loop() -> asyncio.AbstractEventLoop:
     """Get or create a reusable event loop for sync embedding calls."""
-    global _sync_loop
+    global _sync_loop, _sync_loop_lock
     if _sync_loop is None or _sync_loop.is_closed():
         _sync_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(_sync_loop)
+    # Create lock lazily inside the loop's context
+    if _sync_loop_lock is None:
+        _sync_loop_lock = asyncio.Lock()
     return _sync_loop
 
 

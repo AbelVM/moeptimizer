@@ -150,6 +150,21 @@ class AgentContextOptimizer:
         self.kv_warmup = get_kv_cache_warmup() if v050.kv_warmup_enabled else None
         self.async_io = get_async_io_stage() if v050.async_io_enabled else None
 
+    def _budget_tokens(self) -> int:
+        """Return the configured token budget without letting defaults override chars."""
+        cfg = self._config.agentic
+        char_budget = max(1, cfg.max_optimized_chars // 4)
+
+        if cfg.max_optimized_tokens <= 0:
+            return char_budget
+
+        # The default token budget mirrors the default char budget. If a caller
+        # lowers max_optimized_chars for tests or deployments, keep that stricter
+        # budget unless max_optimized_tokens was explicitly lowered too.
+        if cfg.max_optimized_chars == 12000:
+            return cfg.max_optimized_tokens
+        return min(char_budget, cfg.max_optimized_tokens)
+
     def optimize_messages(
         self,
         messages: list[dict[str, Any]],
@@ -192,32 +207,61 @@ class AgentContextOptimizer:
         # Step 5: Apply thinking preservation (pass-through)
         optimized = self.thinking_preserver.process_messages(list(messages))
 
-        # Step 5.0: Check static prefix KV-cache for early exit
+        # Calculate token count early (needed for cache early-exit decisions).
+        max_tokens = self._budget_tokens()
+        proactive_threshold_tokens = int(max_tokens * 0.7)
+        total_tokens = self.token_counter.count_messages(optimized)
+
+        # Step 5.0: Check static prefix KV-cache for early exit.
+        # Only skip the rest of the pipeline when the context is already lean.
+        # If the context is over budget, cache hits must not bypass compaction.
         if self.static_prefix_kv is not None:
             kv_data = self.static_prefix_kv.get(optimized)
             if kv_data is not None:
-                logger.info("[AgentOptimizer] Static prefix KV-cache hit, skipping optimization")
+                if total_tokens <= proactive_threshold_tokens:
+                    logger.info("[AgentOptimizer] Static prefix KV-cache hit, skipping optimization")
+                    optimized = self._strip_internal_flags(optimized)
+                    self.cache_registry.register_context(optimized)
+                    self.cache_registry.save_to_disk()
+                    return optimized
+                logger.info(
+                    "[AgentOptimizer] Static prefix KV-cache hit, but context is over budget "
+                    "(tokens=%d, threshold=%d); continuing compaction",
+                    total_tokens,
+                    proactive_threshold_tokens,
+                )
+
+        # Step 5.1: Check cache hit rate - skip heavy optimization if high and within budget.
+        cache_hit_rate = self.cache_registry.predict_hit_rate(optimized)
+        if cache_hit_rate > 0.9:
+            if total_tokens <= proactive_threshold_tokens:
+                logger.info(
+                    "[AgentOptimizer] High cache hit rate (%.2f), skipping heavy optimization",
+                    cache_hit_rate,
+                )
+                # Still need to strip internal flags and register context
                 optimized = self._strip_internal_flags(optimized)
                 self.cache_registry.register_context(optimized)
                 self.cache_registry.save_to_disk()
                 return optimized
-
-        # Step 5.1: Check cache hit rate - skip heavy optimization if high
-        cache_hit_rate = self.cache_registry.predict_hit_rate(optimized)
-        if cache_hit_rate > 0.9:
             logger.info(
-                "[AgentOptimizer] High cache hit rate (%.2f), skipping heavy optimization",
+                "[AgentOptimizer] High cache hit rate (%.2f), but context is over budget "
+                "(tokens=%d, threshold=%d); continuing compaction",
                 cache_hit_rate,
+                total_tokens,
+                proactive_threshold_tokens,
             )
-            # Still need to strip internal flags and register context
-            optimized = self._strip_internal_flags(optimized)
-            self.cache_registry.register_context(optimized)
-            self.cache_registry.save_to_disk()
-            return optimized
 
         # Step 5.1.5: Check hit prediction model for early exit
-        if self.hit_prediction is not None and self.hit_prediction.should_early_exit(optimized):
-            logger.info("[AgentOptimizer] Hit prediction model suggests early exit")
+        # Only allow early exit if context is within budget (not when we need trimming)
+        if (self.hit_prediction is not None
+            and total_tokens <= proactive_threshold_tokens
+            and self.hit_prediction.should_early_exit(optimized)):
+            logger.info(
+                "[AgentOptimizer] Hit prediction model suggests early exit "
+                "(tokens=%d, budget=%d)",
+                total_tokens, max_tokens,
+            )
             optimized = self._strip_internal_flags(optimized)
             self.cache_registry.register_context(optimized)
             self.cache_registry.save_to_disk()
@@ -226,157 +270,240 @@ class AgentContextOptimizer:
         # Calculate static layer end once (used by multiple steps)
         static_end = self._find_static_layer_end(optimized)
         total_chars = sum(len(m.get("content", "")) for m in optimized)
-        total_tokens = self.token_counter.count_messages(optimized)
 
         # Step 5.2: Build KV slot map for cache control
         slot_tracker = get_kv_slot_tracker()
         slot_map = slot_tracker.build_slot_map(optimized)
 
         # Step 5.5: Apply context canonicalization for cache-friendly formatting
-        optimized = self.context_canonicalizer.canonicalize(optimized)
+        try:
+            optimized = self.context_canonicalizer.canonicalize(optimized)
+        except Exception as e:
+            logger.warning("Context canonicalization failed: %s", e)
 
         # Step 5.7: Apply context compression to reduce token usage
-        optimized = self.context_compressor.compress(optimized)
+        try:
+            optimized = self.context_compressor.compress(optimized)
+        except Exception as e:
+            logger.warning("Context compression failed: %s", e)
 
         # Step 5.8: Apply attention sink management for long-context stability
         if total_chars > 4000:
-            optimized = apply_attention_sinks(optimized, static_end)
+            try:
+                optimized = apply_attention_sinks(optimized, static_end)
+            except Exception as e:
+                logger.warning("Attention sink management failed: %s", e)
 
         # Step 5.9: Warm expert cache for static layer patterns
         if total_chars > 1000:
-            static_content = self._get_static_layer_content(optimized)
-            if static_content:
-                self.expert_cache.warm_cache_for_static_layer(static_content)
+            try:
+                static_content = self._get_static_layer_content(optimized)
+                if static_content:
+                    self.expert_cache.warm_cache_for_static_layer(static_content)
+            except Exception as e:
+                logger.warning("Expert cache warming failed: %s", e)
 
         # Step 5.10: Prefetch dependencies for files in context
-        self._prefetch_dependencies(optimized)
+        try:
+            self._prefetch_dependencies(optimized)
+        except Exception as e:
+            logger.warning("Dependency prefetch failed: %s", e)
 
         # Step 6: Apply prompt template versioning
-        optimized, self._task_type = classify_and_template(optimized)
+        try:
+            optimized, self._task_type = classify_and_template(optimized)
+        except Exception as e:
+            logger.warning("Prompt template versioning failed: %s", e)
 
         # Step 6.5: Apply context template matching
         if not (optimized and optimized[0].get("role") == "system"):
-            template_name = self.context_template_matcher.match_template(optimized)
-            if template_name:
-                optimized = self.context_template_matcher.apply_template(optimized)
+            try:
+                template_name = self.context_template_matcher.match_template(optimized)
+                if template_name:
+                    optimized = self.context_template_matcher.apply_template(optimized)
+            except Exception as e:
+                logger.warning("Context template matching failed: %s", e)
 
         # Step 7: Apply scratchpad compaction
-        optimized = self.compactor.compact_messages(optimized)
+        try:
+            optimized = self.compactor.compact_messages(optimized)
+        except Exception as e:
+            logger.warning("Scratchpad compaction failed: %s", e)
 
         # Step 7.5: Apply selective truncation (remove duplicate code blocks)
-        optimized = self.selective_truncator.remove_duplicates(optimized)
+        try:
+            optimized = self.selective_truncator.remove_duplicates(optimized)
+        except Exception as e:
+            logger.warning("Selective truncation failed: %s", e)
 
         # Step 7.6: Apply semantic deduplication for near-duplicate context
         if total_tokens > 1000:  # Only for larger contexts
-            optimized = self.semantic_deduplicator.deduplicate(
-                optimized,
-                self.embedding_service,
-            )
+            try:
+                optimized = self.semantic_deduplicator.deduplicate(
+                    optimized,
+                    self.embedding_service,
+                )
+            except Exception as e:
+                logger.warning("Semantic deduplication failed: %s", e)
 
         # Step 7.7: Apply dependency ordering for cache locality
-        optimized = self.dependency_orderer.order_by_dependencies(optimized)
+        try:
+            optimized = self.dependency_orderer.order_by_dependencies(optimized)
+        except Exception as e:
+            logger.warning("Dependency ordering failed: %s", e)
 
         # Step 7.8: Apply incremental update for cache preservation
-        optimized = self.incremental_updater.update_context(optimized, "")
+        try:
+            optimized = self.incremental_updater.update_context(optimized, "")
+        except Exception as e:
+            logger.warning("Incremental update failed: %s", e)
 
         # Step 8: Inject RAG context and loop warnings as SEPARATE user messages
-        if loop_warnings:
-            warning_lines: list[str] = []
-            for w in loop_warnings:
-                warning_lines.append(self.loop_detector.get_warning_message(w))
-            if warning_lines:
-                optimized.append({
-                    "role": "user",
-                    "content": "\n".join(warning_lines),
-                })
+        try:
+            if loop_warnings:
+                warning_lines: list[str] = []
+                for w in loop_warnings:
+                    warning_lines.append(self.loop_detector.get_warning_message(w))
+                if warning_lines:
+                    optimized.append({
+                        "role": "user",
+                        "content": "\n".join(warning_lines),
+                    })
 
-        # RAG context: append as a separate user message
-        last_assistant = None
-        for msg in reversed(optimized):
-            if msg.get("role") == "assistant" and not msg.get("_archived"):
-                last_assistant = msg
-                break
+            # RAG context: append as a separate user message
+            last_assistant = None
+            for msg in reversed(optimized):
+                if msg.get("role") == "assistant" and not msg.get("_archived"):
+                    last_assistant = msg
+                    break
 
-        if last_assistant:
-            current_step = AgentStep(
-                role=last_assistant.get("role", "assistant"),
-                content=last_assistant.get("content", ""),
-                tool_name=None,
-                metadata=last_assistant.get("metadata", {}),
-            )
-            rag_context = self.state_rag.get_context_for_step(current_step)
-            if rag_context:
-                optimized.append({
-                    "role": "user",
-                    "content": rag_context,
-                })
+            if last_assistant:
+                current_step = AgentStep(
+                    role=last_assistant.get("role", "assistant"),
+                    content=last_assistant.get("content", ""),
+                    tool_name=None,
+                    metadata=last_assistant.get("metadata", {}),
+                )
+                rag_context = self.state_rag.get_context_for_step(current_step)
+                if rag_context:
+                    optimized.append({
+                        "role": "user",
+                        "content": rag_context,
+                    })
+        except Exception as e:
+            logger.warning("RAG/loop warning injection failed: %s", e)
 
         # Step 8: Apply static layer block alignment for cache optimization
         if total_tokens > 500:  # ~2000 chars
-            optimized = self._align_static_layer(optimized)
+            try:
+                optimized = self._align_static_layer(optimized)
+            except Exception as e:
+                logger.warning("Static layer alignment failed: %s", e)
 
         # Step 9: Pre-seed reasoning prefix for MTP (only if budget allows)
-        max_tokens = self._config.agentic.max_optimized_chars // 4
+        max_tokens = self._budget_tokens()
         if total_tokens < max_tokens * 0.5:
-            optimized = self._preseed_reasoning(optimized)
+            try:
+                optimized = self._preseed_reasoning(optimized)
+            except Exception as e:
+                logger.warning("Reasoning pre-seeding failed: %s", e)
 
         # Step 10: Optimize code blocks in all messages
-        for msg in optimized:
-            content = msg.get("content", "")
-            if isinstance(content, str) and has_code_blocks(content):
-                msg["content"] = optimize_code_in_text(
-                    content,
-                    self._config,
-                    self.embedding_service,
-                )
+        try:
+            for msg in optimized:
+                content = msg.get("content", "")
+                if isinstance(content, str) and self._has_code_blocks(content):
+                    msg["content"] = optimize_code_in_text(
+                        content,
+                        self._config,
+                        self.embedding_service,
+                    )
+        except Exception as e:
+            logger.warning("Code block optimization failed: %s", e)
 
         # Step 10.5: Apply cache-aware chunking for large contexts
         if total_tokens > 750:  # ~3000 chars
-            optimized = self.cache_aware_chunker.chunk_context(optimized)
+            try:
+                optimized = self.cache_aware_chunker.chunk_context(optimized)
+            except Exception as e:
+                logger.warning("Cache-aware chunking failed: %s", e)
 
         # Step 11: Proactive context trimming for MoE KV-cache efficiency
         # Use token-based threshold for more accurate budget enforcement
         proactive_threshold_tokens = int(max_tokens * 0.7)
         if total_tokens > proactive_threshold_tokens:
-            optimized = self._proactive_trim(optimized, proactive_threshold_tokens, use_tokens=True)
+            try:
+                optimized = self._proactive_trim(optimized, proactive_threshold_tokens, use_tokens=True)
+            except Exception as e:
+                logger.warning("Proactive trimming failed: %s", e)
 
         # Step 11.5: Entropy-guided trimming for MTP-friendly content
-        optimized = self._entropy_guided_trim(optimized)
+        try:
+            optimized = self._entropy_guided_trim(optimized)
+        except Exception as e:
+            logger.warning("Entropy-guided trimming failed: %s", e)
 
         # Step 11.6: Stream large tool outputs for better context management
-        optimized = self._stream_large_tool_outputs(optimized)
+        try:
+            optimized = self._stream_large_tool_outputs(optimized)
+        except Exception as e:
+            logger.warning("Tool output streaming failed: %s", e)
 
         # Recalculate total_tokens after entropy trim
-        total_tokens = self.token_counter.count_messages(optimized)
+        try:
+            total_tokens = self.token_counter.count_messages(optimized)
+        except Exception as e:
+            logger.warning("Token recount failed: %s", e)
 
         # Step 11.7: Save MTP state before trimming for context switching
         # This preserves prediction quality across evictions
-        state_key = self.mtp_state_manager.get_state_key(optimized)
-        # Store the state key in the optimizer for potential restoration
-        self._last_mtp_state_key = state_key
+        try:
+            state_key = self.mtp_state_manager.get_state_key(optimized)
+            # Store the state key in the optimizer for potential restoration
+            self._last_mtp_state_key = state_key
+        except Exception as e:
+            logger.warning("MTP state key generation failed: %s", e)
 
         # Step 11.8: Apply sliding window for long contexts
         # This is the preferred method for context management with MTP state preservation
         if total_tokens > int(max_tokens * 0.8):
-            optimized = self._sliding_window_trim(optimized, use_tokens=True)
+            try:
+                optimized = self._sliding_window_trim(optimized, use_tokens=True)
+            except Exception as e:
+                logger.warning("Sliding window trim failed: %s", e)
 
         # Step 11.9: Align to MTP prediction boundary for better MTP accuracy
         # This ensures context length is a multiple of 128 tokens
-        optimized = self.mtp_state_manager.align_prediction_boundary(optimized)
+        try:
+            optimized = self.mtp_state_manager.align_prediction_boundary(optimized)
+        except Exception as e:
+            logger.warning("MTP boundary alignment failed: %s", e)
 
         # Step 12: Enforce hard token cap
-        total_tokens = self.token_counter.count_messages(optimized)
-        if total_tokens > max_tokens:
-            optimized = self._trim_to_budget(optimized, use_tokens=True)
+        try:
+            total_tokens = self.token_counter.count_messages(optimized)
+            if total_tokens > max_tokens:
+                optimized = self._trim_to_budget(optimized, use_tokens=True)
+        except Exception as e:
+            logger.warning("Token budget enforcement failed: %s", e)
 
         # Step 13: Strip internal metadata before sending to model
-        optimized = self._strip_internal_flags(optimized)
+        try:
+            optimized = self._strip_internal_flags(optimized)
+        except Exception as e:
+            logger.warning("Internal flag stripping failed: %s", e)
 
         # Step 14: Register context in cache registry for hit prediction
-        self.cache_registry.register_context(optimized)
+        try:
+            self.cache_registry.register_context(optimized)
+        except Exception as e:
+            logger.warning("Cache registry registration failed: %s", e)
 
         # Step 14.5: Persist cache registry for cross-session reuse
-        self.cache_registry.save_to_disk()
+        try:
+            self.cache_registry.save_to_disk()
+        except Exception as e:
+            logger.warning("Cache registry persistence failed: %s", e)
 
         # Step 14.6: Store static prefix KV-cache for reuse
         if self.static_prefix_kv is not None:
@@ -387,8 +514,8 @@ class AgentContextOptimizer:
                     "timestamp": time.time(),
                 }).encode()
                 self.static_prefix_kv.put(optimized, kv_data)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Static prefix KV-cache storage failed: %s", e)
 
         # Step 14.7: Record hit prediction outcome
         if self.hit_prediction is not None:
@@ -397,8 +524,8 @@ class AgentContextOptimizer:
                     optimized,
                     hit=True,  # We got here, so request succeeded
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Hit prediction recording failed: %s", e)
 
         # Step 14.8: Store code snapshots for delta encoding
         if self.delta_encoder is not None:
@@ -412,22 +539,22 @@ class AgentContextOptimizer:
                             code = match.group(2)
                             file_path = f"inline:{lang}:{hashlib.md5(code.encode()).hexdigest()[:8]}"
                             self.delta_encoder.store_snapshot(file_path, code)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Delta encoding snapshot storage failed: %s", e)
 
         # Step 14.9: Save hierarchical summaries to disk
         if self.hierarchical_summarizer is not None:
             try:
                 self.hierarchical_summarizer.save_to_disk()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Hierarchical summarizer save failed: %s", e)
 
         # Step 14.10: Save static prefix KV-cache to disk
         if self.static_prefix_kv is not None:
             try:
                 self.static_prefix_kv.save_to_disk()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Static prefix KV-cache disk save failed: %s", e)
 
         # Log metrics
         original_chars = sum(len(m.get("content", "")) for m in messages)
@@ -643,7 +770,7 @@ class AgentContextOptimizer:
             use_tokens: If True, use token-based budget; if False, use character-based
         """
         if use_tokens:
-            max_tokens = self._config.agentic.max_optimized_chars // 4
+            max_tokens = self._budget_tokens()
         else:
             max_chars = self._config.agentic.max_optimized_chars
 
@@ -681,41 +808,35 @@ class AgentContextOptimizer:
             system_anchor.append(messages[i])
             i += 1
 
-        # Group remaining into user-assistant pairs.
+        # Group remaining messages into turns.
         # Each turn starts with a user message and includes following assistant/tool messages.
-        # Leading assistants (orphaned from system anchor's first user) are attached to the next user.
+        # Leading assistant/tool messages are attached to the first following user turn.
         turns: list[list[dict[str, Any]]] = []
         current_turn: list[dict[str, Any]] = []
+        orphaned_leading: list[dict[str, Any]] = []
 
         while i < len(messages):
             msg = messages[i]
             role = msg.get("role", "")
             if role == "user":
-                # Save previous turn (complete or pending) before starting new one
                 if current_turn:
                     turns.append(current_turn)
+                    current_turn = []
                 current_turn = [msg]
+            elif current_turn:
+                current_turn.append(msg)
             else:
-                # Assistant/tool messages without a preceding user belong to the next turn.
-                # Collect them until we hit a user message, then attach them there.
-                if not current_turn:
-                    # No pending user yet — save these as an orphaned group
-                    # that will be attached to the next user's turn
-                    current_turn = [{"_orphan": True}]  # marker for attachment
-                    current_turn.append(msg)
-                else:
-                    current_turn.append(msg)
+                orphaned_leading.append(msg)
             i += 1
 
-        if current_turn and not any(m.get("_orphan", False) for m in current_turn):
+        if current_turn:
             turns.append(current_turn)
-        elif current_turn:
-            # This turn starts with orphans — merge into previous turn's end
+
+        if orphaned_leading:
             if turns:
-                turns[-1].extend([m for m in current_turn if not m.get("_orphan")])
+                turns[0] = orphaned_leading + turns[0]
             else:
-                # No previous turn to attach to — keep as standalone pending
-                turns.append(current_turn)
+                turns.append(orphaned_leading)
 
         # Separate complete and pending turns; evict from complete only.
         complete_turns = [t for t in turns if any(m.get("role") == "assistant" for m in t)]
@@ -962,7 +1083,7 @@ class AgentContextOptimizer:
 
         # Check if we have budget headroom for preseeding
         total_tokens = self.token_counter.count_messages(messages)
-        max_tokens = self._config.agentic.max_optimized_chars // 4
+        max_tokens = self._budget_tokens()
         if total_tokens > int(max_tokens * 0.9):
             # Too close to budget, skip preseeding
             return messages
