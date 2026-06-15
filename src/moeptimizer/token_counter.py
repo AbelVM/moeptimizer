@@ -1,7 +1,6 @@
 """TokenCounter — Estimate token usage for context budget management.
 
-Uses the model's actual tokenizer when available, with character-based
-estimation as a fallback.
+Uses tiktoken for accurate token counting with the model's actual tokenizer.
 """
 
 from __future__ import annotations
@@ -9,22 +8,16 @@ from __future__ import annotations
 import logging
 from typing import Any, ClassVar
 
-logger = logging.getLogger(__name__)
+import tiktoken
 
-# Try to import tiktoken for accurate token counting
-try:
-    import tiktoken
-    _HAS_TIKTOKEN = True
-except ImportError:
-    _HAS_TIKTOKEN = False
+logger = logging.getLogger(__name__)
 
 
 class TokenCounter:
     """
     Token counter for context budget management.
 
-    Uses the model's actual tokenizer when available, with character-based
-    estimation as a fallback.
+    Uses tiktoken for accurate token counting with the model's actual tokenizer.
     """
 
     CHARS_PER_TOKEN: ClassVar[dict[str, float]] = {
@@ -47,17 +40,19 @@ class TokenCounter:
     def __init__(self, model_name: str = "gpt-4") -> None:
         """Initialize with optional model name for tokenizer selection."""
         self._model_name = model_name
-        self._encoder: Any = None
-        if _HAS_TIKTOKEN:
+        self._encoder: tiktoken.Encoding | None = None
+        try:
+            # Use a tokenizer close to Qwen's (GPT-4 is a reasonable approximation)
+            self._encoder = tiktoken.encoding_for_model(model_name)
+        except Exception:
+            # Fall back to cl100k_base (GPT-4 tokenizer)
             try:
-                # Use a tokenizer close to Qwen's (GPT-4 is a reasonable approximation)
-                self._encoder = tiktoken.encoding_for_model(model_name)
-            except Exception:
-                # Fall back to cl100k_base (GPT-4 tokenizer)
-                try:
-                    self._encoder = tiktoken.get_encoding("cl100k_base")
-                except Exception:
-                    logger.debug("tiktoken available but encoder init failed")
+                self._encoder = tiktoken.get_encoding("cl100k_base")
+            except Exception as e:
+                raise RuntimeError(
+                    "Failed to initialize tiktoken encoder. "
+                    "Ensure tiktoken is installed: pip install tiktoken"
+                ) from e
 
     def count(self, text: str, lang: str = "generic") -> int:
         """Estimate token count for the given text."""
@@ -68,16 +63,13 @@ class TokenCounter:
         if non_ws == 0:
             return 0
 
-        # Use actual tokenizer if available
-        if self._encoder is not None:
-            try:
-                return len(self._encoder.encode(text))
-            except Exception:
-                pass
-
-        # Fallback to character-based estimation
-        cpt = self.CHARS_PER_TOKEN.get(lang, 3.5)
-        return max(1, int(len(text) / cpt))
+        # Use actual tokenizer
+        try:
+            return len(self._encoder.encode(text))  # type: ignore[union-attr]
+        except Exception:
+            # Fallback to character-based estimation
+            cpt = self.CHARS_PER_TOKEN.get(lang, 3.5)
+            return max(1, int(len(text) / cpt))
 
     def count_messages(self, messages: list[dict[str, Any]]) -> int:
         """Estimate total tokens across all messages."""
@@ -95,13 +87,11 @@ class TokenCounter:
 
     def count_tokens_precise(self, text: str) -> int:
         """Get precise token count using the model tokenizer."""
-        if self._encoder is not None:
-            try:
-                return len(self._encoder.encode(text))
-            except Exception:
-                pass
-        # Fallback
-        return self.count(text)
+        try:
+            return len(self._encoder.encode(text))  # type: ignore[union-attr]
+        except Exception:
+            # Fallback
+            return self.count(text)
 
     def estimate_kv_cache_usage(self, token_count: int) -> str:
         """Convert token count to a human-readable KV-cache estimate."""

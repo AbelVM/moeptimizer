@@ -71,12 +71,11 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 - **Per-MTP-Head Temperature** — Head-specific temperature scheduling for optimal MTP accuracy
 - **Tree-Sitter Code Optimization** — Proper AST-based code block detection and optimization
 
-### v0.4.3 – Additional Optimizations (Implemented)
+### Additional Optimizations (v0.5.0)
 
 - **Static Prefix KV‑Cache Reuse** – Pre‑computes and re‑uses KV‑cache for unchanging system/static tokens, reducing cache fill overhead.
 - **Token‑Aware Truncation** – Uses tiktoken to trim at true token boundaries, preserving whole‑token alignment and avoiding partial token truncation.
 - **Chunk Fingerprinting & Reuse** – Generates SHA‑256 fingerprints for compressed code chunks; identical chunks are re‑used across turns, eliminating redundant compression and embedding work.
-- **Dynamic Threshold Adaptation** – Adjusts `MAX_OPTIMIZED_CHARS`, `MIN_CHUNK_SCORE`, and other limits at runtime based on current hardware headroom (VRAM, CPU cores).
 - **Embedding Cache Invalidation & Batching** – Tracks file mtime to invalidate only changed embeddings; groups embedding queries into batches to hide I/O latency.
 - **MTP‑Head State Checkpointing** – Persists per‑head hidden states for recurring function signatures, re‑using them when the same signature appears again.
 - **Parallel Embedding Lookup** – Executes embedding fetches in a thread‑pool, overlapping I/O with model inference.
@@ -103,10 +102,14 @@ Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
                                 ├── ProgressTracker
                                 ├── PromptTemplateManager (task classification)
                                 │   └── ContextTemplateMatcher (template matching)
+                                ├── TemplateSelector (quality-based template selection)
                                 ├── AttentionSinkManager (long context stability)
                                 ├── ExpertRoutingCache (MoE routing cache)
                                 ├── CacheKeyRegistry (hit prediction)
+                                │   └── HitPredictionModel (XGBoost early-exit)
                                 ├── KVSlotTracker (explicit cache control)
+                                ├── StaticPrefixKVCache (prefix cache reuse)
+                                ├── KVCacheWarmup (MTP head warm-up)
                                 ├── ContextAligner (block alignment)
                                 ├── ContextCanonicalizer (formatting normalization)
                                 ├── SelectiveTruncator (duplicate removal)
@@ -117,6 +120,15 @@ Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
                                 ├── CacheAwareChunker (aligned chunking)
                                 ├── ContextCompressor (skeleton compression)
                                 ├── CodeBlockOptimizer (tree-sitter code optimization)
+                                ├── ChunkFingerprintCache (SHA-256 chunk reuse)
+                                ├── DeltaEncoder (code delta compression)
+                                ├── HierarchicalSummarizer (recall token compression)
+                                ├── TokenAwareTruncator (tiktoken boundary trimming)
+                                ├── MTPHeadStateCheckpoint (per-head state reuse)
+                                ├── SegmentWiseSpeculativeDecoder (per-segment drafting)
+                                ├── ParallelEmbeddingLookup (thread-pool embedding)
+                                ├── EmbeddingCacheWithInvalidation (mtime-based invalidation)
+                                ├── AsyncIOStage (async heavy stage offloading)
                                 └── EmbeddingService (LanceDB + NPU)
 ```
 

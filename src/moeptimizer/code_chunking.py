@@ -32,27 +32,20 @@ def _get_cached_parser(lang_id: str) -> Any | None:
     """Get a cached tree-sitter parser, or create and cache one."""
     if lang_id in _parser_cache:
         return _parser_cache[lang_id]
-    try:
-        from tree_sitter_language_pack import get_parser
+    from tree_sitter_language_pack import get_parser
 
-        parser = get_parser(lang_id)
-        _parser_cache[lang_id] = parser
-        return parser
-    except ImportError:
-        # tree-sitter-language-pack not installed; fall back to line-based chunking
-        return None
-    except Exception:
-        return None
+    parser = get_parser(lang_id)
+    _parser_cache[lang_id] = parser
+    return parser
 
 
 def detect_language_and_id(code: str) -> str:
     """Detect programming language from code content.
 
-    Uses pygments first, with heuristics to disambiguate common confusions
-    (e.g., pygments confuses JavaScript with GDScript). Falls back to
-    tree-sitter-language-pack detection if available.
+    Uses tree-sitter-language-pack for accurate language detection (core dependency).
+    Falls back to pygments if tree-sitter detection fails.
 
-    Results are cached to avoid repeated pygments invocations.
+    Results are cached to avoid repeated invocations.
     """
     # Quick check: short code always generic (no cache needed)
     if len(code) < 40:
@@ -63,49 +56,26 @@ def detect_language_and_id(code: str) -> str:
     if code_hash in _lang_cache:
         return _lang_cache[code_hash]
 
-    # Try pygments first
-    pygments_result: str | None = None
-    try:
-        from pygments.lexers import guess_lexer
+    # Primary: tree-sitter-language-pack (core dependency)
+    from tree_sitter_language_pack import detect_language
 
-        lexer = guess_lexer(code)
-        lexer_name = lexer.name.lower()
-        for key, value in LANG_MAP.items():
-            if key in lexer_name:
-                result = value
-                _lang_cache_put(code_hash, result)
-                return result
-        pygments_result = lexer_name
-    except Exception:
-        pass
+    lang = detect_language(code)
+    if lang and lang in LANG_MAP:
+        _lang_cache_put(code_hash, LANG_MAP[lang])
+        return LANG_MAP[lang]
 
-    # Heuristic: pygments confuses JavaScript with GDScript.
-    # Check for JS-specific patterns when GDScript was detected.
-    if pygments_result and "gdscript" in pygments_result:
-        js_indicators = [
-            "require(", "console.log", "process.env", "import ", "export ",
-            "=>", "let ", "const ", "async ", "await ", "fetch(",
-        ]
-        if any(indicator in code for indicator in js_indicators):
-            result = "javascript"
-            _lang_cache_put(code_hash, result)
-            return result
+    # Fallback: pygments (core dependency)
+    from pygments.lexers import guess_lexer
 
-    # Fallback to tree-sitter-language-pack detection
-    try:
-        from tree_sitter_language_pack import detect_language
+    lexer = guess_lexer(code)
+    lexer_name = lexer.name.lower()
+    for key, value in LANG_MAP.items():
+        if key in lexer_name:
+            _lang_cache_put(code_hash, value)
+            return value
 
-        lang = detect_language(code)
-        if lang and lang in LANG_MAP:
-            result = LANG_MAP[lang]
-            _lang_cache_put(code_hash, result)
-            return result
-    except Exception:
-        pass
-
-    result = "generic"
-    _lang_cache_put(code_hash, result)
-    return result
+    _lang_cache_put(code_hash, "generic")
+    return "generic"
 
 
 def _lang_cache_put(code_hash: str, result: str) -> None:

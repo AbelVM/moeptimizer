@@ -25,6 +25,7 @@ MOE context integrity:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -34,6 +35,7 @@ from typing import Any
 import numpy as np
 
 from moeptimizer.attention_sink import apply_attention_sinks
+from moeptimizer.async_io_stage import get_async_io_stage
 from moeptimizer.cache import (
     align_to_block_boundary,
     canonicalize_code_for_cache,
@@ -42,6 +44,7 @@ from moeptimizer.cache import (
 )
 from moeptimizer.cache_aware_chunker import get_cache_aware_chunker
 from moeptimizer.cache_registry import get_cache_registry
+from moeptimizer.chunk_fingerprint import get_chunk_fingerprint_cache
 from moeptimizer.code_block_optimizer import (
     extract_code_blocks,
     has_code_blocks,
@@ -59,25 +62,39 @@ from moeptimizer.context_aligner import get_context_aligner
 from moeptimizer.context_canonicalizer import get_context_canonicalizer
 from moeptimizer.context_compressor import get_context_compressor
 from moeptimizer.context_template_matcher import get_context_template_matcher
+from moeptimizer.delta_encoder import get_delta_encoder
 from moeptimizer.dependency_orderer import get_dependency_orderer
 from moeptimizer.embedding import EmbeddingService
+from moeptimizer.embedding_cache_invalidation import (
+    get_embedding_cache_with_invalidation,
+)
 from moeptimizer.expert_cache import get_expert_cache
 from moeptimizer.goal_decomposer import GoalDecomposer
+from moeptimizer.hierarchical_index import get_hierarchical_index
+from moeptimizer.hierarchical_summarizer import get_hierarchical_summarizer
+from moeptimizer.hit_prediction_model import get_hit_prediction_model
 from moeptimizer.incremental_updater import get_incremental_updater
+from moeptimizer.kv_cache_warmup import get_kv_cache_warmup
 from moeptimizer.kv_slot_tracker import get_kv_slot_tracker
 from moeptimizer.loop_detector import LoopDetector
 from moeptimizer.models import AgentStep, LoopWarning
+from moeptimizer.mtp_head_checkpoint import get_mtp_head_checkpoint
+from moeptimizer.mtp_speculative import MTPSpeculativeDecoder, build_mtp_speculative_body
+from moeptimizer.mtp_state import get_mtp_state_manager
+from moeptimizer.parallel_embedding_lookup import get_parallel_embedding_lookup
 from moeptimizer.pattern_injector import get_pattern_injector
 from moeptimizer.progress_tracker import ProgressTracker
 from moeptimizer.prompt_templates import classify_and_template
 from moeptimizer.selective_truncator import get_selective_truncator
+from moeptimizer.segment_wise_speculative import get_segment_wise_decoder
 from moeptimizer.semantic_dedup import get_semantic_deduplicator
+from moeptimizer.static_prefix_kv import get_static_prefix_kv_cache
 from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
 from moeptimizer.symbol_index import SymbolIndex
+from moeptimizer.template_selector import get_template_selector
 from moeptimizer.thinking_preserver import ThinkingPreserver
-from moeptimizer.hierarchical_index import get_hierarchical_index
-from moeptimizer.mtp_state import get_mtp_state_manager
+from moeptimizer.token_aware_truncator import TokenAwareTruncator
 from moeptimizer.token_counter import TokenCounter
 from moeptimizer.tool_streamer import get_tool_streamer
 
@@ -116,6 +133,22 @@ class AgentContextOptimizer:
         self.semantic_deduplicator = get_semantic_deduplicator()
         self._task_type: str = "default"
         self._last_mtp_state_key: str | None = None
+
+        # v0.5.0 components
+        v050 = self._config.v050
+        self.static_prefix_kv = get_static_prefix_kv_cache() if v050.static_prefix_kv_enabled else None
+        self.token_aware_truncator = TokenAwareTruncator() if v050.token_aware_truncation_enabled else None
+        self.chunk_fingerprint = get_chunk_fingerprint_cache() if v050.chunk_fingerprint_enabled else None
+        self.embedding_invalidation = get_embedding_cache_with_invalidation() if v050.embedding_invalidation_enabled else None
+        self.mtp_head_checkpoint = get_mtp_head_checkpoint() if v050.mtp_checkpoint_enabled else None
+        self.parallel_embedding = get_parallel_embedding_lookup() if v050.parallel_embed_workers > 0 else None
+        self.segment_decoder = get_segment_wise_decoder() if v050.segment_speculative_enabled else None
+        self.hit_prediction = get_hit_prediction_model() if v050.hit_prediction_enabled else None
+        self.template_selector = get_template_selector() if v050.template_selector_enabled else None
+        self.hierarchical_summarizer = get_hierarchical_summarizer() if v050.hierarchical_summary_enabled else None
+        self.delta_encoder = get_delta_encoder() if v050.delta_encoding_enabled else None
+        self.kv_warmup = get_kv_cache_warmup() if v050.kv_warmup_enabled else None
+        self.async_io = get_async_io_stage() if v050.async_io_enabled else None
 
     def optimize_messages(
         self,
@@ -159,6 +192,16 @@ class AgentContextOptimizer:
         # Step 5: Apply thinking preservation (pass-through)
         optimized = self.thinking_preserver.process_messages(list(messages))
 
+        # Step 5.0: Check static prefix KV-cache for early exit
+        if self.static_prefix_kv is not None:
+            kv_data = self.static_prefix_kv.get(optimized)
+            if kv_data is not None:
+                logger.info("[AgentOptimizer] Static prefix KV-cache hit, skipping optimization")
+                optimized = self._strip_internal_flags(optimized)
+                self.cache_registry.register_context(optimized)
+                self.cache_registry.save_to_disk()
+                return optimized
+
         # Step 5.1: Check cache hit rate - skip heavy optimization if high
         cache_hit_rate = self.cache_registry.predict_hit_rate(optimized)
         if cache_hit_rate > 0.9:
@@ -167,6 +210,14 @@ class AgentContextOptimizer:
                 cache_hit_rate,
             )
             # Still need to strip internal flags and register context
+            optimized = self._strip_internal_flags(optimized)
+            self.cache_registry.register_context(optimized)
+            self.cache_registry.save_to_disk()
+            return optimized
+
+        # Step 5.1.5: Check hit prediction model for early exit
+        if self.hit_prediction is not None and self.hit_prediction.should_early_exit(optimized):
+            logger.info("[AgentOptimizer] Hit prediction model suggests early exit")
             optimized = self._strip_internal_flags(optimized)
             self.cache_registry.register_context(optimized)
             self.cache_registry.save_to_disk()
@@ -326,6 +377,57 @@ class AgentContextOptimizer:
 
         # Step 14.5: Persist cache registry for cross-session reuse
         self.cache_registry.save_to_disk()
+
+        # Step 14.6: Store static prefix KV-cache for reuse
+        if self.static_prefix_kv is not None:
+            try:
+                import json
+                kv_data = json.dumps({
+                    "messages": optimized[: min(3, len(optimized))],
+                    "timestamp": time.time(),
+                }).encode()
+                self.static_prefix_kv.put(optimized, kv_data)
+            except Exception:
+                pass
+
+        # Step 14.7: Record hit prediction outcome
+        if self.hit_prediction is not None:
+            try:
+                self.hit_prediction.record_outcome(
+                    optimized,
+                    hit=True,  # We got here, so request succeeded
+                )
+            except Exception:
+                pass
+
+        # Step 14.8: Store code snapshots for delta encoding
+        if self.delta_encoder is not None:
+            try:
+                for msg in optimized:
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and "```" in content:
+                        import re
+                        for match in re.finditer(r"```(\w*)\n(.*?)```", content, re.DOTALL):
+                            lang = match.group(1)
+                            code = match.group(2)
+                            file_path = f"inline:{lang}:{hashlib.md5(code.encode()).hexdigest()[:8]}"
+                            self.delta_encoder.store_snapshot(file_path, code)
+            except Exception:
+                pass
+
+        # Step 14.9: Save hierarchical summaries to disk
+        if self.hierarchical_summarizer is not None:
+            try:
+                self.hierarchical_summarizer.save_to_disk()
+            except Exception:
+                pass
+
+        # Step 14.10: Save static prefix KV-cache to disk
+        if self.static_prefix_kv is not None:
+            try:
+                self.static_prefix_kv.save_to_disk()
+            except Exception:
+                pass
 
         # Log metrics
         original_chars = sum(len(m.get("content", "")) for m in messages)

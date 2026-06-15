@@ -113,6 +113,132 @@ class SpeculativeConfig(BaseModel):
     )
 
 
+class V050Config(BaseModel):
+    """v0.5.0 optimization settings."""
+
+    # Static Prefix KV-Cache Reuse
+    static_prefix_kv_enabled: bool = Field(
+        default=True,
+        description="Enable static prefix KV-cache reuse",
+    )
+    static_prefix_kv_max_entries: int = Field(
+        default=64,
+        description="Max entries in static prefix KV-cache",
+    )
+
+    # Token-Aware Truncation
+    token_aware_truncation_enabled: bool = Field(
+        default=True,
+        description="Enable token-aware truncation with tiktoken",
+    )
+
+    # Chunk Fingerprinting & Reuse
+    chunk_fingerprint_enabled: bool = Field(
+        default=True,
+        description="Enable chunk fingerprinting and reuse",
+    )
+    chunk_fingerprint_max_entries: int = Field(
+        default=2048,
+        description="Max entries in chunk fingerprint cache",
+    )
+
+    # Embedding Cache Invalidation & Batching
+    embedding_batch_size: int = Field(
+        default=32,
+        description="Batch size for embedding queries",
+    )
+    embedding_invalidation_enabled: bool = Field(
+        default=True,
+        description="Enable file mtime-based embedding invalidation",
+    )
+
+    # MTP-Head State Checkpointing
+    mtp_checkpoint_enabled: bool = Field(
+        default=True,
+        description="Enable MTP-head state checkpointing",
+    )
+    mtp_checkpoint_max_entries: int = Field(
+        default=256,
+        description="Max entries in MTP head checkpoint cache",
+    )
+
+    # Parallel Embedding Lookup
+    parallel_embed_workers: int = Field(
+        default=8,
+        description="Number of thread workers for parallel embedding",
+    )
+
+    # Segment-Wise Speculative Decoding
+    segment_speculative_enabled: bool = Field(
+        default=False,
+        description="Enable segment-wise speculative decoding",
+    )
+
+    # Lightweight Hit-Prediction Model
+    hit_prediction_enabled: bool = Field(
+        default=True,
+        description="Enable lightweight hit-prediction model",
+    )
+    hit_prediction_retrain_threshold: int = Field(
+        default=50,
+        description="Number of new samples before retraining",
+    )
+
+    # Template Selector
+    template_selector_enabled: bool = Field(
+        default=True,
+        description="Enable template selector for cache optimization",
+    )
+    template_selector_exploration_rate: float = Field(
+        default=0.1,
+        description="Exploration rate for template selection",
+    )
+
+    # Hierarchical Summarization
+    hierarchical_summary_enabled: bool = Field(
+        default=True,
+        description="Enable hierarchical summarization of old turns",
+    )
+    hierarchical_summary_max_full_turns: int = Field(
+        default=5,
+        description="Max recent turns to keep in full",
+    )
+
+    # Delta-Encoding of Code
+    delta_encoding_enabled: bool = Field(
+        default=True,
+        description="Enable delta-encoding of code snapshots",
+    )
+    delta_encoding_max_snapshots: int = Field(
+        default=100,
+        description="Max code snapshots to keep",
+    )
+
+    # KV-Cache Warm-Up for MTP Heads
+    kv_warmup_enabled: bool = Field(
+        default=True,
+        description="Enable KV-cache warm-up for MTP heads",
+    )
+    kv_warmup_max_entries: int = Field(
+        default=32,
+        description="Max warmup cache entries",
+    )
+
+    # Async I/O for Heavy Stages
+    async_io_enabled: bool = Field(
+        default=True,
+        description="Enable async I/O for heavy pipeline stages",
+    )
+    async_io_max_thread_workers: int = Field(
+        default=4,
+        description="Max thread workers for CPU-bound stages",
+    )
+    async_io_max_concurrency: int = Field(
+        default=16,
+        description="Max concurrent async tasks",
+    )
+
+
 class AppConfig(BaseSettings):
     """Top-level application configuration."""
 
@@ -122,6 +248,7 @@ class AppConfig(BaseSettings):
     code_chunking: CodeChunkingConfig = Field(default_factory=CodeChunkingConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     speculative: SpeculativeConfig = Field(default_factory=SpeculativeConfig)
+    v050: V050Config = Field(default_factory=V050Config)
 
     model_config = SettingsConfigDict(
         env_prefix="MOEPT_",

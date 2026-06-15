@@ -124,22 +124,6 @@
 
 ## Completed Architecture Fixes
 
-### v0.4.3 Improvements
-- **Static Prefix KV-Cache Reuse** – Pre-computed KV-cache for unchanging system/static tokens
-- **Token-Aware Truncation** – Tiktoken-based trimming at true token boundaries
-- **Chunk Fingerprinting** – SHA-256 fingerprints for compressed code chunks, cross-turn reuse
-- **Dynamic Threshold Adaptation** – Runtime adjustment of limits based on hardware headroom
-- **Embedding Cache Batching** – Batched embedding queries to hide I/O latency
-- **MTP-Head State Checkpointing** – Persisted per-head hidden states for recurring signatures
-- **Parallel Embedding Lookup** – Thread-pool execution for embedding fetches
-- **Segment-Wise Speculative Decoding** – Per code-block draft generation
-- **Lightweight Hit-Prediction Model** – XGBoost model for cache-hit probability prediction
-- **Template Selector** – Chooses optimal prompt template based on quality metrics
-- **Hierarchical Summarization** – Older turns summarized into expandable recall tokens
-- **Delta-Encoding of Code** – Stores diffs between code snapshots
-- **KV-Cache Warm-Up** – Pre-populates KV-cache for static layers
-- **Async I/O** – Heavy stages moved to async workers
-
 ### Bug Fixes
 - Fixed attention sink marker stripping in `_strip_internal_flags`
 - Fixed tool streaming to preserve turn structure (tool role maintained)
