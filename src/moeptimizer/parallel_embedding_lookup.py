@@ -168,9 +168,9 @@ class ParallelEmbeddingLookup:
 _parallel_lookup: ParallelEmbeddingLookup | None = None
 
 
-def get_parallel_embedding_lookup() -> ParallelEmbeddingLookup:
+def get_parallel_embedding_lookup(max_workers: int = 8) -> ParallelEmbeddingLookup:
     """Get or create the global parallel embedding lookup."""
     global _parallel_lookup
     if _parallel_lookup is None:
-        _parallel_lookup = ParallelEmbeddingLookup()
+        _parallel_lookup = ParallelEmbeddingLookup(max_workers=max_workers)
     return _parallel_lookup

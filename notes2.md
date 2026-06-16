@@ -32,7 +32,7 @@ Your task is to review an EXISTING context optimization architecture and identif
 9. Performance bottlenecks
 10. Memory leaks
 
-Assume all proposed changes will be implemented inside a local transparent proxy sitting between the user and Qwen3.6-35B-A3B-MTP (MoE model with MTP) running on llama.cpp using lemonade server.
+Assume all proposed changes will be implemented inside a local, OpenAI API compliant, transparent proxy sitting between the user and Qwen3.6-35B-A3B-MTP (MoE model with MTP) running on llama.cpp using lemonade server.
 
 IMPORTANT:
 
@@ -42,6 +42,17 @@ IMPORTANT:
 - In terms of speed, both TTFT and TPS are important
 - Both speed and responses quality degrades with the context size, so we need to keep it lean
 - Target model is MoE: cache fill is expensive so we want to keep the context lean and avoid triggering cache refills
+- Semantic similarity of responses is key to measure the quality of the optimizing strategies
 
 
 Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+
+The client uses moeptimizer as a standard OpenAI endpoint and doesn't know about custom fields like _session_id or _session_state. We need to ensure conversation continuity.
+
+fully review all the optimization strategies implemented in moeptimizer, propose and implement fixes and/or improvements:
+* are they properly wired?
+* are they properly triggered when needed?
+* is the strategies triggering order right?
+
+
+run benchmark as background task, scenario refactor 30 turns 1 round, save the results as file in scripts folder, analyze the results and propose and implement improvemetns or fixes based on that

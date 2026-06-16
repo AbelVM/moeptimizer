@@ -74,6 +74,8 @@ class HierarchicalSummarizer:
                 break
 
         system_anchor = messages[:system_end]
+        system_only = system_anchor[:1] if system_anchor else []
+        first_user = system_anchor[1:]
         rest = messages[system_end:]
 
         if len(rest) <= self._max_full_turns:
@@ -90,7 +92,7 @@ class HierarchicalSummarizer:
         # Create hierarchical summary
         summary = self._create_hierarchical_summary(to_summarize)
 
-        result = [*system_anchor, summary, *keep_recent]
+        result = [*system_only, summary, *first_user, *keep_recent]
         self._stats["turns_summarized"] += len(to_summarize)
         self._stats["turns_compressed"] += 1
 
@@ -282,10 +284,10 @@ class HierarchicalSummarizer:
 _hierarchical_summarizer: HierarchicalSummarizer | None = None
 
 
-def get_hierarchical_summarizer() -> HierarchicalSummarizer:
+def get_hierarchical_summarizer(max_full_turns: int = 5) -> HierarchicalSummarizer:
     """Get or create the global hierarchical summarizer."""
     global _hierarchical_summarizer
     if _hierarchical_summarizer is None:
-        _hierarchical_summarizer = HierarchicalSummarizer()
+        _hierarchical_summarizer = HierarchicalSummarizer(max_full_turns=max_full_turns)
         _hierarchical_summarizer.load_from_disk()
     return _hierarchical_summarizer

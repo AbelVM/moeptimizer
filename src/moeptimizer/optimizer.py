@@ -34,20 +34,17 @@ from typing import Any
 
 import numpy as np
 
-from moeptimizer.attention_sink import apply_attention_sinks
 from moeptimizer.async_io_stage import get_async_io_stage
+from moeptimizer.attention_sink import apply_attention_sinks
 from moeptimizer.cache import (
     align_to_block_boundary,
-    canonicalize_code_for_cache,
     get_block_aligned_cache_key,
-    set_block_size,
+    get_block_size,
 )
 from moeptimizer.cache_aware_chunker import get_cache_aware_chunker
 from moeptimizer.cache_registry import get_cache_registry
 from moeptimizer.chunk_fingerprint import get_chunk_fingerprint_cache
 from moeptimizer.code_block_optimizer import (
-    extract_code_blocks,
-    has_code_blocks,
     optimize_code_in_text,
 )
 from moeptimizer.code_chunking import (
@@ -79,18 +76,18 @@ from moeptimizer.kv_slot_tracker import get_kv_slot_tracker
 from moeptimizer.loop_detector import LoopDetector
 from moeptimizer.models import AgentStep, LoopWarning
 from moeptimizer.mtp_head_checkpoint import get_mtp_head_checkpoint
-from moeptimizer.mtp_speculative import MTPSpeculativeDecoder, build_mtp_speculative_body
+from moeptimizer.mtp_speculative import build_mtp_speculative_body
 from moeptimizer.mtp_state import get_mtp_state_manager
 from moeptimizer.parallel_embedding_lookup import get_parallel_embedding_lookup
 from moeptimizer.pattern_injector import get_pattern_injector
 from moeptimizer.progress_tracker import ProgressTracker
 from moeptimizer.prompt_templates import classify_and_template
-from moeptimizer.selective_truncator import get_selective_truncator
 from moeptimizer.segment_wise_speculative import get_segment_wise_decoder
+from moeptimizer.selective_truncator import get_selective_truncator
 from moeptimizer.semantic_dedup import get_semantic_deduplicator
-from moeptimizer.static_prefix_kv import get_static_prefix_kv_cache
 from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
+from moeptimizer.static_prefix_kv import get_static_prefix_kv_cache
 from moeptimizer.symbol_index import SymbolIndex
 from moeptimizer.template_selector import get_template_selector
 from moeptimizer.thinking_preserver import ThinkingPreserver
@@ -118,6 +115,7 @@ class AgentContextOptimizer:
         self.expert_cache = get_expert_cache()
         self.symbol_index = SymbolIndex()
         self.cache_registry = get_cache_registry()
+        self.cache_registry.load_from_disk()
         self.context_aligner = get_context_aligner()
         self.context_canonicalizer = get_context_canonicalizer()
         self.context_compressor = get_context_compressor()
@@ -126,29 +124,30 @@ class AgentContextOptimizer:
         self.incremental_updater = get_incremental_updater()
         self.pattern_injector = get_pattern_injector()
         self.selective_truncator = get_selective_truncator()
-        self.cache_aware_chunker = get_cache_aware_chunker()
+        self.cache_aware_chunker = get_cache_aware_chunker(block_size=get_block_size())
         self.hierarchical_index = get_hierarchical_index()
         self.mtp_state_manager = get_mtp_state_manager()
         self.tool_streamer = get_tool_streamer()
         self.semantic_deduplicator = get_semantic_deduplicator()
         self._task_type: str = "default"
         self._last_mtp_state_key: str | None = None
+        self._last_backend_extra_body: dict[str, Any] = {}
 
         # v0.5.0 components
         v050 = self._config.v050
         self.static_prefix_kv = get_static_prefix_kv_cache() if v050.static_prefix_kv_enabled else None
         self.token_aware_truncator = TokenAwareTruncator() if v050.token_aware_truncation_enabled else None
-        self.chunk_fingerprint = get_chunk_fingerprint_cache() if v050.chunk_fingerprint_enabled else None
+        self.mtp_head_checkpoint = get_mtp_head_checkpoint(max_checkpoints=v050.mtp_checkpoint_max_entries) if v050.mtp_checkpoint_enabled else None
+        self.chunk_fingerprint = get_chunk_fingerprint_cache(max_entries=v050.chunk_fingerprint_max_entries) if v050.chunk_fingerprint_enabled else None
         self.embedding_invalidation = get_embedding_cache_with_invalidation() if v050.embedding_invalidation_enabled else None
-        self.mtp_head_checkpoint = get_mtp_head_checkpoint() if v050.mtp_checkpoint_enabled else None
-        self.parallel_embedding = get_parallel_embedding_lookup() if v050.parallel_embed_workers > 0 else None
+        self.parallel_embedding = get_parallel_embedding_lookup(max_workers=v050.parallel_embed_workers) if v050.parallel_embed_workers > 0 else None
         self.segment_decoder = get_segment_wise_decoder() if v050.segment_speculative_enabled else None
-        self.hit_prediction = get_hit_prediction_model() if v050.hit_prediction_enabled else None
-        self.template_selector = get_template_selector() if v050.template_selector_enabled else None
-        self.hierarchical_summarizer = get_hierarchical_summarizer() if v050.hierarchical_summary_enabled else None
+        self.hit_prediction = get_hit_prediction_model(retrain_threshold=v050.hit_prediction_retrain_threshold) if v050.hit_prediction_enabled else None
+        self.template_selector = get_template_selector(exploration_rate=v050.template_selector_exploration_rate) if v050.template_selector_enabled else None
+        self.hierarchical_summarizer = get_hierarchical_summarizer(max_full_turns=v050.hierarchical_summary_max_full_turns) if v050.hierarchical_summary_enabled else None
         self.delta_encoder = get_delta_encoder() if v050.delta_encoding_enabled else None
-        self.kv_warmup = get_kv_cache_warmup() if v050.kv_warmup_enabled else None
-        self.async_io = get_async_io_stage() if v050.async_io_enabled else None
+        self.kv_warmup = get_kv_cache_warmup(max_warmups=v050.kv_warmup_max_entries) if v050.kv_warmup_enabled else None
+        self.async_io = get_async_io_stage(max_thread_workers=v050.async_io_max_thread_workers, max_async_concurrency=v050.async_io_max_concurrency) if v050.async_io_enabled else None
 
     def _budget_tokens(self) -> int:
         """Return the configured token budget without letting defaults override chars."""
@@ -267,13 +266,13 @@ class AgentContextOptimizer:
             self.cache_registry.save_to_disk()
             return optimized
 
-        # Calculate static layer end once (used by multiple steps)
-        static_end = self._find_static_layer_end(optimized)
+        # Static layer end is recomputed after compaction/RAG because those stages
+        # can change the message list.
         total_chars = sum(len(m.get("content", "")) for m in optimized)
 
         # Step 5.2: Build KV slot map for cache control
         slot_tracker = get_kv_slot_tracker()
-        slot_map = slot_tracker.build_slot_map(optimized)
+        slot_tracker.build_slot_map(optimized)
 
         # Step 5.5: Apply context canonicalization for cache-friendly formatting
         try:
@@ -281,18 +280,21 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Context canonicalization failed: %s", e)
 
-        # Step 5.7: Apply context compression to reduce token usage
+        # Step 5.7: Apply context compression only when the context is already
+        # above the proactive threshold. Compression removes code bodies, so it
+        # should never run on lean contexts where full code is affordable.
         try:
-            optimized = self.context_compressor.compress(optimized)
+            current_tokens = self.token_counter.count_messages(optimized)
+            if current_tokens > proactive_threshold_tokens:
+                optimized = self.context_compressor.compress(optimized)
+            else:
+                logger.debug(
+                    "[AgentOptimizer] Context compression skipped: tokens=%d <= threshold=%d",
+                    current_tokens,
+                    proactive_threshold_tokens,
+                )
         except Exception as e:
             logger.warning("Context compression failed: %s", e)
-
-        # Step 5.8: Apply attention sink management for long-context stability
-        if total_chars > 4000:
-            try:
-                optimized = apply_attention_sinks(optimized, static_end)
-            except Exception as e:
-                logger.warning("Attention sink management failed: %s", e)
 
         # Step 5.9: Warm expert cache for static layer patterns
         if total_chars > 1000:
@@ -312,6 +314,10 @@ class AgentContextOptimizer:
         # Step 6: Apply prompt template versioning
         try:
             optimized, self._task_type = classify_and_template(optimized)
+            if self.template_selector is not None:
+                selected_template = self.template_selector.select_template(optimized)
+                if selected_template:
+                    self._task_type = selected_template
         except Exception as e:
             logger.warning("Prompt template versioning failed: %s", e)
 
@@ -324,11 +330,36 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Context template matching failed: %s", e)
 
-        # Step 7: Apply scratchpad compaction
+        # Step 7: Apply scratchpad compaction only when the context is already
+        # above the proactive threshold. This keeps compaction budget-driven
+        # instead of letting it bypass proactive trim on short contexts.
         try:
-            optimized = self.compactor.compact_messages(optimized)
+            current_tokens = self.token_counter.count_messages(optimized)
+            if current_tokens > proactive_threshold_tokens:
+                optimized = self.compactor.compact_messages(optimized)
+            else:
+                logger.debug(
+                    "[AgentOptimizer] Scratchpad compaction skipped: tokens=%d <= threshold=%d",
+                    current_tokens,
+                    proactive_threshold_tokens,
+                )
         except Exception as e:
             logger.warning("Scratchpad compaction failed: %s", e)
+
+        # Recalculate after compaction so later stages use the actual context size.
+        try:
+            total_tokens = self.token_counter.count_messages(optimized)
+            total_chars = sum(len(m.get("content", "")) for m in optimized)
+        except Exception as e:
+            logger.warning("Post-compaction recount failed: %s", e)
+
+        # Step 7.25: Apply attention sink management after compaction, when we
+        # know the preserved context size.
+        if total_chars > 4000:
+            try:
+                optimized = apply_attention_sinks(optimized, self._find_static_layer_end(optimized))
+            except Exception as e:
+                logger.warning("Attention sink management failed: %s", e)
 
         # Step 7.5: Apply selective truncation (remove duplicate code blocks)
         try:
@@ -358,12 +389,19 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Incremental update failed: %s", e)
 
+        try:
+            total_tokens = self.token_counter.count_messages(optimized)
+            total_chars = sum(len(m.get("content", "")) for m in optimized)
+        except Exception as e:
+            logger.warning("Pre-RAG recount failed: %s", e)
+
         # Step 8: Inject RAG context and loop warnings as SEPARATE user messages
         try:
             if loop_warnings:
                 warning_lines: list[str] = []
                 for w in loop_warnings:
-                    warning_lines.append(self.loop_detector.get_warning_message(w))
+                    warning_message = self.loop_detector.get_warning_message(w)
+                    warning_lines.append(warning_message.replace("[LOOP DETECTED: ", "Loop detected: "))
                 if warning_lines:
                     optimized.append({
                         "role": "user",
@@ -393,6 +431,25 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("RAG/loop warning injection failed: %s", e)
 
+        try:
+            total_tokens = self.token_counter.count_messages(optimized)
+            total_chars = sum(len(m.get("content", "")) for m in optimized)
+        except Exception as e:
+            logger.warning("Post-RAG recount failed: %s", e)
+
+        # Step 8.5: Apply hierarchical summarization for long, over-budget
+        # conversations before static-layer and MTP boundary alignment.
+        try:
+            if self.hierarchical_summarizer is not None and self._should_run_hierarchical_summary(
+                optimized,
+                proactive_threshold_tokens,
+            ):
+                optimized = self.hierarchical_summarizer.summarize_turns(optimized)
+                total_tokens = self.token_counter.count_messages(optimized)
+                total_chars = sum(len(m.get("content", "")) for m in optimized)
+        except Exception as e:
+            logger.warning("Hierarchical summarization failed: %s", e)
+
         # Step 8: Apply static layer block alignment for cache optimization
         if total_tokens > 500:  # ~2000 chars
             try:
@@ -413,13 +470,14 @@ class AgentContextOptimizer:
             for msg in optimized:
                 content = msg.get("content", "")
                 if isinstance(content, str) and self._has_code_blocks(content):
-                    msg["content"] = optimize_code_in_text(
-                        content,
-                        self._config,
-                        self.embedding_service,
-                    )
+                    msg["content"] = self._optimize_code_block_content(content)
         except Exception as e:
             logger.warning("Code block optimization failed: %s", e)
+
+        try:
+            total_tokens = self.token_counter.count_messages(optimized)
+        except Exception as e:
+            logger.warning("Post-code recount failed: %s", e)
 
         # Step 10.5: Apply cache-aware chunking for large contexts
         if total_tokens > 750:  # ~3000 chars
@@ -427,6 +485,11 @@ class AgentContextOptimizer:
                 optimized = self.cache_aware_chunker.chunk_context(optimized)
             except Exception as e:
                 logger.warning("Cache-aware chunking failed: %s", e)
+
+        try:
+            total_tokens = self.token_counter.count_messages(optimized)
+        except Exception as e:
+            logger.warning("Post-chunking recount failed: %s", e)
 
         # Step 11: Proactive context trimming for MoE KV-cache efficiency
         # Use token-based threshold for more accurate budget enforcement
@@ -484,6 +547,12 @@ class AgentContextOptimizer:
             total_tokens = self.token_counter.count_messages(optimized)
             if total_tokens > max_tokens:
                 optimized = self._trim_to_budget(optimized, use_tokens=True)
+                total_tokens = self.token_counter.count_messages(optimized)
+                if total_tokens > max_tokens and self.token_aware_truncator is not None:
+                    optimized = self.token_aware_truncator.trim_messages_to_budget(
+                        optimized,
+                        max_tokens,
+                    )
         except Exception as e:
             logger.warning("Token budget enforcement failed: %s", e)
 
@@ -564,6 +633,22 @@ class AgentContextOptimizer:
         duration = time.time() - start_time
         saved_tokens = max(0, original_tokens - optimized_tokens)
 
+        if self.template_selector is not None:
+            try:
+                token_savings = saved_tokens / max(original_tokens, 1)
+                semantic_similarity = (
+                    1.0
+                    if optimized_tokens <= original_tokens
+                    else original_tokens / max(optimized_tokens, 1)
+                )
+                self.template_selector.record_quality(
+                    self._task_type,
+                    max(0.0, min(1.0, semantic_similarity)),
+                    max(0.0, min(1.0, token_savings)),
+                )
+            except Exception as e:
+                logger.warning("Template quality recording failed: %s", e)
+
         logger.info(
             "[AgentOptimizer] %d -> %d chars (%d -> %d tokens, %d saved, %.3fs, %d -> %d msgs, progress: %.0%%, loops: %d detected)",
             original_chars,
@@ -586,20 +671,22 @@ class AgentContextOptimizer:
         Preserves the message structure and content while stripping:
         - _archived: compactor marker
         - Section markers (<!-- STATIC/CONTEXT/DYNAMIC_LAYER -->)
-        - Attention sink markers (# CONTEXT_ANCHOR, STATIC_LAYER_END)
         - Any other _prefixed keys (future-proof)
+
+        Attention sink markers are intentionally left in place because they are
+        model-visible tokens used to stabilize long-context attention.
         """
         result: list[dict[str, Any]] = []
         internal_prefix = "_"
         # Pre-compiled pattern for performance
-        _MARKER_PATTERN = re.compile(
-            r"<!-- (STATIC|CONTEXT|DYNAMIC)_LAYER -->\n?|# (CONTEXT_ANCHOR|STATIC_LAYER_END).*\n?",
+        marker_pattern = re.compile(
+            r"<!-- (STATIC|CONTEXT|DYNAMIC)_LAYER -->\n?",
         )
 
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                content = _MARKER_PATTERN.sub("", content)
+                content = marker_pattern.sub("", content)
 
             cleaned = {
                 k: v
@@ -610,6 +697,18 @@ class AgentContextOptimizer:
             result.append(cleaned)
 
         return result
+
+    def _should_run_hierarchical_summary(
+        self,
+        messages: list[dict[str, Any]],
+        proactive_threshold_tokens: int,
+    ) -> bool:
+        """Gate hierarchical summarization behind length and budget thresholds."""
+        if not messages:
+            return False
+        max_full_turns = max(self._config.v050.hierarchical_summary_max_full_turns, 1)
+        min_messages = max_full_turns + 3
+        return len(messages) >= min_messages and self.token_counter.count_messages(messages) > proactive_threshold_tokens
 
     def _ingest_messages(self, messages: list[dict[str, Any]]) -> None:
         """Convert message list into AgentStateStore steps."""
@@ -641,6 +740,27 @@ class AgentContextOptimizer:
         """Check if text contains fenced code blocks."""
         return bool(re.search(r"```[\s\S]*?```", text))
 
+    def _optimize_code_block_content(self, text: str) -> str:
+        """Optimize code blocks while reusing identical chunk fingerprints."""
+        if self.chunk_fingerprint is None:
+            return optimize_code_in_text(
+                text,
+                self._config,
+                self.embedding_service,
+            )
+
+        cached = self.chunk_fingerprint.get(text)
+        if cached is not None and isinstance(cached.get("optimized_text"), str):
+            return cached["optimized_text"]
+
+        optimized = optimize_code_in_text(
+            text,
+            self._config,
+            self.embedding_service,
+        )
+        self.chunk_fingerprint.put(text, {"optimized_text": optimized})
+        return optimized
+
     def _optimize_code_in_text(self, text: str) -> str:
         """Optimize code blocks within a text string using Tree-Sitter + NPU.
 
@@ -652,9 +772,6 @@ class AgentContextOptimizer:
 
         if not blocks:
             return text
-
-        # Store original blocks for fallback
-        original_blocks = list(blocks)
 
         detected_langs: set[str] = set()
         all_chunks: list[str] = []
@@ -924,10 +1041,7 @@ class AgentContextOptimizer:
         for i, msg in enumerate(messages):
             if msg.get("role") == "system":
                 static_end = i + 1
-            elif msg.get("role") == "user" and static_end > 0:
-                static_end = i + 1
-                break
-            elif msg.get("role") == "user" and static_end == 0:
+            elif (msg.get("role") == "user" and static_end > 0) or (msg.get("role") == "user" and static_end == 0):
                 static_end = i + 1
                 break
 
@@ -986,7 +1100,7 @@ class AgentContextOptimizer:
         in_code_block = False
         code_block_lang = ""
 
-        for i, line in enumerate(lines):
+        for _i, line in enumerate(lines):
             if line.strip().startswith("```") and not in_code_block:
                 in_code_block = True
                 code_block_lang = line.strip().replace("```", "").strip()
@@ -1003,7 +1117,7 @@ class AgentContextOptimizer:
                 elif stripped.startswith("class "):
                     result_lines.append(f"# SECTION: class {stripped[:40]}")
                 elif stripped.startswith("import ") or stripped.startswith("from "):
-                    result_lines.append(f"# SECTION: import")
+                    result_lines.append("# SECTION: import")
                 result_lines.append(line)
             else:
                 result_lines.append(line)
@@ -1014,16 +1128,56 @@ class AgentContextOptimizer:
         """Generate cache key with canonicalization for static layer."""
         return get_block_aligned_cache_key(messages)
 
+    def get_backend_extra_body(
+        self,
+        messages: list[dict[str, Any]],
+        existing_extra_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build backend optimization hints for the next completion request."""
+        extra_body = dict(existing_extra_body or {})
+
+        if self._config.speculative.enabled:
+            extra_body = {
+                **extra_body,
+                **build_mtp_speculative_body(
+                    mtp_heads=3,
+                    mtp_lookahead=self._config.speculative.mtp_lookahead,
+                    confidence_threshold=self._config.speculative.confidence_threshold,
+                ),
+            }
+
+        if self._config.v050.enable_experimental_backend_hints:
+            if self.kv_warmup is not None:
+                static_end = self._find_static_layer_end(messages)
+                static_tokens = self.token_counter.count_messages(messages[:static_end]) if static_end else 0
+                if self.kv_warmup.should_warmup(messages):
+                    self.kv_warmup.store_warmup(
+                        messages,
+                        {"static_tokens": static_tokens},
+                    )
+                warmup_payload = self.kv_warmup.get_warmup_payload(messages)
+                if warmup_payload:
+                    extra_body = {**extra_body, **warmup_payload}
+
+            if (
+                self._config.v050.enable_experimental_backend_hints
+                and len(messages) > 1
+                and sum(len(m.get("content", "")) for m in messages) > 1000
+            ):
+                expert_hints = self.expert_cache.get_expert_hints_for_context(messages)
+                if expert_hints:
+                    extra_body["expert_hints"] = expert_hints
+
+        self._last_backend_extra_body = extra_body
+        return extra_body
+
     def _find_static_layer_end(self, messages: list[dict[str, Any]]) -> int:
         """Find the end index of the static layer (system + first user)."""
         static_end = 0
         for i, msg in enumerate(messages):
             if msg.get("role") == "system":
                 static_end = i + 1
-            elif msg.get("role") == "user" and static_end > 0:
-                static_end = i + 1
-                break
-            elif msg.get("role") == "user" and static_end == 0:
+            elif (msg.get("role") == "user" and static_end > 0) or (msg.get("role") == "user" and static_end == 0):
                 static_end = i + 1
                 break
         return static_end
@@ -1148,10 +1302,7 @@ class AgentContextOptimizer:
         for i, msg in enumerate(messages):
             if msg.get("role") == "system":
                 static_end = i + 1
-            elif msg.get("role") == "user" and static_end > 0:
-                static_end = i + 1
-                break
-            elif msg.get("role") == "user" and static_end == 0:
+            elif (msg.get("role") == "user" and static_end > 0) or (msg.get("role") == "user" and static_end == 0):
                 static_end = i + 1
                 break
 
@@ -1221,62 +1372,41 @@ class AgentContextOptimizer:
 
         # Find static layer
         static_end = self._find_static_layer_end(messages)
-        if use_tokens:
-            static_tokens = self.token_counter.count_messages(messages[:static_end])
-        else:
-            static_chars = sum(len(m.get("content", "")) for m in messages[:static_end])
-            static_tokens = static_chars // 4  # Convert to tokens for comparison
+        static_chars = sum(len(m.get("content", "")) for m in messages[:static_end])
+        static_tokens = (
+            self.token_counter.count_messages(messages[:static_end])
+            if use_tokens
+            else static_chars // 4
+        )
 
         # If static layer alone exceeds window, only keep static
-        if use_tokens:
-            if static_tokens >= window_size:
-                return messages[:static_end]
-        else:
-            if static_chars >= window_size:
-                return messages[:static_end]
+        if (use_tokens and static_tokens >= window_size) or (not use_tokens and static_chars >= window_size):
+            return messages[:static_end]
 
         # Calculate available space for dynamic content
-        if use_tokens:
-            available = window_size - static_tokens
-        else:
-            available = window_size - static_chars
+        available = window_size - static_tokens if use_tokens else window_size - static_chars
 
-        # Keep overlap at the end for MTP state preservation
-        # The overlap region maintains hidden state continuity
+        # Keep the newest suffix of the dynamic layer while preserving message
+        # order. This is the actual sliding-window behavior; the overlap is the
+        # suffix that remains in the model context across evictions.
         result = [dict(m) for m in messages[:static_end]]
         dynamic_messages = messages[static_end:]
-
-        # Add messages from end, keeping overlap
+        selected: list[dict[str, Any]] = []
         current_size = 0
-        kept_for_overlap: list[dict[str, Any]] = []
 
         for msg in reversed(dynamic_messages):
             if use_tokens:
-                msg_tokens = self.token_counter.count_messages([msg])
-                if current_size + msg_tokens <= available:
-                    result.insert(static_end, dict(msg))
-                    current_size += msg_tokens
-                else:
-                    # This message would exceed the window
-                    # Keep it for overlap (will be added at the end)
-                    kept_for_overlap.insert(0, dict(msg))
+                msg_size = self.token_counter.count_messages([msg])
             else:
-                msg_chars = len(msg.get("content", ""))
-                if current_size + msg_chars <= available:
-                    result.insert(static_end, dict(msg))
-                    current_size += msg_chars
-                else:
-                    # This message would exceed the window
-                    # Keep it for overlap (will be added at the end)
-                    kept_for_overlap.insert(0, dict(msg))
+                msg_size = len(msg.get("content", ""))
 
-        # Add overlap messages at the end (after the kept content)
-        # This preserves MTP state continuity
-        # Always add at least one overlap message for state continuity
-        if kept_for_overlap:
-            # Add the most recent overlap message (the one closest to the current turn)
-            result.append(kept_for_overlap[0])
+            if current_size + msg_size <= available or not selected:
+                selected.append(dict(msg))
+                current_size += msg_size
+            else:
+                break
 
+        result.extend(reversed(selected))
         return result
 
     def _entropy_guided_trim(

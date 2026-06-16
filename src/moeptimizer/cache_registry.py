@@ -9,7 +9,7 @@ import hashlib
 import json
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +54,7 @@ class CacheKeyRegistry:
         This should be called after each request to track real cache performance.
         """
         if isinstance(context, list):
-            context = "".join(m.get("content", "") for m in context)
+            context = self._serialize_context(context)
         key = self._hash_context(context)
 
         if key in self._entries:
@@ -88,7 +88,7 @@ class CacheKeyRegistry:
         Accepts either a string or a list of message dicts.
         """
         if isinstance(context, list):
-            context = "".join(m.get("content", "") for m in context)
+            context = self._serialize_context(context)
         key = self._hash_context(context)
         now = time.time()
 
@@ -126,7 +126,7 @@ class CacheKeyRegistry:
         Accepts either a string or a list of message dicts.
         """
         if isinstance(context, list):
-            context = "".join(m.get("content", "") for m in context)
+            context = self._serialize_context(context)
         key = self._hash_context(context)
         if key in self._entries:
             entry = self._entries[key]
@@ -150,6 +150,17 @@ class CacheKeyRegistry:
             "hit_rate": round(total_hits / max(total, 1), 4),
             "unique_contexts": len(self._entries),
         }
+
+    def _serialize_context(
+        self,
+        context: list[dict[str, Any]],
+    ) -> str:
+        """Serialize messages with role/order for stable cache keys."""
+        parts: list[str] = []
+        for msg in context:
+            content = msg.get("content", "")
+            parts.append(f"{msg.get('role', '')}:{content}")
+        return "\n".join(parts)
 
     def _hash_context(
         self,

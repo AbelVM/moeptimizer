@@ -224,6 +224,11 @@ class V050Config(BaseModel):
         description="Max warmup cache entries",
     )
 
+    enable_experimental_backend_hints: bool = Field(
+        default=False,
+        description="Send optional llama.cpp/MTP cache-control hints to the backend. Disabled by default because unsupported backends may ignore or hang on unknown extra_body fields.",
+    )
+
     # Async I/O for Heavy Stages
     async_io_enabled: bool = Field(
         default=True,

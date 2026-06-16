@@ -7,7 +7,6 @@ verifying they work together correctly and produce valid optimized output.
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
@@ -118,6 +117,10 @@ class TestV050Integration:
     def test_chunk_fingerprinting_reuse(self) -> None:
         """Chunk fingerprinting caches and reuses compressed chunks."""
         code = "def foo():\n    x = 1\n    return x\n"
+        self.optimizer.chunk_fingerprint.clear()
+        self.optimizer.cache_registry._entries.clear()
+        self.optimizer.static_prefix_kv = None
+        self.optimizer.hit_prediction = None
 
         messages = _build_messages(
             ("system", "System"),
@@ -143,7 +146,7 @@ class TestV050Integration:
 
         # Fingerprint cache should have entries
         stats = self.optimizer.chunk_fingerprint.get_stats()
-        assert stats["entries"] >= 0  # May or may not have entries depending on code path
+        assert stats["entries"] >= 1
 
     def test_embedding_cache_invalidation(self) -> None:
         """Embedding cache with invalidation tracks and invalidates correctly."""
@@ -232,6 +235,23 @@ class TestV050Integration:
         scores = selector.get_template_scores()
         assert template in scores
         assert scores[template]["sample_count"] >= 1
+
+    def test_template_selector_records_pipeline_quality(self) -> None:
+        """The optimizer records template quality after each run."""
+        selector = self.optimizer.template_selector
+        assert selector is not None
+
+        result = self.optimizer.optimize_messages(
+            _build_messages(
+                ("system", "System"),
+                ("user", "Fix this bug in my code"),
+                ("assistant", "The fix is straightforward."),
+            )
+        )
+
+        assert len(result) >= 2
+        scores = selector.get_template_scores()
+        assert any(score["sample_count"] >= 1 for score in scores.values())
 
     def test_hierarchical_summarization(self) -> None:
         """Hierarchical summarization compresses old turns."""
@@ -366,7 +386,7 @@ class TestV050Integration:
             messages.append({"role": "user", "content": f"Turn {i}: This is a test message with some content."})
             messages.append({"role": "assistant", "content": f"Response {i}: This is a response to turn {i}."})
 
-        # Test summarizer directly (it's not yet integrated into the main pipeline)
+        # Exercise the standalone summarizer directly as well.
         result = summarizer.summarize_turns(messages)
 
         # Should have fewer messages after summarization
@@ -375,6 +395,33 @@ class TestV050Integration:
         # Should have at least one summary message
         summary_msgs = [m for m in result if m.get("_summary_id")]
         assert len(summary_msgs) >= 1
+
+    def test_hierarchical_summarization_in_pipeline(self) -> None:
+        """The main pipeline summarizes long, over-budget conversations."""
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 1200
+        config.agentic.max_optimized_tokens = 60
+        config.v050.static_prefix_kv_enabled = False
+        config.v050.hit_prediction_enabled = False
+        config.v050.hierarchical_summary_max_full_turns = 3
+        optimizer = AgentContextOptimizer(config)
+
+        messages = [{"role": "system", "content": "Unique system prompt for pipeline summarization."}]
+        for i in range(12):
+            messages.append({
+                "role": "user",
+                "content": f"Turn {i}: Please review this detailed implementation note.",
+            })
+            messages.append({
+                "role": "assistant",
+                "content": f"Response {i}: The implementation should preserve the original behavior.",
+            })
+
+        result = optimizer.optimize_messages(messages)
+        content = "\n".join(msg.get("content", "") for msg in result)
+
+        assert len(result) < len(messages)
+        assert "[Recall:" in content
 
     def test_code_delta_encoding_in_pipeline(self) -> None:
         """Delta encoding stores code snapshots during optimization."""

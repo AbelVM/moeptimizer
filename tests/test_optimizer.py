@@ -28,7 +28,7 @@ class TestAgentContextOptimizer:
             {"role": "user", "content": "Build a REST API"},
             {"role": "assistant", "content": "I will build a REST API"},
         ]
-        result = self.optimizer.optimize_messages(messages, original_prompt="Build a REST API")
+        self.optimizer.optimize_messages(messages, original_prompt="Build a REST API")
         goal = self.optimizer.store.get_goal()
         assert goal is not None
         assert "REST API" in goal.original_prompt
@@ -128,3 +128,32 @@ class TestAgentContextOptimizer:
         new_optimizer = AgentContextOptimizer(self.optimizer._config)
         new_optimizer.load_session_state(state)
         assert len(new_optimizer.store.steps) == len(self.optimizer.store.steps)
+
+    def test_attention_sink_markers_survive_final_output(self) -> None:
+        """Attention sink markers are model-visible and must not be stripped."""
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 20000
+        optimizer = AgentContextOptimizer(config)
+        long_unique_words = " ".join(f"unique_token_{i}" for i in range(900))
+
+        result = optimizer.optimize_messages([
+            {"role": "system", "content": "System rules"},
+            {"role": "user", "content": long_unique_words},
+        ])
+
+        system_content = result[0].get("content", "")
+        assert "STATIC_LAYER_END" in system_content
+
+    def test_context_compressor_skips_lean_contexts(self) -> None:
+        """Lean contexts keep full code bodies instead of skeletonizing them."""
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 20000
+        optimizer = AgentContextOptimizer(config)
+        code = "def double(x):\n    return x * 2\n"
+
+        result = optimizer.optimize_messages([
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": f"Use this code:\n```python\n{code}\n```"},
+        ])
+
+        assert code.strip() in "\n".join(m.get("content", "") for m in result)

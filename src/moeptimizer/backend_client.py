@@ -13,7 +13,8 @@ Enhanced with:
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 from openai import AsyncOpenAI
 
@@ -23,6 +24,17 @@ from moeptimizer.mtp_speculative import (
 )
 
 logger = logging.getLogger(__name__)
+
+_CUSTOM_SESSION_FIELDS = {"_session_id", "_session_state"}
+
+
+def _strip_custom_session_fields(params: dict[str, Any]) -> dict[str, Any]:
+    """Remove internal session fields before sending to a standard OpenAI API."""
+    return {
+        key: value
+        for key, value in params.items()
+        if key not in _CUSTOM_SESSION_FIELDS
+    }
 
 
 class SpeculativeDecoder:
@@ -35,16 +47,19 @@ class SpeculativeDecoder:
 
     def __init__(
         self,
-        target_client: "LemonadeClient",
-        draft_client: "LemonadeClient | None" = None,
+        target_client: LemonadeClient,
+        draft_client: LemonadeClient | None = None,
         mtp_lookahead: int = 4,
         confidence_threshold: float = 0.7,
     ) -> None:
         self._target = target_client
         self._draft = draft_client
+        lookahead_heads = [head for head in (2, 3, 4) if head <= max(1, mtp_lookahead)]
+        if not lookahead_heads:
+            lookahead_heads = [1]
         self._mtp_decoder = MTPSpeculativeDecoder(
-            mtp_heads=3,
-            mtp_lookahead=[2, 3, 4],
+            mtp_heads=len(lookahead_heads),
+            mtp_lookahead=lookahead_heads,
             confidence_threshold=confidence_threshold,
         )
         self._stats: dict[str, int] = {"accepted": 0, "rejected": 0, "total": 0}
@@ -91,19 +106,27 @@ class SpeculativeDecoder:
         """MTP-aware speculative generation using native MTP heads."""
         # Build MTP-aware speculative body
         mtp_body = build_mtp_speculative_body(
-            mtp_heads=3,
-            mtp_lookahead=4,
+            mtp_heads=self._mtp_decoder._mtp_heads,
+            mtp_lookahead=max(self._mtp_decoder._mtp_lookahead),
             confidence_threshold=self._mtp_decoder._confidence_threshold,
         )
 
         # Merge with existing extra_body
-        existing_body = kwargs.get("extra_body", {})
-        kwargs["extra_body"] = {**existing_body, **mtp_body}
+        params: dict[str, Any] = {
+            key: value
+            for key, value in kwargs.items()
+            if value is not None and key not in _CUSTOM_SESSION_FIELDS
+        }
+        params["model"] = model
+        params["messages"] = messages
+        existing_body = params.get("extra_body", {})
+        params["extra_body"] = {**existing_body, **mtp_body}
 
-        return await self._target.chat_completions_create(
-            messages=messages,
+        return await self._target._send_chat_completions_request(
+            params=params,
+            validated_messages=messages,
             model=model,
-            **kwargs,
+            stream=bool(params.get("stream", False)),
         )
 
     def get_stats(self) -> dict[str, int]:
@@ -132,7 +155,7 @@ class LemonadeClient:
 
     def enable_speculative_decoding(
         self,
-        draft_client: "LemonadeClient | None" = None,
+        draft_client: LemonadeClient | None = None,
         mtp_lookahead: int = 4,
         confidence_threshold: float = 0.7,
     ) -> None:
@@ -187,10 +210,13 @@ class LemonadeClient:
         if max_tokens is not None:
             params["max_tokens"] = max_tokens
 
-        # Pass through any additional parameters
+        # Pass through any additional parameters, excluding internal session fields
+        # that are not part of the standard OpenAI chat completions schema.
         for key, value in kwargs.items():
-            if value is not None:
+            if value is not None and key not in _CUSTOM_SESSION_FIELDS:
                 params[key] = value
+
+        params = _strip_custom_session_fields(params)
 
         logger.debug("Sending request to Lemonade: model=%s, messages=%d, stream=%s",
                      model, len(validated_messages), stream)
@@ -204,7 +230,34 @@ class LemonadeClient:
                 validated_messages[-1].get("role") if validated_messages else "none",
             )
 
-        response = await self._client.chat.completions.create(**params)
+        if self._speculative_decoder is not None and not stream:
+            spec_params = dict(params)
+            spec_params.pop("model", None)
+            spec_params.pop("messages", None)
+            return await self._speculative_decoder.generate(
+                messages=validated_messages,
+                model=model,
+                **spec_params,
+            )
+
+        return await self._send_chat_completions_request(
+            params=params,
+            validated_messages=validated_messages,
+            model=model,
+            stream=stream,
+        )
+
+    async def _send_chat_completions_request(
+        self,
+        params: dict[str, Any],
+        validated_messages: list[dict[str, Any]],
+        model: str,
+        stream: bool,
+    ) -> Any:
+        """Send a chat completion request without re-entering speculative decoding."""
+        response = await self._client.chat.completions.create(
+            **_strip_custom_session_fields(params),
+        )
 
         # Log response summary
         if hasattr(response, "usage") and response.usage:

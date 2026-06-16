@@ -97,6 +97,11 @@ SCENARIOS = {
 # ---------------------------------------------------------------------------
 
 _PROXY_PROCESS: subprocess.Popen | None = None
+_HUMAN_OUTPUT_TO_STDERR = False
+
+
+def _human_print(*parts: object) -> None:
+    print(*parts, file=sys.stderr if _HUMAN_OUTPUT_TO_STDERR else sys.stdout)
 
 
 def _proxy_is_running(port: int, timeout: float = 3.0) -> bool:
@@ -121,10 +126,10 @@ def _start_proxy(port: int, wait: float = 60.0) -> subprocess.Popen | None:
 
     # If already running, just verify and return None (we don't own it)
     if _proxy_is_running(port):
-        print(f"  Proxy already running on port {port}")
+        _human_print(f"  Proxy already running on port {port}")
         return None
 
-    print(f"  Starting moeptimizer proxy on port {port} ...")
+    _human_print(f"  Starting moeptimizer proxy on port {port} ...")
     env = os.environ.copy()
     # Pass through config env vars so the started process picks up the same settings.
     # If --port differs from MOEPT_PORT/default, force the child proxy to bind there.
@@ -139,14 +144,14 @@ def _start_proxy(port: int, wait: float = 60.0) -> subprocess.Popen | None:
         )
         _PROXY_PROCESS = proc
     except OSError as e:
-        print(f"  ERROR: could not start proxy: {e}")
+        _human_print(f"  ERROR: could not start proxy: {e}")
         return None
 
     # Wait for the health endpoint to become available
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         if _proxy_is_running(port):
-            print(f"  Proxy ready on port {port}")
+            _human_print(f"  Proxy ready on port {port}")
             return proc
         time.sleep(0.5)
 
@@ -157,7 +162,7 @@ def _start_proxy(port: int, wait: float = 60.0) -> subprocess.Popen | None:
     except Exception:
         proc.kill()
         stdout, _ = proc.communicate()
-    print(f"  ERROR: proxy failed to start within {wait}s (exit={proc.returncode})")
+    _human_print(f"  ERROR: proxy failed to start within {wait}s (exit={proc.returncode})")
     if stdout:
         for line in stdout.decode("utf-8", errors="replace").strip().splitlines()[-10:]:
             print(f"    | {line}")
@@ -171,7 +176,7 @@ def _stop_proxy() -> None:
     proc = _PROXY_PROCESS
     _PROXY_PROCESS = None
     if proc is not None and proc.poll() is None:
-        print("  Stopping benchmark proxy ...")
+        _human_print("  Stopping benchmark proxy ...")
         proc.terminate()
         try:
             proc.wait(timeout=5)
@@ -191,7 +196,11 @@ def _request(url: str, body: dict, timeout: float = 180.0) -> tuple[dict, float,
 
     t0 = time.monotonic()
     resp = requests.post(url, json=body, timeout=timeout)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        detail = (resp.text or "")[:1000]
+        raise requests.HTTPError(f"{e}: {detail}") from e
     elapsed_ms = (time.monotonic() - t0) * 1000
     return resp.json(), elapsed_ms, dict(resp.headers)
 
@@ -239,6 +248,16 @@ def _estimate_prompt_tokens(messages: list[dict]) -> int:
         return max(total, 1)
 
 
+def _context_size_summary(messages: list[dict]) -> dict[str, int]:
+    """Return lightweight context-size metrics for benchmark progress logs."""
+    chars = sum(len(_message_text(msg.get("content", ""))) for msg in messages)
+    return {
+        "messages": len(messages),
+        "chars": chars,
+        "estimated_tokens": _estimate_prompt_tokens(messages),
+    }
+
+
 def _looks_like_cached_response(usage: dict[str, Any]) -> bool:
     """Detect responses where usage is cache-driven or incomplete."""
     details = usage.get("prompt_tokens_details") or {}
@@ -266,10 +285,10 @@ def _resolve_prompt_tokens(
     use an estimated prompt count for context-window and token-savings metrics so
     a cached/missing-usage response does not collapse final_prompt_tokens to 0.
     """
+    if optimized_prompt_tokens > 0:
+        return optimized_prompt_tokens, "optimized_header", _looks_like_cached_response(usage or {})
     if raw_prompt_tokens > 0:
         return raw_prompt_tokens, "usage", _looks_like_cached_response(usage or {})
-    if optimized_prompt_tokens > 0:
-        return optimized_prompt_tokens, "estimated_optimized", _looks_like_cached_response(usage or {})
     if messages:
         return _estimate_prompt_tokens(messages), "estimated_missing_usage", _looks_like_cached_response(usage or {})
     return 0, "missing_messages", False
@@ -709,6 +728,7 @@ class TurnMetrics:
     total_turns_at_request: int = 0
     prompt_tokens: int = 0
     raw_prompt_tokens: int = 0
+    optimized_prompt_tokens: int = 0
     prompt_tokens_source: str = "usage"
     cached_response: bool = False
     completion_tokens: int = 0
@@ -874,12 +894,26 @@ class BenchmarkReport:
         budget = self.config.get("char_budget")
         chars_before = [t.proxy.chars_before_optimization for t in self.turns]
         total_chars_before = sum(chars_before)
+        budget_exceeded_turns: list[int] = []
+        compaction_turns: list[int] = []
         eviction_turns: list[int] = []
-        # A turn triggers eviction when the optimizer actually reduced token count,
-        # indicating _trim_to_budget was called and evicted content from the context.
         if budget is not None and chars_before:
-            eviction_turns = [t.turn_index + 1 for t in self.turns
-                              if t.direct.prompt_tokens > t.proxy.prompt_tokens]
+            budget_exceeded_turns = [
+                t.turn_index
+                for t in self.turns
+                if t.proxy.chars_before_optimization > budget
+            ]
+            compaction_turns = [
+                t.turn_index
+                for t in self.turns
+                if t.direct.prompt_tokens > t.proxy.prompt_tokens
+            ]
+            eviction_turns = [
+                t.turn_index
+                for t in self.turns
+                if t.proxy.chars_before_optimization > budget
+                and t.direct.prompt_tokens > t.proxy.prompt_tokens
+            ]
 
         return {
             "config": self.config,
@@ -906,9 +940,11 @@ class BenchmarkReport:
                 "max_context_window": max_context_window,
                 "utilization_pct": final_proxy_ctx_pct,
                 "cached_or_missing_usage_turns": [
-                    t.turn_index + 1
+                    t.turn_index
                     for t in self.turns
-                    if t.proxy.prompt_tokens_source != "usage" or t.proxy.raw_prompt_tokens == 0
+                    if t.proxy.prompt_tokens_source.startswith("estimated")
+                    or t.proxy.raw_prompt_tokens == 0
+                    or t.proxy.cached_response
                 ],
             },
             "correctness": {
@@ -916,7 +952,7 @@ class BenchmarkReport:
                     len(t.proxy.foreign_markers) for t in self.turns
                 ),
                 "turns_with_markers": [
-                    t.turn_index + 1
+                    t.turn_index
                     for t in self.turns
                     if t.proxy.foreign_markers
                 ],
@@ -939,7 +975,9 @@ class BenchmarkReport:
             "eviction": {
                 "char_budget": budget,
                 "total_chars_before_optimization": total_chars_before,
-                "turns_exceeding_budget": len(eviction_turns),
+                "turns_exceeding_budget": len(budget_exceeded_turns),
+                "budget_exceeded_at_turns": budget_exceeded_turns if budget_exceeded_turns else None,
+                "compaction_triggered_at_turns": compaction_turns if compaction_turns else None,
                 "eviction_triggered_at_turns": eviction_turns if eviction_turns else None,
             },
         }
@@ -1072,6 +1110,7 @@ def run_benchmark(
 
     # Calculate dynamic timeout based on turns and rounds
     request_timeout = _calculate_timeout(num_turns, rounds)
+    char_budget = budget or int(os.environ.get("MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS", "12000"))
 
     config = {
         "lemonade_url": LEMONADE_URL,
@@ -1080,7 +1119,7 @@ def run_benchmark(
         "rounds": rounds,
         "max_tokens": max_tokens,
         "proxy_port": proxy_port,
-        "char_budget": budget,
+        "char_budget": char_budget,
         "scenario": scenario,
         "request_timeout": request_timeout,
     }
@@ -1100,6 +1139,11 @@ def run_benchmark(
         base_messages.append({"role": role, "content": content})
 
     turn_index = 0
+    user_tasks = [content for role, content in base_tasks if role == "user"]
+    fallback_user_task = (
+        "Turn {turn_index}: Remember the fibonacci generator we discussed? "
+        "Now write a test suite for it using pytest."
+    )
 
     for round_num in range(rounds):
         # Each round gets an isolated proxy session so prior-round state cannot
@@ -1111,13 +1155,24 @@ def run_benchmark(
         for _ in range(num_turns):
             turn_index += 1
             user_content = (
-                f"Turn {turn_index}: Remember the fibonacci generator we discussed? "
-                "Now write a test suite for it using pytest."
+                user_tasks[(turn_index - 1) % len(user_tasks)]
+                if user_tasks
+                else fallback_user_task.format(turn_index=turn_index)
             )
 
             # Add the current user turn to both contexts before either request.
             direct_messages.append({"role": "user", "content": user_content})
             proxy_messages.append({"role": "user", "content": user_content})
+
+            direct_context = _context_size_summary(direct_messages)
+            proxy_context = _context_size_summary(proxy_messages)
+            _human_print(
+                f"  Turn {turn_index:02d}/{num_turns:02d}: "
+                f"direct_ctx={direct_context['messages']} msgs/{direct_context['chars']:,} chars/"
+                f"~{direct_context['estimated_tokens']:,} tokens; "
+                f"proxy_ctx={proxy_context['messages']} msgs/{proxy_context['chars']:,} chars/"
+                f"~{proxy_context['estimated_tokens']:,} tokens"
+            )
 
             # --- Direct request ---
             direct_resp: dict | None = None
@@ -1126,7 +1181,7 @@ def run_benchmark(
             p_content = ""
 
             try:
-                direct_resp, direct_latency, direct_headers = _direct_request(
+                direct_resp, direct_latency, _direct_headers = _direct_request(
                     direct_messages, max_tokens=max_tokens, timeout=request_timeout
                 )
                 d_usage = direct_resp.get("usage", {}) or {}
@@ -1193,6 +1248,7 @@ def run_benchmark(
                     total_turns_at_request=len(proxy_messages) - 1,
                     prompt_tokens=_p_prompt,
                     raw_prompt_tokens=_p_prompt_raw,
+                    optimized_prompt_tokens=_p_optimized_prompt_tokens,
                     prompt_tokens_source=_p_prompt_source,
                     cached_response=_p_cached_response,
                     completion_tokens=int(p_usage.get("completion_tokens", 0) or 0),
@@ -1245,6 +1301,27 @@ def run_benchmark(
                 quality=quality,
             )
 
+            q_sem = quality.get("semantic_similarity") if quality else None
+            q_jaccard = quality.get("token_jaccard") if quality else None
+            q_rouge = quality.get("rouge_l_f1") if quality else None
+            direct_error = f" direct_error={direct_metrics.error[:80]!r}" if direct_metrics.error else ""
+            proxy_error = f" proxy_error={proxy_metrics.error[:80]!r}" if proxy_metrics.error else ""
+            quality_parts = [
+                f"quality_sem={q_sem:.3f}" if q_sem is not None else "quality_sem=n/a",
+                f"jaccard={q_jaccard:.3f}" if q_jaccard is not None else "jaccard=n/a",
+                f"rouge={q_rouge:.3f}" if q_rouge is not None else "rouge=n/a",
+            ]
+            _human_print(
+                f"  Turn {turn_index:02d}: "
+                f"direct={direct_metrics.latency_ms:.0f}ms/{direct_metrics.prompt_tokens:,}tok/{direct_metrics.response_chars:,}chars"
+                f" proxy={proxy_metrics.latency_ms:.0f}ms/{proxy_metrics.prompt_tokens:,}tok/"
+                f"{proxy_metrics.chars_before_optimization:,}chars_raw/{proxy_metrics.response_chars:,}chars"
+                f" delta={comparison.latency_delta_ms:+.0f}ms/{comparison.token_delta:+,}tok"
+                f" cache={proxy_metrics.cached_tokens:,}/{proxy_metrics.cache_hit_rate:.2f} "
+                f"{' '.join(quality_parts)}"
+                f"{direct_error}{proxy_error}"
+            )
+
             report.turns.append(comparison)
 
     return report
@@ -1259,10 +1336,6 @@ def _fmt_table(headers: list[str], rows: list[list[str]]) -> str:
     """Render a simple ASCII table."""
     widths = [max(len(h), max((len(r[i]) for r in rows), default=0)) for i, h in enumerate(headers)]
     pad = 2
-
-    def _cell(val: str, idx: int) -> str:
-        return val.ljust(widths[idx] + pad)
-
     header_line = "  ".join(_fmt_table.__code__.co_consts[1:3]) if False else "".join(
         h.ljust(w + pad) for h, w in zip(headers, widths, strict=True)
     )
@@ -1273,6 +1346,11 @@ def _fmt_table(headers: list[str], rows: list[list[str]]) -> str:
         lines.append("  ".join(c.ljust(widths[i] + pad) for i, c in enumerate(row)))
     lines.append(sep)
     return "\n".join(lines)
+
+
+def _status(args: argparse.Namespace, *parts: object) -> None:
+    """Print human status output without polluting JSON stdout."""
+    print(*parts, file=sys.stderr if getattr(args, "json_output", False) else sys.stdout)
 
 
 def print_report(report: BenchmarkReport) -> None:
@@ -1375,7 +1453,9 @@ def print_report(report: BenchmarkReport) -> None:
         ev_rows: list[list[str]] = [
             ["Total chars before optimization", f"{ev.get('total_chars_before_optimization', 0):,}"],
             ["Turns exceeding budget", str(ev.get("turns_exceeding_budget", 0))],
-            ["Eviction triggered at turns", ", ".join(str(t) for t in ev.get("eviction_triggered_at_turns") or []) or "never"],
+            ["Budget exceeded at turns", ", ".join(str(t) for t in ev.get("budget_exceeded_at_turns") or []) or "never"],
+            ["Compaction triggered at turns", ", ".join(str(t) for t in ev.get("compaction_triggered_at_turns") or []) or "never"],
+            ["Budget eviction triggered at turns", ", ".join(str(t) for t in ev.get("eviction_triggered_at_turns") or []) or "never"],
         ]
         print(_fmt_table(["Metric", "Value"], ev_rows))
     # ── Response quality ──────────────────────────────────────────────
@@ -1570,14 +1650,17 @@ def run_all_scenarios(args) -> None:
     """Run all scenarios and produce aggregated metrics."""
     all_reports: dict[str, BenchmarkReport] = {}
 
-    print(f"\n  Running all scenarios: {args.turns} turns x {args.rounds} round(s)")
-    print(f"  Model: {MODEL_ID}")
-    print(f"  Lemonade: {LEMONADE_URL}")
-    print(f"  Proxy: http://127.0.0.1:{args.port}/v1")
+    global _HUMAN_OUTPUT_TO_STDERR
+    _HUMAN_OUTPUT_TO_STDERR = args.json_output
+
+    _status(args, f"\n  Running all scenarios: {args.turns} turns x {args.rounds} round(s)")
+    _status(args, f"  Model: {MODEL_ID}")
+    _status(args, f"  Lemonade: {LEMONADE_URL}")
+    _status(args, f"  Proxy: http://127.0.0.1:{args.port}/v1")
 
     if args.budget is not None:
         os.environ["MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS"] = str(args.budget)
-        print(f"  Context char budget: {args.budget}")
+        _status(args, f"  Context char budget: {args.budget}")
 
     _start_proxy(args.port)
 
@@ -1727,18 +1810,21 @@ def main() -> None:
     if args.scenario == "all":
         return run_all_scenarios(args)
 
+    global _HUMAN_OUTPUT_TO_STDERR
+    _HUMAN_OUTPUT_TO_STDERR = args.json_output
+
     # Get scenario tasks
     scenario = SCENARIOS.get(args.scenario, SCENARIOS["default"])
-    print(f"\n  Starting benchmark: {args.turns} turns x {args.rounds} round(s)")
-    print(f"  Scenario: {args.scenario} - {scenario['description']}")
-    print(f"  Model: {MODEL_ID}")
-    print(f"  Lemonade: {LEMONADE_URL}")
-    print(f"  Proxy: http://127.0.0.1:{args.port}/v1")
+    _status(args, f"\n  Starting benchmark: {args.turns} turns x {args.rounds} round(s)")
+    _status(args, f"  Scenario: {args.scenario} - {scenario['description']}")
+    _status(args, f"  Model: {MODEL_ID}")
+    _status(args, f"  Lemonade: {LEMONADE_URL}")
+    _status(args, f"  Proxy: http://127.0.0.1:{args.port}/v1")
 
     # Inject budget override so the started proxy picks it up
     if args.budget is not None:
         os.environ["MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS"] = str(args.budget)
-        print(f"  Context char budget: {args.budget} (eviction will trigger when exceeded)")
+        _status(args, f"  Context char budget: {args.budget} (eviction will trigger when exceeded)")
 
     # Auto-start proxy if not already running
     _start_proxy(args.port)

@@ -167,9 +167,9 @@ class MTPHeadStateCheckpoint:
 _mtp_checkpoint: MTPHeadStateCheckpoint | None = None
 
 
-def get_mtp_head_checkpoint() -> MTPHeadStateCheckpoint:
+def get_mtp_head_checkpoint(max_checkpoints: int = 256) -> MTPHeadStateCheckpoint:
     """Get or create the global MTP head state checkpoint."""
     global _mtp_checkpoint
     if _mtp_checkpoint is None:
-        _mtp_checkpoint = MTPHeadStateCheckpoint()
+        _mtp_checkpoint = MTPHeadStateCheckpoint(max_checkpoints=max_checkpoints)
     return _mtp_checkpoint

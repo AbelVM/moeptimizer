@@ -375,9 +375,9 @@ class HitPredictionModel:
 _hit_model: HitPredictionModel | None = None
 
 
-def get_hit_prediction_model() -> HitPredictionModel:
+def get_hit_prediction_model(retrain_threshold: int = 50) -> HitPredictionModel:
     """Get or create the global hit prediction model."""
     global _hit_model
     if _hit_model is None:
-        _hit_model = HitPredictionModel()
+        _hit_model = HitPredictionModel(retrain_threshold=retrain_threshold)
     return _hit_model

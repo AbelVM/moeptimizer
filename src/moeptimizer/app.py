@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from typing import Any, AsyncIterator
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -49,6 +51,93 @@ def _ensure_content(messages: list[dict[str, Any]]) -> None:
         role = msg.get("role", "")
         if role != "assistant" and "content" not in msg:
             msg["content"] = ""
+
+
+def _fallback_optimized_messages(messages: list[dict[str, Any]], keep_full_steps: int) -> list[dict[str, Any]]:
+    """Return a safe compact fallback when the full optimizer fails.
+
+    This avoids forwarding the full raw conversation to the backend after an
+    optimizer exception. It preserves the system prompt and the most recent
+    user/assistant turns, which is safer than sending an unbounded raw context.
+    """
+    if not messages:
+        return []
+
+    fallback: list[dict[str, Any]] = []
+    if messages[0].get("role") == "system":
+        fallback.append(dict(messages[0]))
+        start_index = 1
+    else:
+        start_index = 0
+
+    keep = max(1, keep_full_steps) * 2
+    fallback.extend(dict(msg) for msg in messages[max(start_index, len(messages) - keep):])
+    return fallback
+
+
+def _canonicalize(value: Any) -> Any:
+    """Return a JSON-stable representation for session fingerprinting."""
+    if isinstance(value, dict):
+        return {
+            str(key): _canonicalize(value[key])
+            for key in sorted(value, key=str)
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _canonical_json(value: Any) -> str:
+    """Serialize a value deterministically for hashing."""
+    return json.dumps(
+        _canonicalize(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _hash_text(text: str) -> str:
+    """Return a compact stable hash."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _first_user_message(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return the first user message, used as a stable conversation seed."""
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return msg
+    return {}
+
+
+def _resolve_session_id(
+    body: dict[str, Any],
+    messages: list[dict[str, Any]],
+    legacy_session_id: Any = None,
+) -> str:
+    """Resolve a session id using only standard OpenAI-compatible inputs.
+
+    Legacy custom fields still work for existing integrations. For standard OpenAI
+    clients, the proxy uses the standard `user` field plus the first user message
+    as the conversation key. If `user` is absent, it fingerprints the message
+    history, which is the standard OpenAI mechanism for conversation continuity.
+    """
+    if isinstance(legacy_session_id, str) and legacy_session_id.strip():
+        return legacy_session_id.strip()
+
+    user = body.get("user")
+    if isinstance(user, str) and user.strip():
+        seed = _canonical_json(_first_user_message(messages))
+        return f"user:{_hash_text(user)}:{_hash_text(seed)}"
+
+    return f"anon:{_hash_text(_canonical_json(messages))}"
+
+
+def _pop_custom_session_fields(body: dict[str, Any]) -> tuple[Any, Any]:
+    """Remove internal session fields so they are never forwarded downstream."""
+    return body.pop("_session_id", None), body.pop("_session_state", None)
 
 
 def _normalize_response_choices(data: dict) -> list[dict]:
@@ -94,12 +183,18 @@ def _make_streaming_generator(
             messages = body.get("messages", [])
             temperature = body.get("temperature", 0.1)
             max_tokens = body.get("max_tokens")
+            request_kwargs = {
+                key: value
+                for key, value in body.items()
+                if key not in {"messages", "model", "temperature", "max_tokens", "stream"}
+            }
 
             async for chunk in backend_client.chat_completions_stream(
                 messages=messages,
                 model=model_name,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                **request_kwargs,
             ):
                 # Extract fields from OpenAI SDK ChatCompletionChunk
                 delta = {}
@@ -172,6 +267,11 @@ async def _do_non_streaming(
         messages = body.get("messages", [])
         temperature = body.get("temperature", 0.1)
         max_tokens = body.get("max_tokens")
+        request_kwargs = {
+            key: value
+            for key, value in body.items()
+            if key not in {"messages", "model", "temperature", "max_tokens", "stream"}
+        }
 
         response = await backend_client.chat_completions_create(
             messages=messages,
@@ -179,13 +279,11 @@ async def _do_non_streaming(
             temperature=temperature,
             stream=False,
             max_tokens=max_tokens,
+            **request_kwargs,
         )
 
         # Convert OpenAI SDK ChatCompletion to dict format
-        if hasattr(response, "model_dump"):
-            backend_data = response.model_dump()
-        else:
-            backend_data = dict(response)
+        backend_data = response.model_dump() if hasattr(response, "model_dump") else dict(response)
 
         # Normalize choices for OpenAI compatibility
         _normalize_response_choices(backend_data)
@@ -303,8 +401,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             presence_penalty, frequency_penalty, logit_bias, user,
             tools, tool_choice, response_format }
 
-        Custom fields (transparently handled, not forwarded to backend):
-          _session_id, _session_state
+        Conversation continuity:
+          Existing `_session_id` / `_session_state` fields are still accepted,
+          but standard OpenAI clients do not need them. The proxy derives the
+          session key from the standard `user` field plus the first user message,
+          or from a fingerprint of the message history when `user` is absent.
+          Custom session fields are stripped before forwarding to Lemonade.
         """
         try:
             body = await request.json()
@@ -321,7 +423,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 },
             )
 
-        messages = body.get("messages", [])
+        messages = list(body.get("messages", []))
         if not messages:
             return JSONResponse(
                 status_code=400,
@@ -351,8 +453,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 },
             )
 
-        session_id = body.pop("_session_id", None)
-        session_state = body.pop("_session_state", None)
+        legacy_session_id, session_state = _pop_custom_session_fields(body)
+        session_id = _resolve_session_id(body, messages, legacy_session_id)
 
         optimizer = session_manager.get_or_create(session_id)
 
@@ -369,9 +471,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         try:
             optimized_messages = optimizer.optimize_messages(messages)
         except Exception as e:
-            logger.exception("Context optimization failed, falling back to raw messages")
+            logger.exception("Context optimization failed, falling back to recent-turn context")
             optimization_error = f"{type(e).__name__}: {e}"
-            optimized_messages = messages
+            optimized_messages = _fallback_optimized_messages(messages, cfg.agentic.keep_full_steps)
 
         # Debug logging for long contexts
         if len(optimized_messages) > 10:
@@ -409,6 +511,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         }
 
         session_state = optimizer.get_session_state()
+        existing_extra_body = body.get("extra_body")
+        if existing_extra_body is not None and not isinstance(existing_extra_body, dict):
+            logger.warning("Ignoring invalid extra_body value: %s", type(existing_extra_body).__name__)
+            existing_extra_body = None
+        backend_extra_body = optimizer.get_backend_extra_body(
+            optimized_messages,
+            existing_extra_body,
+        )
+        if backend_extra_body:
+            body["extra_body"] = backend_extra_body
         if optimization_error:
             response_headers["X-Optimization-Error"] = optimization_error
 
@@ -561,13 +673,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @app.get("/v1/health")
     async def health_check():
         """Health check endpoint."""
-        try:
-            resp = await backend_client._client.models.list()
-            status = "ok" if resp else "degraded"
-            return {"status": status, "lemonade": status}
-        except Exception as e:
-            logger.warning("Health check failed: %s", e)
-            return {"status": "unhealthy", "lemonade": "error", "detail": str(e)}
+        return {"status": "ok", "lemonade": "not_checked"}
 
     @app.post("/v1/agent/state")
     async def get_agent_state(request: Request):

@@ -176,9 +176,9 @@ class KVCacheWarmup:
 _kv_warmup: KVCacheWarmup | None = None
 
 
-def get_kv_cache_warmup() -> KVCacheWarmup:
+def get_kv_cache_warmup(max_warmups: int = 32) -> KVCacheWarmup:
     """Get or create the global KV-cache warmup manager."""
     global _kv_warmup
     if _kv_warmup is None:
-        _kv_warmup = KVCacheWarmup()
+        _kv_warmup = KVCacheWarmup(max_warmups=max_warmups)
     return _kv_warmup

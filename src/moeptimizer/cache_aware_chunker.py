@@ -116,7 +116,7 @@ class CacheAwareChunker:
 
 
 def get_cache_aware_chunker(
-    block_size: int = 1024,
+    block_size: int | None = None,
 ) -> CacheAwareChunker:
     """Get a cache-aware chunker instance."""
     return CacheAwareChunker(block_size=block_size)

@@ -141,9 +141,9 @@ class ChunkFingerprintCache:
 _fingerprint_cache: ChunkFingerprintCache | None = None
 
 
-def get_chunk_fingerprint_cache() -> ChunkFingerprintCache:
+def get_chunk_fingerprint_cache(max_entries: int = 2048) -> ChunkFingerprintCache:
     """Get or create the global chunk fingerprint cache."""
     global _fingerprint_cache
     if _fingerprint_cache is None:
-        _fingerprint_cache = ChunkFingerprintCache()
+        _fingerprint_cache = ChunkFingerprintCache(max_entries=max_entries)
     return _fingerprint_cache

@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 old/
+benchmark_*.json
+notes.md
+notes2.md
 
 # C extensions
 *.so

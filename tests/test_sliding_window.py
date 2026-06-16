@@ -1,6 +1,5 @@
 """Tests for sliding window context with MTP state preservation."""
 
-import pytest
 
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer
@@ -54,3 +53,21 @@ class TestSlidingWindowContext:
         # Static layer should be preserved
         assert result[0].get("role") == "system"
         assert result[1].get("role") == "user"
+
+    def test_sliding_window_preserves_suffix_order(self) -> None:
+        """Sliding window keeps the newest dynamic suffix in chronological order."""
+        config = AppConfig()
+        optimizer = AgentContextOptimizer(config)
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "First"},
+            {"role": "assistant", "content": "one"},
+            {"role": "user", "content": "two"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"},
+            {"role": "assistant", "content": "three"},
+        ]
+        result = optimizer._sliding_window_trim(messages, window_size=20)
+        roles = [msg.get("role") for msg in result]
+        assert roles == ["system", "user", "assistant"]
+        assert result[-1].get("content") == "three"

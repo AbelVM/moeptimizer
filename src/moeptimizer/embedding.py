@@ -48,18 +48,18 @@ class EmbeddingService:
 
     async def initialize(self) -> None:
         """Initialize HTTP client and LanceDB connection."""
-        import httpx  # type: ignore[import-untyped]
+        import httpx2  # type: ignore[import-untyped]
 
-        limits = httpx.Limits(
+        limits = httpx2.Limits(
             max_keepalive_connections=30,
             max_connections=100,
             keepalive_expiry=30.0,
         )
-        self._http_client = httpx.AsyncClient(
+        self._http_client = httpx2.AsyncClient(
             base_url=self._config.server.url,
             limits=limits,
-            timeout=httpx.Timeout(30.0, connect=10.0),
-            transport=httpx.AsyncHTTPTransport(retries=2),
+            timeout=httpx2.Timeout(30.0, connect=10.0),
+            transport=httpx2.AsyncHTTPTransport(retries=2),
         )
 
         try:

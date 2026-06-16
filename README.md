@@ -209,6 +209,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
+Conversation continuity is OpenAI-compatible by default. Clients can set the standard `user` field as a conversation/user key, and moeptimizer combines it with the first user message to reuse optimizer state across turns. If `user` is absent, the proxy fingerprints the `messages` history. Legacy `_session_id` and `_session_state` fields are still accepted for existing integrations, but they are stripped before forwarding requests to Lemonade.
+
 ## API Endpoints
 
 | Method | Path | Description |

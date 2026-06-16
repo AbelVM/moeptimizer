@@ -1,6 +1,5 @@
 """Tests for cache registry."""
 
-import pytest
 
 from moeptimizer.cache_registry import (
     CacheKeyRegistry,
@@ -34,6 +33,19 @@ class TestCacheKeyRegistry:
         registry.register_context(messages, hit=True)
         rate = registry.predict_hit_rate(messages)
         assert rate == 1.0
+
+    def test_context_hash_includes_role_and_order(self) -> None:
+        """Same text with different roles does not share a cache key."""
+        registry = CacheKeyRegistry()
+        user_first = [
+            {"role": "user", "content": "same"},
+            {"role": "assistant", "content": "same"},
+        ]
+        assistant_first = [
+            {"role": "assistant", "content": "same"},
+            {"role": "user", "content": "same"},
+        ]
+        assert registry.register_context(user_first) != registry.register_context(assistant_first)
 
     def test_singleton(self) -> None:
         """Get cache registry returns singleton."""

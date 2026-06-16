@@ -250,9 +250,15 @@ class AsyncIOStage:
 _async_io: AsyncIOStage | None = None
 
 
-def get_async_io_stage() -> AsyncIOStage:
+def get_async_io_stage(
+    max_thread_workers: int = 4,
+    max_async_concurrency: int = 16,
+) -> AsyncIOStage:
     """Get or create the global async I/O stage manager."""
     global _async_io
     if _async_io is None:
-        _async_io = AsyncIOStage()
+        _async_io = AsyncIOStage(
+            max_thread_workers=max_thread_workers,
+            max_async_concurrency=max_async_concurrency,
+        )
     return _async_io

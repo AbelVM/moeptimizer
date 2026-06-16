@@ -205,9 +205,9 @@ class TemplateSelector:
 _template_selector: TemplateSelector | None = None
 
 
-def get_template_selector() -> TemplateSelector:
+def get_template_selector(exploration_rate: float = 0.1) -> TemplateSelector:
     """Get or create the global template selector."""
     global _template_selector
     if _template_selector is None:
-        _template_selector = TemplateSelector()
+        _template_selector = TemplateSelector(exploration_rate=exploration_rate)
     return _template_selector

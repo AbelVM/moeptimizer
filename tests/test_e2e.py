@@ -19,12 +19,13 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from moeptimizer.app import create_app
 from moeptimizer.config import AppConfig
-from moeptimizer.embedding import EmbeddingService
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -85,9 +86,10 @@ class TestDryRunResponseNormalization:
 
     def test_empty_content_filled_from_reasoning(self) -> None:
         """When content is empty but reasoning_content exists, merge it."""
+        from unittest.mock import AsyncMock, MagicMock
+
         from moeptimizer.app import _do_non_streaming
         from moeptimizer.config import AppConfig
-        from unittest.mock import AsyncMock, MagicMock
 
         config = AppConfig()
         config.server.url = LEMONADE_URL
@@ -146,9 +148,10 @@ class TestDryRunResponseNormalization:
 
     def test_non_empty_content_unchanged(self) -> None:
         """When content is already populated, don't overwrite."""
+        from unittest.mock import AsyncMock, MagicMock
+
         from moeptimizer.app import _do_non_streaming
         from moeptimizer.config import AppConfig
-        from unittest.mock import AsyncMock, MagicMock
 
         config = AppConfig()
         config.server.url = LEMONADE_URL
@@ -206,9 +209,10 @@ class TestDryRunResponseNormalization:
 
     def test_reasoning_content_stripped_when_both_present(self) -> None:
         """When both content and reasoning_content exist, only content is used."""
+        from unittest.mock import AsyncMock, MagicMock
+
         from moeptimizer.app import _do_non_streaming
         from moeptimizer.config import AppConfig
-        from unittest.mock import AsyncMock, MagicMock
 
         config = AppConfig()
         config.server.url = LEMONADE_URL
@@ -294,6 +298,125 @@ class TestDryRunMessageValidation:
         _validate_messages(messages)
 
 
+class TestDryRunSessionResolution:
+    """Test standard OpenAI-compatible session continuity."""
+
+    def test_legacy_custom_session_id_still_works(self) -> None:
+        from moeptimizer.app import _resolve_session_id
+
+        session_id = _resolve_session_id(
+            {"user": "alice", "messages": [{"role": "user", "content": "hello"}]},
+            [{"role": "user", "content": "hello"}],
+            legacy_session_id="legacy-session",
+        )
+
+        assert session_id == "legacy-session"
+
+    def test_standard_user_and_first_user_message_form_stable_session(self) -> None:
+        from moeptimizer.app import _resolve_session_id
+
+        first = _resolve_session_id(
+            {"user": "alice"},
+            [{"role": "user", "content": "Build a REST API"}],
+        )
+        second = _resolve_session_id(
+            {"user": "alice"},
+            [
+                {"role": "user", "content": "Build a REST API"},
+                {"role": "assistant", "content": "I can help."},
+                {"role": "user", "content": "Add auth."},
+            ],
+        )
+
+        assert first == second
+        assert first.startswith("user:")
+
+    def test_anonymous_session_falls_back_to_message_fingerprint(self) -> None:
+        from moeptimizer.app import _resolve_session_id
+
+        session_id = _resolve_session_id(
+            {},
+            [{"role": "user", "content": "hello"}],
+        )
+
+        assert session_id.startswith("anon:")
+        assert _resolve_session_id(
+            {},
+            [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
+        ) != session_id
+
+    def test_chat_completion_strips_custom_session_fields_before_lemonade(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        import moeptimizer.app as app_module
+
+        class FakeLemonadeClient:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            async def chat_completions_create(
+                self,
+                messages: list[dict[str, Any]],
+                model: str,
+                **kwargs: Any,
+            ) -> SimpleNamespace:
+                self.calls.append({"messages": messages, "model": model, "kwargs": kwargs})
+                return SimpleNamespace(
+                    model_dump=lambda: {
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    },
+                )
+
+            async def chat_completions_stream(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError("streaming should not be used")
+
+        fake_backend = FakeLemonadeClient()
+        monkeypatch.setattr(app_module, "LemonadeClient", lambda *args, **kwargs: fake_backend)
+        app = app_module.create_app(AppConfig())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "client-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "user": "alice",
+                "stream": False,
+                "_session_id": "legacy-session",
+                "_session_state": "{}",
+            },
+        )
+
+        assert response.status_code == 200
+        assert fake_backend.calls
+        call = fake_backend.calls[0]
+        assert call["model"] == MODEL_ID
+        kwargs = call["kwargs"]
+        messages = call["messages"]
+        assert isinstance(kwargs, dict)
+        assert isinstance(messages, list)
+        assert kwargs.get("user") == "alice"
+        assert "_session_id" not in kwargs
+        assert "_session_state" not in kwargs
+        assert all(
+            "_session_id" not in msg and "_session_state" not in msg
+            for msg in messages
+            if isinstance(msg, dict)
+        )
+
+
 class TestDryRunEnsureContent:
     """Test _ensure_content adds missing 'content' to non-assistant messages."""
 
@@ -349,9 +472,10 @@ class TestDryRunStreamingGenerator:
 
     def test_stream_produces_sse_format(self) -> None:
         """Streaming generator yields proper SSE-formatted chunks."""
+        from unittest.mock import MagicMock
+
         from moeptimizer.app import _make_streaming_generator
         from moeptimizer.config import AppConfig
-        from unittest.mock import MagicMock
 
         cfg = AppConfig()
         cfg.server.llm_model = MODEL_ID
@@ -406,7 +530,7 @@ class TestDryRunStreamingGenerator:
 
         # Check first event is initial chunk with role=assistant, content=""
         assert events[0].startswith("data: {")
-        first_data = json.loads(events[0].replace("data: ", "", 1).rstrip("\n\n"))
+        first_data = json.loads(events[0][len("data: "):].removesuffix("\n\n"))
         assert first_data["object"] == "chat.completion.chunk"
         assert first_data["choices"][0]["delta"]["role"] == "assistant"
 
@@ -415,9 +539,10 @@ class TestDryRunStreamingGenerator:
 
     def test_stream_error_provides_graceful_handling(self) -> None:
         """Streaming errors produce error chunk and [DONE] terminator."""
+        from unittest.mock import MagicMock
+
         from moeptimizer.app import _make_streaming_generator
         from moeptimizer.config import AppConfig
-        from unittest.mock import MagicMock
 
         cfg = AppConfig()
         cfg.server.llm_model = MODEL_ID
@@ -602,8 +727,9 @@ class TestDryRunOptimizerPipeline:
 
     def test_session_state_serialization(self) -> None:
         """Test session state round-trip."""
-        from moeptimizer.optimizer import AgentContextOptimizer
         import json
+
+        from moeptimizer.optimizer import AgentContextOptimizer
 
         config = AppConfig()
         config.agentic.max_optimized_chars = 500
@@ -725,7 +851,7 @@ def _print_comparison(direct: dict, proxy: dict) -> None:
     d_usage = direct.get("usage", {})
     p_usage = proxy.get("usage", {})
 
-    print(f"\n  Tokens:")
+    print("\n  Tokens:")
     print(f"    Direct prompt:     {d_usage.get('prompt_tokens', 0):>8}")
     print(f"    Proxy  prompt:     {p_usage.get('prompt_tokens', 0):>8}")
     print(f"    Direct cached:     {d_usage.get('prompt_tokens_details', {}).get('cached_tokens', 0):>8}")
@@ -734,14 +860,14 @@ def _print_comparison(direct: dict, proxy: dict) -> None:
     d_content = direct["choices"][0]["message"].get("content", "") or direct["choices"][0]["message"].get("reasoning_content", "")
     p_content = proxy["choices"][0]["message"].get("content", "") or proxy["choices"][0]["message"].get("reasoning_content", "")
 
-    print(f"\n  Content:")
+    print("\n  Content:")
     print(f"    Direct length:     {len(d_content):>8} chars")
     print(f"    Proxy  length:     {len(p_content):>8} chars")
     print(f"    Direct finish:     {direct['choices'][0].get('finish_reason', '')}")
     print(f"    Proxy  finish:     {proxy['choices'][0].get('finish_reason', '')}")
 
     markers = _check_foreign_markers([{"role": "assistant", "content": p_content}])
-    print(f"\n  MTP Integrity:")
+    print("\n  MTP Integrity:")
     print(f"    Foreign markers:   {'NONE' if not markers else str(markers)}")
 
     print("=" * 60 + "\n")
