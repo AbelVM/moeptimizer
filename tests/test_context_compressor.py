@@ -1,6 +1,5 @@
 """Tests for context compressor."""
 
-import pytest
 
 from moeptimizer.context_compressor import (
     ContextCompressor,
@@ -31,6 +30,14 @@ class TestContextCompressor:
         content = result[0].get("content", "")
         # Should have skeleton (def foo(): and ...)
         assert "def foo():" in content
+
+    def test_preserves_small_code_snippets(self) -> None:
+        """Keep short original snippets intact for quality-sensitive context."""
+        compressor = ContextCompressor()
+        snippet = "def calc(data):\n    total = 0\n    for item in data:\n        total += item\n    return total"
+        messages = [{"role": "user", "content": f"```python\n{snippet}\n```"}]
+        result = compressor.compress(messages)
+        assert snippet in result[0].get("content", "")
 
     def test_singleton(self) -> None:
         """Get context compressor returns new instance each time."""

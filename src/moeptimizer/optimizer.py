@@ -269,6 +269,7 @@ class AgentContextOptimizer:
         # Static layer end is recomputed after compaction/RAG because those stages
         # can change the message list.
         total_chars = sum(len(m.get("content", "")) for m in optimized)
+        optimized = self._inject_quality_anchor(optimized, proactive_threshold_tokens)
 
         # Step 5.2: Build KV slot map for cache control
         slot_tracker = get_kv_slot_tracker()
@@ -697,6 +698,69 @@ class AgentContextOptimizer:
             result.append(cleaned)
 
         return result
+
+    def _inject_quality_anchor(
+        self,
+        messages: list[dict[str, Any]],
+        proactive_threshold_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Add a compact task-memory anchor when compaction may evict requirements."""
+        if not messages or self.token_counter.count_messages(messages) <= proactive_threshold_tokens:
+            return messages
+        if self._budget_tokens() <= 100:
+            return messages
+
+        anchor = self._build_quality_anchor(messages)
+        if not anchor:
+            return messages
+
+        marker = "\n\n# Conversation Quality Anchor\n"
+        result = [dict(msg) for msg in messages]
+        if result and result[0].get("role") == "system":
+            content = result[0].get("content", "") or ""
+            prefix, separator, existing = content.partition(marker)
+            if separator and existing == anchor:
+                return messages
+            result[0] = {**result[0], "content": f"{prefix}{marker}{anchor}"}
+            return result
+
+        result.insert(0, {"role": "system", "content": f"{marker}{anchor}"})
+        return result
+
+    def _build_quality_anchor(self, messages: list[dict[str, Any]]) -> str:
+        """Build a compact anchor from the original request and short constraints."""
+        user_messages = [
+            msg.get("content", "")
+            for msg in messages
+            if msg.get("role") == "user" and isinstance(msg.get("content", ""), str)
+        ]
+        if not user_messages:
+            return ""
+
+        first_request = self._compact_anchor_text(user_messages[0], max_chars=700)
+        constraints: list[str] = []
+        seen: set[str] = set()
+        for content in user_messages[1:]:
+            compact = self._compact_anchor_text(content, max_chars=160)
+            if not compact or compact in seen:
+                continue
+            seen.add(compact)
+            constraints.append(f"- {compact}")
+
+        lines = [f"Original request:\n{first_request}"]
+        if constraints:
+            lines.append("Accumulated constraints:")
+            lines.extend(constraints[-5:])
+
+        anchor = "\n".join(lines)
+        return self._compact_anchor_text(anchor, max_chars=900)
+
+    def _compact_anchor_text(self, text: str, max_chars: int) -> str:
+        """Compact whitespace and truncate text for quality anchors."""
+        compact = " ".join(text.strip().split())
+        if len(compact) <= max_chars:
+            return compact
+        return f"{compact[: max_chars - 3].rstrip()}..."
 
     def _should_run_hierarchical_summary(
         self,

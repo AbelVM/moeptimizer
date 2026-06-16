@@ -23,8 +23,12 @@ class ContextCompressor:
     def __init__(
         self,
         preserve_signatures: bool = True,
+        preserve_short_code_blocks: bool = True,
+        short_code_block_max_chars: int = 128,
     ) -> None:
         self._preserve_signatures = preserve_signatures
+        self._preserve_short_code_blocks = preserve_short_code_blocks
+        self._short_code_block_max_chars = short_code_block_max_chars
 
     def compress(
         self,
@@ -75,6 +79,13 @@ class ContextCompressor:
     ) -> str:
         """Compress code to skeleton using tree-sitter for proper parsing."""
         if not self._preserve_signatures:
+            return code
+
+        # Small code snippets are often the original problem statement or
+        # minimal reproducible examples. Compressing them removes the exact
+        # semantics the model needs, so preserve them verbatim while still
+        # skeletonizing larger code bodies.
+        if self._preserve_short_code_blocks and len(code.strip()) <= self._short_code_block_max_chars:
             return code
 
         # Try tree-sitter first for proper AST-based skeleton extraction
@@ -145,9 +156,7 @@ class ContextCompressor:
                         sub_kind = _get_kind(sub)
                         if sub_kind == "def":
                             sig_parts.append("def ")
-                        elif sub_kind == "identifier":
-                            sig_parts.append(_get_text(sub))
-                        elif sub_kind == "parameters":
+                        elif sub_kind == "identifier" or sub_kind == "parameters":
                             sig_parts.append(_get_text(sub))
                         elif sub_kind == ":":
                             sig_parts.append(":")
@@ -200,9 +209,7 @@ class ContextCompressor:
         for line in lines:
             stripped = line.strip()
 
-            if stripped.startswith(("def ", "class ")):
-                outline.append(stripped)
-            elif stripped.startswith(("import ", "from ")):
+            if stripped.startswith(("def ", "class ")) or stripped.startswith(("import ", "from ")):
                 outline.append(stripped)
 
         return "\n".join(outline)
