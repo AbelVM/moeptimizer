@@ -108,8 +108,8 @@ class ContextCompressor:
         code: str,
         root: Any,
     ) -> str:
-        """Extract function/class signatures using tree-sitter AST."""
-        skeleton_lines = []
+        """Extract an AST skeleton that preserves signatures and structure."""
+        skeleton_lines: list[str] = []
 
         def _get_text(node: Any) -> str:
             br = node.byte_range()
@@ -117,6 +117,63 @@ class ContextCompressor:
 
         def _get_kind(node: Any) -> str:
             return node.kind()
+
+        def _indent(level: int) -> str:
+            return "    " * level
+
+        def _normalize_signature(text: str) -> str:
+            return " ".join(text.strip().split())
+
+        def _function_signature(node: Any) -> str:
+            text = _get_text(node)
+            colon = text.find(":")
+            if colon != -1:
+                return _normalize_signature(text[: colon + 1])
+
+            first_line = text.splitlines()[0].strip() if text.splitlines() else ""
+            if first_line.endswith(":"):
+                return first_line
+            return _normalize_signature(first_line)
+
+        def _class_signature(node: Any) -> str:
+            first_line = _get_text(node).splitlines()[0].strip()
+            return _normalize_signature(first_line)
+
+        def _append_function(node: Any, level: int) -> None:
+            for child in node.children:
+                if _get_kind(child) == "decorator":
+                    skeleton_lines.append(f"{_indent(level)}{_get_text(child).strip()}")
+            signature = _function_signature(node)
+            if signature:
+                skeleton_lines.append(f"{_indent(level)}{signature}")
+                skeleton_lines.append(f"{_indent(level)}    ...")
+
+        def _append_class(node: Any, level: int) -> None:
+            skeleton_lines.append(f"{_indent(level)}{_class_signature(node)}")
+            child_lines_start = len(skeleton_lines)
+            for child in node.children:
+                kind = _get_kind(child)
+                if kind in def_types:
+                    _append_function(child, level + 1)
+                elif kind in class_types:
+                    _append_class(child, level + 1)
+                elif kind == "comment":
+                    skeleton_lines.append(f"{_indent(level + 1)}{_get_text(child).strip()}")
+
+            if len(skeleton_lines) == child_lines_start:
+                skeleton_lines.append(f"{_indent(level + 1)}...")
+
+        def _append_node(node: Any, level: int) -> None:
+            kind = _get_kind(node)
+            if kind in def_types:
+                _append_function(node, level)
+            elif kind in class_types:
+                _append_class(node, level)
+            elif kind in import_types or kind == "comment":
+                skeleton_lines.append(f"{_indent(level)}{_get_text(node).strip()}")
+            else:
+                for child in node.children:
+                    _append_node(child, level)
 
         # Node types that represent function/class definitions
         def_types = {
@@ -141,35 +198,7 @@ class ContextCompressor:
             "package_clause",
         }
 
-        for i in range(root.child_count()):
-            child = root.child(i)
-            kind = _get_kind(child)
-            text = _get_text(child)
-
-            if kind in def_types or kind in class_types or kind in import_types:
-                # For function definitions, extract just the signature + colon
-                if kind in def_types:
-                    # Get the signature part (def + name + params + :)
-                    sig_parts = []
-                    for j in range(child.child_count()):
-                        sub = child.child(j)
-                        sub_kind = _get_kind(sub)
-                        if sub_kind == "def":
-                            sig_parts.append("def ")
-                        elif sub_kind == "identifier" or sub_kind == "parameters":
-                            sig_parts.append(_get_text(sub))
-                        elif sub_kind == ":":
-                            sig_parts.append(":")
-                            break
-                    skeleton_lines.append("".join(sig_parts))
-                    # Add ellipsis to preserve indentation structure
-                    skeleton_lines.append("    ...")
-                else:
-                    skeleton_lines.append(text)
-            elif kind in ("comment",):
-                # Keep comments for context
-                skeleton_lines.append(text)
-
+        _append_node(root, 0)
         return "\n".join(skeleton_lines)
 
     def _extract_skeleton_fallback(

@@ -166,10 +166,12 @@ Environment variables use the `MOEPT_` prefix with `__` for nested config:
 
 | Variable | Default | Description |
 |---|---|---|
-| `MOEPT_AGENTIC__KEEP_FULL_STEPS` | `3` | Last N steps kept in full detail |
+| `MOEPT_AGENTIC__KEEP_FULL_STEPS` | `5` | Last N steps kept in full detail |
 | `MOEPT_AGENTIC__ARCHIVE_THRESHOLD` | `3` | Steps before this index get compressed |
-| `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` | `12000` | Hard cap on optimized context window (chars) |
-| `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS` | `3000` | Hard cap on optimized context window (tokens) |
+| `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` | `20000` | Hard cap on optimized context window (chars) |
+| `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS` | `5000` | Hard cap on optimized context window (tokens) |
+| `MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO` | `0.7` | Ratio of max tokens where proactive trimming starts |
+| `MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO` | `0.9` | Ratio of max tokens where compaction/compression starts |
 | `MOEPT_AGENTIC__USE_TOKEN_BUDGET` | `true` | Use token-based budget enforcement |
 | `MOEPT_AGENTIC__THINKING_PROTECT_RECENT` | `2` | Keep full thinking for last N steps |
 | `MOEPT_AGENTIC__SESSION_TIMEOUT` | `3600` | Session inactivity timeout (seconds) |
@@ -242,11 +244,14 @@ python scripts/benchmark.py --scenario feature --turns 20 --live
 python scripts/benchmark.py --turns 50 --budget 8000 --live
 
 # JSON output for analysis
-python scripts/benchmark.py --turns 20 --json > report.json
+python scripts/benchmark.py --turns 20 --json > report.json 2> benchmark.log
 
 # Dump full response pairs
 python scripts/benchmark.py --turns 10 --dump-responses
 ```
+
+You might need to run the benchmark as background task to avoid hitting command timeouts. Progress and per-turn information is dumped to stderr.
+
 
 ### Benchmark Scenarios
 

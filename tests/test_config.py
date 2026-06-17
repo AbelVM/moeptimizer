@@ -10,8 +10,11 @@ class TestConfig:
         config = AppConfig()
         assert config.server.url == "http://localhost:13305/api/v1"
         assert config.server.llm_model == "Qwen3.6-35B-A3B-MTP-GGUF"
-        assert config.agentic.keep_full_steps == 3
-        assert config.agentic.max_optimized_chars == 12000
+        assert config.agentic.keep_full_steps == 5
+        assert config.agentic.max_optimized_chars == 20000
+        assert config.agentic.max_optimized_tokens == 5000
+        assert config.agentic.proactive_trim_ratio == 0.7
+        assert config.agentic.compaction_trigger_ratio == 0.9
 
     def test_env_override(self) -> None:
         os.environ["MOEPT_SERVER__URL"] = "http://test:9999/api/v1"

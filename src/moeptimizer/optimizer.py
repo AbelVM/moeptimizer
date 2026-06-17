@@ -104,7 +104,7 @@ class AgentContextOptimizer:
     def __init__(self, config: AppConfig | None = None) -> None:
         self._config = config or AppConfig()
         self.store = AgentStateStore()
-        self.compactor = ScratchpadCompactor()
+        self.compactor = ScratchpadCompactor(keep_full=self._config.agentic.keep_full_steps)
         self.thinking_preserver = ThinkingPreserver()
         self.state_rag = StateBasedRAG(self.store)
         self.loop_detector = LoopDetector(threshold=3)
@@ -157,11 +157,6 @@ class AgentContextOptimizer:
         if cfg.max_optimized_tokens <= 0:
             return char_budget
 
-        # The default token budget mirrors the default char budget. If a caller
-        # lowers max_optimized_chars for tests or deployments, keep that stricter
-        # budget unless max_optimized_tokens was explicitly lowered too.
-        if cfg.max_optimized_chars == 12000:
-            return cfg.max_optimized_tokens
         return min(char_budget, cfg.max_optimized_tokens)
 
     def optimize_messages(
@@ -208,7 +203,8 @@ class AgentContextOptimizer:
 
         # Calculate token count early (needed for cache early-exit decisions).
         max_tokens = self._budget_tokens()
-        proactive_threshold_tokens = int(max_tokens * 0.7)
+        proactive_threshold_tokens = int(max_tokens * self._config.agentic.proactive_trim_ratio)
+        compaction_threshold_tokens = int(max_tokens * self._config.agentic.compaction_trigger_ratio)
         total_tokens = self.token_counter.count_messages(optimized)
 
         # Step 5.0: Check static prefix KV-cache for early exit.
@@ -286,13 +282,13 @@ class AgentContextOptimizer:
         # should never run on lean contexts where full code is affordable.
         try:
             current_tokens = self.token_counter.count_messages(optimized)
-            if current_tokens > proactive_threshold_tokens:
+            if current_tokens > compaction_threshold_tokens:
                 optimized = self.context_compressor.compress(optimized)
             else:
                 logger.debug(
                     "[AgentOptimizer] Context compression skipped: tokens=%d <= threshold=%d",
                     current_tokens,
-                    proactive_threshold_tokens,
+                    compaction_threshold_tokens,
                 )
         except Exception as e:
             logger.warning("Context compression failed: %s", e)
@@ -336,13 +332,14 @@ class AgentContextOptimizer:
         # instead of letting it bypass proactive trim on short contexts.
         try:
             current_tokens = self.token_counter.count_messages(optimized)
-            if current_tokens > proactive_threshold_tokens:
+            pre_compaction_tokens = current_tokens
+            if current_tokens > compaction_threshold_tokens:
                 optimized = self.compactor.compact_messages(optimized)
             else:
                 logger.debug(
                     "[AgentOptimizer] Scratchpad compaction skipped: tokens=%d <= threshold=%d",
                     current_tokens,
-                    proactive_threshold_tokens,
+                    compaction_threshold_tokens,
                 )
         except Exception as e:
             logger.warning("Scratchpad compaction failed: %s", e)
@@ -441,9 +438,12 @@ class AgentContextOptimizer:
         # Step 8.5: Apply hierarchical summarization for long, over-budget
         # conversations before static-layer and MTP boundary alignment.
         try:
-            if self.hierarchical_summarizer is not None and self._should_run_hierarchical_summary(
-                optimized,
-                proactive_threshold_tokens,
+            if self.hierarchical_summarizer is not None and (
+                pre_compaction_tokens > compaction_threshold_tokens
+                or self._should_run_hierarchical_summary(
+                    optimized,
+                    compaction_threshold_tokens,
+                )
             ):
                 optimized = self.hierarchical_summarizer.summarize_turns(optimized)
                 total_tokens = self.token_counter.count_messages(optimized)
@@ -651,7 +651,7 @@ class AgentContextOptimizer:
                 logger.warning("Template quality recording failed: %s", e)
 
         logger.info(
-            "[AgentOptimizer] %d -> %d chars (%d -> %d tokens, %d saved, %.3fs, %d -> %d msgs, progress: %.0%%, loops: %d detected)",
+            "[AgentOptimizer] %d -> %d chars (%d -> %d tokens, %d saved, %.3fs, %d -> %d msgs, progress: %.0f%%, loops: %d detected)",
             original_chars,
             optimized_chars,
             original_tokens,
@@ -985,6 +985,11 @@ class AgentContextOptimizer:
             system_anchor.append(messages[i])
             i += 1
 
+        summary_messages: list[dict[str, Any]] = []
+        while i < len(messages) and messages[i].get("_summary_id"):
+            summary_messages.append(messages[i])
+            i += 1
+
         if i < len(messages) and messages[i].get("role") == "user":
             system_anchor.append(messages[i])
             i += 1
@@ -1031,9 +1036,10 @@ class AgentContextOptimizer:
             evictable = []
             protected = [m for t in complete_turns for m in t]
 
-        # Always preserve pending (unpaired user-only) turns.
-        for t in pending_turns:
-            protected.extend(t)
+        # Always preserve pending (unpaired user-only) turns and hierarchical summaries.
+        for turn in pending_turns:
+            protected.extend(turn)
+        protected.extend(summary_messages)
 
         return system_anchor, evictable, protected
 
@@ -1342,10 +1348,14 @@ class AgentContextOptimizer:
         target: int,
         use_tokens: bool = False,
     ) -> list[dict[str, Any]]:
-        """Proactively trim context to prevent KV-cache performance degradation.
+        """Proactively trim context while preserving complete recent turns.
 
-        For MoE models, KV-cache fill is extremely slow. This method trims
-        context before it becomes a problem, preserving the most recent turns.
+        For MoE models, KV-cache fill is expensive, so context is trimmed before
+        it becomes a problem. This method evicts complete user-assistant turns
+        from the front of the evictable body instead of dropping the newest
+        dynamic message when it cannot fit. That prevents the optimizer from
+        collapsing long conversations down to only the static system/first-user
+        prefix.
 
         Args:
             messages: The message list to trim
@@ -1361,48 +1371,19 @@ class AgentContextOptimizer:
             if total_chars <= target:
                 return messages
 
-        # Find the static layer (system + first user)
-        static_end = 0
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "system":
-                static_end = i + 1
-            elif (msg.get("role") == "user" and static_end > 0) or (msg.get("role") == "user" and static_end == 0):
-                static_end = i + 1
-                break
+        system_anchor, evictable_body, protected_tail = self._partition_for_budget(messages)
 
-        # Calculate how much we can keep from dynamic layer
         if use_tokens:
-            static_tokens = self.token_counter.count_messages(messages[:static_end])
-            available_for_dynamic = target - static_tokens
+            reserved = (self.token_counter.count_messages(system_anchor)
+                        + self.token_counter.count_messages(protected_tail))
+            evictable_budget = max(0, target - reserved)
         else:
-            static_chars = sum(len(m.get("content", "")) for m in messages[:static_end])
-            available_for_dynamic = target - static_chars
+            reserved = (sum(len(m.get("content", "")) for m in system_anchor)
+                        + sum(len(m.get("content", "")) for m in protected_tail))
+            evictable_budget = max(0, target - reserved)
 
-        if available_for_dynamic <= 0:
-            return messages[:static_end]  # Only keep static layer
-
-        # Keep only the most recent dynamic content
-        result = [dict(m) for m in messages[:static_end]]
-        dynamic_messages = messages[static_end:]
-
-        # Add messages from the end until we hit the limit
-        for msg in reversed(dynamic_messages):
-            if use_tokens:
-                msg_tokens = self.token_counter.count_messages([msg])
-                if available_for_dynamic >= msg_tokens:
-                    result.insert(static_end, dict(msg))
-                    available_for_dynamic -= msg_tokens
-                else:
-                    break
-            else:
-                msg_chars = len(msg.get("content", ""))
-                if available_for_dynamic >= msg_chars:
-                    result.insert(static_end, dict(msg))
-                    available_for_dynamic -= msg_chars
-                else:
-                    break
-
-        return result
+        evictable_body = self._evict_for_budget(evictable_body, evictable_budget, use_tokens)
+        return system_anchor + evictable_body + protected_tail
 
     def _sliding_window_trim(
         self,

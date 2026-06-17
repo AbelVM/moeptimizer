@@ -175,6 +175,9 @@ class HierarchicalSummarizer:
             unique_tools = list(dict.fromkeys(tool_uses))[:5]
             summary_parts.append(f"Tools: {', '.join(unique_tools)}")
 
+        if not topics and not code_patterns and not tool_uses:
+            summary_parts.append(f"History: {len(turns)} summarized turns")
+
         # Store full summary for potential expansion
         full_summary = {
             "summary_id": summary_id,

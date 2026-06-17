@@ -47,7 +47,7 @@ class AgenticConfig(BaseModel):
     """Agentic loop tuning parameters for Qwen3.6-35B-A3B-MTP."""
 
     keep_full_steps: int = Field(
-        default=3,
+        default=5,
         description="Last N user-assistant pairs kept in full detail for immediate reasoning context. "
                     "Higher values preserve more conversation history at the cost of token usage.",
     )
@@ -56,12 +56,20 @@ class AgenticConfig(BaseModel):
         description="Steps before this index get compressed",
     )
     max_optimized_chars: int = Field(
-        default=12000,
-        description="Hard cap on optimized context window (characters, converted to ~3000 tokens)",
+        default=20000,
+        description="Hard cap on optimized context window (characters, converted to ~5000 tokens)",
     )
     max_optimized_tokens: int = Field(
-        default=3000,
+        default=5000,
         description="Hard cap on optimized context window (tokens). Takes precedence over max_optimized_chars if set.",
+    )
+    proactive_trim_ratio: float = Field(
+        default=0.7,
+        description="Ratio of max_optimized_tokens at which proactive trimming starts.",
+    )
+    compaction_trigger_ratio: float = Field(
+        default=0.9,
+        description="Ratio of max_optimized_tokens at which compaction and compression start.",
     )
     thinking_protect_recent: int = Field(
         default=2,

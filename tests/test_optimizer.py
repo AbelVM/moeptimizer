@@ -87,6 +87,28 @@ class TestAgentContextOptimizer:
         assert result[-1]["role"] == "assistant"
         assert result[-2]["role"] == "user"
 
+    def test_proactive_trim_preserves_recent_turn_when_newest_message_is_large(self) -> None:
+        """Proactive trimming must not collapse to only the static prefix."""
+        self.optimizer._config.agentic.keep_full_steps = 1
+        self.optimizer._config.agentic.max_optimized_chars = 1000
+
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "First task"},
+            {"role": "assistant", "content": "Old response"},
+            {"role": "user", "content": "Middle task"},
+            {"role": "assistant", "content": "Middle response"},
+            {"role": "user", "content": "Latest task"},
+            {"role": "assistant", "content": "x" * 2000},
+        ]
+
+        result = self.optimizer._proactive_trim(messages, target=100, use_tokens=True)
+
+        assert result[0]["role"] == "system"
+        assert result[-2]["role"] == "user"
+        assert result[-1]["role"] == "assistant"
+        assert result[-1]["content"] == "x" * 2000
+
     def test_no_content_truncation(self) -> None:
         """Front-loading eviction drops whole turns — no content is truncated."""
         long_content = "This is a very detailed response with important information"

@@ -191,6 +191,11 @@ class TokenAwareTruncator:
             system_anchor.append(messages[i])
             i += 1
 
+        summary_messages: list[dict[str, Any]] = []
+        while i < len(messages) and messages[i].get("_summary_id"):
+            summary_messages.append(messages[i])
+            i += 1
+
         if i < len(messages) and messages[i].get("role") == "user":
             system_anchor.append(messages[i])
             i += 1
@@ -235,6 +240,8 @@ class TokenAwareTruncator:
 
         for t in pending_turns:
             protected.extend(t)
+
+        protected.extend(summary_messages)
 
         return system_anchor, evictable, protected
 
@@ -288,8 +295,8 @@ class TokenAwareTruncator:
 
             role = msg.get("role", "")
 
-            # Never truncate system or assistant messages
-            if role in ("system", "assistant"):
+            # Never truncate system, assistant, or hierarchical summary messages.
+            if role in ("system", "assistant") or msg.get("_summary_id"):
                 result.append(msg)
                 continue
 

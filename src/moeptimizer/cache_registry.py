@@ -42,6 +42,7 @@ class CacheKeyRegistry:
 
     def __init__(self, max_size: int = 1000) -> None:
         self._entries: OrderedDict[str, CacheEntry] = OrderedDict()
+        self._prefix_entries: OrderedDict[str, CacheEntry] = OrderedDict()
         self._max_size = max_size
 
     def record_cache_hit(
@@ -55,15 +56,38 @@ class CacheKeyRegistry:
         """
         if isinstance(context, list):
             context = self._serialize_context(context)
-        key = self._hash_context(context)
+        prefix = self._static_prefix(context)
 
-        if key in self._entries:
-            entry = self._entries[key]
+        self._record_cache_hit_for_key(
+            self._hash_context(context),
+            context,
+            hit_tokens,
+            self._entries,
+        )
+        self._record_cache_hit_for_key(
+            self._hash_context(prefix),
+            prefix,
+            hit_tokens,
+            self._prefix_entries,
+        )
+
+        self._evict_old_entries(self._entries)
+        self._evict_old_entries(self._prefix_entries)
+
+    def _record_cache_hit_for_key(
+        self,
+        key: str,
+        context: str,
+        hit_tokens: int,
+        entries: OrderedDict[str, CacheEntry],
+    ) -> None:
+        """Record a cache hit in the provided entry map."""
+        if key in entries:
+            entry = entries[key]
             entry.hit_count += 1
             entry.context_size = len(context)
-            self._entries.move_to_end(key)
+            entries.move_to_end(key)
         else:
-            # Record the hit for future prediction
             now = time.time()
             entry = CacheEntry(
                 key=key,
@@ -73,10 +97,7 @@ class CacheKeyRegistry:
                 context_size=len(context),
                 context_hash=self._hash_content(context),
             )
-            self._entries[key] = entry
-
-        while len(self._entries) > self._max_size:
-            self._entries.popitem(last=False)
+            entries[key] = entry
 
     def register_context(
         self,
@@ -89,33 +110,56 @@ class CacheKeyRegistry:
         """
         if isinstance(context, list):
             context = self._serialize_context(context)
-        key = self._hash_context(context)
+        prefix = self._static_prefix(context)
         now = time.time()
 
-        if key in self._entries:
-            entry = self._entries[key]
+        self._register_context_for_key(
+            self._hash_context(context),
+            context,
+            hit,
+            now,
+            self._entries,
+        )
+        self._register_context_for_key(
+            self._hash_context(prefix),
+            prefix,
+            hit,
+            now,
+            self._prefix_entries,
+        )
+
+        self._evict_old_entries(self._entries)
+        self._evict_old_entries(self._prefix_entries)
+
+        return self._hash_context(context)
+
+    def _register_context_for_key(
+        self,
+        key: str,
+        context: str,
+        hit: bool,
+        timestamp: float,
+        entries: OrderedDict[str, CacheEntry],
+    ) -> None:
+        """Register a context hit/miss in the provided entry map."""
+        if key in entries:
+            entry = entries[key]
             if hit:
                 entry.hit_count += 1
             else:
                 entry.miss_count += 1
-            entry.timestamp = now
-            self._entries.move_to_end(key)
+            entry.timestamp = timestamp
+            entries.move_to_end(key)
         else:
             entry = CacheEntry(
                 key=key,
-                timestamp=now,
+                timestamp=timestamp,
                 hit_count=1 if hit else 0,
                 miss_count=0 if hit else 1,
                 context_size=len(context),
                 context_hash=self._hash_content(context),
             )
-            self._entries[key] = entry
-
-        # Evict oldest if over limit
-        while len(self._entries) > self._max_size:
-            self._entries.popitem(last=False)
-
-        return key
+            entries[key] = entry
 
     def predict_hit_rate(
         self,
@@ -123,16 +167,48 @@ class CacheKeyRegistry:
     ) -> float:
         """Predict the cache hit rate for a context.
 
-        Accepts either a string or a list of message dicts.
+        Accepts either a string or a list of message dicts. Uses the maximum of
+        exact-context and static-prefix hit rates so growing conversations still
+        benefit from stable system/first-user prefix cache entries.
         """
         if isinstance(context, list):
             context = self._serialize_context(context)
-        key = self._hash_context(context)
-        if key in self._entries:
-            entry = self._entries[key]
-            total = entry.hit_count + entry.miss_count
-            if total > 0:
-                return entry.hit_count / total
+        prefix = self._static_prefix(context)
+        exact_hit_rate = self._predict_hit_rate_for_key(
+            self._hash_context(context),
+            self._entries,
+        )
+        prefix_hit_rate = self._predict_hit_rate_for_key(
+            self._hash_context(prefix),
+            self._prefix_entries,
+        )
+        return max(exact_hit_rate, prefix_hit_rate)
+
+    def predict_static_prefix_hit_rate(
+        self,
+        context: str | list[dict[str, Any]],
+    ) -> float:
+        """Predict cache hit rate for the stable static prefix only."""
+        if isinstance(context, list):
+            context = self._serialize_context(context)
+        prefix = self._static_prefix(context)
+        return self._predict_hit_rate_for_key(
+            self._hash_context(prefix),
+            self._prefix_entries,
+        )
+
+    def _predict_hit_rate_for_key(
+        self,
+        key: str,
+        entries: OrderedDict[str, CacheEntry],
+    ) -> float:
+        """Return hit rate for a key in the provided entry map."""
+        entry = entries.get(key)
+        if entry is None:
+            return 0.0
+        total = entry.hit_count + entry.miss_count
+        if total > 0:
+            return entry.hit_count / total
         return 0.0
 
     def get_cache_stats(
@@ -143,12 +219,20 @@ class CacheKeyRegistry:
         total_misses = sum(e.miss_count for e in self._entries.values())
         total = total_hits + total_misses
 
+        prefix_hits = sum(e.hit_count for e in self._prefix_entries.values())
+        prefix_misses = sum(e.miss_count for e in self._prefix_entries.values())
+        prefix_total = prefix_hits + prefix_misses
+
         return {
             "total_entries": len(self._entries),
             "total_hits": total_hits,
             "total_misses": total_misses,
             "hit_rate": round(total_hits / max(total, 1), 4),
             "unique_contexts": len(self._entries),
+            "prefix_entries": len(self._prefix_entries),
+            "prefix_hits": prefix_hits,
+            "prefix_misses": prefix_misses,
+            "prefix_hit_rate": round(prefix_hits / max(prefix_total, 1), 4),
         }
 
     def _serialize_context(
@@ -161,6 +245,32 @@ class CacheKeyRegistry:
             content = msg.get("content", "")
             parts.append(f"{msg.get('role', '')}:{content}")
         return "\n".join(parts)
+
+    def _static_prefix(self, context: str) -> str:
+        """Extract the stable system + first-user prefix from serialized context."""
+        prefix_parts: list[str] = []
+        seen_first_user = False
+
+        for line in context.splitlines():
+            role, separator, _content = line.partition(":")
+            if not separator:
+                continue
+            if role == "system":
+                prefix_parts.append(line)
+            elif role == "user" and not seen_first_user:
+                prefix_parts.append(line)
+                seen_first_user = True
+                break
+
+        return "\n".join(prefix_parts)
+
+    def _evict_old_entries(
+        self,
+        entries: OrderedDict[str, CacheEntry],
+    ) -> None:
+        """Evict the oldest entries from a cache entry map."""
+        while len(entries) > self._max_size:
+            entries.popitem(last=False)
 
     def _hash_context(
         self,
@@ -184,6 +294,7 @@ class CacheKeyRegistry:
     ) -> None:
         """Clear the registry."""
         self._entries.clear()
+        self._prefix_entries.clear()
 
     def save_to_disk(self) -> None:
         """Persist cache registry to disk for cross-session reuse."""
@@ -191,6 +302,9 @@ class CacheKeyRegistry:
         data = {
             "entries": {
                 k: asdict(v) for k, v in self._entries.items()
+            },
+            "prefix_entries": {
+                k: asdict(v) for k, v in self._prefix_entries.items()
             },
         }
         PERSISTENCE_PATH.write_text(json.dumps(data))
@@ -203,6 +317,8 @@ class CacheKeyRegistry:
             data = json.loads(PERSISTENCE_PATH.read_text())
             for k, v in data.get("entries", {}).items():
                 self._entries[k] = CacheEntry(**v)
+            for k, v in data.get("prefix_entries", {}).items():
+                self._prefix_entries[k] = CacheEntry(**v)
         except Exception:
             pass  # Ignore errors, start fresh
 

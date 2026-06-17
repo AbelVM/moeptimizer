@@ -39,6 +39,19 @@ class TestContextCompressor:
         result = compressor.compress(messages)
         assert snippet in result[0].get("content", "")
 
+    def test_ast_compressor_skeletonizes_class_bodies(self) -> None:
+        """AST compression keeps class/function signatures but removes bodies."""
+        compressor = ContextCompressor()
+        code = """class Stats:\n    def __init__(self):\n        self.total = 0\n\n    def add(self, value):\n        self.total += value\n        return self.total\n"""
+        messages = [{"role": "user", "content": f"```python\n{code}\n```"}]
+        result = compressor.compress(messages)
+        content = result[0].get("content", "")
+        assert "class Stats:" in content
+        assert "def __init__(self):" in content
+        assert "def add(self, value):" in content
+        assert "self.total = 0" not in content
+        assert "self.total += value" not in content
+
     def test_singleton(self) -> None:
         """Get context compressor returns new instance each time."""
         c1 = get_context_compressor()

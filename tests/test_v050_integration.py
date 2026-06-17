@@ -116,11 +116,26 @@ class TestV050Integration:
 
     def test_chunk_fingerprinting_reuse(self) -> None:
         """Chunk fingerprinting caches and reuses compressed chunks."""
-        code = "def foo():\n    x = 1\n    return x\n"
+        code = (
+            "def foo(values):\n"
+            "    total = 0\n"
+            "    count = 0\n"
+            "    weighted_total = 0\n"
+            "    for index, value in enumerate(values):\n"
+            "        weight = index + 1\n"
+            "        total += value\n"
+            "        count += 1\n"
+            "        weighted_total += value * weight\n"
+            "    mean = total / max(count, 1)\n"
+            "    weighted_mean = weighted_total / max(count, 1)\n"
+            "    return mean, weighted_mean\n"
+        )
         self.optimizer.chunk_fingerprint.clear()
         self.optimizer.cache_registry._entries.clear()
+        self.optimizer.cache_registry._prefix_entries.clear()
         self.optimizer.static_prefix_kv = None
         self.optimizer.hit_prediction = None
+        self.optimizer._config.agentic.compaction_trigger_ratio = 0.01
 
         messages = _build_messages(
             ("system", "System"),

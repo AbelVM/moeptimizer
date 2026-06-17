@@ -34,6 +34,27 @@ class TestCacheKeyRegistry:
         rate = registry.predict_hit_rate(messages)
         assert rate == 1.0
 
+    def test_predict_static_prefix_hit_rate_survives_dynamic_growth(self) -> None:
+        """Static prefix prediction remains useful as conversation context grows."""
+        registry = CacheKeyRegistry()
+        messages = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "first user prompt"},
+            {"role": "assistant", "content": "first response"},
+        ]
+        registry.register_context(messages, hit=True)
+
+        growing_messages = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "first user prompt"},
+            {"role": "assistant", "content": "first response"},
+            {"role": "user", "content": "new user prompt"},
+            {"role": "assistant", "content": "new response"},
+        ]
+
+        assert registry.predict_static_prefix_hit_rate(growing_messages) == 1.0
+        assert registry.predict_hit_rate(growing_messages) == 1.0
+
     def test_context_hash_includes_role_and_order(self) -> None:
         """Same text with different roles does not share a cache key."""
         registry = CacheKeyRegistry()
