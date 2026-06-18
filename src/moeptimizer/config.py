@@ -64,7 +64,7 @@ class AgenticConfig(BaseModel):
         description="Hard cap on optimized context window (tokens). Takes precedence over max_optimized_chars if set.",
     )
     proactive_trim_ratio: float = Field(
-        default=0.7,
+        default=0.6,
         description="Ratio of max_optimized_tokens at which proactive trimming starts.",
     )
     compaction_trigger_ratio: float = Field(
@@ -82,6 +82,42 @@ class AgenticConfig(BaseModel):
     use_token_budget: bool = Field(
         default=True,
         description="Use token-based budget enforcement instead of character-based",
+    )
+    fast_path_enabled: bool = Field(
+        default=True,
+        description="Bypass expensive transformations when the incoming context is already under the proactive budget.",
+    )
+    rag_enabled: bool = Field(
+        default=True,
+        description="Inject state-based RAG context only when it is enabled and useful for long/over-budget sessions.",
+    )
+    optimize_code_blocks: bool = Field(
+        default=False,
+        description="Run tree-sitter/NPU code-block optimization. Disabled by default to avoid proxy latency and preserve exact code.",
+    )
+    code_skeleton_enabled: bool = Field(
+        default=True,
+        description="Compress large code blocks to AST/line skeletons when proactive context pressure starts.",
+    )
+    semantic_dedup_enabled: bool = Field(
+        default=True,
+        description="Run embedding-based semantic deduplication when context pressure justifies it.",
+    )
+    attention_sinks_enabled: bool = Field(
+        default=False,
+        description="Inject model-visible attention-sink markers. Disabled by default to preserve exact prompts.",
+    )
+    static_layer_alignment_enabled: bool = Field(
+        default=False,
+        description="Pad the static layer to cache-block boundaries. Disabled by default to avoid adding tokens.",
+    )
+    reasoning_preseed_enabled: bool = Field(
+        default=False,
+        description="Inject reasoning scaffolding into user messages. Disabled by default to preserve direct-request semantics.",
+    )
+    mtp_boundary_alignment_enabled: bool = Field(
+        default=False,
+        description="Pad the final context to an MTP prediction boundary. Disabled by default to avoid extra tokens.",
     )
 
 

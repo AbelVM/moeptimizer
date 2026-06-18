@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any
 
@@ -76,7 +77,6 @@ from moeptimizer.kv_slot_tracker import get_kv_slot_tracker
 from moeptimizer.loop_detector import LoopDetector
 from moeptimizer.models import AgentStep, LoopWarning
 from moeptimizer.mtp_head_checkpoint import get_mtp_head_checkpoint
-from moeptimizer.mtp_speculative import build_mtp_speculative_body
 from moeptimizer.mtp_state import get_mtp_state_manager
 from moeptimizer.parallel_embedding_lookup import get_parallel_embedding_lookup
 from moeptimizer.pattern_injector import get_pattern_injector
@@ -97,12 +97,30 @@ from moeptimizer.tool_streamer import get_tool_streamer
 
 logger = logging.getLogger(__name__)
 
+_UNSUPPORTED_BACKEND_EXTRA_BODY_KEYS = {
+    "speculative_decoding",
+    "mtp_heads",
+    "head_temperatures",
+    "expert_hints",
+    "kv_cache_warmup",
+    "cache_control_hints",
+}
+_OPENAI_MESSAGE_KEYS = {
+    "role",
+    "content",
+    "name",
+    "tool_calls",
+    "tool_call_id",
+    "refusal",
+}
+
 
 class AgentContextOptimizer:
     """Main orchestrator for agentic context optimization."""
 
     def __init__(self, config: AppConfig | None = None) -> None:
         self._config = config or AppConfig()
+        self._lock = threading.RLock()
         self.store = AgentStateStore()
         self.compactor = ScratchpadCompactor(keep_full=self._config.agentic.keep_full_steps)
         self.thinking_preserver = ThinkingPreserver()
@@ -159,7 +177,60 @@ class AgentContextOptimizer:
 
         return min(char_budget, cfg.max_optimized_tokens)
 
+    def _register_context(self, messages: list[dict[str, Any]]) -> None:
+        """Register the optimized context and persist only when cache state changes."""
+        self.cache_registry.register_context(messages)
+        self.cache_registry.save_to_disk()
+
+    def _has_nonstandard_message_fields(self, messages: list[dict[str, Any]]) -> bool:
+        """Return True when messages contain internal/proxy-only fields."""
+        for msg in messages:
+            for key in msg:
+                if key.startswith("_") or key not in _OPENAI_MESSAGE_KEYS:
+                    return True
+        return False
+
+    def _has_large_tool_output(self, messages: list[dict[str, Any]]) -> bool:
+        """Return True when a tool output is large enough to need special handling."""
+        for msg in messages:
+            if msg.get("role") == "tool" and len(str(msg.get("content", ""))) > 1000:
+                return True
+        return False
+
+    def _maybe_fast_path(
+        self,
+        messages: list[dict[str, Any]],
+        total_tokens: int,
+        proactive_threshold_tokens: int,
+    ) -> list[dict[str, Any]] | None:
+        """Return a lean fast path for contexts that already fit the quality budget."""
+        if not self._config.agentic.fast_path_enabled:
+            return None
+        if total_tokens > proactive_threshold_tokens:
+            return None
+        if self._has_nonstandard_message_fields(messages):
+            return None
+        if self._has_large_tool_output(messages):
+            return None
+
+        logger.info(
+            "[AgentOptimizer] Lean fast path: tokens=%d <= threshold=%d",
+            total_tokens,
+            proactive_threshold_tokens,
+        )
+        self._register_context(messages)
+        return self._strip_internal_flags(messages)
+
     def optimize_messages(
+        self,
+        messages: list[dict[str, Any]],
+        original_prompt: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run the full optimization pipeline with per-session locking."""
+        with self._lock:
+            return self._optimize_messages_locked(messages, original_prompt)
+
+    def _optimize_messages_locked(
         self,
         messages: list[dict[str, Any]],
         original_prompt: str | None = None,
@@ -207,6 +278,10 @@ class AgentContextOptimizer:
         compaction_threshold_tokens = int(max_tokens * self._config.agentic.compaction_trigger_ratio)
         total_tokens = self.token_counter.count_messages(optimized)
 
+        fast_path = self._maybe_fast_path(optimized, total_tokens, proactive_threshold_tokens)
+        if fast_path is not None:
+            return fast_path
+
         # Step 5.0: Check static prefix KV-cache for early exit.
         # Only skip the rest of the pipeline when the context is already lean.
         # If the context is over budget, cache hits must not bypass compaction.
@@ -216,8 +291,7 @@ class AgentContextOptimizer:
                 if total_tokens <= proactive_threshold_tokens:
                     logger.info("[AgentOptimizer] Static prefix KV-cache hit, skipping optimization")
                     optimized = self._strip_internal_flags(optimized)
-                    self.cache_registry.register_context(optimized)
-                    self.cache_registry.save_to_disk()
+                    self._register_context(optimized)
                     return optimized
                 logger.info(
                     "[AgentOptimizer] Static prefix KV-cache hit, but context is over budget "
@@ -234,10 +308,8 @@ class AgentContextOptimizer:
                     "[AgentOptimizer] High cache hit rate (%.2f), skipping heavy optimization",
                     cache_hit_rate,
                 )
-                # Still need to strip internal flags and register context
                 optimized = self._strip_internal_flags(optimized)
-                self.cache_registry.register_context(optimized)
-                self.cache_registry.save_to_disk()
+                self._register_context(optimized)
                 return optimized
             logger.info(
                 "[AgentOptimizer] High cache hit rate (%.2f), but context is over budget "
@@ -258,8 +330,7 @@ class AgentContextOptimizer:
                 total_tokens, max_tokens,
             )
             optimized = self._strip_internal_flags(optimized)
-            self.cache_registry.register_context(optimized)
-            self.cache_registry.save_to_disk()
+            self._register_context(optimized)
             return optimized
 
         # Static layer end is recomputed after compaction/RAG because those stages
@@ -271,30 +342,44 @@ class AgentContextOptimizer:
         slot_tracker = get_kv_slot_tracker()
         slot_tracker.build_slot_map(optimized)
 
-        # Step 5.5: Apply context canonicalization for cache-friendly formatting
+        # Step 5.5: Apply context canonicalization only when context pressure
+        # justifies normalization. Lean contexts preserve exact user/system text.
         try:
-            optimized = self.context_canonicalizer.canonicalize(optimized)
+            current_tokens = self.token_counter.count_messages(optimized)
+            if current_tokens > proactive_threshold_tokens:
+                optimized = self.context_canonicalizer.canonicalize(optimized)
+            else:
+                logger.debug(
+                    "[AgentOptimizer] Context canonicalization skipped: tokens=%d <= threshold=%d",
+                    current_tokens,
+                    proactive_threshold_tokens,
+                )
         except Exception as e:
             logger.warning("Context canonicalization failed: %s", e)
 
-        # Step 5.7: Apply context compression only when the context is already
-        # above the proactive threshold. Compression removes code bodies, so it
-        # should never run on lean contexts where full code is affordable.
+        # Step 5.7: Apply code-aware compression when proactive pressure starts.
+        # Large code blocks become skeletons to keep the context lean while
+        # preserving signatures, imports, comments, and structure. Small code
+        # snippets remain exact because they often contain the task semantics.
         try:
             current_tokens = self.token_counter.count_messages(optimized)
-            if current_tokens > compaction_threshold_tokens:
+            if current_tokens > proactive_threshold_tokens and (
+                self._config.agentic.code_skeleton_enabled
+                or current_tokens > compaction_threshold_tokens
+            ):
                 optimized = self.context_compressor.compress(optimized)
             else:
                 logger.debug(
                     "[AgentOptimizer] Context compression skipped: tokens=%d <= threshold=%d",
                     current_tokens,
-                    compaction_threshold_tokens,
+                    proactive_threshold_tokens,
                 )
         except Exception as e:
             logger.warning("Context compression failed: %s", e)
 
-        # Step 5.9: Warm expert cache for static layer patterns
-        if total_chars > 1000:
+        # Step 5.9: Warm expert cache only for contexts under enough pressure to
+        # benefit from cache-local static patterns.
+        if total_chars > 1000 and total_tokens > proactive_threshold_tokens:
             try:
                 static_content = self._get_static_layer_content(optimized)
                 if static_content:
@@ -302,28 +387,41 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Expert cache warming failed: %s", e)
 
-        # Step 5.10: Prefetch dependencies for files in context
-        try:
-            self._prefetch_dependencies(optimized)
-        except Exception as e:
-            logger.warning("Dependency prefetch failed: %s", e)
+        # Step 5.10: Prefetch dependencies only when the context is over budget.
+        # This keeps RAG/cache enrichment quality-focused instead of always-on.
+        if total_tokens > proactive_threshold_tokens:
+            try:
+                self._prefetch_dependencies(optimized)
+            except Exception as e:
+                logger.warning("Dependency prefetch failed: %s", e)
 
-        # Step 6: Apply prompt template versioning
+        # Step 6: Apply prompt template versioning only when context pressure
+        # justifies template specialization.
         try:
-            optimized, self._task_type = classify_and_template(optimized)
-            if self.template_selector is not None:
-                selected_template = self.template_selector.select_template(optimized)
-                if selected_template:
-                    self._task_type = selected_template
+            current_tokens = self.token_counter.count_messages(optimized)
+            if current_tokens > proactive_threshold_tokens:
+                optimized, self._task_type = classify_and_template(optimized)
+                if self.template_selector is not None:
+                    selected_template = self.template_selector.select_template(optimized)
+                    if selected_template:
+                        self._task_type = selected_template
+            else:
+                logger.debug(
+                    "[AgentOptimizer] Prompt template specialization skipped: tokens=%d <= threshold=%d",
+                    current_tokens,
+                    proactive_threshold_tokens,
+                )
         except Exception as e:
             logger.warning("Prompt template versioning failed: %s", e)
 
-        # Step 6.5: Apply context template matching
-        if not (optimized and optimized[0].get("role") == "system"):
+        # Step 6.5: Apply context template matching only for over-budget
+        # contexts where a task template can preserve quality with fewer tokens.
+        if self.token_counter.count_messages(optimized) > proactive_threshold_tokens:
             try:
-                template_name = self.context_template_matcher.match_template(optimized)
-                if template_name:
-                    optimized = self.context_template_matcher.apply_template(optimized)
+                if not (optimized and optimized[0].get("role") == "system"):
+                    template_name = self.context_template_matcher.match_template(optimized)
+                    if template_name:
+                        optimized = self.context_template_matcher.apply_template(optimized)
             except Exception as e:
                 logger.warning("Context template matching failed: %s", e)
 
@@ -351,9 +449,9 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Post-compaction recount failed: %s", e)
 
-        # Step 7.25: Apply attention sink management after compaction, when we
-        # know the preserved context size.
-        if total_chars > 4000:
+        # Step 7.25: Apply attention sink management only when explicitly
+        # enabled and the context is long enough to benefit from it.
+        if self._config.agentic.attention_sinks_enabled and total_chars > 4000:
             try:
                 optimized = apply_attention_sinks(optimized, self._find_static_layer_end(optimized))
             except Exception as e:
@@ -365,8 +463,9 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Selective truncation failed: %s", e)
 
-        # Step 7.6: Apply semantic deduplication for near-duplicate context
-        if total_tokens > 1000:  # Only for larger contexts
+        # Step 7.6: Apply semantic deduplication when explicitly enabled and
+        # proactive leanness pressure makes duplicate removal worthwhile.
+        if self._config.agentic.semantic_dedup_enabled and total_tokens > proactive_threshold_tokens:
             try:
                 optimized = self.semantic_deduplicator.deduplicate(
                     optimized,
@@ -393,7 +492,9 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Pre-RAG recount failed: %s", e)
 
-        # Step 8: Inject RAG context and loop warnings as SEPARATE user messages
+        # Step 8: Inject RAG context and loop warnings as SEPARATE user messages.
+        # RAG is quality-preserving for long histories but should not add tokens to
+        # already-lean contexts. Loop warnings remain safety-critical.
         try:
             if loop_warnings:
                 warning_lines: list[str] = []
@@ -406,26 +507,27 @@ class AgentContextOptimizer:
                         "content": "\n".join(warning_lines),
                     })
 
-            # RAG context: append as a separate user message
-            last_assistant = None
-            for msg in reversed(optimized):
-                if msg.get("role") == "assistant" and not msg.get("_archived"):
-                    last_assistant = msg
-                    break
+            rag_tokens = self.token_counter.count_messages(optimized)
+            if self._config.agentic.rag_enabled and rag_tokens > proactive_threshold_tokens:
+                last_assistant = None
+                for msg in reversed(optimized):
+                    if msg.get("role") == "assistant" and not msg.get("_archived"):
+                        last_assistant = msg
+                        break
 
-            if last_assistant:
-                current_step = AgentStep(
-                    role=last_assistant.get("role", "assistant"),
-                    content=last_assistant.get("content", ""),
-                    tool_name=None,
-                    metadata=last_assistant.get("metadata", {}),
-                )
-                rag_context = self.state_rag.get_context_for_step(current_step)
-                if rag_context:
-                    optimized.append({
-                        "role": "user",
-                        "content": rag_context,
-                    })
+                if last_assistant:
+                    current_step = AgentStep(
+                        role=last_assistant.get("role", "assistant"),
+                        content=last_assistant.get("content", ""),
+                        tool_name=None,
+                        metadata=last_assistant.get("metadata", {}),
+                    )
+                    rag_context = self.state_rag.get_context_for_step(current_step)
+                    if rag_context:
+                        optimized.append({
+                            "role": "user",
+                            "content": rag_context,
+                        })
         except Exception as e:
             logger.warning("RAG/loop warning injection failed: %s", e)
 
@@ -451,37 +553,43 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Hierarchical summarization failed: %s", e)
 
-        # Step 8: Apply static layer block alignment for cache optimization
-        if total_tokens > 500:  # ~2000 chars
+        # Step 8: Apply static layer block alignment only when explicitly
+        # enabled. Padding adds tokens and can change prompt semantics.
+        if self._config.agentic.static_layer_alignment_enabled and total_tokens > 500:
             try:
                 optimized = self._align_static_layer(optimized)
             except Exception as e:
                 logger.warning("Static layer alignment failed: %s", e)
 
-        # Step 9: Pre-seed reasoning prefix for MTP (only if budget allows)
+        # Step 9: Pre-seed reasoning prefix only when explicitly enabled.
+        # Disabled by default because direct-request semantics are the quality target.
         max_tokens = self._budget_tokens()
-        if total_tokens < max_tokens * 0.5:
+        if self._config.agentic.reasoning_preseed_enabled and total_tokens < max_tokens * 0.5:
             try:
                 optimized = self._preseed_reasoning(optimized)
             except Exception as e:
                 logger.warning("Reasoning pre-seeding failed: %s", e)
 
-        # Step 10: Optimize code blocks in all messages
-        try:
-            for msg in optimized:
-                content = msg.get("content", "")
-                if isinstance(content, str) and self._has_code_blocks(content):
-                    msg["content"] = self._optimize_code_block_content(content)
-        except Exception as e:
-            logger.warning("Code block optimization failed: %s", e)
+        # Step 10: Optimize code blocks only when explicitly enabled.
+        # Exact code is preferred for quality; budget eviction handles leanness.
+        if self._config.agentic.optimize_code_blocks:
+            try:
+                for msg in optimized:
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and self._has_code_blocks(content):
+                        msg["content"] = self._optimize_code_block_content(content)
+            except Exception as e:
+                logger.warning("Code block optimization failed: %s", e)
 
         try:
             total_tokens = self.token_counter.count_messages(optimized)
         except Exception as e:
             logger.warning("Post-code recount failed: %s", e)
 
-        # Step 10.5: Apply cache-aware chunking for large contexts
-        if total_tokens > 750:  # ~3000 chars
+        # Step 10.5: Apply cache-aware chunking only for contexts that remain
+        # over the compaction threshold after cheaper quality-preserving passes.
+        total_tokens = self.token_counter.count_messages(optimized)
+        if total_tokens > compaction_threshold_tokens:
             try:
                 optimized = self.cache_aware_chunker.chunk_context(optimized)
             except Exception as e:
@@ -492,26 +600,29 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Post-chunking recount failed: %s", e)
 
-        # Step 11: Proactive context trimming for MoE KV-cache efficiency
-        # Use token-based threshold for more accurate budget enforcement
-        proactive_threshold_tokens = int(max_tokens * 0.7)
+        # Step 11: Proactive context trimming for MoE KV-cache efficiency.
+        # Keep this aligned with the configured proactive threshold so early gates
+        # and final trimming use the same quality/leanness policy.
+        proactive_threshold_tokens = int(max_tokens * self._config.agentic.proactive_trim_ratio)
         if total_tokens > proactive_threshold_tokens:
             try:
                 optimized = self._proactive_trim(optimized, proactive_threshold_tokens, use_tokens=True)
             except Exception as e:
                 logger.warning("Proactive trimming failed: %s", e)
 
-        # Step 11.5: Entropy-guided trimming for MTP-friendly content
-        try:
-            optimized = self._entropy_guided_trim(optimized)
-        except Exception as e:
-            logger.warning("Entropy-guided trimming failed: %s", e)
+        # Step 11.5: Entropy-guided trimming only when context pressure exists.
+        if total_tokens > proactive_threshold_tokens:
+            try:
+                optimized = self._entropy_guided_trim(optimized)
+            except Exception as e:
+                logger.warning("Entropy-guided trimming failed: %s", e)
 
-        # Step 11.6: Stream large tool outputs for better context management
-        try:
-            optimized = self._stream_large_tool_outputs(optimized)
-        except Exception as e:
-            logger.warning("Tool output streaming failed: %s", e)
+        # Step 11.6: Stream large tool outputs only when needed for leanness.
+        if total_tokens > proactive_threshold_tokens:
+            try:
+                optimized = self._stream_large_tool_outputs(optimized)
+            except Exception as e:
+                logger.warning("Tool output streaming failed: %s", e)
 
         # Recalculate total_tokens after entropy trim
         try:
@@ -536,12 +647,13 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Sliding window trim failed: %s", e)
 
-        # Step 11.9: Align to MTP prediction boundary for better MTP accuracy
-        # This ensures context length is a multiple of 128 tokens
-        try:
-            optimized = self.mtp_state_manager.align_prediction_boundary(optimized)
-        except Exception as e:
-            logger.warning("MTP boundary alignment failed: %s", e)
+        # Step 11.9: Align to MTP prediction boundary only when explicitly
+        # enabled; padding increases context and is disabled by default.
+        if self._config.agentic.mtp_boundary_alignment_enabled:
+            try:
+                optimized = self.mtp_state_manager.align_prediction_boundary(optimized)
+            except Exception as e:
+                logger.warning("MTP boundary alignment failed: %s", e)
 
         # Step 12: Enforce hard token cap
         try:
@@ -563,17 +675,12 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Internal flag stripping failed: %s", e)
 
-        # Step 14: Register context in cache registry for hit prediction
+        # Step 14: Register context in cache registry for hit prediction.
+        # _register_context persists only when cache state changed.
         try:
-            self.cache_registry.register_context(optimized)
+            self._register_context(optimized)
         except Exception as e:
             logger.warning("Cache registry registration failed: %s", e)
-
-        # Step 14.5: Persist cache registry for cross-session reuse
-        try:
-            self.cache_registry.save_to_disk()
-        except Exception as e:
-            logger.warning("Cache registry persistence failed: %s", e)
 
         # Step 14.6: Store static prefix KV-cache for reuse
         if self.static_prefix_kv is not None:
@@ -619,7 +726,7 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Hierarchical summarizer save failed: %s", e)
 
-        # Step 14.10: Save static prefix KV-cache to disk
+        # Step 14.10: Save static prefix KV-cache only when it changed.
         if self.static_prefix_kv is not None:
             try:
                 self.static_prefix_kv.save_to_disk()
@@ -672,6 +779,7 @@ class AgentContextOptimizer:
         Preserves the message structure and content while stripping:
         - _archived: compactor marker
         - Section markers (<!-- STATIC/CONTEXT/DYNAMIC_LAYER -->)
+        - Proxy-only fields such as chunk_index
         - Any other _prefixed keys (future-proof)
 
         Attention sink markers are intentionally left in place because they are
@@ -690,9 +798,9 @@ class AgentContextOptimizer:
                 content = marker_pattern.sub("", content)
 
             cleaned = {
-                k: v
-                for k, v in msg.items()
-                if not k.startswith(internal_prefix)
+                key: value
+                for key, value in msg.items()
+                if key in _OPENAI_MESSAGE_KEYS and not key.startswith(internal_prefix)
             }
             cleaned["content"] = content
             result.append(cleaned)
@@ -737,11 +845,14 @@ class AgentContextOptimizer:
         if not user_messages:
             return ""
 
-        first_request = self._compact_anchor_text(user_messages[0], max_chars=700)
+        first_request = self._compact_anchor_text(
+            self._placeholder_code_blocks(user_messages[0]),
+            max_chars=700,
+        )
         constraints: list[str] = []
         seen: set[str] = set()
         for content in user_messages[1:]:
-            compact = self._compact_anchor_text(content, max_chars=160)
+            compact = self._compact_anchor_text(self._placeholder_code_blocks(content), max_chars=160)
             if not compact or compact in seen:
                 continue
             seen.add(compact)
@@ -754,6 +865,10 @@ class AgentContextOptimizer:
 
         anchor = "\n".join(lines)
         return self._compact_anchor_text(anchor, max_chars=900)
+
+    def _placeholder_code_blocks(self, text: str) -> str:
+        """Replace large code fences with a compact placeholder for anchors."""
+        return re.sub(r"```[\s\S]*?```", "[code block]", text)
 
     def _compact_anchor_text(self, text: str, max_chars: int) -> str:
         """Compact whitespace and truncate text for quality anchors."""
@@ -797,6 +912,10 @@ class AgentContextOptimizer:
             elif role == "tool":
                 step.tool_call_id = msg.get("tool_call_id", "")
 
+            fingerprint = self.store.step_fingerprint(step)
+            if self.store.has_step_fingerprint(fingerprint):
+                continue
+
             self.store.add_step(step)
             self.progress_tracker.record_step(step)
 
@@ -814,8 +933,10 @@ class AgentContextOptimizer:
             )
 
         cached = self.chunk_fingerprint.get(text)
-        if cached is not None and isinstance(cached.get("optimized_text"), str):
-            return cached["optimized_text"]
+        if cached is not None:
+            cached_text = cached.get("optimized_text")
+            if isinstance(cached_text, str):
+                return cached_text
 
         optimized = optimize_code_in_text(
             text,
@@ -900,8 +1021,8 @@ class AgentContextOptimizer:
 
     def _rank_chunks(
         self,
-        query_vec: np.ndarray,
-        chunk_vecs: list[np.ndarray],
+        query_vec: np.ndarray[Any, Any],
+        chunk_vecs: list[np.ndarray[Any, Any]],
         chunks: list[str],
     ) -> list[str]:
         """Rank chunks by cosine similarity, return top-K."""
@@ -1203,41 +1324,18 @@ class AgentContextOptimizer:
         messages: list[dict[str, Any]],
         existing_extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Build backend optimization hints for the next completion request."""
-        extra_body = dict(existing_extra_body or {})
+        """Return only standard OpenAI-compatible extra_body fields.
 
-        if self._config.speculative.enabled:
-            extra_body = {
-                **extra_body,
-                **build_mtp_speculative_body(
-                    mtp_heads=3,
-                    mtp_lookahead=self._config.speculative.mtp_lookahead,
-                    confidence_threshold=self._config.speculative.confidence_threshold,
-                ),
-            }
-
-        if self._config.v050.enable_experimental_backend_hints:
-            if self.kv_warmup is not None:
-                static_end = self._find_static_layer_end(messages)
-                static_tokens = self.token_counter.count_messages(messages[:static_end]) if static_end else 0
-                if self.kv_warmup.should_warmup(messages):
-                    self.kv_warmup.store_warmup(
-                        messages,
-                        {"static_tokens": static_tokens},
-                    )
-                warmup_payload = self.kv_warmup.get_warmup_payload(messages)
-                if warmup_payload:
-                    extra_body = {**extra_body, **warmup_payload}
-
-            if (
-                self._config.v050.enable_experimental_backend_hints
-                and len(messages) > 1
-                and sum(len(m.get("content", "")) for m in messages) > 1000
-            ):
-                expert_hints = self.expert_cache.get_expert_hints_for_context(messages)
-                if expert_hints:
-                    extra_body["expert_hints"] = expert_hints
-
+        Lemonade exposes a standard OpenAI API. Do not inject proxy-internal
+        MTP, KV-cache, or expert-routing fields into the backend request; most
+        Lemonade/llama.cpp builds will ignore them, and some may reject them.
+        """
+        del messages
+        extra_body = {
+            key: value
+            for key, value in (existing_extra_body or {}).items()
+            if key not in _UNSUPPORTED_BACKEND_EXTRA_BODY_KEYS
+        }
         self._last_backend_extra_body = extra_body
         return extra_body
 
@@ -1424,9 +1522,11 @@ class AgentContextOptimizer:
             else static_chars // 4
         )
 
-        # If static layer alone exceeds window, only keep static
+        # If static layer alone exceeds window, keep the most recent request
+        # context rather than silently dropping the active user turn.
         if (use_tokens and static_tokens >= window_size) or (not use_tokens and static_chars >= window_size):
-            return messages[:static_end]
+            tail = messages[-min(2, len(messages)):]
+            return [dict(m) for m in tail]
 
         # Calculate available space for dynamic content
         available = window_size - static_tokens if use_tokens else window_size - static_chars

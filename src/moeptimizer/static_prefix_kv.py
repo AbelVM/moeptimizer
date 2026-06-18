@@ -33,6 +33,7 @@ class StaticPrefixKVCache:
         self._max_entries = max_entries
         self._hits = 0
         self._misses = 0
+        self._last_context_changed = False
 
     def get_static_prefix(self, messages: list[dict[str, Any]]) -> str:
         """Extract the static prefix (system + first user) from messages."""
@@ -80,6 +81,7 @@ class StaticPrefixKVCache:
         key = self.get_cache_key(prefix)
         self._cache[key] = kv_data
         self._cache.move_to_end(key)
+        self._last_context_changed = True
 
         # Evict oldest if over limit
         while len(self._cache) > self._max_entries:
@@ -95,15 +97,17 @@ class StaticPrefixKVCache:
             return
 
         key = self.get_cache_key(prefix)
-        self._cache.pop(key, None)
+        if self._cache.pop(key, None) is not None:
+            self._last_context_changed = True
 
     def clear(self) -> None:
         """Clear all cached KV-cache entries."""
         self._cache.clear()
         self._hits = 0
         self._misses = 0
+        self._last_context_changed = True
 
-    def get_stats(self) -> dict[str, int]:
+    def get_stats(self) -> dict[str, int | float]:
         """Get cache statistics."""
         total = self._hits + self._misses
         return {
@@ -113,11 +117,14 @@ class StaticPrefixKVCache:
             "hit_rate": round(self._hits / max(total, 1), 4),
         }
 
-    def save_to_disk(self) -> None:
+    def save_to_disk(self, force: bool = False) -> None:
         """Persist KV-cache to disk for cross-session reuse."""
+        if not force and not self._last_context_changed:
+            return
         try:
             _PERSISTENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
             _PERSISTENCE_PATH.write_bytes(pickle.dumps(dict(self._cache)))
+            self._last_context_changed = False
         except Exception as e:
             logger.warning("[StaticPrefixKV] Failed to save to disk: %s", e)
 
@@ -128,6 +135,8 @@ class StaticPrefixKVCache:
         try:
             data = pickle.loads(_PERSISTENCE_PATH.read_bytes())
             self._cache = OrderedDict(data)
+            while len(self._cache) > self._max_entries:
+                self._cache.popitem(last=False)
         except Exception as e:
             logger.warning("[StaticPrefixKV] Failed to load from disk: %s", e)
 

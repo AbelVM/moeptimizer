@@ -170,7 +170,7 @@ Environment variables use the `MOEPT_` prefix with `__` for nested config:
 | `MOEPT_AGENTIC__ARCHIVE_THRESHOLD` | `3` | Steps before this index get compressed |
 | `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` | `20000` | Hard cap on optimized context window (chars) |
 | `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS` | `5000` | Hard cap on optimized context window (tokens) |
-| `MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO` | `0.7` | Ratio of max tokens where proactive trimming starts |
+| `MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO` | `0.6` | Ratio of max tokens where proactive trimming starts |
 | `MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO` | `0.9` | Ratio of max tokens where compaction/compression starts |
 | `MOEPT_AGENTIC__USE_TOKEN_BUDGET` | `true` | Use token-based budget enforcement |
 | `MOEPT_AGENTIC__THINKING_PROTECT_RECENT` | `2` | Keep full thinking for last N steps |

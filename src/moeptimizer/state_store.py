@@ -6,6 +6,7 @@ replacing semantic RAG with graph traversal for agentic workflows.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -29,6 +30,8 @@ class AgentStateStore:
         self.subtask_index: dict[str, list[str]] = defaultdict(list)
         self.tool_index: dict[str, list[str]] = defaultdict(list)
         self._step_index: dict[str, int] = {}
+        self._step_hashes: dict[int, str] = {}
+        self._step_hash_set: set[str] = set()
         self._goal_id: str | None = None
         self._config = get_config().agentic
 
@@ -38,6 +41,8 @@ class AgentStateStore:
         step.step_index = idx
         self.steps.append(step)
         self._step_index[step.step_id] = idx
+        self._step_hashes[idx] = self.step_fingerprint(step)
+        self._step_hash_set.add(self._step_hashes[idx])
 
         if step.tool_name:
             self.tool_index[step.tool_name].append(step.step_id)
@@ -47,6 +52,19 @@ class AgentStateStore:
             self.subtask_index[subtask].append(step.step_id)
 
         return step.step_id
+
+    @staticmethod
+    def step_fingerprint(step: AgentStep) -> str:
+        """Return a stable fingerprint for a message-position pair."""
+        tool_call_id = step.tool_call_id or ""
+        metadata = json.dumps(step.metadata, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(
+            f"{step.role}\0{step.step_index}\0{step.content}\0{tool_call_id}\0{metadata}".encode()
+        ).hexdigest()
+
+    def has_step_fingerprint(self, fingerprint: str) -> bool:
+        """Return True if this exact message-position fingerprint was ingested."""
+        return fingerprint in self._step_hash_set
 
     def set_goal(self, original_prompt: str) -> str:
         """Set the root goal for this agent session."""
@@ -183,6 +201,9 @@ class AgentStateStore:
             step.step_index = idx
             store.steps.append(step)
             store._step_index[step.step_id] = idx
+            fingerprint = cls.step_fingerprint(step)
+            store._step_hashes[idx] = fingerprint
+            store._step_hash_set.add(fingerprint)
             if step.tool_name:
                 store.tool_index[step.tool_name].append(step.step_id)
             subtask = step.metadata.get("subtask") or store._infer_subtask(step)

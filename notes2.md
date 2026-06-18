@@ -1,6 +1,6 @@
-# REVIEW REQUEST for a Transparent OpenAI API proxy that optimizes context for MoE + MTP models in multi-turns agentic tasks.
+# REVIEW REQUEST for a Transparent OpenAI API proxy that optimizes context for MoE + MTP models in multi-turns agentic tasks
 
-What do we call "context optimization"? Keeping the leanest possible context that provides the best response quality from model in multi-turns agentic coding conversations, with minimal proxy latency and without triggering model kv-cache refill (being careful with MoE models).
+Main optimization target: keep the leanest possible multi-turn agentic-coding context while preserving response quality, measured by semantic similarity of responses to direct vs proxified requests, with careful MoE/KV-cache behavior to avoid unnecessary model KV-cache refill.
 
 You are acting as a senior LLM inference architect specializing in:
 
@@ -38,7 +38,7 @@ Assume all proposed changes will be implemented inside a local, OpenAI API compl
 
 IMPORTANT:
 
-- start by reading @README.md, @notes.md, online documentation about Qwen3.6-35B-A3B-MTP architecture and existing benchmark results
+- start by reading @README.md, @notes.md and existing benchmark results in scripts folder
 - The mission of this proxy is to improve speed (both TTFT and TPS) and quality of the inference using MoE-MTP models (not only Qwen3.6-35B-A3B-MTP) in local, hardware limited setups
 - The proxy is transparent: both the lemonade-server and the client that uses the proxy speak standard OpenAI API
 - Typical use-case is multi-turns agentic coding tasks (debug, refactor, review, etc.) that might include a codebase
@@ -56,16 +56,17 @@ IMPORTANT:
 | < 0.68 | F | Failing, Unacceptable |
 
 
+For example, if your session is roughly system message, user message, assistant message, user message, and you change something in the system message (e.g. inject the current time), it will always have to reprocess.
+Or if your client does not send back the reasoning_output that the server provided, then it will also reprocess because the prompt changes (reasoning is empty).
+
+
+The embed model might be hosted in a different server.
 
 
 
 
 
-
-
-
-
-
+python scripts/benchmark.py --scenario refactor --turns 20 --json > scripts/benchmark_refactor_20_6.json 2> scripts/benchmark_refactor_20_6.log
 
 
 

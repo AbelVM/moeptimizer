@@ -26,6 +26,26 @@ from moeptimizer.mtp_speculative import (
 logger = logging.getLogger(__name__)
 
 _CUSTOM_SESSION_FIELDS = {"_session_id", "_session_state"}
+_UNSUPPORTED_EXTRA_BODY_KEYS = {
+    "speculative_decoding",
+    "mtp_heads",
+    "head_temperatures",
+    "expert_hints",
+    "kv_cache_warmup",
+    "cache_control_hints",
+}
+
+
+def _strip_unsupported_extra_body(params: dict[str, Any]) -> dict[str, Any]:
+    """Remove proxy-internal fields that are not part of standard OpenAI API."""
+    extra_body = params.get("extra_body")
+    if isinstance(extra_body, dict):
+        params["extra_body"] = {
+            key: value
+            for key, value in extra_body.items()
+            if key not in _UNSUPPORTED_EXTRA_BODY_KEYS
+        }
+    return params
 
 
 def _strip_custom_session_fields(params: dict[str, Any]) -> dict[str, Any]:
@@ -256,7 +276,7 @@ class LemonadeClient:
     ) -> Any:
         """Send a chat completion request without re-entering speculative decoding."""
         response = await self._client.chat.completions.create(
-            **_strip_custom_session_fields(params),
+            **_strip_custom_session_fields(_strip_unsupported_extra_body(params)),
         )
 
         # Log response summary
@@ -296,14 +316,15 @@ class LemonadeClient:
         Yields:
             ChatCompletionChunk objects
         """
-        async for chunk in await self.chat_completions_create(
+        stream = self.chat_completions_create(
             messages=messages,
             model=model,
             temperature=temperature,
             stream=True,
             max_tokens=max_tokens,
             **kwargs,
-        ):
+        )
+        async for chunk in stream:  # type: ignore[attr-defined]
             yield chunk
 
     @property

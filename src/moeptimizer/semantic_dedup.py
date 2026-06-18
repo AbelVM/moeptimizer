@@ -74,8 +74,11 @@ class SemanticDeduplicator:
                 self._stats["similar_pairs_checked"] += 1
                 similarity = self._cosine_similarity(embeddings[i], embeddings[j])
                 if similarity >= self._similarity_threshold:
-                    # Remove the older message (higher index)
-                    to_remove.add(j)
+                    # Keep the newer message. Dropping newer user constraints or
+                    # assistant answers is more harmful than dropping older ones.
+                    if messages[i].get("role") == "system" or messages[j].get("role") == "system":
+                        continue
+                    to_remove.add(i)
                     self._stats["duplicates_found"] += 1
 
         # Build result without duplicates

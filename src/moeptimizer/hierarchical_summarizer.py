@@ -45,6 +45,7 @@ class HierarchicalSummarizer:
             "turns_compressed": 0,
             "recall_tokens_created": 0,
         }
+        self._last_context_changed = False
 
     def summarize_turns(
         self,
@@ -190,6 +191,7 @@ class HierarchicalSummarizer:
         }
 
         self._summaries[summary_id] = full_summary
+        self._last_context_changed = True
         while len(self._summaries) > 100:
             self._summaries.popitem(last=False)
 
@@ -260,15 +262,19 @@ class HierarchicalSummarizer:
             "turns_compressed": 0,
             "recall_tokens_created": 0,
         }
+        self._last_context_changed = True
 
-    def save_to_disk(self) -> None:
+    def save_to_disk(self, force: bool = False) -> None:
         """Persist summaries to disk."""
+        if not force and not self._last_context_changed:
+            return
         try:
             _PERSISTENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 k: v for k, v in self._summaries.items()
             }
             _PERSISTENCE_PATH.write_text(json.dumps(data))
+            self._last_context_changed = False
         except Exception as e:
             logger.warning("[HierarchicalSummary] Failed to save: %s", e)
 
@@ -279,6 +285,8 @@ class HierarchicalSummarizer:
         try:
             data = json.loads(_PERSISTENCE_PATH.read_text())
             self._summaries = OrderedDict(data)
+            while len(self._summaries) > 100:
+                self._summaries.popitem(last=False)
         except Exception as e:
             logger.warning("[HierarchicalSummary] Failed to load: %s", e)
 

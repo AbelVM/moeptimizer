@@ -234,6 +234,9 @@ class CodeDeltaEncoder:
             self._snapshots = OrderedDict(data.get("snapshots", {}))
             self._deltas = OrderedDict(data.get("deltas", {}))
             self._stats = data.get("stats", self._stats)
+            while len(self._snapshots) > self._max_snapshots:
+                old_key, _ = self._snapshots.popitem(last=False)
+                self._deltas.pop(old_key, None)
         except Exception as e:
             logger.warning("[DeltaEncoder] Failed to load: %s", e)
 

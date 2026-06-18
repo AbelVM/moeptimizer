@@ -1,7 +1,5 @@
 """Tests for hierarchical_summarizer module."""
 
-import pytest
-
 from moeptimizer.hierarchical_summarizer import (
     HierarchicalSummarizer,
     get_hierarchical_summarizer,
@@ -51,7 +49,7 @@ class TestHierarchicalSummarizer:
             {"role": "assistant", "content": "Response 3"},
         ]
         result = self.summarizer.summarize_turns(messages)
-        summary_msg = [m for m in result if m.get("_summary_id")][0]
+        summary_msg = next(m for m in result if m.get("_summary_id"))
         expanded = self.summarizer.expand_summary(summary_msg)
         assert expanded["_summary_level"] == 2
 

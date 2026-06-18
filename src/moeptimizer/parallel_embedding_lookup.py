@@ -88,18 +88,7 @@ class ParallelEmbeddingLookup:
         texts: list[str],
         embed_fn,
     ) -> list[Any]:
-        """Async version: embed a batch of texts concurrently.
-
-        Uses asyncio.gather to run embeddings concurrently within
-        the async event loop.
-
-        Args:
-            texts: List of text strings to embed
-            embed_fn: Async function to embed a single text
-
-        Returns:
-            List of embeddings in the same order as texts
-        """
+        """Async version: embed a batch of texts concurrently."""
         if not texts:
             return []
 
@@ -112,38 +101,50 @@ class ParallelEmbeddingLookup:
             return list(await asyncio.gather(*(embed_fn(t) for t in texts)))
 
         try:
-            loop = asyncio.get_event_loop()
-            results = loop.run_until_complete(_gather())
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            # Already in async context
             results = asyncio.run(_gather())
+        else:
+            if loop.is_running():
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="async_runner",
+                ) as pool:
+                    results = pool.submit(
+                        lambda: asyncio.new_event_loop().run_until_complete(_gather())
+                    ).result()
+            else:
+                results = loop.run_until_complete(_gather())
 
         self._stats["batches_processed"] += 1
         return results
+
 
     def _run_async_in_sync(self, coro_fn, *args) -> Any:
         """Run an async function from a sync context."""
         import asyncio
 
-        coro = coro_fn(*args)
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Create a new loop in a separate thread
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="async_runner",
-                ) as pool:
-                    return pool.submit(
-                        lambda: asyncio.new_event_loop().run_until_complete(coro)
-                    ).result()
-            return loop.run_until_complete(coro)
+            loop = asyncio.get_running_loop()
         except RuntimeError:
+            return asyncio.run(coro_fn(*args))
+
+        if not loop.is_running():
+            return loop.run_until_complete(coro_fn(*args))
+
+        def _runner() -> Any:
             new_loop = asyncio.new_event_loop()
             try:
-                return new_loop.run_until_complete(coro)
+                asyncio.set_event_loop(new_loop)
+                return new_loop.run_until_complete(coro_fn(*args))
             finally:
                 new_loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="async_runner",
+        ) as pool:
+            return pool.submit(_runner).result()
 
     def shutdown(self) -> None:
         """Shutdown the thread pool executor."""

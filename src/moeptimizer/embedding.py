@@ -73,9 +73,11 @@ class EmbeddingService:
             self._lancedb_db = None
 
     async def close(self) -> None:
-        """Close HTTP client."""
+        """Close HTTP client and LanceDB connection if available."""
         if self._http_client:
             await self._http_client.aclose()
+        if self._lancedb_db is not None and hasattr(self._lancedb_db, "close"):
+            self._lancedb_db.close()
 
     async def get_embedding(self, text: str) -> NDArray[np.float32]:
         """Get an embedding for the given text, using cache when possible."""
@@ -121,8 +123,17 @@ class EmbeddingService:
             return zero_vec
 
     def _sync_get_embedding(self, text: str) -> NDArray[np.float32]:
-        """Synchronous embedding (for use in thread pools)."""
-        loop = _get_sync_loop()
+        """Synchronous embedding helper safe from sync or async contexts."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.get_embedding(text))
+
+        if loop.is_running():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(
+                    lambda: asyncio.new_event_loop().run_until_complete(self.get_embedding(text))
+                ).result()
         return loop.run_until_complete(self.get_embedding(text))
 
     def embed_batch_sync(self, texts: list[str]) -> list[NDArray[np.float32]]:

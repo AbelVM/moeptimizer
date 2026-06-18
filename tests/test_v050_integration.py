@@ -136,6 +136,8 @@ class TestV050Integration:
         self.optimizer.static_prefix_kv = None
         self.optimizer.hit_prediction = None
         self.optimizer._config.agentic.compaction_trigger_ratio = 0.01
+        self.optimizer._config.agentic.optimize_code_blocks = True
+        self.optimizer._config.agentic.fast_path_enabled = False
 
         messages = _build_messages(
             ("system", "System"),

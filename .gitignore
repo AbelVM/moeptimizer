@@ -6,6 +6,7 @@ old/
 benchmark_*.json
 notes.md
 notes2.md
+.kilo/
 
 # C extensions
 *.so

@@ -1,7 +1,5 @@
 """Tests for static_prefix_kv module."""
 
-import pytest
-
 from moeptimizer.static_prefix_kv import StaticPrefixKVCache, get_static_prefix_kv_cache
 
 
@@ -102,6 +100,17 @@ class TestStaticPrefixKVCache:
         assert stats["hits"] == 2
         assert stats["misses"] == 1
         assert stats["entries"] == 1
+
+    def test_save_to_disk_skips_unchanged_cache(self) -> None:
+        """Disk persistence is skipped unless cache contents changed."""
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "User"},
+        ]
+        self.cache.put(messages, b"data")
+        self.cache.save_to_disk()
+        self.cache.save_to_disk()
+        assert self.cache.get_stats()["entries"] == 1
 
     def test_global_instance(self) -> None:
         cache = get_static_prefix_kv_cache()

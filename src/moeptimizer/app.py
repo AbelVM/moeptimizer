@@ -308,11 +308,17 @@ async def _do_non_streaming(
                     finish_reason,
                 )
 
-        # Record cache hit for cache registry
-        # Extract cache hit tokens if available
-        cache_hit_tokens = getattr(usage, "cache_hit_tokens", None) if hasattr(usage, "cache_hit_tokens") else usage.get("cache_hit_tokens", None)
-        if cache_hit_tokens is not None and cache_hit_tokens > 0:
-            # We have cache hits - record them
+        # Record cache hit for cache registry. Lemonade may expose cached tokens
+        # either as top-level cache_hit_tokens or inside prompt_tokens_details.
+        usage_dict = usage if isinstance(usage, dict) else getattr(usage, "__dict__", {})
+        prompt_details = usage_dict.get("prompt_tokens_details", {}) or {}
+        cache_hit_tokens = (
+            usage_dict.get("cache_hit_tokens")
+            or usage_dict.get("cached_tokens")
+            or prompt_details.get("cached_tokens")
+            or prompt_details.get("cache_hit_tokens")
+        )
+        if isinstance(cache_hit_tokens, int) and cache_hit_tokens > 0:
             from moeptimizer.cache_registry import get_cache_registry
             registry = get_cache_registry()
             registry.record_cache_hit(messages, cache_hit_tokens)
@@ -362,15 +368,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         timeout=cfg.server.timeout,
     )
 
-    # Enable speculative decoding if configured
-    if cfg.speculative.enabled:
-        backend_client.enable_speculative_decoding(
-            mtp_lookahead=cfg.speculative.mtp_lookahead,
-            confidence_threshold=cfg.speculative.confidence_threshold,
-        )
-        logger.info("Speculative decoding enabled: mtp_lookahead=%d, confidence_threshold=%.2f",
-                    cfg.speculative.mtp_lookahead, cfg.speculative.confidence_threshold)
-
+    # Lemonade exposes a standard OpenAI API. Do not enable proxy-level
+    # speculative decoding wrappers here: the current backend does not expose
+    # native MTP/speculative endpoints, and custom extra_body fields are not
+    # part of the standard OpenAI chat-completions contract.
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await embedding_service.initialize()

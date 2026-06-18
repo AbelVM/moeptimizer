@@ -1,6 +1,7 @@
 """Tests for the full optimizer pipeline — front-loading eviction strategy."""
 
 import json
+from unittest.mock import patch
 
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer
@@ -152,9 +153,10 @@ class TestAgentContextOptimizer:
         assert len(new_optimizer.store.steps) == len(self.optimizer.store.steps)
 
     def test_attention_sink_markers_survive_final_output(self) -> None:
-        """Attention sink markers are model-visible and must not be stripped."""
+        """Attention sink markers are model-visible when explicitly enabled."""
         config = AppConfig()
         config.agentic.max_optimized_chars = 20000
+        config.agentic.attention_sinks_enabled = True
         optimizer = AgentContextOptimizer(config)
         long_unique_words = " ".join(f"unique_token_{i}" for i in range(900))
 
@@ -166,10 +168,30 @@ class TestAgentContextOptimizer:
         system_content = result[0].get("content", "")
         assert "STATIC_LAYER_END" in system_content
 
-    def test_context_compressor_skips_lean_contexts(self) -> None:
-        """Lean contexts keep full code bodies instead of skeletonizing them."""
+    def test_fast_path_preserves_lean_context_and_strips_proxy_fields(self) -> None:
+        """Lean contexts should bypass transformations while removing proxy-only fields."""
         config = AppConfig()
         config.agentic.max_optimized_chars = 20000
+        optimizer = AgentContextOptimizer(config)
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Explain this function", "chunk_index": 0},
+            {"role": "assistant", "content": "I can help."},
+        ]
+
+        result = optimizer.optimize_messages(messages)
+
+        assert len(result) == len(messages)
+        assert "chunk_index" not in result[1]
+        assert result[1]["content"] == "Explain this function"
+
+    def test_padding_and_code_optimization_are_disabled_by_default(self) -> None:
+        """Quality target prefers exact prompts and exact code unless explicitly enabled."""
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 20000
+        config.agentic.static_layer_alignment_enabled = False
+        config.agentic.reasoning_preseed_enabled = False
+        config.agentic.optimize_code_blocks = False
         optimizer = AgentContextOptimizer(config)
         code = "def double(x):\n    return x * 2\n"
 
@@ -178,4 +200,114 @@ class TestAgentContextOptimizer:
             {"role": "user", "content": f"Use this code:\n```python\n{code}\n```"},
         ])
 
-        assert code.strip() in "\n".join(m.get("content", "") for m in result)
+        joined = "\n".join(m.get("content", "") for m in result)
+        assert "Use this code:" in joined
+        assert code.strip() in joined
+        assert "Let's reason step by step" not in joined
+
+    def test_large_code_blocks_are_skeletonized_after_proactive_threshold(self) -> None:
+        """Huge codebases should become lean skeletons once proactive pressure starts."""
+        config = AppConfig()
+        config.agentic.max_optimized_tokens = 1000
+        config.agentic.proactive_trim_ratio = 0.001
+        config.agentic.compaction_trigger_ratio = 0.9
+        config.agentic.fast_path_enabled = False
+        config.agentic.semantic_dedup_enabled = False
+        config.agentic.code_skeleton_enabled = True
+        optimizer = AgentContextOptimizer(config)
+        code = (
+            "import os\n\n"
+            "def process(values):\n"
+            "    total = 0\n"
+            "    for value in values:\n"
+            "        total += value * 2\n"
+            "        if value > 10:\n"
+            "            total += value * 3\n"
+            "    return total\n"
+        )
+
+        result = optimizer.optimize_messages([
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": f"Use this code:\n```python\n{code}\n```"},
+        ])
+
+        joined = "\n".join(m.get("content", "") for m in result)
+        assert "def process(values):" in joined
+        assert "import os" in joined
+        assert "total += value * 2" not in joined
+        assert "..." in joined
+
+    def test_small_code_blocks_remain_exact_during_skeletonization(self) -> None:
+        """Small snippets should remain exact because they often define the task."""
+        config = AppConfig()
+        config.agentic.max_optimized_tokens = 1000
+        config.agentic.proactive_trim_ratio = 0.001
+        config.agentic.fast_path_enabled = False
+        config.agentic.semantic_dedup_enabled = False
+        config.agentic.code_skeleton_enabled = True
+        optimizer = AgentContextOptimizer(config)
+        code = "def double(x):\n    return x * 2\n"
+
+        result = optimizer.optimize_messages([
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": f"Use this code:\n```python\n{code}\n```"},
+        ])
+
+        joined = "\n".join(m.get("content", "") for m in result)
+        assert code.strip() in joined
+
+    def test_proactive_trim_uses_configured_threshold(self) -> None:
+        """Proactive trimming should follow the configured ratio, not a hardcoded value."""
+        config = AppConfig()
+        config.agentic.max_optimized_tokens = 1000
+        config.agentic.proactive_trim_ratio = 0.4
+        config.agentic.compaction_trigger_ratio = 0.9
+        config.agentic.fast_path_enabled = False
+        config.agentic.semantic_dedup_enabled = False
+        optimizer = AgentContextOptimizer(config)
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "word " * 700},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def capture_trim(msgs: object, target: int, **kwargs: object) -> object:
+            calls.append(((msgs, target), kwargs))
+            return msgs
+
+        with patch.object(
+            optimizer,
+            "_proactive_trim",
+            side_effect=capture_trim,
+        ):
+            optimizer.optimize_messages(messages)
+
+        assert len(calls) == 1
+        assert calls[0][0][1] == 400
+        assert calls[0][1]["use_tokens"] is True
+
+    def test_semantic_dedup_runs_after_proactive_threshold(self) -> None:
+        """Semantic dedup supports leanness once proactive threshold is exceeded."""
+        config = AppConfig()
+        config.agentic.max_optimized_tokens = 1000
+        config.agentic.proactive_trim_ratio = 0.4
+        config.agentic.compaction_trigger_ratio = 0.9
+        config.agentic.fast_path_enabled = False
+        config.agentic.semantic_dedup_enabled = True
+        optimizer = AgentContextOptimizer(config)
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "word " * 700},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        with patch.object(
+            optimizer.semantic_deduplicator,
+            "deduplicate",
+            side_effect=lambda msgs, embedding_service: msgs,
+        ) as dedup:
+            optimizer.optimize_messages(messages)
+
+        dedup.assert_called_once()

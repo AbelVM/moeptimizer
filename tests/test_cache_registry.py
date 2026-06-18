@@ -68,6 +68,15 @@ class TestCacheKeyRegistry:
         ]
         assert registry.register_context(user_first) != registry.register_context(assistant_first)
 
+    def test_save_to_disk_skips_unchanged_registry(self) -> None:
+        """Disk persistence is skipped unless a new cache entry was created."""
+        registry = CacheKeyRegistry()
+        messages = [{"role": "user", "content": "Test"}]
+        registry.register_context(messages)
+        registry.save_to_disk()
+        registry.save_to_disk()
+        assert registry.get_cache_stats()["total_entries"] == 1
+
     def test_singleton(self) -> None:
         """Get cache registry returns singleton."""
         registry1 = get_cache_registry()

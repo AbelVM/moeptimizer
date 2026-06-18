@@ -13,8 +13,14 @@ class TestConfig:
         assert config.agentic.keep_full_steps == 5
         assert config.agentic.max_optimized_chars == 20000
         assert config.agentic.max_optimized_tokens == 5000
-        assert config.agentic.proactive_trim_ratio == 0.7
+        assert config.agentic.proactive_trim_ratio == 0.6
         assert config.agentic.compaction_trigger_ratio == 0.9
+        assert config.agentic.fast_path_enabled is True
+        assert config.agentic.optimize_code_blocks is False
+        assert config.agentic.code_skeleton_enabled is True
+        assert config.agentic.semantic_dedup_enabled is True
+        assert config.agentic.static_layer_alignment_enabled is False
+        assert config.agentic.reasoning_preseed_enabled is False
 
     def test_env_override(self) -> None:
         os.environ["MOEPT_SERVER__URL"] = "http://test:9999/api/v1"

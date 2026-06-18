@@ -67,8 +67,8 @@ class TestLemonadeClient:
         client.enable_speculative_decoding()
         assert client.speculative_decoder is not None
 
-    async def test_chat_completions_create_forwards_extra_body(self) -> None:
-        """Chat completion requests forward backend optimization hints."""
+    async def test_chat_completions_create_forwards_standard_extra_body(self) -> None:
+        """Chat completion requests forward standard OpenAI-compatible extra_body."""
         client = LemonadeClient(base_url="http://localhost:13305/api/v1")
         fake = _FakeClient()
         client._client = fake  # type: ignore[assignment]
@@ -76,15 +76,35 @@ class TestLemonadeClient:
         await client.chat_completions_create(
             messages=[{"role": "user", "content": "hello"}],
             model="test-model",
-            extra_body={"kv_cache_warmup": {"enabled": True}},
+            extra_body={"metadata": {"purpose": "test"}},
         )
 
         assert fake.chat.completions.kwargs["extra_body"] == {
-            "kv_cache_warmup": {"enabled": True},
+            "metadata": {"purpose": "test"},
         }
 
-    async def test_speculative_decoder_merges_extra_body(self) -> None:
-        """Enabled speculative decoding still preserves caller extra_body hints."""
+    async def test_chat_completions_create_strips_proxy_internal_extra_body(self) -> None:
+        """Proxy-internal MTP/KV fields must not reach Lemonade."""
+        client = LemonadeClient(base_url="http://localhost:13305/api/v1")
+        fake = _FakeClient()
+        client._client = fake  # type: ignore[assignment]
+
+        await client.chat_completions_create(
+            messages=[{"role": "user", "content": "hello"}],
+            model="test-model",
+            extra_body={
+                "metadata": {"purpose": "test"},
+                "kv_cache_warmup": {"enabled": True},
+                "expert_hints": [{"position": 0, "experts": [1]}],
+            },
+        )
+
+        assert fake.chat.completions.kwargs["extra_body"] == {
+            "metadata": {"purpose": "test"},
+        }
+
+    async def test_speculative_decoder_does_not_inject_nonstandard_extra_body(self) -> None:
+        """Enabled speculative wrapper must not send unsupported Lemonade fields."""
         client = LemonadeClient(base_url="http://localhost:13305/api/v1")
         client.enable_speculative_decoding(mtp_lookahead=2)
         fake = _FakeClient()
@@ -98,9 +118,8 @@ class TestLemonadeClient:
 
         extra_body = fake.chat.completions.kwargs["extra_body"]
         assert isinstance(extra_body, dict)
-        assert extra_body["speculative_decoding"]["enabled"] is True
-        assert extra_body["speculative_decoding"]["mtp_lookahead"] == 2
-        assert extra_body["expert_hints"] == [{"position": 0, "experts": [1]}]
+        assert "speculative_decoding" not in extra_body
+        assert "expert_hints" not in extra_body
 
     async def test_chat_completions_create_strips_custom_session_fields(self) -> None:
         """Internal session fields must not reach a standard OpenAI backend."""

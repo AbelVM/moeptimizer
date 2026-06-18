@@ -44,6 +44,7 @@ class CacheKeyRegistry:
         self._entries: OrderedDict[str, CacheEntry] = OrderedDict()
         self._prefix_entries: OrderedDict[str, CacheEntry] = OrderedDict()
         self._max_size = max_size
+        self._last_context_changed = False
 
     def record_cache_hit(
         self,
@@ -98,6 +99,7 @@ class CacheKeyRegistry:
                 context_hash=self._hash_content(context),
             )
             entries[key] = entry
+            self._last_context_changed = True
 
     def register_context(
         self,
@@ -160,6 +162,7 @@ class CacheKeyRegistry:
                 context_hash=self._hash_content(context),
             )
             entries[key] = entry
+            self._last_context_changed = True
 
     def predict_hit_rate(
         self,
@@ -295,9 +298,12 @@ class CacheKeyRegistry:
         """Clear the registry."""
         self._entries.clear()
         self._prefix_entries.clear()
+        self._last_context_changed = True
 
-    def save_to_disk(self) -> None:
+    def save_to_disk(self, force: bool = False) -> None:
         """Persist cache registry to disk for cross-session reuse."""
+        if not force and not self._last_context_changed:
+            return
         PERSISTENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "entries": {
@@ -308,6 +314,7 @@ class CacheKeyRegistry:
             },
         }
         PERSISTENCE_PATH.write_text(json.dumps(data))
+        self._last_context_changed = False
 
     def load_from_disk(self) -> None:
         """Load cache registry from disk."""
@@ -319,6 +326,8 @@ class CacheKeyRegistry:
                 self._entries[k] = CacheEntry(**v)
             for k, v in data.get("prefix_entries", {}).items():
                 self._prefix_entries[k] = CacheEntry(**v)
+            self._evict_old_entries(self._entries)
+            self._evict_old_entries(self._prefix_entries)
         except Exception:
             pass  # Ignore errors, start fresh
 
