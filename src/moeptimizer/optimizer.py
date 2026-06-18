@@ -38,7 +38,6 @@ import numpy as np
 from moeptimizer.async_io_stage import get_async_io_stage
 from moeptimizer.attention_sink import apply_attention_sinks
 from moeptimizer.cache import (
-    align_to_block_boundary,
     get_block_aligned_cache_key,
     get_block_size,
 )
@@ -111,6 +110,7 @@ _OPENAI_MESSAGE_KEYS = {
     "name",
     "tool_calls",
     "tool_call_id",
+    "reasoning_content",
     "refusal",
 }
 
@@ -430,7 +430,6 @@ class AgentContextOptimizer:
         # instead of letting it bypass proactive trim on short contexts.
         try:
             current_tokens = self.token_counter.count_messages(optimized)
-            pre_compaction_tokens = current_tokens
             if current_tokens > compaction_threshold_tokens:
                 optimized = self.compactor.compact_messages(optimized)
             else:
@@ -463,16 +462,9 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Selective truncation failed: %s", e)
 
-        # Step 7.6: Apply semantic deduplication when explicitly enabled and
-        # proactive leanness pressure makes duplicate removal worthwhile.
-        if self._config.agentic.semantic_dedup_enabled and total_tokens > proactive_threshold_tokens:
-            try:
-                optimized = self.semantic_deduplicator.deduplicate(
-                    optimized,
-                    self.embedding_service,
-                )
-            except Exception as e:
-                logger.warning("Semantic deduplication failed: %s", e)
+        # Step 7.6: Semantic deduplication is disabled for cache-stable mode.
+        # Removing messages from the middle of history changes the serialized
+        # prompt prefix even when the remaining text is semantically similar.
 
         # Step 7.7: Apply dependency ordering for cache locality
         try:
@@ -492,21 +484,16 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Pre-RAG recount failed: %s", e)
 
-        # Step 8: Inject RAG context and loop warnings as SEPARATE user messages.
-        # RAG is quality-preserving for long histories but should not add tokens to
-        # already-lean contexts. Loop warnings remain safety-critical.
+        # Step 8: Append RAG context and loop warnings to the newest user turn.
+        # Do not create extra user messages after the active prompt; volatile
+        # context must be part of the last turn to preserve chat structure.
         try:
-            if loop_warnings:
-                warning_lines: list[str] = []
-                for w in loop_warnings:
-                    warning_message = self.loop_detector.get_warning_message(w)
-                    warning_lines.append(warning_message.replace("[LOOP DETECTED: ", "Loop detected: "))
-                if warning_lines:
-                    optimized.append({
-                        "role": "user",
-                        "content": "\n".join(warning_lines),
-                    })
+            warning_lines: list[str] = []
+            for w in loop_warnings:
+                warning_message = self.loop_detector.get_warning_message(w)
+                warning_lines.append(warning_message.replace("[LOOP DETECTED: ", "Loop detected: "))
 
+            rag_context = ""
             rag_tokens = self.token_counter.count_messages(optimized)
             if self._config.agentic.rag_enabled and rag_tokens > proactive_threshold_tokens:
                 last_assistant = None
@@ -522,12 +509,30 @@ class AgentContextOptimizer:
                         tool_name=None,
                         metadata=last_assistant.get("metadata", {}),
                     )
-                    rag_context = self.state_rag.get_context_for_step(current_step)
-                    if rag_context:
-                        optimized.append({
-                            "role": "user",
-                            "content": rag_context,
-                        })
+                    rag_context = self.state_rag.get_context_for_step(current_step) or ""
+
+            extras = []
+            if warning_lines:
+                extras.append("\n".join(warning_lines))
+            if rag_context:
+                extras.append(rag_context)
+            if extras:
+                last_user_idx = -1
+                for idx in range(len(optimized) - 1, -1, -1):
+                    if optimized[idx].get("role") == "user":
+                        last_user_idx = idx
+                        break
+
+                if last_user_idx >= 0:
+                    user_msg = optimized[last_user_idx]
+                    content = user_msg.get("content", "")
+                    if not isinstance(content, str):
+                        content = str(content)
+                    suffix = "\n\n".join(extras)
+                    optimized[last_user_idx] = {
+                        **user_msg,
+                        "content": f"{content}\n\n{suffix}" if content else suffix,
+                    }
         except Exception as e:
             logger.warning("RAG/loop warning injection failed: %s", e)
 
@@ -537,21 +542,9 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Post-RAG recount failed: %s", e)
 
-        # Step 8.5: Apply hierarchical summarization for long, over-budget
-        # conversations before static-layer and MTP boundary alignment.
-        try:
-            if self.hierarchical_summarizer is not None and (
-                pre_compaction_tokens > compaction_threshold_tokens
-                or self._should_run_hierarchical_summary(
-                    optimized,
-                    compaction_threshold_tokens,
-                )
-            ):
-                optimized = self.hierarchical_summarizer.summarize_turns(optimized)
-                total_tokens = self.token_counter.count_messages(optimized)
-                total_chars = sum(len(m.get("content", "")) for m in optimized)
-        except Exception as e:
-            logger.warning("Hierarchical summarization failed: %s", e)
+        # Step 8.5: Hierarchical summarization is disabled for cache-stable mode.
+        # Summary messages inserted in the middle of history change the prompt
+        # prefix and violate top-only eviction.
 
         # Step 8: Apply static layer block alignment only when explicitly
         # enabled. Padding adds tokens and can change prompt semantics.
@@ -781,9 +774,6 @@ class AgentContextOptimizer:
         - Section markers (<!-- STATIC/CONTEXT/DYNAMIC_LAYER -->)
         - Proxy-only fields such as chunk_index
         - Any other _prefixed keys (future-proof)
-
-        Attention sink markers are intentionally left in place because they are
-        model-visible tokens used to stabilize long-context attention.
         """
         result: list[dict[str, Any]] = []
         internal_prefix = "_"
@@ -802,7 +792,8 @@ class AgentContextOptimizer:
                 for key, value in msg.items()
                 if key in _OPENAI_MESSAGE_KEYS and not key.startswith(internal_prefix)
             }
-            cleaned["content"] = content
+            if "content" in msg or msg.get("role") != "assistant":
+                cleaned["content"] = content
             result.append(cleaned)
 
         return result
@@ -812,7 +803,12 @@ class AgentContextOptimizer:
         messages: list[dict[str, Any]],
         proactive_threshold_tokens: int,
     ) -> list[dict[str, Any]]:
-        """Add a compact task-memory anchor when compaction may evict requirements."""
+        """Append a compact task-memory anchor to the last user turn only.
+
+        The system prompt and historical turns are immutable once sent. Any
+        derived/volatile context must be appended to the newest user message so
+        llama.cpp can keep the common prefix stable across turns.
+        """
         if not messages or self.token_counter.count_messages(messages) <= proactive_threshold_tokens:
             return messages
         if self._budget_tokens() <= 100:
@@ -824,24 +820,47 @@ class AgentContextOptimizer:
 
         marker = "\n\n# Conversation Quality Anchor\n"
         result = [dict(msg) for msg in messages]
-        if result and result[0].get("role") == "system":
-            content = result[0].get("content", "") or ""
-            prefix, separator, existing = content.partition(marker)
-            if separator and existing == anchor:
-                return messages
-            result[0] = {**result[0], "content": f"{prefix}{marker}{anchor}"}
+        last_user_idx = -1
+        for idx in range(len(result) - 1, -1, -1):
+            if result[idx].get("role") == "user":
+                last_user_idx = idx
+                break
+
+        if last_user_idx < 0:
+            result.append({"role": "user", "content": f"{marker}{anchor}"})
             return result
 
-        result.insert(0, {"role": "system", "content": f"{marker}{anchor}"})
+        user_msg = result[last_user_idx]
+        content = user_msg.get("content", "")
+        if not isinstance(content, str):
+            return messages
+
+        existing_anchor = f"{marker}{anchor}"
+        if content.endswith(existing_anchor):
+            return messages
+
+        # Avoid nesting prior anchors inside the new anchor text.
+        stripped = re.sub(
+            re.escape(marker) + r"[\s\S]*$",
+            "",
+            content,
+        )
+        result[last_user_idx] = {
+            **user_msg,
+            "content": f"{stripped}{existing_anchor}",
+        }
         return result
 
     def _build_quality_anchor(self, messages: list[dict[str, Any]]) -> str:
         """Build a compact anchor from the original request and short constraints."""
-        user_messages = [
-            msg.get("content", "")
-            for msg in messages
-            if msg.get("role") == "user" and isinstance(msg.get("content", ""), str)
-        ]
+        marker = "\n\n# Conversation Quality Anchor\n"
+        user_messages = []
+        for msg in messages:
+            if msg.get("role") == "user" and isinstance(msg.get("content", ""), str):
+                content = msg.get("content", "")
+                if marker in content:
+                    content = content.split(marker, 1)[0]
+                user_messages.append(content)
         if not user_messages:
             return ""
 
@@ -1218,47 +1237,12 @@ class AgentContextOptimizer:
         return [m for pair in pairs for m in pair]
 
     def _align_static_layer(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Align static layer to block boundary for cache optimization.
+        """No-op: never pad or modify the static layer sent to the model.
 
-        Pads the static layer (system + first user) to align to
-        CONTEXT_BLOCK_SIZE boundary, improving prefix cache hit rates.
-        Only applies padding if it doesn't exceed budget.
+        Cache-block alignment is useful only as an internal cache-key concept.
+        Adding newlines to system or first-user messages changes the literal
+        prompt and forces llama.cpp to re-prefill the static prefix.
         """
-        if not messages:
-            return messages
-
-        # Find static layer end (system + first user)
-        static_end = 0
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "system":
-                static_end = i + 1
-            elif (msg.get("role") == "user" and static_end > 0) or (msg.get("role") == "user" and static_end == 0):
-                static_end = i + 1
-                break
-
-        if static_end == 0:
-            return messages
-
-        # Calculate current static layer size
-        static_content = "\n".join(
-            m.get("content", "") for m in messages[:static_end]
-        )
-        aligned_content = align_to_block_boundary(static_content)
-
-        # Only add padding if it's small and won't break the budget
-        # (padding is for cache alignment, not content)
-        padding_needed = len(aligned_content) - len(static_content)
-        # Only pad if less than 100 newlines (small alignment)
-        if padding_needed > 0 and padding_needed < 100:
-            # Create a copy of messages to avoid mutation
-            result = [dict(m) for m in messages]
-            # Add padding to the last static message
-            result[static_end - 1] = {
-                **result[static_end - 1],
-                "content": result[static_end - 1].get("content", "") + "\n" * padding_needed,
-            }
-            return result
-
         return messages
 
     def _apply_syntax_stable_mtp(
@@ -1490,121 +1474,88 @@ class AgentContextOptimizer:
         overlap_size: int = 256,
         use_tokens: bool = False,
     ) -> list[dict[str, Any]]:
-        """Apply sliding window with MTP state preservation.
+        """Drop whole old turns from the top while preserving the static prefix.
 
-        Uses a sliding window approach that preserves MTP state in the overlap region.
-        This maintains prediction quality across context switches.
-
-        Args:
-            messages: The message list to trim
-            window_size: Target size (chars or tokens depending on use_tokens)
-            overlap_size: Size of overlap region for state continuity
-            use_tokens: If True, window_size is in tokens; if False, in characters
+        The model-visible chat history must remain a contiguous prefix. This
+        method never truncates message content and never inserts a middle summary;
+        it only removes complete user/assistant turns from the front of the
+        dynamic layer after the immutable system message.
         """
+        del overlap_size
+
         if window_size is None:
-            window_size = self._config.agentic.max_optimized_chars
+            window_size = self._budget_tokens() if use_tokens else self._config.agentic.max_optimized_chars
 
-        if use_tokens:
-            total_tokens = self.token_counter.count_messages(messages)
-            if total_tokens <= window_size:
-                return messages
-        else:
-            total_chars = sum(len(m.get("content", "")) for m in messages)
-            if total_chars <= window_size:
-                return messages
+        if not messages:
+            return messages
 
-        # Find static layer
         static_end = self._find_static_layer_end(messages)
-        static_chars = sum(len(m.get("content", "")) for m in messages[:static_end])
-        static_tokens = (
-            self.token_counter.count_messages(messages[:static_end])
-            if use_tokens
-            else static_chars // 4
-        )
-
-        # If static layer alone exceeds window, keep the most recent request
-        # context rather than silently dropping the active user turn.
-        if (use_tokens and static_tokens >= window_size) or (not use_tokens and static_chars >= window_size):
-            tail = messages[-min(2, len(messages)):]
-            return [dict(m) for m in tail]
-
-        # Calculate available space for dynamic content
-        available = window_size - static_tokens if use_tokens else window_size - static_chars
-
-        # Keep the newest suffix of the dynamic layer while preserving message
-        # order. This is the actual sliding-window behavior; the overlap is the
-        # suffix that remains in the model context across evictions.
-        result = [dict(m) for m in messages[:static_end]]
+        static_messages = messages[:static_end]
         dynamic_messages = messages[static_end:]
-        selected: list[dict[str, Any]] = []
-        current_size = 0
 
-        for msg in reversed(dynamic_messages):
+        def msg_size(msg: dict[str, Any]) -> int:
             if use_tokens:
-                msg_size = self.token_counter.count_messages([msg])
-            else:
-                msg_size = len(msg.get("content", ""))
+                return self.token_counter.count_messages([msg])
+            return len(msg.get("content", ""))
 
-            if current_size + msg_size <= available or not selected:
-                selected.append(dict(msg))
-                current_size += msg_size
-            else:
-                break
+        static_size = sum(msg_size(msg) for msg in static_messages)
+        if static_size >= window_size:
+            return messages
 
-        result.extend(reversed(selected))
+        if not dynamic_messages:
+            return messages
+
+        # Keep the newest user turn as the active request. Evict only complete
+        # turns from the front of the dynamic layer. A dynamic assistant/tool
+        # message before the next user belongs to that next user's turn.
+        active_turn: list[dict[str, Any]] = []
+        evictable_turns: list[list[dict[str, Any]]] = []
+        current_turn: list[dict[str, Any]] = []
+
+        for msg in dynamic_messages:
+            role = msg.get("role", "")
+            if role == "user":
+                if current_turn:
+                    if current_turn[0].get("role") == "user":
+                        evictable_turns.append(current_turn)
+                    else:
+                        current_turn.append(dict(msg))
+                        evictable_turns.append(current_turn)
+                    current_turn = []
+                else:
+                    current_turn = [dict(msg)]
+            else:
+                current_turn.append(dict(msg))
+
+        if current_turn:
+            if current_turn[0].get("role") == "user":
+                active_turn = current_turn
+            else:
+                evictable_turns.append(current_turn)
+
+        result_turns = list(evictable_turns)
+        while result_turns and static_size + sum(
+            sum(msg_size(msg) for msg in turn) for turn in [*result_turns, active_turn]
+        ) > window_size:
+            result_turns = result_turns[1:]
+
+        result = list(static_messages)
+        for turn in result_turns:
+            result.extend(turn)
+        result.extend(active_turn)
         return result
 
     def _entropy_guided_trim(
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Trim high-entropy content while preserving low-entropy code structures.
+        """No-op: do not mutate tool or user content in the middle of history.
 
-        MTP heads perform better with low-entropy contexts. This method:
-        - Identifies high-entropy "noise" messages (tool logs, errors)
-        - Trims them first while preserving code structures
-        - Never modifies assistant content to avoid KV-cache refill
-        - Never removes assistant messages (they're part of the chat template)
+        Replacing tool output with a summary changes the serialized assistant/tool
+        turn and breaks prefix stability. Budget pressure is handled by dropping
+        whole old turns from the top instead.
         """
-        if not messages:
-            return messages
-
-        # Find static layer (system + first user)
-        static_end = self._find_static_layer_end(messages)
-
-        # Separate static and dynamic
-        static_messages = messages[:static_end]
-        dynamic_messages = messages[static_end:]
-
-        # Only trim tool messages with high entropy
-        # Never trim assistant messages (they're part of the chat template)
-        trimmed_dynamic = []
-        for msg in dynamic_messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-
-            # Always keep assistant messages (chat template integrity)
-            if role == "assistant":
-                trimmed_dynamic.append(msg)
-                continue
-
-            # For tool messages, check entropy
-            if role == "tool" and isinstance(content, str):
-                entropy = self._calculate_message_entropy(content)
-                # High entropy tool output - can be trimmed
-                if entropy > 0.7 and len(content) > 500:
-                    # Replace with summary instead of removing
-                    # This preserves the turn structure
-                    trimmed_dynamic.append({
-                        **msg,
-                        "content": f"[Tool output truncated - {len(content)} chars]",
-                    })
-                else:
-                    trimmed_dynamic.append(msg)
-            else:
-                trimmed_dynamic.append(msg)
-
-        return static_messages + trimmed_dynamic
+        return messages
 
     def _calculate_message_entropy(self, content: str) -> float:
         """Calculate entropy of a message.
@@ -1630,38 +1581,8 @@ class AgentContextOptimizer:
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Stream large tool outputs as separate user messages.
-
-        Large tool outputs are split into chunks to avoid context bloat
-        while maintaining MTP prediction patterns.
-
-        CRITICAL: Tool messages are kept as tool role to preserve turn structure.
-        The model expects user→assistant→tool turn patterns.
-        """
-        result = []
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-
-            if role == "tool" and isinstance(content, str):
-                if self.tool_streamer.should_stream(content):
-                    # Stream as separate tool messages (not user!)
-                    # This preserves the turn structure for the model
-                    tool_name = msg.get("metadata", {}).get("name", "unknown")
-                    streamed = self.tool_streamer.stream_output(content, tool_name)
-                    for i, chunk in enumerate(streamed):
-                        # Keep as tool role, add chunk index for tracking
-                        result.append({
-                            **msg,
-                            "content": chunk,
-                            "chunk_index": i,
-                        })
-                else:
-                    result.append(msg)
-            else:
-                result.append(msg)
-
-        return result
+        """No-op: do not split or rewrite tool messages."""
+        return messages
 
     def get_optimal_temperature(
         self,

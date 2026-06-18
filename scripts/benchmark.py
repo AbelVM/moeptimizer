@@ -21,6 +21,10 @@ Usage:
 
     # Real-life coding scenarios
     python scripts/benchmark.py --scenario debug --turns 15
+    python scripts/benchmark.py --scenario debug_long --turns 30
+    python scripts/benchmark.py --scenario refactor_long --turns 30
+    python scripts/benchmark.py --scenario feature_long --turns 30
+    python scripts/benchmark.py --scenario default_long --turns 30
 
     # Run all scenarios
     python scripts/benchmark.py --scenario all --turns 10
@@ -52,7 +56,400 @@ MODEL_ID = os.environ.get(
 )
 MOEPT_PORT = int(os.environ.get("MOEPT_PORT", "8080"))
 
+# ---------------------------------------------------------------------------
+# Long benchmark scenarios
+# ---------------------------------------------------------------------------
+
+def _long_refactor_code_snippet(turn: int) -> str:
+    """Return a realistic code snippet for a long refactor benchmark."""
+    extra = ""
+    if turn % 3 == 0:
+        extra = """
+
+@dataclass(slots=True)
+class Config:
+    input_path: Path = Path("users.jsonl")
+    dry_run: bool = False
+"""
+    elif turn % 3 == 1:
+        extra = """
+
+class UserService:
+    def __init__(self, repository: UserRepository):
+        self.repository = repository
+
+    def active_count(self) -> int:
+        return sum(1 for user in self.repository.load() if user.active)
+"""
+    else:
+        extra = """
+
+def main() -> None:
+    repository = UserRepository(Path("users.jsonl"))
+    users = repository.load()
+    print(summarize(users))
+"""
+    return f"""from dataclasses import dataclass
+from pathlib import Path
+import json
+
+@dataclass(slots=True)
+class User:
+    id: int
+    name: str
+    active: bool = True
+
+class UserRepository:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def load(self) -> list[User]:
+        users = []
+        with self.path.open() as fh:
+            for line_no, line in enumerate(fh, 1):
+                raw = json.loads(line)
+                users.append(User(id=int(raw["id"]), name=str(raw["name"]), active=bool(raw.get("active", True))))
+        return users
+
+def summarize(users: list[User]) -> dict[str, int | bool]:
+    return {{"count": len(users), "active": sum(1 for user in users if user.active)}}
+{extra}
+"""
+
+
+LONG_REFACTOR_INSTRUCTIONS = [
+    "Start by turning this into a typed, testable module with dataclasses and a clear separation between IO and business logic.",
+    "Now add a `UserRepository` class that reads from a JSONL file, validates the schema, and returns `User` objects instead of raw dicts.",
+    "Next, introduce a `Config` dataclass that loads from environment variables and supports a `dry_run` flag.",
+    "Refactor the summarizer into a service class with dependency injection so tests can swap in a fake repository.",
+    "Add structured logging to the service so each step emits a compact event object.",
+    "Please add a CLI entry point that accepts `--input`, `--output`, and `--dry-run`.",
+    "Now add a pytest suite that covers happy path, missing file, invalid JSONL, and dry-run behavior.",
+    "Add async support with `aiofiles` for the repository and a small async wrapper around the CLI path.",
+    "Refactor the code into a package layout with `src/`, `tests/`, and `pyproject.toml`.",
+    "Add a Dockerfile that installs the package and runs the CLI against a mounted input file.",
+    "Add a GitHub Actions workflow that runs formatting, linting, and tests on push.",
+    "Add a lightweight benchmark script that measures repository load time and summary latency on a 10k-row fixture.",
+    "Add documentation for the package: usage, config, CLI flags, and a short architecture note.",
+    "Add a changelog entry for the refactor and a release checklist.",
+    "Harden the repository against malformed JSONL rows by adding row-level error reporting and a `strict` mode.",
+    "Add metrics emission for load count, parse errors, and summary duration using a simple in-memory metrics object.",
+    "Add observability hooks so the service can export a trace id and propagate it through logs.",
+    "Add a migration path from the old dict-based API to the new typed API.",
+    "Add release notes that explain the new data model, CLI, and async support.",
+    "Do a final cleanup pass: remove dead code, tighten type hints, and make the package easier to navigate.",
+    "Add a streaming API variant that yields processed users one at a time instead of loading everything into memory.",
+    "Add retry logic around file reads with exponential backoff and a max retry count.",
+    "Add localization support for user-facing CLI errors and show how the code chooses a locale.",
+    "Add a performance optimization for the summary step by using `collections.Counter` and avoiding repeated scans where possible.",
+    "Add a plugin hook that allows external validators to be registered and run during repository loading.",
+    "Add config validation so invalid environment variables fail fast with clear messages.",
+    "Add a final refactor that groups related helpers into small modules without changing behavior.",
+    "Add a short architecture diagram in text form and explain how data flows from input to output.",
+    "Add a final test that simulates a 30-turn conversation by replaying the refactor steps against the package.",
+    "Finish by summarizing the refactor, listing the remaining risks, and suggesting the next production hardening step.",
+]
+
+LONG_REFACTOR_TASKS = [
+    f"""{instruction}
+
+Conversation constraints:
+- Preserve the existing public API unless the request explicitly asks to change it.
+- Prefer small, incremental patches over broad rewrites.
+- Keep code blocks complete enough to compile or explain exactly what changed.
+- Mention any tradeoff that affects latency, cache stability, or testability.
+
+Current code:
+
+```python
+{_long_refactor_code_snippet(index)}
+```
+
+Please apply the requested change and keep the response concise."""
+    for index, instruction in enumerate(LONG_REFACTOR_INSTRUCTIONS)
+]
+
+
+def _build_long_tasks(instructions: list[str], code_snippet_fn) -> list[str]:
+    """Build 30-turn long benchmark tasks from instructions and a code snippet generator."""
+    return [
+        f"""{instruction}
+
+Conversation constraints:
+- Preserve the existing public API unless the request explicitly asks to change it.
+- Prefer small, incremental patches over broad rewrites.
+- Keep code blocks complete enough to compile or explain exactly what changed.
+- Mention any tradeoff that affects latency, cache stability, or testability.
+
+Current code:
+
+```python
+{code_snippet_fn(index)}
+```
+
+Current tests and config:
+
+```python
+def test_placeholder() -> None:
+    assert True
+```
+
+```toml
+[project]
+name = "benchmark-package"
+version = "0.1.0"
+requires-python = ">=3.11"
+```
+
+Please apply the requested change and keep the response concise."""
+        for index, instruction in enumerate(instructions)
+    ]
+
+
+def _long_debug_code_snippet(turn: int) -> str:
+    """Return a realistic code snippet for a long debug benchmark."""
+    extra = ""
+    if turn % 3 == 0:
+        extra = """
+
+class Item(BaseModel):
+    name: str
+    quantity: int
+"""
+    elif turn % 3 == 1:
+        extra = """
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+"""
+    else:
+        extra = """
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+"""
+    return f"""from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import logging
+
+app = FastAPI()
+logger = logging.getLogger(__name__)
+
+{extra}
+
+@app.post("/items")
+def create_item(item: Item):
+    if item.quantity < 0:
+        raise HTTPException(status_code=400, detail="Quantity must be positive")
+    return {{"name": item.name, "total": item.quantity * 10}}
+"""
+
+
+DEBUG_LONG_INSTRUCTIONS = [
+    "Start by diagnosing the IndexError in the helper and explain the failing path.",
+    "Now fix the off-by-one bug and add a regression test for empty input.",
+    "Add clearer validation for malformed records and return structured error details.",
+    "Introduce logging around the failing section so the next incident is easier to trace.",
+    "Add a retry wrapper around the file read path and keep the public API stable.",
+    "Refactor the error handling into a small helper that can be reused across endpoints.",
+    "Add a unit test for the retry path using a fake file object.",
+    "Make the API return a consistent error shape for validation failures.",
+    "Add a CLI smoke test that exercises the failing path end to end.",
+    "Refactor the module so the pure logic is separated from FastAPI plumbing.",
+    "Add a timeout around the file read path and document the tradeoff.",
+    "Introduce a small metrics object that counts successful and failed parses.",
+    "Add structured logging for every request and include the trace id in the response.",
+    "Harden the endpoint against oversized payloads without changing the happy path.",
+    "Add a compatibility shim for clients that still send the old dict format.",
+    "Refactor the retry logic to use exponential backoff with jitter.",
+    "Add a test that verifies the endpoint rejects negative quantities.",
+    "Add a small benchmark fixture that measures the debug path on 10k rows.",
+    "Add documentation for the new error contract and retry behavior.",
+    "Do a final cleanup pass to remove dead code and tighten type hints.",
+    "Add a streaming variant that yields parsed items one at a time.",
+    "Add localization support for user-facing error messages.",
+    "Add a plugin hook for custom validators that can be registered at startup.",
+    "Add config validation so bad environment variables fail fast.",
+    "Add a final refactor that groups related helpers into small modules.",
+    "Add a short architecture diagram in text form and explain the data flow.",
+    "Add a final test that replays the debug session against the package.",
+    "Finish by summarizing the fix, remaining risks, and next hardening step.",
+    "Add a small observability hook that exports request duration and parse errors.",
+    "Add a final release note that explains the bug fix and the new safeguards.",
+]
+
+
+def _long_feature_code_snippet(turn: int) -> str:
+    """Return a realistic code snippet for a long feature benchmark."""
+    extra = ""
+    if turn % 3 == 0:
+        extra = """
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+"""
+    elif turn % 3 == 1:
+        extra = """
+
+def _now() -> datetime:
+    return datetime.utcnow()
+"""
+    else:
+        extra = """
+
+def _fake_dependency() -> str:
+    return "test-user"
+"""
+    return f"""from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+import jwt
+
+app = FastAPI()
+SECRET_KEY = "dev-secret"
+
+{extra}
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@app.post("/login")
+def login(payload: LoginRequest) -> TokenResponse:
+    if payload.password != "secret":
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = jwt.encode({{"sub": payload.username, "exp": datetime.utcnow() + timedelta(hours=1)}}, SECRET_KEY, algorithm="HS256")
+    return TokenResponse(access_token=token)
+"""
+
+
+FEATURE_LONG_INSTRUCTIONS = [
+    "Start by sketching the authentication API shape and the data models it needs.",
+    "Add a login endpoint that validates credentials and returns a bearer token.",
+    "Introduce a config object for JWT settings and keep the public API stable.",
+    "Refactor token creation into a small service so tests can swap the signer.",
+    "Add rate limiting to the login endpoint without changing the response shape.",
+    "Add a dependency injection layer so the auth service can use a fake repository.",
+    "Add a test suite for login success, invalid credentials, and expired tokens.",
+    "Add async support around the token refresh path while preserving sync behavior.",
+    "Refactor the package layout so auth logic lives in its own module.",
+    "Add a Dockerfile that runs the API and mounts a config file.",
+    "Add a CI workflow that runs lint, type checks, and auth tests.",
+    "Add a lightweight benchmark for login throughput on a warm token cache.",
+    "Add documentation for the auth API, config, and token lifecycle.",
+    "Add a changelog entry for the authentication feature.",
+    "Harden the endpoint against malformed payloads and oversized requests.",
+    "Add metrics for login success, failure, and rate-limit hits.",
+    "Add observability hooks that propagate a trace id through auth responses.",
+    "Add a migration path from the old session cookie flow to bearer tokens.",
+    "Add release notes that explain the new auth flow and breaking changes.",
+    "Do a final cleanup pass to remove dead code and tighten type hints.",
+    "Add a streaming token refresh endpoint that yields refresh events.",
+    "Add retry logic around external token validation with bounded backoff.",
+    "Add localization support for user-facing auth errors.",
+    "Add a performance optimization for token validation using an LRU cache.",
+    "Add a plugin hook for custom auth backends.",
+    "Add config validation so bad JWT settings fail fast.",
+    "Add a final refactor that groups related auth helpers into small modules.",
+    "Add a short architecture diagram in text form and explain the auth flow.",
+    "Add a final test that simulates the full feature conversation against the package.",
+    "Finish by summarizing the feature, remaining risks, and next hardening step.",
+]
+
+
+def _long_default_code_snippet(turn: int) -> str:
+    """Return a realistic code snippet for a long default benchmark."""
+    extra = ""
+    if turn % 3 == 0:
+        extra = """
+
+from dataclasses import dataclass
+
+@dataclass(slots=True)
+class Result:
+    value: int
+"""
+    elif turn % 3 == 1:
+        extra = """
+
+def _validate_n(n: int) -> None:
+    if n < 0:
+        raise ValueError("n must be non-negative")
+"""
+    else:
+        extra = """
+
+def main() -> None:
+    print(list(fibonacci_gen(10)))
+"""
+    return f"""from typing import Iterator
+
+{extra}
+
+def fibonacci(n: int) -> list[int]:
+    if n <= 0:
+        return []
+    if n == 1:
+        return [0]
+    values = [0, 1]
+    for _ in range(2, n):
+        values.append(values[-1] + values[-2])
+    return values
+
+
+def fibonacci_gen(n: int) -> Iterator[int]:
+    a, b = 0, 1
+    for _ in range(n):
+        yield a
+        a, b = b, a + b
+"""
+
+
+DEFAULT_LONG_INSTRUCTIONS = [
+    "Start by explaining the simplest iterative Fibonacci implementation and its tradeoffs.",
+    "Refactor the helper into a generator that yields one value at a time.",
+    "Add type hints and a small docstring while preserving the public API.",
+    "Introduce a config object that controls the sequence length and output format.",
+    "Refactor the generator into a service class with dependency injection for tests.",
+    "Add structured logging around each yielded value and keep the output stable.",
+    "Add a CLI entry point that accepts `--count` and `--format`.",
+    "Add a pytest suite for zero, one, many, and negative inputs.",
+    "Add async support with a small wrapper around the generator.",
+    "Refactor the code into a package layout with `src/`, `tests/`, and `pyproject.toml`.",
+    "Add a Dockerfile that runs the CLI against a mounted config file.",
+    "Add a GitHub Actions workflow that runs formatting, linting, and tests.",
+    "Add a lightweight benchmark that measures generator throughput on large n.",
+    "Add documentation for usage, config, and the generator contract.",
+    "Add a changelog entry for the generator refactor and CLI.",
+    "Harden the CLI against invalid arguments and malformed config files.",
+    "Add metrics for count, duration, and yielded values.",
+    "Add observability hooks that propagate a trace id through CLI output.",
+    "Add a migration path from the old list API to the new generator API.",
+    "Add release notes that explain the new generator and CLI behavior.",
+    "Do a final cleanup pass to remove dead code and tighten type hints.",
+    "Add a streaming API variant that yields formatted lines one at a time.",
+    "Add retry logic around config loading with bounded backoff.",
+    "Add localization support for user-facing CLI errors.",
+    "Add a performance optimization for large n using a rolling pair.",
+    "Add a plugin hook for custom formatters.",
+    "Add config validation so invalid settings fail fast.",
+    "Add a final refactor that groups related helpers into small modules.",
+    "Add a short architecture diagram in text form and explain the data flow.",
+    "Finish by summarizing the refactor, remaining risks, and next hardening step.",
+]
+
+
+DEBUG_LONG_TASKS = _build_long_tasks(DEBUG_LONG_INSTRUCTIONS, _long_debug_code_snippet)
+FEATURE_LONG_TASKS = _build_long_tasks(FEATURE_LONG_INSTRUCTIONS, _long_feature_code_snippet)
+DEFAULT_LONG_TASKS = _build_long_tasks(DEFAULT_LONG_INSTRUCTIONS, _long_default_code_snippet)
+
+# ---------------------------------------------------------------------------
 # Real-life coding scenarios for benchmarking
+# ---------------------------------------------------------------------------
+
 SCENARIOS = {
     "debug": {
         "description": "Debugging session with error analysis",
@@ -62,6 +459,10 @@ SCENARIOS = {
             ("user", "Now I need to add error handling for empty input. How should I do it?"),
         ],
     },
+    "debug_long": {
+        "description": "Long real-life debug conversation with 30 unique turns and code blocks",
+        "tasks": [("user", task) for task in DEBUG_LONG_TASKS],
+    },
     "refactor": {
         "description": "Code refactoring session",
         "tasks": [
@@ -69,6 +470,10 @@ SCENARIOS = {
             ("user", "Can you add type hints and make it a class?"),
             ("user", "Add caching for repeated calls with the same data."),
         ],
+    },
+    "refactor_long": {
+        "description": "Long real-life refactor conversation with 30 unique turns and code blocks",
+        "tasks": [("user", task) for task in LONG_REFACTOR_TASKS],
     },
     "feature": {
         "description": "Feature implementation session",
@@ -79,6 +484,10 @@ SCENARIOS = {
             ("user", "Add unit tests for the authentication endpoint."),
         ],
     },
+    "feature_long": {
+        "description": "Long real-life feature conversation with 30 unique turns and code blocks",
+        "tasks": [("user", task) for task in FEATURE_LONG_TASKS],
+    },
     "default": {
         "description": "General coding conversation",
         "tasks": [
@@ -87,6 +496,10 @@ SCENARIOS = {
             ("user", "Great. Now refactor it to use a generator instead of building a list."),
             ("user", "Add type hints and docstrings to the generator."),
         ],
+    },
+    "default_long": {
+        "description": "Long general coding conversation with 30 unique turns and code blocks",
+        "tasks": [("user", task) for task in DEFAULT_LONG_TASKS],
     },
 }
 
@@ -183,6 +596,24 @@ def _stop_proxy() -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+def _apply_profile_overrides(args: argparse.Namespace) -> None:
+    """Apply benchmark-level context optimization profile overrides."""
+    if args.profile != "aggressive":
+        return
+
+    overrides = {
+        "MOEPT_AGENTIC__KEEP_FULL_STEPS": "3",
+        "MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS": "12000",
+        "MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS": "3000",
+        "MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO": "0.45",
+        "MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO": "0.75",
+    }
+    for key, value in overrides.items():
+        os.environ.setdefault(key, value)
+
+    _status(args, "  Context profile: aggressive (top-only eviction, 3000-token cap)")
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +2093,8 @@ def run_all_scenarios(args) -> None:
         os.environ["MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS"] = str(args.budget)
         _status(args, f"  Context char budget: {args.budget}")
 
+    _apply_profile_overrides(args)
+
     _start_proxy(args.port)
 
     try:
@@ -1800,6 +2233,11 @@ def main() -> None:
         help="Override max_optimized_chars (char budget). Eviction triggers when context exceeds this.",
     )
     parser.add_argument(
+        "--profile", type=str, default="balanced",
+        choices=["balanced", "aggressive"],
+        help="Context optimization profile for the proxy. 'aggressive' favors token savings with top-only eviction.",
+    )
+    parser.add_argument(
         "--scenario", type=str, default="default",
         choices=[*SCENARIOS.keys(), "all"],
         help="Real-life coding scenario: debug, refactor, feature, default, or all",
@@ -1821,10 +2259,12 @@ def main() -> None:
     _status(args, f"  Lemonade: {LEMONADE_URL}")
     _status(args, f"  Proxy: http://127.0.0.1:{args.port}/v1")
 
-    # Inject budget override so the started proxy picks it up
+    # Inject budget/profile overrides so the started proxy picks them up
     if args.budget is not None:
         os.environ["MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS"] = str(args.budget)
         _status(args, f"  Context char budget: {args.budget} (eviction will trigger when exceeded)")
+
+    _apply_profile_overrides(args)
 
     # Auto-start proxy if not already running
     _start_proxy(args.port)

@@ -78,28 +78,12 @@ class ContextTemplateMatcher:
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Apply template to context if matched.
+        """Return messages unchanged.
 
-        Only applies if there's no existing system message to avoid duplication.
+        Inserting or changing a system prompt mid-session changes the first
+        tokens sent to llama.cpp and forces a full static-prefix re-prefill.
         """
-        template_name = self.match_template(messages)
-        if not template_name:
-            return messages
-
-        static = self.get_template_static(template_name)
-        if not static:
-            return messages
-
-        # Check if we already have a system message
-        if messages and messages[0].get("role") == "system":
-            # Don't modify existing system message
-            return messages
-
-        # Apply template as new system message
-        result = [dict(m) for m in messages]
-        result.insert(0, {"role": "system", "content": static})
-
-        return result
+        return [dict(m) for m in messages]
 
     def get_template_key(
         self,

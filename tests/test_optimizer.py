@@ -34,6 +34,31 @@ class TestAgentContextOptimizer:
         assert goal is not None
         assert "REST API" in goal.original_prompt
 
+    def test_aggressive_defaults_use_top_only_eviction(self) -> None:
+        """Default aggressive settings evict old complete turns without mutating history."""
+        config = AppConfig()
+        config.agentic.rag_enabled = False
+        optimizer = AgentContextOptimizer(config)
+        messages = [{"role": "system", "content": "System"}]
+        for idx in range(5):
+            messages.append({"role": "user", "content": f"task {idx} " + "x" * 120})
+            messages.append({"role": "assistant", "content": f"response {idx} " + "y" * 120})
+
+        result = optimizer.optimize_messages(messages)
+
+        assert [msg["role"] for msg in result[:3]] == ["system", "user", "assistant"]
+        assert result[1]["content"].startswith("task 0")
+        assert [msg["role"] for msg in result[-6:]] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert result[-6]["content"].startswith("task 2")
+        assert result[-2]["content"].startswith("task 4")
+
     def test_optimize_enforces_budget_via_eviction(self) -> None:
         """Budget enforcement via _trim_to_budget works correctly."""
         # Test the _trim_to_budget method directly since the full pipeline
@@ -152,8 +177,8 @@ class TestAgentContextOptimizer:
         new_optimizer.load_session_state(state)
         assert len(new_optimizer.store.steps) == len(self.optimizer.store.steps)
 
-    def test_attention_sink_markers_survive_final_output(self) -> None:
-        """Attention sink markers are model-visible when explicitly enabled."""
+    def test_attention_sink_markers_are_not_injected(self) -> None:
+        """Attention sink markers are not model-visible in cache-stable mode."""
         config = AppConfig()
         config.agentic.max_optimized_chars = 20000
         config.agentic.attention_sinks_enabled = True
@@ -166,7 +191,7 @@ class TestAgentContextOptimizer:
         ])
 
         system_content = result[0].get("content", "")
-        assert "STATIC_LAYER_END" in system_content
+        assert "STATIC_LAYER_END" not in system_content
 
     def test_fast_path_preserves_lean_context_and_strips_proxy_fields(self) -> None:
         """Lean contexts should bypass transformations while removing proxy-only fields."""
@@ -288,8 +313,8 @@ class TestAgentContextOptimizer:
         assert calls[0][0][1] == 400
         assert calls[0][1]["use_tokens"] is True
 
-    def test_semantic_dedup_runs_after_proactive_threshold(self) -> None:
-        """Semantic dedup supports leanness once proactive threshold is exceeded."""
+    def test_semantic_dedup_is_disabled_for_cache_stability(self) -> None:
+        """Semantic deduplication does not remove middle-history messages."""
         config = AppConfig()
         config.agentic.max_optimized_tokens = 1000
         config.agentic.proactive_trim_ratio = 0.4
@@ -306,8 +331,8 @@ class TestAgentContextOptimizer:
         with patch.object(
             optimizer.semantic_deduplicator,
             "deduplicate",
-            side_effect=lambda msgs, embedding_service: msgs,
+            side_effect=AssertionError("semantic dedup should not run"),
         ) as dedup:
             optimizer.optimize_messages(messages)
 
-        dedup.assert_called_once()
+        dedup.assert_not_called()

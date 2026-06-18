@@ -31,7 +31,7 @@ Enhanced with:
 
 from __future__ import annotations
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 from moeptimizer.async_io_stage import AsyncIOStage, get_async_io_stage
 from moeptimizer.attention_sink import AttentionSinkManager, apply_attention_sinks

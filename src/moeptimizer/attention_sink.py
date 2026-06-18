@@ -44,25 +44,13 @@ class AttentionSinkManager:
         messages: list[dict[str, Any]],
         static_layer_size: int,
     ) -> list[dict[str, Any]]:
-        """Inject attention sink markers at strategic positions.
+        """Return messages unchanged.
 
-        Adds markers at:
-        - Static layer boundary
-        - Every N tokens in dynamic layer
-        - Before code blocks
+        Injecting markers changes the literal token stream and can modify the
+        system/static prefix, so this helper is cache-stability safe no-op.
         """
-        result = []
-        for i, msg in enumerate(messages):
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                # Add sink marker at static layer boundary
-                if i == 0 and msg.get("role") == "system":
-                    content = self._add_static_sink(content, static_layer_size)
-                # Add periodic sink markers in code
-                if "```" in content:
-                    content = self._add_code_sinks(content)
-            result.append({**msg, "content": content})
-        return result
+        del static_layer_size
+        return [dict(msg) for msg in messages]
 
     def _add_static_sink(
         self,
@@ -138,8 +126,11 @@ def apply_attention_sinks(
     messages: list[dict[str, Any]],
     static_layer_size: int,
 ) -> list[dict[str, Any]]:
-    """Apply attention sink management to message list."""
-    manager = AttentionSinkManager()
-    if manager.should_inject_sinks(messages):
-        return manager.inject_sink_markers(messages, static_layer_size)
+    """No-op: do not inject model-visible markers into the prompt.
+
+    Attention sink markers change the literal token stream and can modify the
+    system/static prefix, so they are not compatible with absolute KV-cache
+    stability.
+    """
+    del static_layer_size
     return messages

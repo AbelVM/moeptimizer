@@ -35,6 +35,10 @@ class ServerConfig(BaseModel):
     """Lemonade server connection settings."""
 
     url: str = Field(default="http://localhost:13305/api/v1")
+    embed_url: str = Field(
+        default="http://localhost:13305/api/v1",
+        description="Base URL for the OpenAI-compatible embedding server.",
+    )
     llm_model: str = Field(default="Qwen3.6-35B-A3B-MTP-GGUF")
     embed_model: str = Field(default="embed-gemma-300m-FLM")
     timeout: float = Field(
@@ -47,28 +51,29 @@ class AgenticConfig(BaseModel):
     """Agentic loop tuning parameters for Qwen3.6-35B-A3B-MTP."""
 
     keep_full_steps: int = Field(
-        default=5,
+        default=3,
         description="Last N user-assistant pairs kept in full detail for immediate reasoning context. "
-                    "Higher values preserve more conversation history at the cost of token usage.",
+                    "Lower values improve token savings by evicting older complete turns from the top; "
+                    "the optimizer never mutates middle-history content.",
     )
     archive_threshold: int = Field(
         default=3,
-        description="Steps before this index get compressed",
+        description="Steps before this index are archived/compressed",
     )
     max_optimized_chars: int = Field(
-        default=20000,
-        description="Hard cap on optimized context window (characters, converted to ~5000 tokens)",
+        default=12000,
+        description="Character fallback cap for optimized context (converted to ~3000 tokens)",
     )
     max_optimized_tokens: int = Field(
-        default=5000,
+        default=3000,
         description="Hard cap on optimized context window (tokens). Takes precedence over max_optimized_chars if set.",
     )
     proactive_trim_ratio: float = Field(
-        default=0.6,
-        description="Ratio of max_optimized_tokens at which proactive trimming starts.",
+        default=0.45,
+        description="Ratio of max_optimized_tokens at which proactive top-only trimming starts.",
     )
     compaction_trigger_ratio: float = Field(
-        default=0.9,
+        default=0.75,
         description="Ratio of max_optimized_tokens at which compaction and compression start.",
     )
     thinking_protect_recent: int = Field(
@@ -100,8 +105,8 @@ class AgenticConfig(BaseModel):
         description="Compress large code blocks to AST/line skeletons when proactive context pressure starts.",
     )
     semantic_dedup_enabled: bool = Field(
-        default=True,
-        description="Run embedding-based semantic deduplication when context pressure justifies it.",
+        default=False,
+        description="Run embedding-based semantic deduplication when context pressure justifies it. Disabled by default because removing middle-history messages breaks KV-cache prefixes.",
     )
     attention_sinks_enabled: bool = Field(
         default=False,
@@ -240,8 +245,8 @@ class V050Config(BaseModel):
 
     # Hierarchical Summarization
     hierarchical_summary_enabled: bool = Field(
-        default=True,
-        description="Enable hierarchical summarization of old turns",
+        default=False,
+        description="Enable hierarchical summarization of old turns. Disabled by default because middle-history summaries break contiguous KV-cache prefixes.",
     )
     hierarchical_summary_max_full_turns: int = Field(
         default=5,

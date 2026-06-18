@@ -13,15 +13,14 @@ class TestAttentionSinkManager:
         assert result == []
 
     def test_inject_static_sink(self) -> None:
-        """Inject sink marker at static layer boundary."""
+        """Injection helpers remain available but do not mutate prompts."""
         manager = AttentionSinkManager()
         messages = [
             {"role": "system", "content": "System rules"},
             {"role": "user", "content": "First task"},
         ]
         result = manager.inject_sink_markers(messages, 100)
-        # Check that sink marker was added
-        assert any("STATIC_LAYER_END" in m.get("content", "") for m in result)
+        assert result == messages
 
     def test_calculate_attention_entropy(self) -> None:
         """Calculate attention entropy for context quality."""
@@ -43,10 +42,10 @@ class TestAttentionSinkManager:
         assert manager.should_inject_sinks(messages, threshold=1.5) is False
 
     def test_apply_attention_sinks_function(self) -> None:
-        """Test the module-level apply_attention_sinks function."""
+        """The public apply function is cache-stable and no-op."""
         messages = [
             {"role": "system", "content": "System"},
             {"role": "user", "content": "Task"},
         ]
         result = apply_attention_sinks(messages, 100)
-        assert len(result) == 2
+        assert result == messages

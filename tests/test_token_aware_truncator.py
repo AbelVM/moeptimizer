@@ -25,12 +25,12 @@ class TestTokenAwareTruncator:
     def test_truncate_to_token_limit_long(self) -> None:
         text = "word " * 1000
         result = self.truncator.truncate_to_token_limit(text, 10)
-        assert len(result) < len(text)
+        assert result == text
 
     def test_truncate_message(self) -> None:
         msg = {"role": "user", "content": "word " * 1000}
         result = self.truncator.truncate_message(msg, 10)
-        assert result["content"] != msg["content"]
+        assert result == msg
         assert result["role"] == "user"
 
     def test_count_message_tokens(self) -> None:
@@ -69,7 +69,7 @@ class TestTokenAwareTruncator:
         assert len(result) <= len(messages)
 
     def test_char_based_truncate_fallback(self) -> None:
-        """tiktoken truncation works correctly."""
+        """Content truncation is disabled for KV-cache stability."""
         text = "word " * 1000
         result = self.truncator.truncate_to_token_limit(text, 10)
-        assert len(result) < len(text)
+        assert result == text

@@ -18,25 +18,33 @@ class TestSlidingWindowContext:
         assert len(result) == len(messages)
 
     def test_sliding_window_trim_large_context(self) -> None:
-        """Large context is trimmed to window size."""
+        """Large context drops whole old turns while preserving active request."""
         config = AppConfig()
         config.agentic.max_optimized_chars = 10000
         optimizer = AgentContextOptimizer(config)
-        # Create large context
-        large_content = "x" * 2000
+        # Create enough old dynamic turns that only complete turns can be evicted.
+        large_content = "x" * 800
         messages = [
             {"role": "system", "content": "You are helpful"},
-            {"role": "user", "content": "Task 1"},
-            {"role": "assistant", "content": "Response 1"},
-            {"role": "user", "content": "Task 2"},
-            {"role": "assistant", "content": "Response 2"},
-            {"role": "user", "content": large_content},
+            {"role": "user", "content": "First user"},
         ]
-        result = optimizer._sliding_window_trim(messages, window_size=1000)
-        # Should be trimmed (static layer + some dynamic)
-        total_chars = sum(len(m.get("content", "")) for m in result)
-        # The result should be smaller than original (6000+ chars)
-        assert total_chars < 6000
+        for index in range(40):
+            messages.append({"role": "assistant", "content": f"Response {index}"})
+            messages.append({"role": "user", "content": f"Task {index}"})
+        messages.append({"role": "user", "content": large_content})
+
+        result = optimizer._sliding_window_trim(messages, window_size=1200)
+
+        # Static prefix and the newest user turn are immutable; only complete
+        # old dynamic turns are dropped from the front.
+        expected = messages[:2] + messages[42:]
+        assert result == expected
+        assert len(result) < len(messages)
+        assert result[-1].get("content") == large_content
+        assert all(
+            len(m.get("content", "")) == len(e.get("content", ""))
+            for m, e in zip(result, expected, strict=True)
+        )
 
     def test_sliding_window_preserves_static_layer(self) -> None:
         """Sliding window preserves static layer (system + first user)."""

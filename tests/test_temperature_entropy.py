@@ -1,7 +1,5 @@
 """Tests for temperature calibration and entropy-guided trimming."""
 
-import pytest
-
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer
 
@@ -74,14 +72,14 @@ class TestEntropyGuidedTrimming:
         assistant_msgs = [m for m in result if m.get("role") == "assistant"]
         assert len(assistant_msgs) == 2
 
-    def test_entropy_guided_trim_trims_tool(self) -> None:
-        """Entropy trimming can trim high-entropy tool output."""
+    def test_entropy_guided_trim_does_not_modify_tool_content(self) -> None:
+        """Entropy trimming does not rewrite tool output."""
         config = AppConfig()
         config.agentic.max_optimized_chars = 500
         optimizer = AgentContextOptimizer(config)
 
         # Create high-entropy tool output
-        high_entropy_tool = "x" * 600  # High entropy, long
+        high_entropy_tool = "x" * 600
         messages = [
             {"role": "system", "content": "You are helpful"},
             {"role": "user", "content": "Task 1"},
@@ -89,7 +87,8 @@ class TestEntropyGuidedTrimming:
             {"role": "tool", "content": high_entropy_tool},
         ]
         result = optimizer._entropy_guided_trim(messages)
-        # Tool output should be truncated
-        tool_msg = next((m for m in result if m.get("role") == "tool"), None)
-        if tool_msg:
-            assert "truncated" in tool_msg.get("content", "") or len(tool_msg.get("content", "")) < 600
+        # Tool output is part of the serialized history and must not be rewritten.
+        assert result == messages
+        tool_msg = next(m for m in result if m.get("role") == "tool")
+        assert tool_msg.get("content") == high_entropy_tool
+        assert "truncated" not in tool_msg.get("content", "")

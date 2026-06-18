@@ -33,21 +33,27 @@ class ContextCanonicalizer:
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Canonicalize all message content.
+        """Canonicalize only the newest user message.
 
-        Only applies to system and user messages to preserve assistant chat template.
+        Historical user/system messages are immutable once sent. Only the active
+        last user turn may receive derived formatting changes.
         """
-        result = []
-        for msg in messages:
-            content = msg.get("content", "")
-            role = msg.get("role", "")
+        result = [dict(msg) for msg in messages]
+        last_user_idx = -1
+        for idx in range(len(result) - 1, -1, -1):
+            if result[idx].get("role") == "user":
+                last_user_idx = idx
+                break
 
-            # Only canonicalize system and user messages
-            # Assistant messages must preserve the model's expected template
-            if role in ("system", "user"):
-                content = self._canonicalize_content(content)
+        if last_user_idx < 0:
+            return result
 
-            result.append({**msg, "content": content})
+        content = result[last_user_idx].get("content", "")
+        if isinstance(content, str):
+            result[last_user_idx] = {
+                **result[last_user_idx],
+                "content": self._canonicalize_content(content),
+            }
 
         return result
 

@@ -270,8 +270,8 @@ class TestV050Integration:
         scores = selector.get_template_scores()
         assert any(score["sample_count"] >= 1 for score in scores.values())
 
-    def test_hierarchical_summarization(self) -> None:
-        """Hierarchical summarization compresses old turns."""
+    def test_hierarchical_summarization_standalone(self) -> None:
+        """Hierarchical summarization remains available as a standalone utility."""
         summarizer = self.optimizer.hierarchical_summarizer
         assert summarizer is not None
 
@@ -290,9 +290,7 @@ class TestV050Integration:
         )
 
         result = summarizer.summarize_turns(messages)
-        # Should have fewer messages after summarization
         assert len(result) < len(messages)
-        # Should have a summary message
         summary_msgs = [m for m in result if m.get("_summary_id")]
         assert len(summary_msgs) == 1
 
@@ -413,8 +411,8 @@ class TestV050Integration:
         summary_msgs = [m for m in result if m.get("_summary_id")]
         assert len(summary_msgs) >= 1
 
-    def test_hierarchical_summarization_in_pipeline(self) -> None:
-        """The main pipeline summarizes long, over-budget conversations."""
+    def test_hierarchical_summarization_not_in_pipeline(self) -> None:
+        """The main pipeline does not inject middle-history summaries."""
         config = AppConfig()
         config.agentic.max_optimized_chars = 1200
         config.agentic.max_optimized_tokens = 60
@@ -438,7 +436,7 @@ class TestV050Integration:
         content = "\n".join(msg.get("content", "") for msg in result)
 
         assert len(result) < len(messages)
-        assert "[Recall:" in content
+        assert "[Recall:" not in content
 
     def test_code_delta_encoding_in_pipeline(self) -> None:
         """Delta encoding stores code snapshots during optimization."""

@@ -13,6 +13,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from openai import AsyncOpenAI
 
 from moeptimizer.backend_client import LemonadeClient
 from moeptimizer.config import AppConfig, get_config
@@ -128,9 +129,13 @@ def _resolve_session_id(
         return legacy_session_id.strip()
 
     user = body.get("user")
+    first_user = _first_user_message(messages)
     if isinstance(user, str) and user.strip():
-        seed = _canonical_json(_first_user_message(messages))
+        seed = _canonical_json(first_user)
         return f"user:{_hash_text(user)}:{_hash_text(seed)}"
+
+    if first_user:
+        return f"anon:{_hash_text(_canonical_json(first_user))}"
 
     return f"anon:{_hash_text(_canonical_json(messages))}"
 
@@ -141,15 +146,16 @@ def _pop_custom_session_fields(body: dict[str, Any]) -> tuple[Any, Any]:
 
 
 def _normalize_response_choices(data: dict) -> list[dict]:
-    """Normalize backend response choices for OpenAI API compatibility.
+    """Normalize backend response choices while preserving Qwen reasoning.
 
-    Merges reasoning_content into content when content is empty,
-    and always strips reasoning_content from the output.
+    Qwen/llama.cpp can return explicit `reasoning_content`. The proxy must echo
+    that field back to the client unchanged so the next assistant message can
+    preserve the exact thinking tokens required for KV-cache stability.
     """
     choices = data.get("choices", [])
     for choice in choices:
         message = choice.get("message", {})
-        reasoning = message.pop("reasoning_content", "") or ""
+        reasoning = message.get("reasoning_content") or ""
         if reasoning and not message.get("content"):
             message["content"] = reasoning
     return choices
@@ -208,6 +214,8 @@ def _make_streaming_generator(
                             delta["role"] = d.role
                         if hasattr(d, "content") and d.content is not None:
                             delta["content"] = d.content
+                        if hasattr(d, "reasoning_content") and d.reasoning_content is not None:
+                            delta["reasoning_content"] = d.reasoning_content
                     if hasattr(choice, "finish_reason") and choice.finish_reason:
                         finish_reason = choice.finish_reason
 
@@ -367,6 +375,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         api_key="lemonade",
         timeout=cfg.server.timeout,
     )
+    embed_client = AsyncOpenAI(
+        base_url=cfg.server.embed_url,
+        api_key="lemonade",
+        timeout=cfg.server.timeout,
+    )
 
     # Lemonade exposes a standard OpenAI API. Do not enable proxy-level
     # speculative decoding wrappers here: the current backend does not expose
@@ -377,6 +390,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         await embedding_service.initialize()
         yield
         await embedding_service.close()
+        await embed_client.close()
 
     app = FastAPI(
         title="Lemonade MoE Agentic Optimizer",
@@ -391,6 +405,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     # Expose services for direct access by endpoints
     app.state.embedding_service = embedding_service
     app.state.backend_client = backend_client
+    app.state.embed_client = embed_client
 
     @app.post("/v1/chat/completions")
     async def chat_completions_proxy(request: Request):
@@ -631,7 +646,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             )
 
         try:
-            result = await backend_client._client.embeddings.create(
+            embed_client = getattr(app.state, "embed_client", backend_client._client)
+            result = await embed_client.embeddings.create(
                 model=model,
                 input=input_list,
             )

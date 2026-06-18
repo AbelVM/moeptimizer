@@ -42,48 +42,25 @@ class TokenAwareTruncator:
         text: str,
         max_tokens: int,
     ) -> str:
-        """Truncate text to fit within max_tokens, cutting only at token boundaries.
+        """Return text unchanged.
 
-        Args:
-            text: The text to truncate
-            max_tokens: Maximum number of tokens to keep
-
-        Returns:
-            Truncated text that fits within the token limit
+        The KV-cache stability guide forbids chopping historical message content.
+        This method is kept for API compatibility, but budget enforcement now
+        drops whole turns/messages from the top instead of slicing text.
         """
-        if not text:
-            return text
-
-        tokens = self._encoder.encode(text)
-        if len(tokens) <= max_tokens:
-            return text
-
-        truncated_tokens = tokens[:max_tokens]
-        return self._encoder.decode(truncated_tokens)
+        return text
 
     def truncate_message(
         self,
         message: dict[str, Any],
         max_tokens: int,
     ) -> dict[str, Any]:
-        """Truncate a single message to fit within max_tokens.
+        """Return message unchanged.
 
-        Args:
-            message: The message dict to truncate
-            max_tokens: Maximum tokens for this message
-
-        Returns:
-            Truncated message dict
+        Content-level truncation changes token IDs for preserved history and can
+        invalidate downstream KV-cache matching. Use `trim_messages_to_budget`
+        to evict whole turns instead.
         """
-        content = message.get("content", "")
-        if not isinstance(content, str):
-            return message
-
-        truncated = self.truncate_to_token_limit(content, max_tokens)
-        if truncated != content:
-            result = dict(message)
-            result["content"] = truncated
-            return result
         return message
 
     def count_tokens(self, text: str) -> int:
@@ -172,10 +149,12 @@ class TokenAwareTruncator:
 
         result = system_anchor + evictable_body + protected_tail
 
-        # If still over budget, truncate individual messages at token boundaries
+        # If still over budget, drop whole non-system messages from the front of
+        # the dynamic layer. Do not truncate content or remove the active last
+        # user turn unless the static prefix itself exceeds the budget.
         total = self.count_messages_tokens(result)
         if total > max_tokens:
-            result = self._truncate_individual_messages(result, max_tokens)
+            result = self._drop_whole_messages_from_front(result, max_tokens)
 
         return result
 
@@ -278,50 +257,49 @@ class TokenAwareTruncator:
 
         return [m for pair in pairs for m in pair]
 
+    def _drop_whole_messages_from_front(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Drop whole messages from the front after the system anchor."""
+        if not messages:
+            return messages
+
+        system_anchor: list[dict[str, Any]] = []
+        start = 0
+        if messages[0].get("role") == "system":
+            system_anchor.append(messages[0])
+            start = 1
+
+        # Preserve the last user turn as the active request whenever possible.
+        last_user_idx = -1
+        for idx in range(len(messages) - 1, start - 1, -1):
+            if messages[idx].get("role") == "user":
+                last_user_idx = idx
+                break
+
+        protected_tail: list[dict[str, Any]] = []
+        if last_user_idx >= 0:
+            protected_tail = [dict(msg) for msg in messages[last_user_idx:]]
+            dynamic_middle = messages[start:last_user_idx]
+        else:
+            dynamic_middle = messages[start:]
+
+        result = list(system_anchor)
+        for msg in dynamic_middle:
+            if self.count_messages_tokens(result + [msg] + protected_tail) <= max_tokens:
+                result.append(dict(msg))
+            else:
+                break
+
+        result.extend(protected_tail)
+        return result
+
     def _truncate_individual_messages(
         self,
         messages: list[dict[str, Any]],
         max_tokens: int,
     ) -> list[dict[str, Any]]:
-        """Truncate individual messages at token boundaries to fit budget."""
-        result: list[dict[str, Any]] = []
-        total = self.count_messages_tokens(messages)
-
-        # Start from the front (after system anchor) and truncate
-        for msg in messages:
-            if total <= max_tokens:
-                result.append(msg)
-                continue
-
-            role = msg.get("role", "")
-
-            # Never truncate system, assistant, or hierarchical summary messages.
-            if role in ("system", "assistant") or msg.get("_summary_id"):
-                result.append(msg)
-                continue
-
-            content = msg.get("content", "")
-            if not isinstance(content, str):
-                result.append(msg)
-                continue
-
-            # Calculate how much we need to reduce
-            msg_tokens = self.count_message_tokens(msg)
-            remaining_budget = max_tokens - (total - msg_tokens)
-
-            if remaining_budget <= 0:
-                # Skip this message entirely
-                total -= msg_tokens
-                continue
-
-            # Truncate to remaining budget
-            truncated = self.truncate_to_token_limit(content, remaining_budget)
-            new_tokens = self.count_tokens(truncated) + 5
-
-            if new_tokens < msg_tokens:
-                result.append({**msg, "content": truncated})
-                total -= msg_tokens - new_tokens
-            else:
-                result.append(msg)
-
-        return result
+        """No-op for API compatibility; content truncation is disabled."""
+        return messages

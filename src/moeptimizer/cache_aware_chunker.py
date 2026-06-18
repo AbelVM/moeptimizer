@@ -30,25 +30,34 @@ class CacheAwareChunker:
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Chunk context to align with cache blocks."""
-        result = []
+        """Chunk only the newest user message.
 
-        for msg in messages:
-            content = msg.get("content", "")
+        Historical messages must remain immutable. Splitting old messages changes
+        the serialized chat structure and can break KV-cache prefix matching.
+        """
+        result = [dict(msg) for msg in messages]
+        last_user_idx = -1
+        for idx in range(len(result) - 1, -1, -1):
+            if result[idx].get("role") == "user":
+                last_user_idx = idx
+                break
 
-            # Check if content has code blocks
-            if "```" in content:
-                chunked = self._chunk_code_message(content)
-                for i, chunk in enumerate(chunked):
-                    result.append({
-                        **msg,
-                        "content": chunk,
-                        "chunk_index": i,
-                    })
-            else:
-                result.append(dict(msg))
+        if last_user_idx < 0:
+            return result
 
-        return result
+        content = result[last_user_idx].get("content", "")
+        if not isinstance(content, str) or "```" not in content:
+            return result
+
+        chunked = self._chunk_code_message(content)
+        replacement = [
+            {
+                **result[last_user_idx],
+                "content": chunk,
+            }
+            for chunk in chunked
+        ]
+        return result[:last_user_idx] + replacement
 
     def _chunk_code_message(
         self,

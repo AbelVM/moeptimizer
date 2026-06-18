@@ -92,42 +92,12 @@ class MTPStateManager:
         messages: list[dict[str, Any]],
         target_boundary: int = 128,
     ) -> list[dict[str, Any]]:
-        """Align context to MTP prediction boundary.
+        """No-op: never pad model-visible messages for MTP alignment.
 
-        MTP predictions work best when context length is a multiple of
-        the prediction boundary (typically 128 tokens for Qwen3.6-35B-A3B-MTP).
-
-        This method pads or trims context to align to the boundary,
-        preserving prediction quality.
+        Adding invisible newlines changes token IDs and violates the cache
+        stability rule against trailing whitespace variations.
         """
-        if not messages:
-            return messages
-
-        # Calculate current context length in tokens
-        total_chars = sum(len(m.get("content", "")) for m in messages)
-        # Rough estimate: ~4 chars per token
-        current_tokens = total_chars // 4
-
-        # Find the boundary multiple
-        remainder = current_tokens % target_boundary
-        if remainder == 0:
-            return messages  # Already aligned
-
-        # Calculate padding needed
-        padding_needed = target_boundary - remainder
-
-        # Add padding to the last message (non-assistant to preserve chat template)
-        # Find the last non-assistant message
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") != "assistant":
-                # Add padding as newlines (invisible to model but counts as tokens)
-                result = [dict(m) for m in messages]
-                result[i] = {
-                    **result[i],
-                    "content": result[i].get("content", "") + "\n" * padding_needed,
-                }
-                return result
-
+        del target_boundary
         return messages
 
     def get_stats(self) -> dict[str, int]:

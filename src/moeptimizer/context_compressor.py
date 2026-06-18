@@ -34,22 +34,27 @@ class ContextCompressor:
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Compress context to skeletons.
+        """Compress only the newest user message.
 
-        Compresses code in all messages to reduce context size.
-        Preserves the model's expected chat template structure.
+        Historical user/system content is immutable once sent. Code skeleton
+        compression is allowed only on the active user turn when explicitly used.
         """
-        result = []
-        for msg in messages:
-            content = msg.get("content", "")
-            role = msg.get("role", "")
+        result = [dict(msg) for msg in messages]
+        last_user_idx = -1
+        for idx in range(len(result) - 1, -1, -1):
+            if result[idx].get("role") == "user":
+                last_user_idx = idx
+                break
 
-            # Only compress code in user/system messages, not assistant responses
-            # Assistant responses should be preserved as-is for quality
-            if role in ("system", "user"):
-                content = self._compress_content(content)
+        if last_user_idx < 0:
+            return result
 
-            result.append({**msg, "content": content})
+        content = result[last_user_idx].get("content", "")
+        if isinstance(content, str):
+            result[last_user_idx] = {
+                **result[last_user_idx],
+                "content": self._compress_content(content),
+            }
 
         return result
 

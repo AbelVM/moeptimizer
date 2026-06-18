@@ -9,7 +9,7 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 ### First version (v0.1.0)
 
 - **Scratchpad Compaction** — Front-Loading Eviction for MTP head protection.
-- **Thinking Preservation** — Protects recent `<thinking>` blocks, archives stale reasoning to reclaim KV-cache
+- **Thinking Preservation** — Protects recent `<think>` blocks, archives stale reasoning to reclaim KV-cache
 - **State-Based RAG** — Graph-indexed retrieval (Goal -> Subtask -> Tool -> Outcome) instead of flat embeddings
 - **Loop Detection** — Detects repeated tool calls, actions, and thinking loops
 - **Progress Tracking** — Heuristic-based goal completion tracking with subtask decomposition
@@ -87,12 +87,26 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 - **KV‑Cache Warm‑Up for MTP Heads** – Runs a cheap forward pass on static layers to pre‑populate KV‑cache before the first token generation.
 - **Async I/O for Heavy Stages** – Moves AST parsing, embedding retrieval, and compression to async workers to keep the request thread responsive.
 
+### KV-Cache Stability Fixes (v0.5.1)
+
+- **Immutable Static Layer** – Stops padding or rewriting system and first-user messages so llama.cpp can reuse the stable prefix cache.
+- **Reasoning Preservation** – Keeps `reasoning_content` and thinking tokens visible in optimized and streamed responses.
+- **Stable Turn Structure** – Appends volatile anchors, RAG context, and loop warnings to the newest user turn instead of inserting extra middle-history messages.
+- **Top-Only Eviction** – Drops old complete turns from the front and avoids content slicing, middle summaries, semantic deduplication, or entropy rewrites.
+- **Stable Anonymous Sessions** – Derives anonymous session identity from the first user message so cache state remains consistent across turns.
+
 ## Architecture
 
 ```
 Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
                                 │
                                 ├── SessionManager (per-session isolation)
+                                │   └── Stable Anonymous Session Resolver
+                                ├── AgentContextOptimizer (cache-stability policy)
+                                │   ├── Immutable Static Layer Guard
+                                │   ├── Reasoning Content Preserver
+                                │   ├── Stable Turn Structure Normalizer
+                                │   └── Top-Only Eviction Policy
                                 ├── AgentStateStore (KV graph)
                                 ├── ScratchpadCompactor
                                 ├── ThinkingPreserver
@@ -103,27 +117,27 @@ Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
                                 ├── PromptTemplateManager (task classification)
                                 │   └── ContextTemplateMatcher (template matching)
                                 ├── TemplateSelector (quality-based template selection)
-                                ├── AttentionSinkManager (long context stability)
+                                ├── AttentionSinkManager (internal cache hint only; no model-visible markers)
                                 ├── ExpertRoutingCache (MoE routing cache)
                                 ├── CacheKeyRegistry (hit prediction)
                                 │   └── HitPredictionModel (XGBoost early-exit)
                                 ├── KVSlotTracker (explicit cache control)
-                                ├── StaticPrefixKVCache (prefix cache reuse)
+                                ├── StaticPrefixKVCache (internal cache-key reuse only)
                                 ├── KVCacheWarmup (MTP head warm-up)
-                                ├── ContextAligner (block alignment)
-                                ├── ContextCanonicalizer (formatting normalization)
-                                ├── SelectiveTruncator (duplicate removal)
-                                ├── SemanticDeduplicator (near-duplicate removal)
-                                ├── PatternInjector (section markers)
+                                ├── ContextAligner (internal alignment; no prompt padding)
+                                ├── ContextCanonicalizer (newest-user-turn only)
+                                ├── SelectiveTruncator (newest-user-turn only)
+                                ├── SemanticDeduplicator (disabled in stable pipeline)
+                                ├── PatternInjector (section markers; stripped before model input)
                                 ├── DependencyOrderer (import ordering)
                                 ├── IncrementalUpdater (cache preservation)
                                 ├── CacheAwareChunker (aligned chunking)
-                                ├── ContextCompressor (skeleton compression)
+                                ├── ContextCompressor (newest-user-turn only)
                                 ├── CodeBlockOptimizer (tree-sitter code optimization)
                                 ├── ChunkFingerprintCache (SHA-256 chunk reuse)
                                 ├── DeltaEncoder (code delta compression)
-                                ├── HierarchicalSummarizer (recall token compression)
-                                ├── TokenAwareTruncator (tiktoken boundary trimming)
+                                ├── HierarchicalSummarizer (standalone only; disabled in stable pipeline)
+                                ├── TokenAwareTruncator (whole-message top-only fallback)
                                 ├── MTPHeadStateCheckpoint (per-head state reuse)
                                 ├── SegmentWiseSpeculativeDecoder (per-segment drafting)
                                 ├── ParallelEmbeddingLookup (thread-pool embedding)
@@ -146,7 +160,8 @@ Copy `.env.example` to `.env` and adjust:
 cp .env.example .env
 ```
 
-Environment variables use the `MOEPT_` prefix with `__` for nested config:
+Environment variables use the `MOEPT_` prefix with `__` for nested config.
+For example, `server.url` maps to `MOEPT_SERVER__URL`.
 
 ### Proxy Server
 
@@ -158,23 +173,34 @@ Environment variables use the `MOEPT_` prefix with `__` for nested config:
 
 | Variable | Default | Description |
 |---|---|---|
-| `MOEPT_SERVER__URL` | `http://localhost:13305/api/v1` | Base URL of the Lemonade server API |
-| `MOEPT_SERVER__LLM_MODEL` | `Qwen3.6-35B-A3B-MTP-GGUF` | LLM model identifier for completions |
-| `MOEPT_SERVER__EMBED_MODEL` | `embed-gemma-300m-FLM` | Embedding model for semantic search |
+| `MOEPT_SERVER__URL` | `http://localhost:13305/api/v1` | Base URL of the Lemonade chat-completions server API |
+| `MOEPT_SERVER__EMBED_URL` | `http://localhost:13305/api/v1` | Base URL of the OpenAI-compatible embedding server; set separately when embeddings are hosted elsewhere |
+| `MOEPT_SERVER__LLM_MODEL` | `Qwen3.6-35B-A3B-MTP-GGUF` | LLM model identifier for chat completions |
+| `MOEPT_SERVER__EMBED_MODEL` | `embed-gemma-300m-FLM` | Embedding model identifier |
+| `MOEPT_SERVER__TIMEOUT` | `300.0` | Request timeout in seconds for long context conversations |
 
 ### Agentic Loop Tuning
 
 | Variable | Default | Description |
 |---|---|---|
-| `MOEPT_AGENTIC__KEEP_FULL_STEPS` | `5` | Last N steps kept in full detail |
-| `MOEPT_AGENTIC__ARCHIVE_THRESHOLD` | `3` | Steps before this index get compressed |
-| `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` | `20000` | Hard cap on optimized context window (chars) |
-| `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS` | `5000` | Hard cap on optimized context window (tokens) |
-| `MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO` | `0.6` | Ratio of max tokens where proactive trimming starts |
-| `MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO` | `0.9` | Ratio of max tokens where compaction/compression starts |
-| `MOEPT_AGENTIC__USE_TOKEN_BUDGET` | `true` | Use token-based budget enforcement |
+| `MOEPT_AGENTIC__KEEP_FULL_STEPS` | `3` | Last N user-assistant pairs kept in full detail; older complete turns are evicted from the top |
+| `MOEPT_AGENTIC__ARCHIVE_THRESHOLD` | `3` | Steps before this index are archived/compressed |
+| `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` | `12000` | Character fallback cap for optimized context |
+| `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS` | `3000` | Token budget cap; takes precedence over character cap |
+| `MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO` | `0.45` | Ratio of max tokens where proactive top-only trimming starts |
+| `MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO` | `0.75` | Ratio of max tokens where compaction/compression starts |
 | `MOEPT_AGENTIC__THINKING_PROTECT_RECENT` | `2` | Keep full thinking for last N steps |
-| `MOEPT_AGENTIC__SESSION_TIMEOUT` | `3600` | Session inactivity timeout (seconds) |
+| `MOEPT_AGENTIC__SESSION_TIMEOUT` | `3600` | Session inactivity timeout in seconds |
+| `MOEPT_AGENTIC__USE_TOKEN_BUDGET` | `true` | Use token-based budget enforcement |
+| `MOEPT_AGENTIC__FAST_PATH_ENABLED` | `true` | Bypass expensive transformations for contexts already under budget |
+| `MOEPT_AGENTIC__RAG_ENABLED` | `true` | Enable state-based RAG injection for long/over-budget sessions |
+| `MOEPT_AGENTIC__OPTIMIZE_CODE_BLOCKS` | `false` | Run tree-sitter/NPU code-block optimization |
+| `MOEPT_AGENTIC__CODE_SKELETON_ENABLED` | `true` | Compress large code blocks to skeletons under context pressure |
+| `MOEPT_AGENTIC__SEMANTIC_DEDUP_ENABLED` | `false` | Enable embedding-based semantic deduplication |
+| `MOEPT_AGENTIC__ATTENTION_SINKS_ENABLED` | `false` | Inject model-visible attention-sink markers |
+| `MOEPT_AGENTIC__STATIC_LAYER_ALIGNMENT_ENABLED` | `false` | Pad static layer to cache-block boundaries |
+| `MOEPT_AGENTIC__REASONING_PRESEED_ENABLED` | `false` | Inject reasoning scaffolding into user messages |
+| `MOEPT_AGENTIC__MTP_BOUNDARY_ALIGNMENT_ENABLED` | `false` | Pad final context to an MTP prediction boundary |
 
 ### Code Chunking
 
@@ -183,6 +209,7 @@ Environment variables use the `MOEPT_` prefix with `__` for nested config:
 | `MOEPT_CODE_CHUNKING__CHUNK_MAX_CHARS` | `1500` | Maximum characters per code chunk |
 | `MOEPT_CODE_CHUNKING__TOP_K_CHUNKS` | `5` | Number of top relevant chunks to retrieve |
 | `MOEPT_CODE_CHUNKING__MIN_CHUNK_SCORE` | `0.05` | Minimum embedding similarity score |
+| `MOEPT_CODE_CHUNKING__EMBEDDING_DIM` | `384` | Embedding vector dimension |
 
 ### Cache
 
@@ -190,6 +217,44 @@ Environment variables use the `MOEPT_` prefix with `__` for nested config:
 |---|---|---|
 | `MOEPT_CACHE__EMBED_CACHE_MAX` | `512` | Maximum embeddings in memory cache |
 | `MOEPT_CACHE__LANCEDB_PATH` | `~/.moeptimizer/lancedb` | LanceDB vector database data directory |
+
+### Speculative Decoding
+
+| Variable | Default | Description |
+|---|---|---|
+| `MOEPT_SPECULATIVE__ENABLED` | `false` | Enable MTP-aware speculative decoding |
+| `MOEPT_SPECULATIVE__MTP_LOOKAHEAD` | `4` | Number of tokens to predict ahead with MTP heads |
+| `MOEPT_SPECULATIVE__CONFIDENCE_THRESHOLD` | `0.7` | Minimum confidence for accepting speculative tokens |
+
+### v0.5.x Optimizations
+
+| Variable | Default | Description |
+|---|---|---|
+| `MOEPT_V050__STATIC_PREFIX_KV_ENABLED` | `true` | Enable static prefix KV-cache reuse |
+| `MOEPT_V050__STATIC_PREFIX_KV_MAX_ENTRIES` | `64` | Max entries in static prefix KV-cache |
+| `MOEPT_V050__TOKEN_AWARE_TRUNCATION_ENABLED` | `true` | Enable token-aware truncation with tiktoken |
+| `MOEPT_V050__CHUNK_FINGERPRINT_ENABLED` | `true` | Enable chunk fingerprinting and reuse |
+| `MOEPT_V050__CHUNK_FINGERPRINT_MAX_ENTRIES` | `2048` | Max entries in chunk fingerprint cache |
+| `MOEPT_V050__EMBEDDING_BATCH_SIZE` | `32` | Batch size for embedding queries |
+| `MOEPT_V050__EMBEDDING_INVALIDATION_ENABLED` | `true` | Enable file mtime-based embedding invalidation |
+| `MOEPT_V050__MTP_CHECKPOINT_ENABLED` | `true` | Enable MTP-head state checkpointing |
+| `MOEPT_V050__MTP_CHECKPOINT_MAX_ENTRIES` | `256` | Max entries in MTP head checkpoint cache |
+| `MOEPT_V050__PARALLEL_EMBED_WORKERS` | `8` | Number of thread workers for parallel embedding |
+| `MOEPT_V050__SEGMENT_SPECULATIVE_ENABLED` | `false` | Enable segment-wise speculative decoding |
+| `MOEPT_V050__HIT_PREDICTION_ENABLED` | `true` | Enable lightweight hit-prediction model |
+| `MOEPT_V050__HIT_PREDICTION_RETRAIN_THRESHOLD` | `50` | New samples before retraining |
+| `MOEPT_V050__TEMPLATE_SELECTOR_ENABLED` | `true` | Enable template selector for cache optimization |
+| `MOEPT_V050__TEMPLATE_SELECTOR_EXPLORATION_RATE` | `0.1` | Exploration rate for template selection |
+| `MOEPT_V050__HIERARCHICAL_SUMMARY_ENABLED` | `false` | Enable hierarchical summarization of old turns |
+| `MOEPT_V050__HIERARCHICAL_SUMMARY_MAX_FULL_TURNS` | `5` | Max recent turns to keep in full |
+| `MOEPT_V050__DELTA_ENCODING_ENABLED` | `true` | Enable delta-encoding of code snapshots |
+| `MOEPT_V050__DELTA_ENCODING_MAX_SNAPSHOTS` | `100` | Max code snapshots to keep |
+| `MOEPT_V050__KV_WARMUP_ENABLED` | `true` | Enable KV-cache warm-up for MTP heads |
+| `MOEPT_V050__KV_WARMUP_MAX_ENTRIES` | `32` | Max warmup cache entries |
+| `MOEPT_V050__ENABLE_EXPERIMENTAL_BACKEND_HINTS` | `false` | Send optional llama.cpp/MTP cache-control hints |
+| `MOEPT_V050__ASYNC_IO_ENABLED` | `true` | Enable async I/O for heavy pipeline stages |
+| `MOEPT_V050__ASYNC_IO_MAX_THREAD_WORKERS` | `4` | Max thread workers for CPU-bound stages |
+| `MOEPT_V050__ASYNC_IO_MAX_CONCURRENCY` | `16` | Max concurrent async tasks |
 
 ## Usage
 
@@ -237,11 +302,17 @@ python scripts/benchmark.py
 
 # Real-life coding scenarios
 python scripts/benchmark.py --scenario debug --turns 15 --live
-python scripts/benchmark.py --scenario refactor --turns 10 --live
+python scripts/benchmark.py --scenario debug_long --turns 30 --live
+python scripts/benchmark.py --scenario refactor_long --turns 30 --live
+python scripts/benchmark.py --scenario feature_long --turns 30 --live
+python scripts/benchmark.py --scenario default_long --turns 30 --live
 python scripts/benchmark.py --scenario feature --turns 20 --live
 
 # Stress test with context eviction
 python scripts/benchmark.py --turns 50 --budget 8000 --live
+
+# Aggressive token-savings profile (top-only eviction, 3000-token cap)
+python scripts/benchmark.py --scenario refactor_long --turns 30 --profile aggressive --json > report.json
 
 # JSON output for analysis
 python scripts/benchmark.py --turns 20 --json > report.json 2> benchmark.log
@@ -258,9 +329,13 @@ You might need to run the benchmark as background task to avoid hitting command 
 | Scenario | Description |
 |----------|-------------|
 | `debug` | Debugging session with error analysis and fix suggestions |
+| `debug_long` | 30-turn real-life debug conversation with evolving code blocks and context growth beyond 32k tokens |
 | `refactor` | Code refactoring with performance optimization and type hints |
+| `refactor_long` | 30-turn real-life refactor conversation with evolving code blocks and context growth beyond 32k tokens |
 | `feature` | Feature implementation with API design and testing |
+| `feature_long` | 30-turn real-life feature conversation with evolving code blocks and context growth beyond 32k tokens |
 | `default` | General coding conversation (Fibonacci example) |
+| `default_long` | 30-turn general coding conversation with evolving code blocks and context growth beyond 32k tokens |
 
 ### Metrics Collected
 

@@ -140,10 +140,10 @@ class TestDryRunResponseNormalization:
         content = data["choices"][0]["message"]["content"]
 
         assert content == "Thinking...\n\nAnswer is 42.", (
-            f"Content should be merged from reasoning_content, got: {content}"
+            f"Content should be filled from reasoning_content, got: {content}"
         )
-        assert "reasoning_content" not in data["choices"][0]["message"], (
-            "reasoning_content should be removed after merge"
+        assert data["choices"][0]["message"]["reasoning_content"] == "Thinking...\n\nAnswer is 42.", (
+            "reasoning_content should be preserved for cache-stable echo"
         )
 
     def test_non_empty_content_unchanged(self) -> None:
@@ -204,11 +204,12 @@ class TestDryRunResponseNormalization:
         assert content == "Direct answer.", (
             "Existing content should not be overwritten"
         )
-        # reasoning_content should still be removed
-        assert "reasoning_content" not in data["choices"][0]["message"]
+        assert data["choices"][0]["message"]["reasoning_content"] == "Thinking...", (
+            "reasoning_content should be preserved for cache-stable echo"
+        )
 
-    def test_reasoning_content_stripped_when_both_present(self) -> None:
-        """When both content and reasoning_content exist, only content is used."""
+    def test_reasoning_content_preserved_when_both_present(self) -> None:
+        """When both content and reasoning_content exist, preserve both."""
         from unittest.mock import AsyncMock, MagicMock
 
         from moeptimizer.app import _do_non_streaming
@@ -256,7 +257,7 @@ class TestDryRunResponseNormalization:
         data = json.loads(result.body)
         msg = data["choices"][0]["message"]
         assert msg["content"] == "The answer is 42."
-        assert "reasoning_content" not in msg
+        assert msg["reasoning_content"] == "Step-by-step reasoning..."
 
 
 class TestDryRunMessageValidation:
@@ -331,19 +332,22 @@ class TestDryRunSessionResolution:
         assert first == second
         assert first.startswith("user:")
 
-    def test_anonymous_session_falls_back_to_message_fingerprint(self) -> None:
+    def test_anonymous_session_uses_first_user_message_for_stability(self) -> None:
         from moeptimizer.app import _resolve_session_id
 
-        session_id = _resolve_session_id(
+        first = _resolve_session_id(
             {},
             [{"role": "user", "content": "hello"}],
         )
-
-        assert session_id.startswith("anon:")
-        assert _resolve_session_id(
+        second = _resolve_session_id(
             {},
-            [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
-        ) != session_id
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        )
+        assert first.startswith("anon:")
+        assert first == second
 
     def test_chat_completion_strips_custom_session_fields_before_lemonade(
         self,

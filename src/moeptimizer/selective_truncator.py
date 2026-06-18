@@ -28,29 +28,19 @@ class SelectiveTruncator:
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Truncate context to max tokens while preserving structure."""
-        # Estimate current token count
-        total_chars = sum(
-            len(m.get("content", "")) for m in messages
-        )
-        estimated_tokens = total_chars // 4
-
-        if estimated_tokens <= self._max_tokens:
+        """Drop whole old messages from the front without content truncation."""
+        if not messages:
             return messages
 
-        # Truncate from oldest to newest
         result = []
         remaining = self._max_tokens * 4
 
         for msg in messages:
-            content = msg.get("content", "")
-            if len(content) <= remaining:
+            msg_size = len(msg.get("content", ""))
+            if msg_size <= remaining:
                 result.append(dict(msg))
-                remaining -= len(content)
+                remaining -= msg_size
             else:
-                # Truncate this message
-                truncated = self._truncate_message(content, remaining)
-                result.append({**msg, "content": truncated})
                 break
 
         return result
@@ -60,75 +50,47 @@ class SelectiveTruncator:
         content: str,
         max_chars: int,
     ) -> str:
-        """Truncate a message, preferring to keep code."""
-        # Find code blocks
-        code_blocks = list(
-            re.finditer(r"```[\w]*\n(.*?)```", content, re.DOTALL)
-        )
-
-        if not code_blocks:
-            return content[:max_chars]
-
-        # Keep code blocks, truncate explanations
-        result = []
-        last_end = 0
-
-        for match in code_blocks:
-            # Add text before code block
-            before = content[last_end : match.start()]
-            if before:
-                # Truncate before text
-                before = before[: max_chars // 4]
-                result.append(before)
-                max_chars -= len(before)
-
-            # Add code block
-            code = match.group(0)
-            if len(code) <= max_chars:
-                result.append(code)
-                max_chars -= len(code)
-            else:
-                # Truncate code block
-                result.append(code[:max_chars])
-                max_chars = 0
-                break
-
-            last_end = match.end()
-
-        return "".join(result)
+        """No-op for API compatibility; content truncation is disabled."""
+        del max_chars
+        return content
 
     def remove_duplicates(
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Remove duplicate code blocks from context."""
+        """Remove duplicate code blocks only from the newest user message."""
+        result = [dict(msg) for msg in messages]
+        last_user_idx = -1
+        for idx in range(len(result) - 1, -1, -1):
+            if result[idx].get("role") == "user":
+                last_user_idx = idx
+                break
+
+        if last_user_idx < 0:
+            return result
+
+        msg = result[last_user_idx]
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            return result
+
         seen_code = set()
-        result = []
+        code_blocks = re.findall(
+            r"(```[\w]*\n.*?)```", content, re.DOTALL
+        )
+        if not code_blocks:
+            return result
 
-        for msg in messages:
-            content = msg.get("content", "")
-            # Extract code blocks (including language identifier)
-            code_blocks = re.findall(
-                r"(```[\w]*\n.*?)```", content, re.DOTALL
-            )
+        new_content = content
+        for code in code_blocks:
+            if code in seen_code:
+                new_content = new_content.replace(
+                    f"{code}```", "", 1
+                )
+            else:
+                seen_code.add(code)
 
-            if not code_blocks:
-                result.append(dict(msg))
-                continue
-
-            # Check for duplicates
-            new_content = content
-            for code in code_blocks:
-                if code in seen_code:
-                    # Remove this code block (including the opening fence)
-                    new_content = new_content.replace(
-                        f"{code}```", "", 1
-                    )
-                else:
-                    seen_code.add(code)
-
-            result.append({**msg, "content": new_content})
-
+        result[last_user_idx] = {**msg, "content": new_content}
         return result
 
     def summarize_old_turns(
