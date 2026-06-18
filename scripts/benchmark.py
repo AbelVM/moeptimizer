@@ -1525,6 +1525,218 @@ def _build_conversation_turns(num_turns: int) -> list[dict]:
     return messages
 
 
+def _collect_direct_conversation(
+    messages: list[dict],
+    num_turns: int,
+    user_tasks: list[str],
+    fallback_user_task: str,
+    request_timeout: float,
+    max_tokens: int,
+    turn_offset: int,
+) -> tuple[list[TurnMetrics], list[str]]:
+    """Run a full conversation against direct Lemonade."""
+    direct_contents: list[str] = []
+    direct_metrics: list[TurnMetrics] = []
+
+    for local_turn in range(num_turns):
+        turn_index = turn_offset + local_turn + 1
+        user_content = (
+            user_tasks[(turn_index - 1) % len(user_tasks)]
+            if user_tasks
+            else fallback_user_task.format(turn_index=turn_index)
+        )
+        messages.append({"role": "user", "content": user_content})
+
+        direct_context = _context_size_summary(messages)
+        _human_print(
+            f"  Direct turn {turn_index:02d}/{num_turns:02d}: "
+            f"ctx={direct_context['messages']} msgs/{direct_context['chars']:,} chars/"
+            f"~{direct_context['estimated_tokens']:,} tokens"
+        )
+
+        try:
+            direct_resp, direct_latency, _ = _direct_request(
+                messages, max_tokens=max_tokens, timeout=request_timeout
+            )
+            d_usage = direct_resp.get("usage", {}) or {}
+            d_msg = direct_resp["choices"][0]["message"]
+            d_content = (d_msg.get("content") or "") + (d_msg.get("reasoning_content") or "")
+
+            _d_prompt_raw = int(d_usage.get("prompt_tokens", 0) or 0)
+            _d_cached = int((d_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
+            _d_prompt, _d_prompt_source, _d_cached_response = _resolve_prompt_tokens(
+                _d_prompt_raw, messages, d_usage
+            )
+            metrics = TurnMetrics(
+                turn_index=turn_index,
+                total_turns_at_request=len(messages) - 1,  # exclude system
+                prompt_tokens=_d_prompt,
+                raw_prompt_tokens=_d_prompt_raw,
+                prompt_tokens_source=_d_prompt_source,
+                cached_response=_d_cached_response,
+                completion_tokens=int(d_usage.get("completion_tokens", 0) or 0),
+                total_tokens=int(d_usage.get("total_tokens", 0) or 0),
+                cached_tokens=_d_cached,
+                cache_hit_rate=round(_d_cached / max(_d_prompt, 1), 2),
+                latency_ms=round(direct_latency, 2),
+                response_chars=len(d_content),
+                finish_reason=direct_resp["choices"][0].get("finish_reason", ""),
+                content_preview=d_content[:200],
+            )
+        except Exception as e:
+            metrics = TurnMetrics(
+                turn_index=turn_index,
+                total_turns_at_request=len(messages) - 1,
+                prompt_tokens=_estimate_prompt_tokens(messages) if messages else 0,
+                prompt_tokens_source="estimated_after_error",
+                latency_ms=0.0,
+                error=str(e)[:200],
+            )
+            d_content = ""
+
+        if d_content:
+            messages.append({"role": "assistant", "content": d_content})
+            direct_contents.append(d_content)
+        else:
+            direct_contents.append("")
+
+        direct_metrics.append(metrics)
+
+    return direct_metrics, direct_contents
+
+
+def _collect_proxy_conversation(
+    messages: list[dict],
+    session_id: str,
+    num_turns: int,
+    user_tasks: list[str],
+    fallback_user_task: str,
+    request_timeout: float,
+    max_tokens: int,
+    turn_offset: int,
+) -> tuple[list[TurnMetrics], list[str]]:
+    """Run a full conversation through the moeptimizer proxy."""
+    proxy_contents: list[str] = []
+    proxy_metrics: list[TurnMetrics] = []
+
+    for local_turn in range(num_turns):
+        turn_index = turn_offset + local_turn + 1
+        user_content = (
+            user_tasks[(turn_index - 1) % len(user_tasks)]
+            if user_tasks
+            else fallback_user_task.format(turn_index=turn_index)
+        )
+        messages.append({"role": "user", "content": user_content})
+
+        proxy_context = _context_size_summary(messages)
+        _human_print(
+            f"  Proxy turn {turn_index:02d}/{num_turns:02d}: "
+            f"ctx={proxy_context['messages']} msgs/{proxy_context['chars']:,} chars/"
+            f"~{proxy_context['estimated_tokens']:,} tokens"
+        )
+
+        try:
+            proxy_resp, proxy_latency, proxy_headers = _proxy_request(
+                messages, session_id=session_id, max_tokens=max_tokens, timeout=request_timeout
+            )
+            p_usage = proxy_resp.get("usage", {}) or {}
+            p_msg = proxy_resp["choices"][0]["message"]
+            p_content = (p_msg.get("content") or "") + (p_msg.get("reasoning_content") or "")
+
+            _p_prompt_raw = int(p_usage.get("prompt_tokens", 0) or 0)
+            _p_cached = int((p_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
+            _p_optimized_prompt_tokens = int(
+                proxy_headers.get("X-Optimized-Prompt-Tokens")
+                or proxy_headers.get("x-optimized-prompt-tokens")
+                or 0
+            )
+            _p_prompt, _p_prompt_source, _p_cached_response = _resolve_prompt_tokens(
+                _p_prompt_raw,
+                messages,
+                p_usage,
+                optimized_prompt_tokens=_p_optimized_prompt_tokens,
+            )
+            # Measure total chars before proxy optimization (for eviction tracking)
+            _chars_before = sum(len(_message_text(m.get("content", ""))) for m in messages)
+            metrics = TurnMetrics(
+                turn_index=turn_index,
+                total_turns_at_request=len(messages) - 1,
+                prompt_tokens=_p_prompt,
+                raw_prompt_tokens=_p_prompt_raw,
+                optimized_prompt_tokens=_p_optimized_prompt_tokens,
+                prompt_tokens_source=_p_prompt_source,
+                cached_response=_p_cached_response,
+                completion_tokens=int(p_usage.get("completion_tokens", 0) or 0),
+                total_tokens=int(p_usage.get("total_tokens", 0) or 0),
+                cached_tokens=_p_cached,
+                cache_hit_rate=round(_p_cached / max(_p_prompt, 1), 2),
+                latency_ms=round(proxy_latency, 2),
+                response_chars=len(p_content),
+                finish_reason=proxy_resp["choices"][0].get("finish_reason", ""),
+                content_preview=p_content[:200],
+                chars_before_optimization=_chars_before,
+            )
+
+            # Check for leaked internal markers
+            metrics.foreign_markers = _check_foreign_markers(p_content)
+        except Exception as e:
+            metrics = TurnMetrics(
+                turn_index=turn_index,
+                total_turns_at_request=len(messages) - 1,
+                prompt_tokens=_estimate_prompt_tokens(messages) if messages else 0,
+                prompt_tokens_source="estimated_after_error",
+                latency_ms=0.0,
+                error=str(e)[:200],
+            )
+            # Try to extract optimization error from response headers if available
+            if hasattr(e, "response") and hasattr(e.response, "headers"):
+                opt_error = e.response.headers.get("X-Optimization-Error")
+                if opt_error:
+                    metrics.error = f"{metrics.error} | optimization: {opt_error}"
+            p_content = ""
+
+        if p_content:
+            messages.append({"role": "assistant", "content": p_content})
+            proxy_contents.append(p_content)
+        else:
+            proxy_contents.append("")
+
+        proxy_metrics.append(metrics)
+
+    return proxy_metrics, proxy_contents
+
+
+def _build_turn_comparisons(
+    direct_metrics: list[TurnMetrics],
+    proxy_metrics: list[TurnMetrics],
+    direct_contents: list[str],
+    proxy_contents: list[str],
+) -> list[TurnComparison]:
+    """Build per-turn comparisons after both full conversations complete."""
+    comparisons: list[TurnComparison] = []
+    for direct, proxy, d_content, p_content in zip(
+        direct_metrics,
+        proxy_metrics,
+        direct_contents,
+        proxy_contents,
+        strict=True,
+    ):
+        quality: dict[str, float | None] = {}
+        if d_content and p_content:
+            quality.update(_compute_quality_metrics(d_content, p_content))
+
+        comparison = TurnComparison(
+            turn_index=direct.turn_index,
+            direct=direct,
+            proxy=proxy,
+            latency_delta_ms=round(proxy.latency_ms - direct.latency_ms, 2),
+            token_delta=proxy.prompt_tokens - direct.prompt_tokens,
+            quality=quality,
+        )
+        comparisons.append(comparison)
+    return comparisons
+
+
 def run_benchmark(
     num_turns: int,
     rounds: int,
@@ -1533,7 +1745,12 @@ def run_benchmark(
     budget: int | None = None,
     scenario: str = "default",
 ) -> BenchmarkReport:
-    """Run the multi-turn benchmark and collect metrics."""
+    """Run the multi-turn benchmark and collect metrics.
+
+    Direct Lemonade is run as a complete conversation before the proxy is run as a
+    complete conversation. This keeps model cache state contiguous and avoids
+    alternating direct/proxy requests from invalidating the direct benchmark.
+    """
 
     # Update module-level port so _proxy_request uses it
     global MOEPT_PORT
@@ -1553,6 +1770,7 @@ def run_benchmark(
         "char_budget": char_budget,
         "scenario": scenario,
         "request_timeout": request_timeout,
+        "execution_order": "direct_full_conversation_then_proxy_full_conversation",
     }
 
     report = BenchmarkReport(config=config)
@@ -1569,7 +1787,6 @@ def run_benchmark(
     for role, content in base_tasks:
         base_messages.append({"role": role, "content": content})
 
-    turn_index = 0
     user_tasks = [content for role, content in base_tasks if role == "user"]
     fallback_user_task = (
         "Turn {turn_index}: Remember the fibonacci generator we discussed? "
@@ -1580,180 +1797,61 @@ def run_benchmark(
         # Each round gets an isolated proxy session so prior-round state cannot
         # leak into the next benchmark round.
         session_id = f"benchmark-{int(time.time())}-{round_num}-{uuid.uuid4().hex[:8]}"
+
+        _human_print(f"  Round {round_num + 1}/{rounds}: direct conversation")
         direct_messages: list[dict] = [dict(msg) for msg in base_messages]
+        direct_metrics, direct_contents = _collect_direct_conversation(
+            direct_messages,
+            num_turns,
+            user_tasks,
+            fallback_user_task,
+            request_timeout,
+            max_tokens,
+            turn_offset=round_num * num_turns,
+        )
+
+        _human_print(f"  Round {round_num + 1}/{rounds}: proxy conversation")
         proxy_messages: list[dict] = [dict(msg) for msg in base_messages]
+        proxy_metrics, proxy_contents = _collect_proxy_conversation(
+            proxy_messages,
+            session_id,
+            num_turns,
+            user_tasks,
+            fallback_user_task,
+            request_timeout,
+            max_tokens,
+            turn_offset=round_num * num_turns,
+        )
 
-        for _ in range(num_turns):
-            turn_index += 1
-            user_content = (
-                user_tasks[(turn_index - 1) % len(user_tasks)]
-                if user_tasks
-                else fallback_user_task.format(turn_index=turn_index)
-            )
+        comparisons = _build_turn_comparisons(
+            direct_metrics,
+            proxy_metrics,
+            direct_contents,
+            proxy_contents,
+        )
+        report.turns.extend(comparisons)
 
-            # Add the current user turn to both contexts before either request.
-            direct_messages.append({"role": "user", "content": user_content})
-            proxy_messages.append({"role": "user", "content": user_content})
-
-            direct_context = _context_size_summary(direct_messages)
-            proxy_context = _context_size_summary(proxy_messages)
-            _human_print(
-                f"  Turn {turn_index:02d}/{num_turns:02d}: "
-                f"direct_ctx={direct_context['messages']} msgs/{direct_context['chars']:,} chars/"
-                f"~{direct_context['estimated_tokens']:,} tokens; "
-                f"proxy_ctx={proxy_context['messages']} msgs/{proxy_context['chars']:,} chars/"
-                f"~{proxy_context['estimated_tokens']:,} tokens"
-            )
-
-            # --- Direct request ---
-            direct_resp: dict | None = None
-            proxy_resp: dict | None = None
-            d_content = ""
-            p_content = ""
-
-            try:
-                direct_resp, direct_latency, _direct_headers = _direct_request(
-                    direct_messages, max_tokens=max_tokens, timeout=request_timeout
-                )
-                d_usage = direct_resp.get("usage", {}) or {}
-                d_msg = direct_resp["choices"][0]["message"]
-                d_content = (d_msg.get("content") or "") + (d_msg.get("reasoning_content") or "")
-
-                _d_prompt_raw = int(d_usage.get("prompt_tokens", 0) or 0)
-                _d_cached = int((d_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
-                _d_prompt, _d_prompt_source, _d_cached_response = _resolve_prompt_tokens(
-                    _d_prompt_raw, direct_messages, d_usage
-                )
-                direct_metrics = TurnMetrics(
-                    turn_index=turn_index,
-                    total_turns_at_request=len(direct_messages) - 1,  # exclude system
-                    prompt_tokens=_d_prompt,
-                    raw_prompt_tokens=_d_prompt_raw,
-                    prompt_tokens_source=_d_prompt_source,
-                    cached_response=_d_cached_response,
-                    completion_tokens=int(d_usage.get("completion_tokens", 0) or 0),
-                    total_tokens=int(d_usage.get("total_tokens", 0) or 0),
-                    cached_tokens=_d_cached,
-                    cache_hit_rate=round(_d_cached / max(_d_prompt, 1), 2),
-                    latency_ms=round(direct_latency, 2),
-                    response_chars=len(d_content),
-                    finish_reason=direct_resp["choices"][0].get("finish_reason", ""),
-                    content_preview=d_content[:200],
-                )
-            except Exception as e:
-                direct_metrics = TurnMetrics(
-                    turn_index=turn_index,
-                    total_turns_at_request=len(direct_messages) - 1,
-                    prompt_tokens=_estimate_prompt_tokens(direct_messages) if direct_messages else 0,
-                    prompt_tokens_source="estimated_after_error",
-                    latency_ms=0.0,
-                    error=str(e)[:200],
-                )
-
-            # --- Proxy request ---
-            try:
-                proxy_resp, proxy_latency, proxy_headers = _proxy_request(
-                    proxy_messages, session_id=session_id, max_tokens=max_tokens, timeout=request_timeout
-                )
-                p_usage = proxy_resp.get("usage", {}) or {}
-                p_msg = proxy_resp["choices"][0]["message"]
-                p_content = (p_msg.get("content") or "") + (p_msg.get("reasoning_content") or "")
-
-                _p_prompt_raw = int(p_usage.get("prompt_tokens", 0) or 0)
-                _p_cached = int((p_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
-                _p_optimized_prompt_tokens = int(
-                    proxy_headers.get("X-Optimized-Prompt-Tokens")
-                    or proxy_headers.get("x-optimized-prompt-tokens")
-                    or 0
-                )
-                _p_prompt, _p_prompt_source, _p_cached_response = _resolve_prompt_tokens(
-                    _p_prompt_raw,
-                    proxy_messages,
-                    p_usage,
-                    optimized_prompt_tokens=_p_optimized_prompt_tokens,
-                )
-                # Measure total chars before proxy optimization (for eviction tracking)
-                _chars_before = sum(len(_message_text(m.get("content", ""))) for m in proxy_messages)
-                proxy_metrics = TurnMetrics(
-                    turn_index=turn_index,
-                    total_turns_at_request=len(proxy_messages) - 1,
-                    prompt_tokens=_p_prompt,
-                    raw_prompt_tokens=_p_prompt_raw,
-                    optimized_prompt_tokens=_p_optimized_prompt_tokens,
-                    prompt_tokens_source=_p_prompt_source,
-                    cached_response=_p_cached_response,
-                    completion_tokens=int(p_usage.get("completion_tokens", 0) or 0),
-                    total_tokens=int(p_usage.get("total_tokens", 0) or 0),
-                    cached_tokens=_p_cached,
-                    cache_hit_rate=round(_p_cached / max(_p_prompt, 1), 2),
-                    latency_ms=round(proxy_latency, 2),
-                    response_chars=len(p_content),
-                    finish_reason=proxy_resp["choices"][0].get("finish_reason", ""),
-                    content_preview=p_content[:200],
-                    chars_before_optimization=_chars_before,
-                )
-
-                # Check for leaked internal markers
-                proxy_metrics.foreign_markers = _check_foreign_markers(p_content)
-
-            except Exception as e:
-                proxy_metrics = TurnMetrics(
-                    turn_index=turn_index,
-                    total_turns_at_request=len(proxy_messages) - 1,
-                    prompt_tokens=_estimate_prompt_tokens(proxy_messages) if proxy_messages else 0,
-                    prompt_tokens_source="estimated_after_error",
-                    latency_ms=0.0,
-                    error=str(e)[:200],
-                )
-                # Try to extract optimization error from response headers if available
-                if hasattr(e, "response") and hasattr(e.response, "headers"):
-                    opt_error = e.response.headers.get("X-Optimization-Error")
-                    if opt_error:
-                        proxy_metrics.error = f"{proxy_metrics.error} | optimization: {opt_error}"
-
-            # Append each side's assistant response to its own context for the next turn.
-            if d_content:
-                direct_messages.append({"role": "assistant", "content": d_content})
-            if p_content:
-                proxy_messages.append({"role": "assistant", "content": p_content})
-
-            # Compute quality metrics (only if both responses are valid)
-            quality: dict[str, float | None] = {}
-            if d_content and p_content:
-                quality = _compute_quality_metrics(d_content, p_content)
-
-            # Compute deltas
-            comparison = TurnComparison(
-                turn_index=turn_index,
-                direct=direct_metrics,
-                proxy=proxy_metrics,
-                latency_delta_ms=round(proxy_metrics.latency_ms - direct_metrics.latency_ms, 2),
-                token_delta=proxy_metrics.prompt_tokens - direct_metrics.prompt_tokens,
-                quality=quality,
-            )
-
-            q_sem = quality.get("semantic_similarity") if quality else None
-            q_jaccard = quality.get("token_jaccard") if quality else None
-            q_rouge = quality.get("rouge_l_f1") if quality else None
-            direct_error = f" direct_error={direct_metrics.error[:80]!r}" if direct_metrics.error else ""
-            proxy_error = f" proxy_error={proxy_metrics.error[:80]!r}" if proxy_metrics.error else ""
+        for comparison in comparisons:
+            q_sem = comparison.quality.get("semantic_similarity") if comparison.quality else None
+            q_jaccard = comparison.quality.get("token_jaccard") if comparison.quality else None
+            q_rouge = comparison.quality.get("rouge_l_f1") if comparison.quality else None
+            direct_error = f" direct_error={comparison.direct.error[:80]!r}" if comparison.direct.error else ""
+            proxy_error = f" proxy_error={comparison.proxy.error[:80]!r}" if comparison.proxy.error else ""
             quality_parts = [
                 f"quality_sem={q_sem:.3f}" if q_sem is not None else "quality_sem=n/a",
                 f"jaccard={q_jaccard:.3f}" if q_jaccard is not None else "jaccard=n/a",
                 f"rouge={q_rouge:.3f}" if q_rouge is not None else "rouge=n/a",
             ]
             _human_print(
-                f"  Turn {turn_index:02d}: "
-                f"direct={direct_metrics.latency_ms:.0f}ms/{direct_metrics.prompt_tokens:,}tok/{direct_metrics.response_chars:,}chars"
-                f" proxy={proxy_metrics.latency_ms:.0f}ms/{proxy_metrics.prompt_tokens:,}tok/"
-                f"{proxy_metrics.chars_before_optimization:,}chars_raw/{proxy_metrics.response_chars:,}chars"
+                f"  Turn {comparison.turn_index:02d}: "
+                f"direct={comparison.direct.latency_ms:.0f}ms/{comparison.direct.prompt_tokens:,}tok/{comparison.direct.response_chars:,}chars"
+                f" proxy={comparison.proxy.latency_ms:.0f}ms/{comparison.proxy.prompt_tokens:,}tok/"
+                f"{comparison.proxy.chars_before_optimization:,}chars_raw/{comparison.proxy.response_chars:,}chars"
                 f" delta={comparison.latency_delta_ms:+.0f}ms/{comparison.token_delta:+,}tok"
-                f" cache={proxy_metrics.cached_tokens:,}/{proxy_metrics.cache_hit_rate:.2f} "
+                f" cache={comparison.proxy.cached_tokens:,}/{comparison.proxy.cache_hit_rate:.2f} "
                 f"{' '.join(quality_parts)}"
                 f"{direct_error}{proxy_error}"
             )
-
-            report.turns.append(comparison)
 
     return report
 
