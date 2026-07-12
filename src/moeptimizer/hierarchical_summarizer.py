@@ -181,7 +181,12 @@ class HierarchicalSummarizer:
             self._summarized_turn_count = end
 
         keep_recent = [m for t in turns[end:] for m in t]
-        return [*frozen, self._build_rolling_summary_block(), *keep_recent]
+        # Append the rolling summary as a TRAILING turn (review §1/§9, priority
+        # fix #1): inserting it right after the frozen prefix shifts every later
+        # turn's token offset and invalidates the backend's prefix cache. As a
+        # trailing turn it never alters the stable leading prefix, so the backend
+        # reuses its cached KV for the frozen + recent turns.
+        return [*frozen, *keep_recent, self._build_rolling_summary_block()]
 
     def _build_rolling_summary_block(self) -> dict[str, Any]:
         """Return the single rolling-summary message (append-only content)."""

@@ -1,7 +1,12 @@
-"""MTP state management for context switching.
+"""MTP state management — NON-FUNCTIONAL placeholder (see review03.md §2.1/§10).
 
-Serializes and restores MTP hidden states to maintain prediction quality
-across context evictions.
+MTP (multi-token prediction) is a model-internal decoder optimization. A
+client-side OpenAI proxy CANNOT read or write MTP hidden states or draft tokens
+— there is no OpenAI field for them. This module therefore cannot preserve MTP
+state. It is retained only as inert scaffolding behind a disabled-by-default
+config flag so existing imports keep working; `save_state` is never called from
+the optimizer and `align_prediction_boundary` is an explicit no-op. Do not rely
+on this for any MTP optimization.
 """
 
 from __future__ import annotations
@@ -10,17 +15,17 @@ import hashlib
 import logging
 import pickle
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
 
 class MTPStateManager:
     """
-    Manages MTP hidden state serialization for context switching.
+    Inert MTP-state scaffolding (non-functional; see module docstring).
 
-    When context is evicted and restored, MTP internal state is lost.
-    This module preserves that state to maintain prediction quality.
+    MTP hidden state cannot be captured or restored by an OpenAI client proxy.
+    This class exists only so imports resolve; it performs no MTP optimization.
     """
 
     def __init__(self, max_states: int = 100) -> None:
@@ -76,15 +81,42 @@ class MTPStateManager:
         self,
         messages: list[dict[str, Any]],
         overlap_tokens: int = 128,
+        encode: "Callable[[str], list[int]] | None" = None,
     ) -> str:
-        """Generate state key for context.
+        """Generate a state key from the trailing context (review §6 bug #6).
 
-        Uses the overlap region to ensure state continuity.
-        Uses 32 hex chars (128 bits) to minimize collision risk.
+        The previous implementation sliced the last ``overlap_tokens`` *characters*
+        despite the parameter name saying "tokens", which collided across very
+        different contexts. This now tokenizes and hashes the last
+        ``overlap_tokens`` *tokens* when a tokenizer is available, falling back to
+        characters only if tokenization fails. (This key is inert — see module
+        docstring — but the bug is fixed so the scaffolding is at least correct.)
+
+        ``encode`` is an optional ``str -> list[int]`` callable (e.g. the
+        optimizer's ``TokenCounter._encode``) to avoid reloading a tokenizer.
         """
-        # Get the last N tokens of context for state key
         content = "".join(m.get("content", "") for m in messages)
-        overlap = content[-overlap_tokens:] if len(content) > overlap_tokens else content
+        if not content:
+            return hashlib.md5(b"").hexdigest()[:32]
+        if encode is not None:
+            try:
+                ids = encode(content)
+                tail = ids[-overlap_tokens:] if len(ids) > overlap_tokens else ids
+                overlap = " ".join(str(t) for t in tail)
+                return hashlib.md5(overlap.encode()).hexdigest()[:32]
+            except Exception:
+                pass
+        try:  # pragma: no cover - best effort; depends on transformers availability
+            from transformers import AutoTokenizer  # type: ignore
+
+            tok = AutoTokenizer.from_pretrained(
+                "Qwen/Qwen2.5-32B", local_files_only=True, trust_remote_code=False
+            )
+            ids = tok.encode(content, add_special_tokens=False)
+            tail = ids[-overlap_tokens:] if len(ids) > overlap_tokens else ids
+            overlap = " ".join(str(t) for t in tail)
+        except Exception:
+            overlap = content[-overlap_tokens:] if len(content) > overlap_tokens else content
         return hashlib.md5(overlap.encode()).hexdigest()[:32]
 
     def align_prediction_boundary(

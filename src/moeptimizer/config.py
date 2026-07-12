@@ -41,6 +41,19 @@ class ServerConfig(BaseModel):
     )
     llm_model: str = Field(default="Qwen3.6-35B-A3B-MTP-GGUF")
     embed_model: str = Field(default="embed-gemma-300m-FLM")
+    tokenizer: str = Field(
+        default="auto",
+        description=(
+            "Tokenizer used for budget/counting (review §6 bug #1). One of: "
+            "'auto' (try a local Qwen HF tokenizer, else fall back to tiktoken "
+            "cl100k_base), a HuggingFace repo id or local directory/path to a "
+            "tokenizer.json (loaded via transformers AutoTokenizer), or a tiktoken "
+            "encoding name (e.g. 'cl100k_base'). NOTE: cl100k_base is GPT-4's BPE, "
+            "not Qwen's, so it only approximates Qwen token counts; runtime "
+            "calibration from the backend's real prompt_tokens corrects the ratio "
+            "per turn regardless of this setting."
+        ),
+    )
     timeout: float = Field(
         default=300.0,
         description="Request timeout in seconds for long context conversations",
@@ -120,9 +133,42 @@ class AgenticConfig(BaseModel):
         default=False,
         description="Inject reasoning scaffolding into user messages. Disabled by default to preserve direct-request semantics.",
     )
+    tool_output_compression_enabled: bool = Field(
+        default=True,
+        description=(
+            "Boundary-compress large tool/assistant outputs (logs, file dumps, "
+            "RAG blobs) with cheap, lossless-ish transforms before they enter the "
+            "stable prefix (headroom/snip-style). Applied once when a tool message "
+            "first appears, so the compressed form is frozen into the prefix and "
+            "the backend's prefix cache stays valid. Truncates oversized outputs "
+            "(head+tail keep), collapses repeated stack frames, strips ANSI, and "
+            "keeps code signatures. Disabled only if you need verbatim tool output."
+        ),
+    )
+    tool_output_compression_max_chars: int = Field(
+        default=4000,
+        description="Tool/assistant outputs longer than this (chars) are boundary-compressed.",
+    )
+    eviction_low_water_ratio: float = Field(
+        default=0.8,
+        description=(
+            "High/low watermark for budget eviction (review03.md §6/§9). Eviction "
+            "is triggered when the evictable body exceeds the budget (high water), "
+            "but then trims down to budget * this ratio (low water) in one batch. "
+            "This keeps the oldest kept turn byte-stable across many subsequent "
+            "turns instead of evicting one pair every over-budget turn, so the "
+            "backend's native prefix cache (cached_tokens) is reused far more. Set "
+            "to 1.0 to restore trim-to-exact-budget behavior."
+        ),
+    )
     mtp_boundary_alignment_enabled: bool = Field(
         default=False,
-        description="Pad the final context to an MTP prediction boundary. Disabled by default to avoid extra tokens.",
+        description=(
+            "Pad the final context to an MTP prediction boundary. NON-FUNCTIONAL: "
+            "an OpenAI client proxy cannot read/write MTP hidden state, so this "
+            "only does a no-op prompt pad (review03.md §2.1/§10). Disabled by "
+            "default to avoid extra tokens."
+        ),
     )
     immutable_prefix_enabled: bool = Field(
         default=True,
@@ -136,6 +182,28 @@ class AgenticConfig(BaseModel):
         default=200,
         description="Maximum steps retained in AgentStateStore per session. Oldest archived steps are "
                     "pruned beyond this cap to bound memory growth over long agentic sessions.",
+    )
+    quality_profile: str = Field(
+        default="balanced",
+        description=(
+            "Optimization preset that trades token savings against response fidelity "
+            "(review03.md §10). One of: 'quality' (no summarization, RAG/anchor/code-skeleton "
+            "off, only lossless boundary compression — maximizes similarity to the direct "
+            "baseline), 'balanced' (current defaults), 'aggressive' (lower token cap, more "
+            "top-only eviction, compaction starts earlier). Applied on top of any explicit "
+            "field overrides, so individual fields can still be tuned."
+        ),
+    )
+    explain_mode_enabled: bool = Field(
+        default=False,
+        description=(
+            "Dry-run / explain mode (review03.md §10). When enabled, the proxy attaches "
+            "the optimized prompt it would send to the backend as the `X-MOEPT-Optimized-Messages` "
+            "response header (JSON) so operators can inspect exactly what the proxy changed. "
+            "A single request can also opt in via the `X-MOEPT-Explain: true` request header, "
+            "which works regardless of this flag. Off by default to avoid leaking full context "
+            "in response headers."
+        ),
     )
 
 
@@ -159,11 +227,21 @@ class CacheConfig(BaseModel):
 
 
 class SpeculativeConfig(BaseModel):
-    """Speculative decoding settings for MTP models."""
+    """Speculative decoding settings for MTP models.
+
+    NOTE: these hints are sent as OpenAI extra_body keys and are stripped before
+    forwarding unless `native_mtp_passthrough` is enabled (review03.md §2.1/§10).
+    A client proxy cannot actually drive MTP; the only effective path is a
+    backend that natively supports speculative decoding.
+    """
 
     enabled: bool = Field(
         default=False,
-        description="Enable MTP-aware speculative decoding",
+        description=(
+            "Enable MTP-aware speculative decoding hints. NON-FUNCTIONAL for a "
+            "client proxy: hints are stripped before send unless the backend "
+            "supports native MTP passthrough (review03.md §2.1/§10)."
+        ),
     )
     mtp_lookahead: int = Field(
         default=4,
@@ -181,7 +259,15 @@ class V050Config(BaseModel):
     # Static Prefix KV-Cache Reuse
     static_prefix_kv_enabled: bool = Field(
         default=True,
-        description="Enable static prefix KV-cache reuse",
+        description=(
+            "Enable the static-prefix fast path. NOTE: this stores a TEXT memo of "
+            "the system+first-user prefix, NOT real KV tensors -- a client-side "
+            "OpenAI proxy cannot read the backend's KV cache. It only short-circuits "
+            "the pipeline when the incoming prefix is byte-identical and already "
+            "under budget; it does NOT reuse model KV (the backend's own prefix "
+            "cache does that). Keep enabled for the latency win, but do not rely on "
+            "it for KV reuse."
+        ),
     )
     static_prefix_kv_max_entries: int = Field(
         default=64,
@@ -237,6 +323,17 @@ class V050Config(BaseModel):
     hierarchical_summary_max_full_turns: int = Field(
         default=5,
         description="Max recent turns to keep in full",
+    )
+    persist_state_to_disk: bool = Field(
+        default=False,
+        description=(
+            "Persist optimizer state (hierarchical summaries, static-prefix KV "
+            "memo, delta-encoder snapshots) to disk each turn. OFF by default: "
+            "those subsystems are in-memory and the per-turn pickle writes add "
+            "latency to the request path for no benefit on a single-process proxy "
+            "(review03.md §8). Enable only if you need crash recovery / cross-process "
+            "state. State is still kept in memory every turn regardless of this flag."
+        ),
     )
 
     # Delta-Encoding of Code
@@ -328,3 +425,92 @@ class AppConfig(BaseSettings):
 def get_config() -> AppConfig:
     """Return the global application configuration."""
     return AppConfig()
+
+
+# Quality-profile presets (review03.md §10). Each preset is a set of
+# AgenticConfig field overrides layered on top of the loaded config. Explicit
+# field values (env / .env) still win because the preset is applied first and
+# individual overrides are then re-applied by pydantic's env loading order — to
+# keep semantics simple, presets are applied at app-build time via
+# `apply_quality_profile`, not during env parsing.
+QUALITY_PROFILES: dict[str, dict[str, object]] = {
+    "quality": {
+        # Maximize fidelity to the direct baseline: no middle-history mutation,
+        # only lossless boundary compression of oversized tool/assistant output.
+        "hierarchical_summary_enabled": False,
+        "rag_enabled": False,
+        "reasoning_preseed_enabled": False,
+        "code_skeleton_enabled": False,
+        "semantic_dedup_enabled": False,
+        "attention_sinks_enabled": False,
+        "mtp_boundary_alignment_enabled": False,
+        "keep_full_steps": 6,
+        "max_optimized_tokens": 6000,
+        "max_optimized_chars": 24000,
+        "proactive_trim_ratio": 0.7,
+        "compaction_trigger_ratio": 0.9,
+    },
+    "balanced": {
+        # Current defaults; explicit here so the resolver is a single source.
+        "hierarchical_summary_enabled": False,
+        "rag_enabled": True,
+        "reasoning_preseed_enabled": False,
+        "code_skeleton_enabled": True,
+        "semantic_dedup_enabled": False,
+        "attention_sinks_enabled": False,
+        "mtp_boundary_alignment_enabled": False,
+        "keep_full_steps": 3,
+        "max_optimized_tokens": 3000,
+        "max_optimized_chars": 12000,
+        "proactive_trim_ratio": 0.45,
+        "compaction_trigger_ratio": 0.75,
+    },
+    "aggressive": {
+        # Maximize token savings: lower cap, earlier compaction, more full steps
+        # evicted from the top.
+        "hierarchical_summary_enabled": False,
+        "rag_enabled": True,
+        "reasoning_preseed_enabled": False,
+        "code_skeleton_enabled": True,
+        "semantic_dedup_enabled": False,
+        "attention_sinks_enabled": False,
+        "mtp_boundary_alignment_enabled": False,
+        "keep_full_steps": 2,
+        "max_optimized_tokens": 2000,
+        "max_optimized_chars": 8000,
+        "proactive_trim_ratio": 0.35,
+        "compaction_trigger_ratio": 0.6,
+    },
+}
+
+
+def apply_quality_profile(config: AppConfig) -> AppConfig:
+    """Layer the selected quality preset onto ``config`` in place.
+
+    Each preset field is routed to whichever sub-config actually owns it
+    (``agentic`` for loop-tuning fields, ``v050`` for fields like
+    ``hierarchical_summary_enabled``). Returns ``config`` for chaining. Unknown
+    profile names fall back to ``balanced`` with a warning so a typo never
+    silently disables optimization.
+    """
+    profile = (config.agentic.quality_profile or "balanced").strip().lower()
+    overrides = QUALITY_PROFILES.get(profile)
+    if overrides is None:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Unknown quality_profile=%r; falling back to 'balanced'.", profile
+        )
+        profile = "balanced"
+        overrides = QUALITY_PROFILES["balanced"]
+        config.agentic.quality_profile = "balanced"
+    # Route each override to the sub-config that owns the field. agentic is
+    # checked first so loop-tuning fields land there; v050 owns the remainder
+    # (e.g. hierarchical_summary_enabled).
+    targets = (config.agentic, config.v050)
+    for field, value in overrides.items():
+        for target in targets:
+            if hasattr(target, field):
+                setattr(target, field, value)
+                break
+    return config

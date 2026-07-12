@@ -36,7 +36,7 @@ class SelectiveTruncator:
         remaining = self._max_tokens * 4
 
         for msg in messages:
-            msg_size = len(msg.get("content", ""))
+            msg_size = len(msg.get("content") or "")
             if msg_size <= remaining:
                 result.append(dict(msg))
                 remaining -= msg_size

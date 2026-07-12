@@ -786,6 +786,97 @@ class TestDryRunHealthAndModels:
         model_ids = [m["id"] for m in data["data"]]
         assert MODEL_ID in model_ids
 
+    def test_metrics_endpoint(self) -> None:
+        from moeptimizer.app import PROXY_METRICS
+
+        app, _ = _create_app()
+        from fastapi.testclient import TestClient
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Reset then feed a couple of synthetic turns so the snapshot is
+        # deterministic regardless of test ordering.
+        PROXY_METRICS.reset()
+        PROXY_METRICS.record_turn(cached_tokens=100, prompt_tokens=500, saved_tokens=200, latency_ms=40.0)
+        PROXY_METRICS.record_turn(cached_tokens=0, prompt_tokens=500, saved_tokens=0, latency_ms=60.0)
+
+        resp = client.get("/v1/metrics")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "proxy.metrics"
+        assert data["requests"] == 2
+        assert data["cache_hits"] == 1
+        assert data["cache_misses"] == 1
+        assert data["cache_hit_rate"] == 0.5
+        assert data["total_cached_tokens"] == 100
+        assert data["total_prompt_tokens"] == 1000
+        assert data["total_saved_tokens"] == 200
+        assert data["avg_latency_ms"] == 50.0
+        assert data["prefix_cache_reuse_ratio"] == 0.1
+
+    def test_metrics_reset_endpoint(self) -> None:
+        from moeptimizer.app import PROXY_METRICS
+
+        app, _ = _create_app()
+        from fastapi.testclient import TestClient
+        client = TestClient(app, raise_server_exceptions=False)
+
+        PROXY_METRICS.record_turn(cached_tokens=10, prompt_tokens=20)
+        resp = client.post("/v1/metrics/reset")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "reset"
+
+        snapshot = client.get("/v1/metrics").json()
+        assert snapshot["requests"] == 0
+
+    def test_explain_mode_header(self) -> None:
+        import base64
+
+        app, _ = _create_app()
+        from fastapi.testclient import TestClient
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Backend is unreachable in tests, but the explain headers are attached
+        # before the backend call, so they survive the 500.
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL_ID,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+            headers={"X-MOEPT-Explain": "true"},
+        )
+        assert resp.headers.get("X-MOEPT-Explain") == "true"
+        encoded = resp.headers.get("X-MOEPT-Optimized-Messages")
+        assert encoded
+        decoded = json.loads(base64.b64decode(encoded))
+        assert isinstance(decoded, list)
+        assert decoded[0]["role"] == "user"
+        assert decoded[0]["content"] == "hello"
+
+    def test_explain_mode_global_flag(self) -> None:
+        import base64
+
+        cfg = AppConfig()
+        cfg.agentic.explain_mode_enabled = True
+        app = create_app(cfg)
+        from fastapi.testclient import TestClient
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL_ID,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+            },
+        )
+        assert resp.headers.get("X-MOEPT-Explain") == "true"
+        encoded = resp.headers.get("X-MOEPT-Optimized-Messages")
+        assert encoded
+        decoded = json.loads(base64.b64decode(encoded))
+        assert decoded[0]["content"] == "hi"
+
 
 def _create_app(config: AppConfig | None = None) -> tuple:
     """Create app and return (app, embedding_service)."""

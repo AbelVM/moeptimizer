@@ -56,3 +56,33 @@ class TestTokenCounter:
         counter = TokenCounter()
         assert "KV slots" in counter.estimate_kv_cache_usage(100)
         assert "near context limit" in counter.estimate_kv_cache_usage(50000)
+
+    def test_count_messages_memoized_by_fingerprint(self) -> None:
+        """Identical message lists return the same count and hit the fingerprint cache."""
+        counter = TokenCounter(max_cache=16)
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello " + "x" * 500},
+            {"role": "assistant", "content": "Hi there " + "y" * 500},
+        ]
+        first = counter.count_messages(messages)
+        # A fresh list with identical content must produce the same count and
+        # be served from the fingerprint cache (no re-tokenization).
+        again = counter.count_messages(
+            [
+                {"role": "system", "content": "You are helpful"},
+                {"role": "user", "content": "Hello " + "x" * 500},
+                {"role": "assistant", "content": "Hi there " + "y" * 500},
+            ]
+        )
+        assert again == first
+        assert counter._cache  # fingerprint cache was populated
+
+    def test_count_messages_cache_invalidated_on_content_change(self) -> None:
+        """Changing content yields a different count (distinct fingerprint)."""
+        counter = TokenCounter(max_cache=16)
+        a = counter.count_messages([{"role": "user", "content": "alpha"}])
+        b = counter.count_messages(
+            [{"role": "user", "content": "alpha " + "word " * 20}]
+        )
+        assert b > a

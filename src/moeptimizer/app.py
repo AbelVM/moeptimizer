@@ -26,6 +26,89 @@ from moeptimizer.session_manager import SessionManager
 logger = logging.getLogger(__name__)
 
 
+class _ProxyMetrics:
+    """Process-wide aggregate metrics for the proxy (review §11.1).
+
+    Fed from the backend's real ``cached_tokens`` signal on every turn so
+    operators can see whether the proxy is actually helping (prefix-cache reuse,
+    token savings, latency delta). Cheap, lock-protected counters; no per-turn
+    allocation on the request path beyond a couple of integer adds.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.requests = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.total_cached_tokens = 0
+        self.total_prompt_tokens = 0
+        self.total_saved_tokens = 0
+        self.total_latency_ms = 0.0
+
+    def record_turn(
+        self,
+        *,
+        cached_tokens: int | None = None,
+        prompt_tokens: int | None = None,
+        saved_tokens: int | None = None,
+        latency_ms: float | None = None,
+    ) -> None:
+        with self._lock:
+            self.requests += 1
+            if cached_tokens is not None:
+                if cached_tokens > 0:
+                    self.cache_hits += 1
+                else:
+                    self.cache_misses += 1
+                self.total_cached_tokens += max(0, cached_tokens)
+            if prompt_tokens is not None:
+                self.total_prompt_tokens += max(0, prompt_tokens)
+            if saved_tokens is not None:
+                self.total_saved_tokens += max(0, saved_tokens)
+            if latency_ms is not None:
+                self.total_latency_ms += max(0.0, latency_ms)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            requests = self.requests
+            hits = self.cache_hits
+            cached = self.total_cached_tokens
+            reuse_ratio = (cached / max(1, self.total_prompt_tokens)) if self.total_prompt_tokens else 0.0
+            return {
+                "requests": requests,
+                "cache_hits": hits,
+                "cache_misses": self.cache_misses,
+                "cache_hit_rate": round(hits / max(1, requests), 4),
+                "total_cached_tokens": cached,
+                "total_prompt_tokens": self.total_prompt_tokens,
+                "prefix_cache_reuse_ratio": round(reuse_ratio, 4),
+                "total_saved_tokens": self.total_saved_tokens,
+                "total_latency_ms": round(self.total_latency_ms, 1),
+                "avg_latency_ms": round(self.total_latency_ms / max(1, requests), 1),
+            }
+
+    def reset(self) -> None:
+        with self._lock:
+            self.__init__()
+
+
+# Single process-wide metrics instance.
+PROXY_METRICS = _ProxyMetrics()
+
+
+def _explain_header_value(messages: list[dict[str, Any]]) -> str:
+    """Serialize the optimized prompt for the explain-mode response header.
+
+    Base64-encoded JSON so the value is header-safe regardless of message
+    content (newlines, colons, unicode). Decoded on the client with
+    ``json.loads(base64.b64decode(value))``.
+    """
+    import base64
+
+    payload = json.dumps(messages, ensure_ascii=False).encode("utf-8")
+    return base64.b64encode(payload).decode("ascii")
+
+
 def _validate_messages(messages: list[dict[str, Any]]) -> None:
     """Validate that all non-assistant messages have a 'content' field.
 
@@ -194,6 +277,7 @@ def _make_streaming_generator(
     backend_client: LemonadeClient,
     optimizer: AgentContextOptimizer | None = None,
     id_slot: int | None = None,
+    turn_start: float | None = None,
 ) -> Any:
     """Create an async generator for SSE streaming using OpenAI SDK."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -327,6 +411,14 @@ def _make_streaming_generator(
             except Exception:
                 logger.debug("Failed to record streaming cache outcome", exc_info=True)
 
+        # Aggregate process-wide metrics from the authoritative backend signal.
+        PROXY_METRICS.record_turn(
+            cached_tokens=cached_tokens,
+            prompt_tokens=(optimizer.last_optimized_token_count if optimizer is not None else None),
+            saved_tokens=(optimizer.last_saved_token_count if optimizer is not None else None),
+            latency_ms=((time.time() - turn_start) * 1000.0 if turn_start is not None else None),
+        )
+
         # Calibrate the proxy's token estimates against the backend's real
         # tokenizer (review §1/§9, priority fix #6). The backend reports its true
         # `prompt_tokens` for the optimized prompt we sent; the ratio between that
@@ -334,7 +426,11 @@ def _make_streaming_generator(
         # counts instead of an estimate that diverges for code-heavy prompts.
         if optimizer is not None and isinstance(backend_prompt_tokens, int) and backend_prompt_tokens > 0:
             try:
-                proxy_estimated = optimizer.token_counter.count_messages(messages)
+                # Calibrate against the OPTIMIZED prompt we actually sent
+                # (optimizer._last_optimized), not the raw incoming messages, so
+                # the ratio reflects the true backend/proxy token gap (#6).
+                proxy_estimated_msgs = getattr(optimizer, "_last_optimized", None) or messages
+                proxy_estimated = optimizer.token_counter.count_messages(proxy_estimated_msgs)
                 if proxy_estimated > 0:
                     optimizer.set_token_calibration(backend_prompt_tokens / proxy_estimated)
             except Exception:
@@ -361,6 +457,7 @@ async def _do_non_streaming(
     optimization_error: str | None = None,
     optimizer: AgentContextOptimizer | None = None,
     id_slot: int | None = None,
+    turn_start: float | None = None,
 ) -> JSONResponse:
     """Execute non-streaming backend call using LemonadeClient (OpenAI SDK)."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -436,6 +533,14 @@ async def _do_non_streaming(
             except Exception:
                 logger.debug("Failed to record cache outcome", exc_info=True)
 
+        # Aggregate process-wide metrics from the authoritative backend signal.
+        PROXY_METRICS.record_turn(
+            cached_tokens=cache_hit_tokens if isinstance(cache_hit_tokens, int) else None,
+            prompt_tokens=(optimizer.last_optimized_token_count if optimizer is not None else None),
+            saved_tokens=(optimizer.last_saved_token_count if optimizer is not None else None),
+            latency_ms=((time.time() - turn_start) * 1000.0 if turn_start is not None else None),
+        )
+
         # Calibrate the proxy's token estimates against the backend's real
         # tokenizer (review §1/§9, priority fix #6). The backend reports its true
         # `prompt_tokens` for the optimized prompt we sent; the ratio between that
@@ -445,7 +550,11 @@ async def _do_non_streaming(
             try:
                 backend_prompt_tokens = usage_dict.get("prompt_tokens")
                 if isinstance(backend_prompt_tokens, int) and backend_prompt_tokens > 0:
-                    proxy_estimated = optimizer.token_counter.count_messages(messages)
+                    # Calibrate against the OPTIMIZED prompt we actually sent
+                    # (optimizer._last_optimized), not the raw incoming messages,
+                    # so the ratio reflects the true backend/proxy token gap (#6).
+                    proxy_estimated_msgs = getattr(optimizer, "_last_optimized", None) or messages
+                    proxy_estimated = optimizer.token_counter.count_messages(proxy_estimated_msgs)
                     if proxy_estimated > 0:
                         optimizer.set_token_calibration(
                             backend_prompt_tokens / proxy_estimated
@@ -494,7 +603,12 @@ async def _do_non_streaming(
 def create_app(config: AppConfig | None = None) -> FastAPI:
     """Create and configure the FastAPI application."""
     cfg = config or get_config()
-    session_manager = SessionManager()
+    # Layer the selected quality preset (quality/balanced/aggressive) onto the
+    # agentic config before any optimizer is built (review03.md §10).
+    from moeptimizer.config import apply_quality_profile
+
+    apply_quality_profile(cfg)
+    session_manager = SessionManager(config=cfg)
     embedding_service = EmbeddingService()
     backend_client = LemonadeClient(
         base_url=cfg.server.url,
@@ -565,6 +679,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
           or from a fingerprint of the message history when `user` is absent.
           Custom session fields are stripped before forwarding to Lemonade.
         """
+        _turn_start = time.time()
         try:
             body = await request.json()
         except Exception:
@@ -657,8 +772,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     "[Proxy] Message %d: role=%s, content_len=%d, preview=%s",
                     i,
                     msg.get("role"),
-                    len(msg.get("content", "")),
-                    (msg.get("content", "") or "")[:100],
+                    len(msg.get("content") or ""),
+                    (msg.get("content") or "")[:100],
                 )
             if len(optimized_messages) > 5:
                 logger.info(
@@ -675,8 +790,25 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
-            "X-Optimized-Prompt-Tokens": str(optimizer.token_counter.count_messages(optimized_messages)),
+            "X-Optimized-Prompt-Tokens": str(
+                optimizer.last_optimized_token_count
+                if optimizer.last_optimized_token_count is not None
+                else optimizer.token_counter.count_messages(optimized_messages)
+            ),
         }
+
+        # Dry-run / explain mode (review03.md §10): expose the exact optimized
+        # prompt the proxy would send to the backend so operators can inspect
+        # what changed. Opt-in per request via the X-MOEPT-Explain header, or
+        # globally via agentic.explain_mode_enabled.
+        explain_on = cfg.agentic.explain_mode_enabled or str(
+            request.headers.get("X-MOEPT-Explain", "")
+        ).strip().lower() in ("1", "true", "yes") or bool(body.get("_explain"))
+        if explain_on:
+            response_headers["X-MOEPT-Explain"] = "true"
+            response_headers["X-MOEPT-Optimized-Messages"] = _explain_header_value(
+                optimized_messages
+            )
 
         session_state = optimizer.get_session_state()
         existing_extra_body = body.get("extra_body")
@@ -710,13 +842,13 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
         if is_streaming:
             return StreamingResponse(
-                _make_streaming_generator(body, cfg, backend_client, optimizer, id_slot),
+                _make_streaming_generator(body, cfg, backend_client, optimizer, id_slot, _turn_start),
                 media_type="text/event-stream",
                 headers=response_headers,
             )
         else:
             return await _do_non_streaming(
-                body, session_state, cfg, backend_client, response_headers, optimization_error, optimizer, id_slot
+                body, session_state, cfg, backend_client, response_headers, optimization_error, optimizer, id_slot, _turn_start
             )
 
     @app.get("/v1/models")
@@ -739,6 +871,23 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 },
             ],
         }
+
+    @app.get("/v1/metrics")
+    async def proxy_metrics():
+        """Process-wide proxy effectiveness metrics (review §11.1, fix #10).
+
+        Surfaces whether the proxy is actually helping: real prefix-cache reuse
+        (from the backend's authoritative ``cached_tokens``), token savings from
+        optimization, cache-hit rate, and average latency. Not part of the OpenAI
+        contract; purely observational for operators.
+        """
+        return {"object": "proxy.metrics", **PROXY_METRICS.snapshot()}
+
+    @app.post("/v1/metrics/reset")
+    async def proxy_metrics_reset():
+        """Reset the process-wide proxy metrics counters."""
+        PROXY_METRICS.reset()
+        return {"object": "proxy.metrics", "status": "reset"}
 
     @app.post("/v1/embeddings")
     async def create_embeddings(request: Request):

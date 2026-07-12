@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Any
 
-from moeptimizer.config import get_config
+from moeptimizer.config import AppConfig, get_config
 from moeptimizer.optimizer import AgentContextOptimizer
 
 
@@ -19,12 +19,20 @@ class SessionManager:
     Sessions expire after AGENTIC_SESSION_TIMEOUT seconds of inactivity.
     """
 
-    def __init__(self, session_timeout: int | None = None) -> None:
-        config = get_config().agentic
+    def __init__(
+        self,
+        session_timeout: int | None = None,
+        config: AppConfig | None = None,
+    ) -> None:
+        self._config = config or get_config()
+        agentic = self._config.agentic
         self._sessions: dict[str, AgentContextOptimizer] = {}
         self._session_timestamps: dict[str, float] = {}
-        self._session_timeout = session_timeout or config.session_timeout
+        self._session_timeout = session_timeout or agentic.session_timeout
         self._lock = threading.RLock()
+
+    def _make_optimizer(self) -> AgentContextOptimizer:
+        return AgentContextOptimizer(self._config)
 
     def get_or_create(self, session_id: str | None = None) -> AgentContextOptimizer:
         """Get an existing optimizer for the session, or create a new one."""
@@ -36,7 +44,7 @@ class SessionManager:
             self._cleanup_expired(now)
 
             if session_id not in self._sessions:
-                self._sessions[session_id] = AgentContextOptimizer()
+                self._sessions[session_id] = self._make_optimizer()
                 self._session_timestamps[session_id] = now
 
             self._session_timestamps[session_id] = time.time()
@@ -67,7 +75,7 @@ class SessionManager:
         """Reset a session's optimizer."""
         with self._lock:
             if session_id in self._sessions:
-                self._sessions[session_id] = AgentContextOptimizer()
+                self._sessions[session_id] = self._make_optimizer()
                 self._session_timestamps[session_id] = time.time()
                 return True
             return False

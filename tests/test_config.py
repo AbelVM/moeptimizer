@@ -2,7 +2,11 @@
 
 import os
 
-from moeptimizer.config import AppConfig, get_config
+from moeptimizer.config import (
+    AppConfig,
+    apply_quality_profile,
+    get_config,
+)
 
 
 class TestConfig:
@@ -22,6 +26,8 @@ class TestConfig:
         assert config.agentic.semantic_dedup_enabled is False
         assert config.agentic.static_layer_alignment_enabled is False
         assert config.agentic.reasoning_preseed_enabled is False
+        assert config.agentic.quality_profile == "balanced"
+        assert config.agentic.explain_mode_enabled is False
 
     def test_env_override(self) -> None:
         os.environ["MOEPT_SERVER__URL"] = "http://test:9999/api/v1"
@@ -40,3 +46,76 @@ class TestConfig:
     def test_get_config(self) -> None:
         config = get_config()
         assert isinstance(config, AppConfig)
+
+
+class TestQualityProfile:
+    def test_balanced_is_default(self) -> None:
+        config = AppConfig()
+        apply_quality_profile(config)
+        assert config.agentic.keep_full_steps == 3
+        assert config.agentic.max_optimized_tokens == 3000
+        assert config.agentic.code_skeleton_enabled is True
+
+    def test_quality_profile_maximizes_fidelity(self) -> None:
+        config = AppConfig()
+        config.agentic.quality_profile = "quality"
+        apply_quality_profile(config)
+        assert config.v050.hierarchical_summary_enabled is False
+        assert config.agentic.rag_enabled is False
+        assert config.agentic.code_skeleton_enabled is False
+        assert config.agentic.reasoning_preseed_enabled is False
+        assert config.agentic.keep_full_steps == 6
+        assert config.agentic.max_optimized_tokens == 6000
+
+    def test_aggressive_profile_saves_more(self) -> None:
+        config = AppConfig()
+        config.agentic.quality_profile = "aggressive"
+        apply_quality_profile(config)
+        assert config.agentic.keep_full_steps == 2
+        assert config.agentic.max_optimized_tokens == 2000
+        assert config.agentic.proactive_trim_ratio == 0.35
+
+    def test_unknown_profile_falls_back_to_balanced(self) -> None:
+        config = AppConfig()
+        config.agentic.quality_profile = "bogus"
+        apply_quality_profile(config)
+        assert config.agentic.quality_profile == "balanced"
+        assert config.agentic.max_optimized_tokens == 3000
+
+
+class TestConfigCheck:
+    def test_clean_config_has_no_errors(self) -> None:
+        from moeptimizer.config_check import check_config
+
+        config = AppConfig()
+        apply_quality_profile(config)
+        issues = check_config(config)
+        assert not any(i.severity == "ERROR" for i in issues)
+
+    def test_bad_trim_order_is_error(self) -> None:
+        from moeptimizer.config_check import check_config
+
+        config = AppConfig()
+        config.agentic.proactive_trim_ratio = 0.9
+        config.agentic.compaction_trigger_ratio = 0.5
+        issues = check_config(config)
+        codes = {i.code for i in issues}
+        assert "trim_order" in codes
+
+    def test_summary_breaks_prefix_warns(self) -> None:
+        from moeptimizer.config_check import check_config
+
+        config = AppConfig()
+        config.v050.hierarchical_summary_enabled = True
+        issues = check_config(config)
+        codes = {i.code for i in issues}
+        assert "summary_breaks_prefix" in codes
+
+    def test_low_water_out_of_range_is_error(self) -> None:
+        from moeptimizer.config_check import check_config
+
+        config = AppConfig()
+        config.agentic.eviction_low_water_ratio = 1.5
+        issues = check_config(config)
+        codes = {i.code for i in issues}
+        assert "low_water" in codes

@@ -1,9 +1,13 @@
-"""Expert routing cache for MoE models.
+"""Expert-routing cache — NON-FUNCTIONAL placeholder (see review03.md §2.1).
 
-Caches expert routing decisions to improve:
-- Expert cache locality
-- Routing consistency
-- MTP prediction accuracy
+MoE expert routing is decided inside the backend model. A client-side OpenAI
+proxy cannot observe real expert assignments, so this module's masks are
+*placeholder heuristics* (e.g. "Python -> experts 0-15") derived from language
+guessing — they are fabricated, never learned from the model, and are stripped
+before sending unless experimental backend hints are enabled. They provide no
+real routing cache. Retained only as inert scaffolding behind a
+disabled-by-default flag so imports resolve. Do not rely on this for expert
+cache locality or MTP accuracy.
 """
 
 from __future__ import annotations
@@ -18,11 +22,10 @@ logger = logging.getLogger(__name__)
 
 class ExpertRoutingCache:
     """
-    Cache for MoE expert routing decisions.
+    Inert expert-routing scaffolding (non-functional; see module docstring).
 
-    Qwen3.6-35B-A3B-MTP uses token-level expert routing.
-    This cache stores (token_pattern → expert_mask) mappings
-    to reduce routing overhead and improve expert cache locality.
+    Stores placeholder expert masks from language heuristics, not observed
+    routing. Performs no real MoE expert caching.
     """
 
     def __init__(self, max_size: int = 4096) -> None:

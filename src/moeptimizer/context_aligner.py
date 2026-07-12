@@ -47,7 +47,7 @@ class ContextAligner:
 
         # Calculate current static layer size
         static_chars = sum(
-            len(m.get("content", "")) for m in messages[:static_end]
+            len(m.get("content") or "") for m in messages[:static_end]
         )
 
         # Check if alignment is needed
@@ -168,10 +168,17 @@ class ContextAligner:
         When ``frozen_prefix_turns <= 0`` (legacy behavior) only the system
         prompt is frozen verbatim. When ``frozen_prefix_turns > 0`` (cache-stable
         mode, review §1/§3/§7) the system prompt and the next
-        ``frozen_prefix_turns`` complete turns are frozen verbatim from
-        ``original``, while the first user message is kept in its (deterministic,
-        stable) compressed form so the proxy still saves tokens on the largest
-        message.
+        ``frozen_prefix_turns`` complete turns are frozen verbatim, while the
+        first user message is kept in its (deterministic, stable) compressed form
+        so the proxy still saves tokens on the largest message.
+
+        The frozen block is sourced from ``original`` (which the caller passes as
+        the already-optimized messages, i.e. *after* tool-output compression at
+        step 11.6). Sourcing the frozen prefix from the optimized messages — not
+        the raw client payload — is what lets the proxy's boundary compression
+        actually take effect on benchmark/agentic traffic: the compressed tool
+        output is deterministic and idempotent, so it is byte-stable across turns
+        and safe to freeze, while still saving the tokens the compressor recovered.
 
         Freezing the early turns is what makes the backend's automatic prefix
         cache reusable across turns: the proxy's front-eviction otherwise drops

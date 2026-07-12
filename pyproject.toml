@@ -58,6 +58,7 @@ all = [
 
 [project.scripts]
 moeptimizer = "moeptimizer.__main__:main"
+moeptimizer-config-check = "moeptimizer.config_check:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/moeptimizer"]

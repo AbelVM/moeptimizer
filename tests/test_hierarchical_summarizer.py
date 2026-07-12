@@ -134,17 +134,22 @@ class TestHierarchicalSummarizer:
         assert result[3] == messages[3]
         assert result[4] == messages[4]
 
-        # A single rolling summary block follows the frozen prefix.
-        summary_block = result[5]
+        # The rolling summary block is now a TRAILING turn (review §1/§9, priority
+        # fix #1): inserting it right after the frozen prefix shifts every later
+        # turn's token offset and invalidates the backend's prefix cache. As a
+        # trailing turn it never alters the stable leading prefix, so the backend
+        # reuses its cached KV for the frozen + recent turns.
+        summary_block = result[-1]
         assert summary_block.get("_summary_id")
         assert summary_block.get("_rolling_summary") is True
         assert summary_block["role"] == "user"
         assert "Context summary (rolling):" in summary_block["content"]
 
-        # Most recent max_full_turns (3) turns retained in full after the block.
-        # Dynamic layer = Turn2..Turn5 (4 turns); the oldest folds into the
-        # summary, so the 3 most recent (Turn3..Turn5) stay verbatim at result[6:].
-        assert result[6:] == messages[7:]
+        # Most recent max_full_turns (3) turns retained in full, verbatim, between
+        # the frozen prefix and the trailing summary block. Dynamic layer =
+        # Turn2..Turn5 (4 turns); the oldest folds into the summary, so the 3 most
+        # recent (Turn3..Turn5) stay verbatim at result[5:-1].
+        assert result[5:-1] == messages[7:]
 
     def test_summarize_cache_stable_retains_constraints(self) -> None:
         """The rolling summary retains the task's 'don't' constraints."""

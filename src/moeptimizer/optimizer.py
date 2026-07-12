@@ -84,6 +84,7 @@ from moeptimizer.symbol_index import SymbolIndex
 from moeptimizer.thinking_preserver import ThinkingPreserver
 from moeptimizer.token_aware_truncator import TokenAwareTruncator
 from moeptimizer.token_counter import TokenCounter
+from moeptimizer.tool_output_compressor import ToolOutputCompressor, compress_tool_messages
 from moeptimizer.tool_streamer import get_tool_streamer
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ class AgentContextOptimizer:
         self.state_rag = StateBasedRAG(self.store)
         self.loop_detector = LoopDetector(threshold=3)
         self.progress_tracker = ProgressTracker()
-        self.token_counter = TokenCounter()
+        self.token_counter = TokenCounter(tokenizer=self._config.server.tokenizer)
         self.goal_decomposer = GoalDecomposer()
         self.embedding_service = EmbeddingService()
         self.expert_cache = get_expert_cache()
@@ -142,6 +143,9 @@ class AgentContextOptimizer:
         self.hierarchical_index = get_hierarchical_index()
         self.mtp_state_manager = get_mtp_state_manager()
         self.tool_streamer = get_tool_streamer()
+        self.tool_output_compressor = ToolOutputCompressor(
+            max_chars=self._config.agentic.tool_output_compression_max_chars
+        )
         self.semantic_deduplicator = get_semantic_deduplicator()
         self._task_type: str = "default"
         self._last_mtp_state_key: str | None = None
@@ -154,6 +158,8 @@ class AgentContextOptimizer:
         # cached_tokens from usage.prompt_tokens_details.
         self._last_static_prefix_hit: bool = False
         self._last_optimized: list[dict[str, Any]] = []
+        self._last_optimized_token_count: int | None = None
+        self._last_original_token_count: int | None = None
         # Token-count calibration (review §1/§9, priority fix #6). Scales the
         # proxy's tiktoken estimate toward the backend's real tokenizer so the
         # budget is enforced against true token counts. Learned from the backend's
@@ -236,7 +242,7 @@ class AgentContextOptimizer:
     def _has_large_tool_output(self, messages: list[dict[str, Any]]) -> bool:
         """Return True when a tool output is large enough to need special handling."""
         for msg in messages:
-            if msg.get("role") == "tool" and len(str(msg.get("content", ""))) > 1000:
+            if msg.get("role") == "tool" and len(str(msg.get("content") or "")) > 1000:
                 return True
         return False
 
@@ -294,7 +300,7 @@ class AgentContextOptimizer:
         elif not self.store.get_goal() and messages:
             for msg in messages:
                 if msg.get("role") == "user":
-                    goal_text = msg.get("content", "")[:500]
+                    goal_text = (msg.get("content") or "")[:500]
                     self.store.set_goal(goal_text)
                     subtasks = self.goal_decomposer.decompose(goal_text)
                     self.progress_tracker.set_subtasks(subtasks)
@@ -379,8 +385,12 @@ class AgentContextOptimizer:
 
         # Static layer end is recomputed after compaction/RAG because those stages
         # can change the message list.
-        total_chars = sum(len(m.get("content", "")) for m in optimized)
-        optimized = self._inject_quality_anchor(optimized, proactive_threshold_tokens)
+        total_chars = sum(len(m.get("content") or "") for m in optimized)
+        # NOTE: the quality anchor is no longer injected here. Volatile context
+        # (anchor + RAG + loop warnings) is appended as a single trailing user
+        # turn at the very end of the pipeline (Step 14.12) so that no historical
+        # turn is mutated and the leading prefix stays byte-stable for the
+        # backend's prefix cache (review §1/§9, priority fix #1).
 
         # Step 5.2: Build KV slot map for cache control. This output is only
         # useful when the backend actually receives cache-control hints, so skip
@@ -439,7 +449,10 @@ class AgentContextOptimizer:
         ):
             try:
                 static_content = self._get_static_layer_content(optimized)
-                if static_content:
+                if static_content and self._config.v050.enable_experimental_backend_hints:
+                    # Only warm the (placeholder) expert cache when the backend
+                    # actually receives hints; otherwise it is discarded and the
+                    # work is pure overhead (review03.md §2.1/§6 #4).
                     self.expert_cache.warm_cache_for_static_layer(static_content)
             except Exception as e:
                 logger.warning("Expert cache warming failed: %s", e)
@@ -497,7 +510,7 @@ class AgentContextOptimizer:
         # Recalculate after compaction so later stages use the actual context size.
         try:
             total_tokens = self.token_counter.count_messages(optimized)
-            total_chars = sum(len(m.get("content", "")) for m in optimized)
+            total_chars = sum(len(m.get("content") or "") for m in optimized)
         except Exception as e:
             logger.warning("Post-compaction recount failed: %s", e)
 
@@ -533,20 +546,22 @@ class AgentContextOptimizer:
 
         try:
             total_tokens = self.token_counter.count_messages(optimized)
-            total_chars = sum(len(m.get("content", "")) for m in optimized)
+            total_chars = sum(len(m.get("content") or "") for m in optimized)
         except Exception as e:
             logger.warning("Pre-RAG recount failed: %s", e)
 
-        # Step 8: Append RAG context and loop warnings to the newest user turn.
-        # Do not create extra user messages after the active prompt; volatile
-        # context must be part of the last turn to preserve chat structure.
+        # Step 8: Compute RAG context and loop warnings. Injection is DEFERRED
+        # to the final volatile-context step (Step 14.12, review §1/§9, priority
+        # fix #1). These are derived/volatile and must NOT mutate any historical
+        # turn or be inserted into the middle of history, or the backend's prefix
+        # cache is invalidated and must re-prefill on every turn.
+        warning_lines: list[str] = []
+        rag_context = ""
         try:
-            warning_lines: list[str] = []
             for w in loop_warnings:
                 warning_message = self.loop_detector.get_warning_message(w)
                 warning_lines.append(warning_message.replace("[LOOP DETECTED: ", "Loop detected: "))
 
-            rag_context = ""
             rag_tokens = self.token_counter.count_messages(optimized)
             if self._config.agentic.rag_enabled and rag_tokens > proactive_threshold_tokens:
                 last_assistant = None
@@ -558,40 +573,17 @@ class AgentContextOptimizer:
                 if last_assistant:
                     current_step = AgentStep(
                         role=last_assistant.get("role", "assistant"),
-                        content=last_assistant.get("content", ""),
+                        content=last_assistant.get("content") or "",
                         tool_name=None,
                         metadata=last_assistant.get("metadata", {}),
                     )
                     rag_context = self.state_rag.get_context_for_step(current_step) or ""
-
-            extras = []
-            if warning_lines:
-                extras.append("\n".join(warning_lines))
-            if rag_context:
-                extras.append(rag_context)
-            if extras:
-                last_user_idx = -1
-                for idx in range(len(optimized) - 1, -1, -1):
-                    if optimized[idx].get("role") == "user":
-                        last_user_idx = idx
-                        break
-
-                if last_user_idx >= 0:
-                    user_msg = optimized[last_user_idx]
-                    content = user_msg.get("content", "")
-                    if not isinstance(content, str):
-                        content = str(content)
-                    suffix = "\n\n".join(extras)
-                    optimized[last_user_idx] = {
-                        **user_msg,
-                        "content": f"{content}\n\n{suffix}" if content else suffix,
-                    }
         except Exception as e:
-            logger.warning("RAG/loop warning injection failed: %s", e)
+            logger.warning("RAG/loop warning computation failed: %s", e)
 
         try:
             total_tokens = self.token_counter.count_messages(optimized)
-            total_chars = sum(len(m.get("content", "")) for m in optimized)
+            total_chars = sum(len(m.get("content") or "") for m in optimized)
         except Exception as e:
             logger.warning("Post-RAG recount failed: %s", e)
 
@@ -640,7 +632,7 @@ class AgentContextOptimizer:
         if self._config.agentic.optimize_code_blocks:
             try:
                 for msg in optimized:
-                    content = msg.get("content", "")
+                    content = msg.get("content") or ""
                     if isinstance(content, str) and self._has_code_blocks(content):
                         msg["content"] = self._optimize_code_block_content(content)
             except Exception as e:
@@ -682,12 +674,16 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Entropy-guided trimming failed: %s", e)
 
-        # Step 11.6: Stream large tool outputs only when needed for leanness.
-        if total_tokens > proactive_threshold_tokens:
+        # Step 11.6: Boundary-compress large tool/assistant outputs (headroom/
+        # snip-style, review §3/§5.1). Applied once when a tool message first
+        # appears, so the compressed form is frozen into the stable leading
+        # prefix and the backend's prefix cache stays valid. Idempotent on
+        # already-compressed (small) outputs, so re-running is safe.
+        if self._config.agentic.tool_output_compression_enabled:
             try:
-                optimized = self._stream_large_tool_outputs(optimized)
+                optimized = self._compress_tool_outputs(optimized)
             except Exception as e:
-                logger.warning("Tool output streaming failed: %s", e)
+                logger.warning("Tool output compression failed: %s", e)
 
         # Recalculate total_tokens after entropy trim (calibrated to the backend
         # tokenizer so the budget is enforced against true token counts, #6).
@@ -701,7 +697,9 @@ class AgentContextOptimizer:
         # the bookkeeping otherwise (the result is never sent to the model).
         if self._config.v050.enable_experimental_backend_hints:
             try:
-                state_key = self.mtp_state_manager.get_state_key(optimized)
+                state_key = self.mtp_state_manager.get_state_key(
+                    optimized, encode=getattr(self.token_counter, "_encode", None)
+                )
                 # Store the state key in the optimizer for potential restoration
                 self._last_mtp_state_key = state_key
             except Exception as e:
@@ -769,6 +767,13 @@ class AgentContextOptimizer:
         # to whether our own static-prefix KV cache was reused this turn. The old
         # constant hit=True label is gone because it trained the model on noise.
         self._last_optimized = optimized
+        # Cache the token count of the optimized prompt so the app layer can set
+        # the X-Optimized-Prompt-Tokens header without re-tokenizing the whole
+        # prompt on the event loop (expensive with the real HF Qwen tokenizer).
+        try:
+            self._last_optimized_token_count = self.token_counter.count_messages(optimized)
+        except Exception:  # pragma: no cover - defensive
+            self._last_optimized_token_count = None
         if self.hit_prediction is not None:
             try:
                 self.hit_prediction.record_outcome(
@@ -782,7 +787,7 @@ class AgentContextOptimizer:
         if self.delta_encoder is not None:
             try:
                 for msg in optimized:
-                    content = msg.get("content", "")
+                    content = msg.get("content") or ""
                     if isinstance(content, str) and "```" in content:
                         import re
                         for match in re.finditer(r"```(\w*)\n(.*?)```", content, re.DOTALL):
@@ -793,27 +798,34 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Delta encoding snapshot storage failed: %s", e)
 
-        # Step 14.9: Save hierarchical summaries to disk
-        if self.hierarchical_summarizer is not None:
+        # Step 14.9: Save hierarchical summaries to disk. Gated behind
+        # persist_state_to_disk (review §8): per-turn pickle writes add latency to
+        # the request path for no benefit on a single-process proxy. State is still
+        # kept in memory every turn regardless.
+        if self._config.v050.persist_state_to_disk and self.hierarchical_summarizer is not None:
             try:
                 self.hierarchical_summarizer.save_to_disk()
             except Exception as e:
                 logger.warning("Hierarchical summarizer save failed: %s", e)
 
         # Step 14.10: Save static prefix KV-cache only when it changed.
-        if self.static_prefix_kv is not None:
+        if self._config.v050.persist_state_to_disk and self.static_prefix_kv is not None:
             try:
                 self.static_prefix_kv.save_to_disk()
             except Exception as e:
                 logger.warning("Static prefix KV-cache disk save failed: %s", e)
 
         # Log metrics
-        original_chars = sum(len(m.get("content", "")) for m in messages)
-        optimized_chars = sum(len(m.get("content", "")) for m in optimized)
+        original_chars = sum(len(m.get("content") or "") for m in messages)
+        optimized_chars = sum(len(m.get("content") or "") for m in optimized)
         original_tokens = self.token_counter.count_messages(messages)
         optimized_tokens = self.token_counter.count_messages(optimized)
         duration = time.time() - start_time
         saved_tokens = max(0, original_tokens - optimized_tokens)
+
+        # Cache the original count so the app layer can report token savings
+        # (review §11.1 / fix #10) without re-tokenizing the raw messages.
+        self._last_original_token_count = original_tokens
 
         logger.info(
             "[AgentOptimizer] %d -> %d chars (%d -> %d tokens, %d saved, %.3fs, %d -> %d msgs, progress: %.0f%%, loops: %d detected)",
@@ -844,11 +856,31 @@ class AgentContextOptimizer:
                     else 0
                 )
                 optimized = self.context_aligner.freeze_static_prefix(
-                    messages, optimized, frozen_prefix_turns=frozen_turns
+                    optimized, optimized, frozen_prefix_turns=frozen_turns
                 )
             except Exception as e:
                 logger.warning("Static prefix freeze failed: %s", e)
 
+        # Step 14.12: Append volatile (derived) context as a SINGLE trailing user
+        # turn (review §1/§9, priority fix #1). The quality anchor, RAG context,
+        # and loop warnings are volatile: they differ every turn. By appending
+        # them as one trailing user turn — instead of mutating the active user
+        # turn or inserting into the middle of history — every historical turn
+        # stays byte-identical across turns. The backend's native prefix cache
+        # then reuses its KV for the whole stable leading prefix and avoids an
+        # expensive MoE re-prefill. This is the core KV-cache preservation change.
+        try:
+            anchor = self._build_quality_anchor(optimized)
+            optimized = self._append_volatile_context(
+                optimized, anchor, rag_context, warning_lines, proactive_threshold_tokens
+            )
+        except Exception as e:
+            logger.warning("Volatile context append failed: %s", e)
+
+        # Record the final optimized prompt (with the trailing volatile turn) so
+        # the app layer's cache-outcome and token-calibration signals match what
+        # was actually sent to the backend (#6, review §1/§9).
+        self._last_optimized = optimized
         return optimized
 
     def _strip_internal_flags(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -868,7 +900,7 @@ class AgentContextOptimizer:
         )
 
         for msg in messages:
-            content = msg.get("content", "")
+            content = msg.get("content") or ""
             if isinstance(content, str):
                 content = marker_pattern.sub("", content)
 
@@ -883,57 +915,53 @@ class AgentContextOptimizer:
 
         return result
 
-    def _inject_quality_anchor(
+    def _append_volatile_context(
         self,
         messages: list[dict[str, Any]],
+        anchor: str,
+        rag_context: str,
+        warning_lines: list[str],
         proactive_threshold_tokens: int,
     ) -> list[dict[str, Any]]:
-        """Append a compact task-memory anchor to the last user turn only.
+        """Append volatile (derived) context as ONE trailing user turn.
 
-        The system prompt and historical turns are immutable once sent. Any
-        derived/volatile context must be appended to the newest user message so
-        llama.cpp can keep the common prefix stable across turns.
+        KV-cache stability (review §1/§9, priority fix #1): the quality anchor,
+        RAG context, and loop warnings are volatile — they change every turn. If
+        they were appended to the active (last) user turn, that turn's content
+        would differ between the turn it was generated and the next turn (when it
+        becomes historical), shifting the token boundary the backend hashes and
+        defeating prefix-cache reuse for everything up to that turn. Appending
+        them as a single trailing user turn keeps every historical turn
+        byte-identical across turns, so the backend reuses its cached KV for the
+        whole stable leading prefix instead of re-prefilling.
+
+        Only injected when the context is already over the proactive threshold
+        (matching the prior behavior): lean contexts stay untouched.
         """
-        if not messages or self.token_counter.count_messages(messages) <= proactive_threshold_tokens:
+        if not messages:
+            return messages
+        if self.token_counter.count_messages(messages) <= proactive_threshold_tokens:
             return messages
         if self._budget_tokens() <= 100:
             return messages
 
-        anchor = self._build_quality_anchor(messages)
-        if not anchor:
+        parts: list[str] = []
+        if anchor:
+            parts.append(f"# Conversation Quality Anchor\n{anchor}")
+        if warning_lines:
+            parts.append("\n\n".join(warning_lines))
+        if rag_context:
+            parts.append(f"# Relevant Context\n{rag_context}")
+        if not parts:
             return messages
 
-        marker = "\n\n# Conversation Quality Anchor\n"
+        content = "\n\n".join(parts)
+        # Avoid duplicating an identical trailing volatile turn from a prior pass.
+        if messages[-1].get("role") == "user" and messages[-1].get("content") == content:
+            return messages
+
         result = [dict(msg) for msg in messages]
-        last_user_idx = -1
-        for idx in range(len(result) - 1, -1, -1):
-            if result[idx].get("role") == "user":
-                last_user_idx = idx
-                break
-
-        if last_user_idx < 0:
-            result.append({"role": "user", "content": f"{marker}{anchor}"})
-            return result
-
-        user_msg = result[last_user_idx]
-        content = user_msg.get("content", "")
-        if not isinstance(content, str):
-            return messages
-
-        existing_anchor = f"{marker}{anchor}"
-        if content.endswith(existing_anchor):
-            return messages
-
-        # Avoid nesting prior anchors inside the new anchor text.
-        stripped = re.sub(
-            re.escape(marker) + r"[\s\S]*$",
-            "",
-            content,
-        )
-        result[last_user_idx] = {
-            **user_msg,
-            "content": f"{stripped}{existing_anchor}",
-        }
+        result.append({"role": "user", "content": content})
         return result
 
     def _build_quality_anchor(self, messages: list[dict[str, Any]]) -> str:
@@ -941,8 +969,8 @@ class AgentContextOptimizer:
         marker = "\n\n# Conversation Quality Anchor\n"
         user_messages = []
         for msg in messages:
-            if msg.get("role") == "user" and isinstance(msg.get("content", ""), str):
-                content = msg.get("content", "")
+            if msg.get("role") == "user" and isinstance(msg.get("content") or "", str):
+                content = msg.get("content") or ""
                 if marker in content:
                     content = content.split(marker, 1)[0]
                 user_messages.append(content)
@@ -997,7 +1025,7 @@ class AgentContextOptimizer:
         """Convert message list into AgentStateStore steps."""
         for i, msg in enumerate(messages):
             role = msg.get("role", "assistant")
-            content = msg.get("content", "")
+            content = msg.get("content") or ""
 
             step = AgentStep(
                 role=role,
@@ -1197,8 +1225,8 @@ class AgentContextOptimizer:
                         + self.calibrated_token_count(protected_tail))
             evictable_budget = max(0, max_tokens - reserved)
         else:
-            reserved = (sum(len(m.get("content", "")) for m in system_anchor)
-                        + sum(len(m.get("content", "")) for m in protected_tail))
+            reserved = (sum(len(m.get("content") or "") for m in system_anchor)
+                        + sum(len(m.get("content") or "") for m in protected_tail))
             evictable_budget = max(0, max_chars - reserved)
 
         # Evict from front of evictable body until under remaining budget
@@ -1328,21 +1356,30 @@ class AgentContextOptimizer:
 
         # Drop from front until under budget.
         if use_tokens:
-            total_tokens = sum(
-                self.token_counter.count_messages(pair) for pair in pairs
-            )
+            total = sum(self.token_counter.count_messages(pair) for pair in pairs)
         else:
-            total_chars = sum(len(m.get("content", "")) for p in pairs for m in p)
+            total = sum(len(m.get("content") or "") for p in pairs for m in p)
 
-        while (use_tokens and total_tokens > budget) or (not use_tokens and total_chars > budget):
+        # High/low watermark (review03.md §6/§9): only start evicting once the
+        # body exceeds the budget (high water), but then trim in one batch down
+        # to budget * low_water_ratio (low water). This keeps the oldest kept
+        # turn byte-stable across many subsequent turns, so the backend's native
+        # prefix cache is reused instead of being invalidated every over-budget
+        # turn. When already under budget this is a no-op.
+        if total <= budget:
+            return [m for pair in pairs for m in pair]
+
+        ratio = self._config.agentic.eviction_low_water_ratio
+        ratio = max(0.1, min(1.0, ratio))
+        low_water = int(budget * ratio)
+
+        while total > low_water:
             if not pairs:
                 break
             if use_tokens:
-                pair_tokens = self.token_counter.count_messages(pairs[0])
-                total_tokens -= pair_tokens
+                total -= self.token_counter.count_messages(pairs[0])
             else:
-                pair_size = sum(len(m.get("content", "")) for m in pairs[0])
-                total_chars -= pair_size
+                total -= sum(len(m.get("content") or "") for m in pairs[0])
             pairs = pairs[1:]
 
         return [m for pair in pairs for m in pair]
@@ -1369,7 +1406,7 @@ class AgentContextOptimizer:
         """
         result = []
         for msg in messages:
-            content = msg.get("content", "")
+            content = msg.get("content") or ""
             if isinstance(content, str) and self._has_code_blocks(content):
                 content = self._inject_syntax_markers(content)
             result.append({**msg, "content": content})
@@ -1409,6 +1446,23 @@ class AgentContextOptimizer:
                 result_lines.append(line)
 
         return "\n".join(result_lines)
+
+    @property
+    def last_optimized_token_count(self) -> int | None:
+        """Token count of the most recent optimized prompt (cached from optimize_messages)."""
+        return self._last_optimized_token_count
+
+    @property
+    def last_original_token_count(self) -> int | None:
+        """Token count of the most recent raw (pre-optimization) prompt."""
+        return self._last_original_token_count
+
+    @property
+    def last_saved_token_count(self) -> int | None:
+        """Tokens saved by the last optimization (original - optimized), if known."""
+        if self._last_original_token_count is None or self._last_optimized_token_count is None:
+            return None
+        return max(0, self._last_original_token_count - self._last_optimized_token_count)
 
     def get_cache_key(self, messages: list[dict[str, Any]]) -> str:
         """Generate cache key with canonicalization for static layer."""
@@ -1472,7 +1526,7 @@ class AgentContextOptimizer:
         static_end = self._find_static_layer_end(messages)
         if static_end == 0:
             return ""
-        return "\n".join(m.get("content", "") for m in messages[:static_end])
+        return "\n".join(m.get("content") or "" for m in messages[:static_end])
 
     def _prefetch_dependencies(
         self,
@@ -1502,7 +1556,7 @@ class AgentContextOptimizer:
         file_pattern = re.compile(r"[\w/]+\.(py|js|ts|go|rs|cpp|h|java)")
 
         for msg in messages:
-            content = msg.get("content", "")
+            content = msg.get("content") or ""
             if isinstance(content, str):
                 matches = file_pattern.findall(content)
                 file_refs.extend(matches)
@@ -1540,7 +1594,7 @@ class AgentContextOptimizer:
 
         # Pre-seed reasoning for the last user message
         user_msg = messages[last_user_idx]
-        content = user_msg.get("content", "")
+        content = user_msg.get("content") or ""
 
         if isinstance(content, str):
             # Add reasoning pre-seed
@@ -1583,7 +1637,7 @@ class AgentContextOptimizer:
             if total_tokens <= target:
                 return messages
         else:
-            total_chars = sum(len(m.get("content", "")) for m in messages)
+            total_chars = sum(len(m.get("content") or "") for m in messages)
             if total_chars <= target:
                 return messages
 
@@ -1594,8 +1648,8 @@ class AgentContextOptimizer:
                         + self.token_counter.count_messages(protected_tail))
             evictable_budget = max(0, target - reserved)
         else:
-            reserved = (sum(len(m.get("content", "")) for m in system_anchor)
-                        + sum(len(m.get("content", "")) for m in protected_tail))
+            reserved = (sum(len(m.get("content") or "") for m in system_anchor)
+                        + sum(len(m.get("content") or "") for m in protected_tail))
             evictable_budget = max(0, target - reserved)
 
         evictable_body = self._evict_for_budget(evictable_body, evictable_budget, use_tokens)
@@ -1645,7 +1699,7 @@ class AgentContextOptimizer:
         def msg_size(msg: dict[str, Any]) -> int:
             if use_tokens:
                 return self.token_counter.count_messages([msg])
-            return len(msg.get("content", ""))
+            return len(msg.get("content") or "")
 
         static_size = sum(msg_size(msg) for msg in static_messages)
         if static_size >= window_size:
@@ -1726,12 +1780,17 @@ class AgentContextOptimizer:
         ratio = len(symbols) / len(tokens)
         return min(1.0, ratio)
 
-    def _stream_large_tool_outputs(
+    def _compress_tool_outputs(
         self,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """No-op: do not split or rewrite tool messages."""
-        return messages
+        """Boundary-compress large tool/assistant outputs (review §3/§5.1).
+
+        Cheap, lossless-ish transforms (truncate, collapse repeated lines/frames,
+        strip ANSI) applied before the output enters the stable prefix. Idempotent
+        on small/already-compressed content, so it is safe to run every turn.
+        """
+        return compress_tool_messages(messages, self.tool_output_compressor)
 
     def get_optimal_temperature(
         self,
@@ -1753,7 +1812,7 @@ class AgentContextOptimizer:
         msg_count = 0
 
         for msg in messages:
-            content = msg.get("content", "")
+            content = msg.get("content") or ""
             if isinstance(content, str) and len(content) > 100:
                 entropy = self._calculate_message_entropy(content)
                 total_entropy += entropy

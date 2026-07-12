@@ -83,7 +83,7 @@ class AttentionSinkManager:
         Returns a value between 0 and 1.
         """
         total_tokens = sum(
-            len(m.get("content", "").split()) for m in messages
+            len((m.get("content") or "").split()) for m in messages
         )
         if total_tokens == 0:
             return 0.0

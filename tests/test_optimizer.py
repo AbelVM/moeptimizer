@@ -84,6 +84,58 @@ class TestAgentContextOptimizer:
         assistant_msgs = [m for m in result if m["role"] == "assistant"]
         assert len(assistant_msgs) <= 2, f"Expected ≤2 assistant msgs, got {len(assistant_msgs)}"
 
+    def test_eviction_hysteresis_batches_to_low_water(self) -> None:
+        """Once eviction triggers, it trims to the low-water mark in one batch and
+        keeps the oldest kept turn byte-stable across the next over-budget turn.
+
+        This is the review03.md §6/§9 property: batching to a low-water mark means
+        the backend's native prefix cache is reused across many turns instead of
+        being invalidated every over-budget turn.
+        """
+        self.optimizer._config.agentic.eviction_low_water_ratio = 0.5
+
+        def pair(i: int) -> list[dict[str, str]]:
+            return [
+                {"role": "user", "content": f"task {i} " + "x" * 90},
+                {"role": "assistant", "content": f"resp {i} " + "y" * 90},
+            ]
+
+        # 10 pairs, ~200 chars each -> ~2000 chars total. Budget 1000, low water 500.
+        body = [m for i in range(10) for m in pair(i)]
+        budget = 1000
+
+        trimmed = self.optimizer._evict_for_budget(body, budget, use_tokens=False)
+        total = sum(len(m.get("content", "")) for m in trimmed)
+        # Trimmed down to <= low water (500), not merely under budget (1000).
+        assert total <= 500
+        first_kept = trimmed[0]["content"]
+
+        # Add one more pair (simulating the next turn) and re-evict. Because the
+        # body is now under budget again (hysteresis headroom), the oldest kept
+        # turn does NOT change -> the leading prefix stays byte-stable.
+        next_body = trimmed + pair(10)
+        if sum(len(m.get("content", "")) for m in next_body) <= budget:
+            re_trimmed = self.optimizer._evict_for_budget(
+                next_body, budget, use_tokens=False
+            )
+            assert re_trimmed[0]["content"] == first_kept
+
+    def test_eviction_low_water_ratio_one_trims_to_budget(self) -> None:
+        """ratio=1.0 restores classic trim-to-exact-budget behavior."""
+        self.optimizer._config.agentic.eviction_low_water_ratio = 1.0
+        body = [
+            m
+            for i in range(10)
+            for m in (
+                {"role": "user", "content": f"t{i} " + "x" * 90},
+                {"role": "assistant", "content": f"r{i} " + "y" * 90},
+            )
+        ]
+        budget = 1000
+        trimmed = self.optimizer._evict_for_budget(body, budget, use_tokens=False)
+        total = sum(len(m.get("content", "")) for m in trimmed)
+        assert total <= budget
+
     def test_static_prefix_cache_hit_still_enforces_budget(self) -> None:
         """Static prefix cache hits must not bypass context compaction."""
         from moeptimizer.static_prefix_kv import get_static_prefix_kv_cache
@@ -388,3 +440,63 @@ class TestAgentContextOptimizer:
         joined = "\n".join(m["content"] for m in result)
         assert "Second task" in joined
         assert "Third task" in joined
+
+
+class TestToolOutputCompressionPipeline:
+    """Step 11.6: large tool outputs must be boundary-compressed by the pipeline."""
+
+    def test_large_tool_output_is_compressed(self) -> None:
+        config = AppConfig()
+        # Generous budget so nothing is evicted; we are testing compression,
+        # not eviction. Keep default 4000-char compression threshold.
+        config.agentic.max_optimized_chars = 200_000
+        assert config.agentic.tool_output_compression_enabled
+        threshold = config.agentic.tool_output_compression_max_chars
+        optimizer = AgentContextOptimizer(config)
+
+        # A realistic oversized run_command log: many repeated lines -> well over
+        # the threshold so the boundary compressor fires and collapses it.
+        big_log = "\n".join(["DEBUG worker heartbeat ok"] * 400)
+        assert len(big_log) > threshold
+
+        messages = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Run the test suite."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "run_command", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "name": "run_command", "content": big_log},
+        ]
+
+        result = optimizer.optimize_messages(messages)
+
+        tool_msg = next(m for m in result if m.get("role") == "tool")
+        # The tool output survived (not evicted) but was compressed.
+        assert len(tool_msg["content"]) < len(big_log)
+        # Compression collapsed the repeated line rather than forwarding verbatim.
+        assert tool_msg["content"].count("DEBUG worker heartbeat ok") < 400
+
+    def test_small_tool_output_forwarded_verbatim(self) -> None:
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 200_000
+        optimizer = AgentContextOptimizer(config)
+
+        small = "3 passed in 0.12s"
+        messages = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Run the tests."},
+            {"role": "tool", "tool_call_id": "c1", "name": "run_command", "content": small},
+        ]
+
+        result = optimizer.optimize_messages(messages)
+        tool_msg = next(m for m in result if m.get("role") == "tool")
+        # Under the threshold -> quality-safe verbatim forwarding.
+        assert tool_msg["content"] == small

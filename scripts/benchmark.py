@@ -2,7 +2,17 @@
 """Multi-turn benchmark: direct Lemonade vs moeptimizer proxy.
 
 Compares latency, token usage, context-window efficiency, and response quality
-across realistic multi-turn conversations that grow the context window.
+across realistic multi-turn agentic-coding conversations that grow the context
+window.
+
+Every scenario runs as an OpenCode-style harness by default: each turn sends a
+real agent payload — the user task plus assistant ``tool_calls`` and the
+corresponding ``tool`` results (file reads, test/lint/build logs) — and the
+OpenAI ``tools`` schema is forwarded to the backend, exactly like a production
+coding client. The proxy boundary-compresses large tool outputs (terminal
+logs, file dumps) via ToolOutputCompressor before they enter the stable prefix,
+so the benchmark exercises that path too. Pass ``--no-agentic`` to fall back to
+plain user messages.
 
 The proxy is auto-started if not already running on the target port (checked via /v1/health).
 
@@ -19,12 +29,20 @@ Usage:
     # Dump full response pairs with all quality metrics
     python scripts/benchmark.py --dump-responses
 
-    # Real-life coding scenarios
+    # Real-life coding scenarios (all agentic / OpenCode-harness by default)
     python scripts/benchmark.py --scenario debug --turns 15
     python scripts/benchmark.py --scenario debug_long --turns 30
     python scripts/benchmark.py --scenario refactor_long --turns 30
     python scripts/benchmark.py --scenario feature_long --turns 30
     python scripts/benchmark.py --scenario default_long --turns 30
+
+    # OpenCode-harness replay of the real fixture project (user task + tool
+    # calls + real tool outputs read from scripts/fixtures/)
+    python scripts/benchmark.py --scenario fixtures --turns 30
+    python scripts/benchmark.py --scenario opencode --turns 30
+
+    # Plain user messages instead of agent payloads
+    python scripts/benchmark.py --scenario debug_long --turns 30 --no-agentic
 
     # Run all scenarios
     python scripts/benchmark.py --scenario all --turns 10
@@ -56,40 +74,299 @@ MODEL_ID = os.environ.get(
 )
 MOEPT_PORT = int(os.environ.get("MOEPT_PORT", "8080"))
 
+# Realistic agentic-coding system prompt. This is the frozen-prefix anchor that
+# the proxy keeps byte-stable across turns, so it should resemble what a real
+# coding client (e.g. OpenCode) actually sends: tool-use framing, conciseness
+# guidance, and an instruction to preserve prior context.
+SYSTEM_PROMPT = (
+    "You are an autonomous coding agent operating inside a developer's editor. "
+    "You have access to tools for reading files, running shell commands, editing "
+    "code, and searching the repository. Follow these rules:\n"
+    "1. Think step by step, but keep reasoning concise and never repeat what the "
+    "user or a previous turn already established.\n"
+    "2. When the user pastes the current module, treat it as the source of truth "
+    "and apply the requested change incrementally.\n"
+    "3. Prefer small, well-scoped edits over broad rewrites unless asked.\n"
+    "4. Show the key updated sections; you may omit unchanged boilerplate.\n"
+    "5. Mention any tradeoff that affects latency, cache stability, or testability."
+)
+
+# OpenAI-compatible tool schemas an agentic coding client (e.g. OpenCode) sends
+# on every request. The benchmark includes these in the request body whenever it
+# runs in agentic (OpenCode-harness) mode so the payload matches what a real
+# client ships to the backend — and so the proxy must forward `tools` alongside
+# the `tool_calls` / `tool` messages below.
+OPENCODE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file from the workspace and return its contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path to the file."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Apply a search/replace or unified-diff edit to a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path to the file."},
+                    "edits": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "List of edits to apply.",
+                    },
+                },
+                "required": ["path", "edits"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a shell command in the workspace and return stdout/stderr.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The command to run."},
+                    "timeout": {"type": "integer", "description": "Optional timeout in seconds."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search the workspace for a pattern and return matching lines.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern to search for."},
+                    "path": {"type": "string", "description": "Optional path to search within."},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files in a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory to list (defaults to workspace root)."},
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+
+# Fallback run_command log used only if the fixture loader is unavailable. It is
+# deliberately >4k chars so the proxy's tool-output compression still fires.
+_FALLBACK_AGENT_LOG = "\n".join(
+    [
+        "======================== test session starts ========================",
+        "platform linux -- Python 3.14.0, pytest-8.3.4, pluggy-1.5.0",
+        "collected 12 items",
+        "",
+        "tests/test_users.py::test_load_happy_path PASSED                 [  8%]",
+        "tests/test_users.py::test_missing_file_raises PASSED            [ 16%]",
+        "tests/test_users.py::test_invalid_jsonl_strict_mode PASSED      [ 25%]",
+        "tests/test_users.py::test_service_summarize PASSED              [ 33%]",
+        "tests/test_users.py::test_config_from_env PASSED                [ 41%]",
+        "tests/test_users.py::test_streaming_repository PASSED           [ 50%]",
+        "tests/test_users.py::test_legacy_migration PASSED              [ 58%]",
+        "tests/test_users.py::test_cli_output_flag PASSED               [ 66%]",
+        "tests/test_users.py::test_register_validator PASSED            [ 75%]",
+        "tests/test_users.py::test_stats_submodule PASSED               [ 83%]",
+        "tests/test_users.py::test_pyproject_extra PASSED               [ 91%]",
+        "tests/test_users.py::test_docker_healthcheck PASSED            [100%]",
+        "",
+        "======================== 12 passed in 0.34s ========================",
+        "",
+        "$ ruff check .",
+        "All checks passed!",
+        "",
+        "$ mypy users",
+        "Success: no issues found in 7 source files",
+        "",
+        "$ pytest --cov=users --cov-report=term-missing -q",
+        "TOTAL                  305    17    94%",
+        "",
+        "$ docker build -t users-service:dev .",
+        "Successfully tagged users-service:dev",
+    ]
+    + ["DEBUG worker heartbeat ok"] * 200
+)
+
+
+def _agentic_exchange(
+    user_content: str,
+    turn_index: int,
+    tool_outputs: list[dict] | None = None,
+) -> list[dict]:
+    """Build one OpenCode-style agentic turn as a list of messages.
+
+    The turn is a realistic agent payload: the user task, followed by assistant
+    ``tool_calls`` and the corresponding ``tool`` results. ``tool_outputs`` is a
+    list of ``{"name", "arguments", "content"}`` describing the tool calls the
+    agent makes this turn and their (already-computed) results. When omitted, a
+    default ``read_file`` + ``run_command`` pair is synthesized with *realistic*
+    content (a real fixture file plus a >4k-char test/lint/build log) so even the
+    synthetic scenarios emit a believable agent payload and exercise the proxy's
+    tool-output compression path.
+    """
+    if tool_outputs is None:
+        loader = _get_fixture_loader()
+        if loader is not None:
+            read_content = loader.read_fixture_file("users/repository.py")
+            run_content = loader.agent_log_output(True)
+        else:
+            read_content = None
+            run_content = _FALLBACK_AGENT_LOG
+        tool_outputs = [
+            {
+                "name": "read_file",
+                "arguments": {"path": "users/repository.py"},
+                "content": read_content
+                or "(current file contents would be returned here by the harness)",
+            },
+            {
+                "name": "run_command",
+                "arguments": {"command": "python -m pytest -q users"},
+                "content": run_content,
+            },
+        ]
+    msgs: list[dict] = [{"role": "user", "content": user_content}]
+    for i, tool in enumerate(tool_outputs):
+        call_id = f"call_{turn_index}_{i}"
+        msgs.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool["name"],
+                            "arguments": json.dumps(tool["arguments"]),
+                        },
+                    }
+                ],
+            }
+        )
+        msgs.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": tool["name"],
+                "content": tool["content"],
+            }
+        )
+    return msgs
+
+
+def _append_assistant_message(messages: list[dict], msg: dict) -> None:
+    """Append an assistant response, synthesizing tool results if it emitted tool_calls.
+
+    Keeps the conversation valid for the next turn even if the backend chooses to
+    call tools: each ``tool_call`` gets a placeholder tool result so the history
+    never ends on a dangling assistant ``tool_calls`` entry.
+    """
+    tool_calls = msg.get("tool_calls")
+    content = msg.get("content") or ""
+    if tool_calls:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": tool_calls,
+            }
+        )
+        for tc in tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "name": (tc.get("function") or {}).get("name", "tool"),
+                    "content": "(tool executed by harness; result omitted in benchmark replay)",
+                }
+            )
+    else:
+        messages.append({"role": "assistant", "content": content})
+
+
 # ---------------------------------------------------------------------------
 # Long benchmark scenarios
 # ---------------------------------------------------------------------------
 
-def _long_refactor_code_snippet(turn: int) -> str:
-    """Return a realistic code snippet for a long refactor benchmark."""
-    extra = ""
-    if turn % 3 == 0:
-        extra = """
+# Realistic long-benchmark scenarios model an *accumulating* codebase: each turn
+# the user pastes the current module, which has grown with every prior edit. The
+# pasted code therefore genuinely grows turn-over-turn (instead of re-pasting a
+# static file), which is what makes older turns become stale and lets the proxy's
+# cache-stable summarization / front-eviction behave like in production.
 
-@dataclass(slots=True)
-class Config:
-    input_path: Path = Path("users.jsonl")
-    dry_run: bool = False
-"""
-    elif turn % 3 == 1:
-        extra = """
+def _cumulative_code(base: str, steps: list[str], index: int) -> str:
+    """Return the module state after applying code steps 0..index (capped).
 
-class UserService:
-    def __init__(self, repository: UserRepository):
-        self.repository = repository
+    Real agentic coding accumulates state: each turn the user pastes the
+    current file, which has grown with every prior edit. We model that by
+    appending each step's delta to the base so the pasted code genuinely
+    grows turn-over-turn (instead of re-pasting a static file). This is what
+    makes older turns become stale and lets the proxy's cache-stable
+    summarization / front-eviction behave like in production.
+    """
+    if not steps:
+        return base
+    idx = min(index, len(steps) - 1)
+    applied = [s for s in steps[: idx + 1] if s.strip()]
+    if not applied:
+        return base.rstrip()
+    return base.rstrip() + "\n\n" + "\n\n".join(applied)
 
-    def active_count(self) -> int:
-        return sum(1 for user in self.repository.load() if user.active)
-"""
-    else:
-        extra = """
 
-def main() -> None:
-    repository = UserRepository(Path("users.jsonl"))
-    users = repository.load()
-    print(summarize(users))
-"""
-    return f"""from dataclasses import dataclass
+def _build_long_tasks(
+    instructions: list[str], base_code: str, code_steps: list[str]
+) -> list[str]:
+    """Build long-benchmark tasks: each turn pastes the *current* (cumulative) code."""
+    return [
+        f"""{instruction}
+
+Conversation constraints:
+- Preserve the existing public API unless the request explicitly asks to change it.
+- Prefer small, incremental patches over broad rewrites.
+- Show the key updated sections; you may omit unchanged boilerplate.
+- Mention any tradeoff that affects latency, cache stability, or testability.
+
+Current code (module state after prior turns):
+
+```python
+{_cumulative_code(base_code, code_steps, index)}
+```
+
+Please apply the requested change."""
+        for index, instruction in enumerate(instructions)
+    ]
+
+
+BASE_REFACTOR_CODE = """from dataclasses import dataclass
 from pathlib import Path
 import json
 
@@ -112,9 +389,183 @@ class UserRepository:
         return users
 
 def summarize(users: list[User]) -> dict[str, int | bool]:
-    return {{"count": len(users), "active": sum(1 for user in users if user.active)}}
-{extra}
+    return {"count": len(users), "active": sum(1 for user in users if user.active)}
 """
+
+# One code delta per LONG_REFACTOR_INSTRUCTIONS entry. Empty string = the turn
+# asks for an artifact that lives outside this module (tests, Dockerfile, CI,
+# docs, changelog), so the pasted module is unchanged that turn.
+REFACTOR_STEPS = [
+    # 0: typed, testable module + entry point
+    '''__all__ = ["User", "UserRepository", "summarize"]
+
+if __name__ == "__main__":
+    repo = UserRepository(Path("users.jsonl"))
+    print(summarize(repo.load()))''',
+    # 1: schema validation for malformed rows
+    '''class UserSchemaError(ValueError):
+    """Raised when a JSONL row fails schema validation."""
+
+def _parse_row(line: str, line_no: int) -> User:
+    raw = json.loads(line)
+    if "id" not in raw or "name" not in raw:
+        raise UserSchemaError(f"row {line_no}: missing id/name")
+    return User(id=int(raw["id"]), name=str(raw["name"]), active=bool(raw.get("active", True)))''',
+    # 2: Config dataclass loaded from env
+    '''import os
+
+@dataclass(slots=True)
+class Config:
+    input_path: Path = Path("users.jsonl")
+    dry_run: bool = False
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        return cls(
+            input_path=Path(os.environ.get("USERS_INPUT", "users.jsonl")),
+            dry_run=os.environ.get("USERS_DRY_RUN", "0") == "1",
+        )''',
+    # 3: service class with dependency injection
+    '''class SummarizerService:
+    def __init__(self, repository: UserRepository):
+        self.repository = repository
+
+    def summarize(self) -> dict[str, int | bool]:
+        return summarize(self.repository.load())''',
+    # 4: structured logging
+    '''import logging
+
+logger = logging.getLogger("users")
+
+def log_event(step: str, **fields: object) -> None:
+    logger.info(json.dumps({"step": step, **fields}))''',
+    # 5: CLI entry point
+    '''import argparse
+
+def build_cli() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Summarize users")
+    parser.add_argument("--input", default="users.jsonl")
+    parser.add_argument("--output")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser''',
+    # 6: pytest suite (separate file; module unchanged)
+    "",
+    # 7: async support with aiofiles
+    '''import aiofiles
+
+class AsyncUserRepository:
+    def __init__(self, path: Path):
+        self.path = path
+
+    async def load(self) -> list[User]:
+        users: list[User] = []
+        async with aiofiles.open(self.path) as fh:
+            async for line in fh:
+                users.append(_parse_row(line, 0))
+        return users''',
+    # 8: package layout (structural; module unchanged)
+    "",
+    # 9: Dockerfile (separate; module unchanged)
+    "",
+    # 10: GitHub Actions workflow (separate; module unchanged)
+    "",
+    # 11: lightweight benchmark script
+    '''import time
+
+def benchmark_load(path: Path, rows: int = 10_000) -> float:
+    start = time.perf_counter()
+    _ = UserRepository(path).load()
+    return time.perf_counter() - start''',
+    # 12: documentation (module unchanged)
+    "",
+    # 13: changelog entry (module unchanged)
+    "",
+    # 14: harden against malformed JSONL with strict mode
+    '''def load_strict(self) -> list[User]:
+    users: list[User] = []
+    errors: list[str] = []
+    with self.path.open() as fh:
+        for line_no, line in enumerate(fh, 1):
+            try:
+                users.append(_parse_row(line, line_no))
+            except UserSchemaError as exc:
+                errors.append(str(exc))
+    if errors:
+        raise UserSchemaError(f"{len(errors)} bad rows: {errors[:3]}")
+    return users''',
+    # 15: in-memory metrics emission
+    '''@dataclass
+class Metrics:
+    loads: int = 0
+    parse_errors: int = 0
+    summary_ms: float = 0.0
+
+    def record_load(self, n: int) -> None:
+        self.loads += n''',
+    # 16: observability trace id
+    '''import uuid
+
+@dataclass
+class TraceContext:
+    trace_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    def bind(self, **fields: object) -> dict[str, object]:
+        return {"trace_id": self.trace_id, **fields}''',
+    # 17: migration path from the old dict API
+    '''def legacy_load(path: Path) -> list[dict]:
+    """Backwards-compatible dict-based loader for old callers."""
+    return [vars(u) for u in UserRepository(path).load()]''',
+    # 18: release notes (module unchanged)
+    "",
+    # 19: final cleanup pass
+    '''def active_count(users: list[User]) -> int:
+    return sum(1 for u in users if u.active)''',
+    # 20: streaming variant
+    '''def stream_users(path: Path) -> Iterator[User]:
+    with path.open() as fh:
+        for line_no, line in enumerate(fh, 1):
+            yield _parse_row(line, line_no)''',
+    # 21: retry logic with exponential backoff
+    '''import time
+
+def load_with_retry(path: Path, retries: int = 3) -> list[User]:
+    for attempt in range(retries):
+        try:
+            return UserRepository(path).load()
+        except OSError:
+            time.sleep(2 ** attempt)
+    raise OSError(f"failed after {retries} retries")''',
+    # 22: localization for user-facing errors
+    '''class Localizer:
+    def __init__(self, locale: str = "en") -> None:
+        self.locale = locale
+
+    def error(self, key: str) -> str:
+        return {"missing_file": "input file not found"}.get(key, key)''',
+    # 23: Counter-based summary optimization
+    '''from collections import Counter
+
+def summarize(users: list[User]) -> dict[str, int | bool]:
+    counts = Counter(u.active for u in users)
+    return {"count": len(users), "active": counts.get(True, 0)}''',
+    # 24: plugin hook for external validators
+    '''_validators: list[Callable[[User], None]] = []
+
+def register_validator(fn: Callable[[User], None]) -> None:
+    _validators.append(fn)''',
+    # 25: config validation that fails fast
+    '''def validate_config(cfg: Config) -> None:
+    if cfg.input_path is None:
+        raise ValueError("input_path is required")''',
+    # 26: group helpers (module unchanged)
+    "",
+    # 27: architecture diagram (module unchanged)
+    "",
+    # 28: final replay test (module unchanged)
+    "",
+    # 29: final summary (module unchanged)
+    "",
+]
 
 
 LONG_REFACTOR_INSTRUCTIONS = [
@@ -150,101 +601,162 @@ LONG_REFACTOR_INSTRUCTIONS = [
     "Finish by summarizing the refactor, listing the remaining risks, and suggesting the next production hardening step.",
 ]
 
-LONG_REFACTOR_TASKS = [
-    f"""{instruction}
-
-Conversation constraints:
-- Preserve the existing public API unless the request explicitly asks to change it.
-- Prefer small, incremental patches over broad rewrites.
-- Keep code blocks complete enough to compile or explain exactly what changed.
-- Mention any tradeoff that affects latency, cache stability, or testability.
-
-Current code:
-
-```python
-{_long_refactor_code_snippet(index)}
-```
-
-Please apply the requested change and keep the response concise."""
-    for index, instruction in enumerate(LONG_REFACTOR_INSTRUCTIONS)
-]
+LONG_REFACTOR_TASKS = _build_long_tasks(LONG_REFACTOR_INSTRUCTIONS, BASE_REFACTOR_CODE, REFACTOR_STEPS)
 
 
-def _build_long_tasks(instructions: list[str], code_snippet_fn) -> list[str]:
-    """Build 30-turn long benchmark tasks from instructions and a code snippet generator."""
-    return [
-        f"""{instruction}
-
-Conversation constraints:
-- Preserve the existing public API unless the request explicitly asks to change it.
-- Prefer small, incremental patches over broad rewrites.
-- Keep code blocks complete enough to compile or explain exactly what changed.
-- Mention any tradeoff that affects latency, cache stability, or testability.
-
-Current code:
-
-```python
-{code_snippet_fn(index)}
-```
-
-Current tests and config:
-
-```python
-def test_placeholder() -> None:
-    assert True
-```
-
-```toml
-[project]
-name = "benchmark-package"
-version = "0.1.0"
-requires-python = ">=3.11"
-```
-
-Please apply the requested change and keep the response concise."""
-        for index, instruction in enumerate(instructions)
-    ]
-
-
-def _long_debug_code_snippet(turn: int) -> str:
-    """Return a realistic code snippet for a long debug benchmark."""
-    extra = ""
-    if turn % 3 == 0:
-        extra = """
-
-class Item(BaseModel):
-    name: str
-    quantity: int
-"""
-    elif turn % 3 == 1:
-        extra = """
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
-"""
-    else:
-        extra = """
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-"""
-    return f"""from fastapi import FastAPI, HTTPException
+BASE_DEBUG_CODE = """from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import logging
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
 
-{extra}
+class Item(BaseModel):
+    name: str
+    quantity: int
 
 @app.post("/items")
 def create_item(item: Item):
     if item.quantity < 0:
         raise HTTPException(status_code=400, detail="Quantity must be positive")
-    return {{"name": item.name, "total": item.quantity * 10}}
+    return {"name": item.name, "total": item.quantity * 10}
 """
+
+# One code delta per DEBUG_LONG_INSTRUCTIONS entry. Empty = artifact outside the
+# module (tests, CLI, docs, diagram); the pasted module is unchanged that turn.
+DEBUG_STEPS = [
+    # 0: diagnose the IndexError -> safe indexing helper
+    '''def _safe_get(items: list[Item], i: int) -> Item | None:
+    if not items:
+        return None
+    return items[i % len(items)]''',
+    # 1: fix off-by-one + guard empty input
+    '''def _normalize(items: list[Item]) -> list[Item]:
+    if not items:
+        return []
+    return items[:-1]''',
+    # 2: validation for malformed records
+    '''class ItemSchemaError(ValueError):
+    """Raised when a record fails validation."""
+
+def _validate(item: Item) -> None:
+    if item.quantity < 0:
+        raise ItemSchemaError("quantity must be non-negative")''',
+    # 3: logging around the failing section
+    '''def log_failure(step: str, **fields: object) -> None:
+    logger.error(json.dumps({"step": step, **fields}))''',
+    # 4: retry wrapper around the read path
+    '''import time
+
+def read_with_retry(path: str, retries: int = 3) -> list[Item]:
+    for attempt in range(retries):
+        try:
+            return _read(path)
+        except OSError:
+            time.sleep(2 ** attempt)
+    raise OSError(f"read failed after {retries} retries")''',
+    # 5: reusable error-handling helper
+    '''def handle_error(exc: Exception) -> dict[str, str]:
+    return {"error": type(exc).__name__, "detail": str(exc)}''',
+    # 6: unit test for the retry path (separate file; module unchanged)
+    "",
+    # 7: consistent error shape for validation failures
+    '''from pydantic import BaseModel as _BM
+
+class ErrorResponse(_BM):
+    error: str
+    detail: str''',
+    # 8: CLI smoke test (separate; module unchanged)
+    "",
+    # 9: separate pure logic from FastAPI plumbing
+    '''def parse_items(raw: list[dict]) -> list[Item]:
+    return [Item(**r) for r in raw]''',
+    # 10: timeout around the read path
+    '''READ_TIMEOUT = 5.0
+
+def read_with_timeout(path: str) -> list[Item]:
+    with timeout(READ_TIMEOUT):
+        return _read(path)''',
+    # 11: metrics object
+    '''@dataclass
+class Metrics:
+    successes: int = 0
+    failures: int = 0
+
+    def record(self, ok: bool) -> None:
+        if ok:
+            self.successes += 1
+        else:
+            self.failures += 1''',
+    # 12: structured logging + trace id
+    '''import uuid
+
+def bind_trace() -> str:
+    return uuid.uuid4().hex''',
+    # 13: harden against oversized payloads
+    '''MAX_PAYLOAD_BYTES = 1_000_000
+
+def _check_size(payload: bytes) -> None:
+    if len(payload) > MAX_PAYLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="payload too large")''',
+    # 14: compatibility shim for old dict format
+    '''def legacy_create(payload: dict) -> dict:
+    item = Item(name=payload["name"], quantity=payload.get("qty", 0))
+    return create_item(item)''',
+    # 15: exponential backoff with jitter
+    '''import random
+
+def read_with_jitter(path: str, retries: int = 3) -> list[Item]:
+    for attempt in range(retries):
+        try:
+            return _read(path)
+        except OSError:
+            time.sleep((2 ** attempt) + random.uniform(0, 0.5))  # noqa: B608
+    raise OSError("read failed")''',
+    # 16: test rejects negative quantities (separate; module unchanged)
+    "",
+    # 17: benchmark fixture
+    '''def benchmark_parse(rows: int = 10_000) -> float:
+    import time
+    start = time.perf_counter()
+    _ = parse_items([{"name": "x", "quantity": 1} for _ in range(rows)])
+    return time.perf_counter() - start''',
+    # 18: documentation (module unchanged)
+    "",
+    # 19: final cleanup pass
+    '''def active_count(items: list[Item]) -> int:
+    return sum(1 for i in items if i.quantity > 0)''',
+    # 20: streaming variant
+    '''def stream_items(raw: list[dict]) -> Iterator[Item]:
+    for r in raw:
+        yield Item(**r)''',
+    # 21: localization for user-facing errors
+    '''class Localizer:
+    def error(self, key: str) -> str:
+        return {"negative_qty": "quantity must be positive"}.get(key, key)''',
+    # 22: plugin hook for custom validators
+    '''_validators: list[Callable[[Item], None]] = []
+
+def register_validator(fn: Callable[[Item], None]) -> None:
+    _validators.append(fn)''',
+    # 23: config validation that fails fast
+    '''def validate_config(cfg: dict) -> None:
+    if "secret" not in cfg:
+        raise ValueError("secret is required")''',
+    # 24: group helpers (module unchanged)
+    "",
+    # 25: architecture diagram (module unchanged)
+    "",
+    # 26: replay test (module unchanged)
+    "",
+    # 27: summarize the fix (module unchanged)
+    "",
+    # 28: observability hook
+    '''def record_duration(trace_id: str, ms: float) -> None:
+    logger.info(json.dumps({"trace_id": trace_id, "duration_ms": ms}))''',
+    # 29: release note (module unchanged)
+    "",
+]
 
 
 DEBUG_LONG_INSTRUCTIONS = [
@@ -281,29 +793,7 @@ DEBUG_LONG_INSTRUCTIONS = [
 ]
 
 
-def _long_feature_code_snippet(turn: int) -> str:
-    """Return a realistic code snippet for a long feature benchmark."""
-    extra = ""
-    if turn % 3 == 0:
-        extra = """
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-"""
-    elif turn % 3 == 1:
-        extra = """
-
-def _now() -> datetime:
-    return datetime.utcnow()
-"""
-    else:
-        extra = """
-
-def _fake_dependency() -> str:
-    return "test-user"
-"""
-    return f"""from fastapi import FastAPI, Depends, HTTPException
+BASE_FEATURE_CODE = """from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 import jwt
@@ -311,7 +801,9 @@ import jwt
 app = FastAPI()
 SECRET_KEY = "dev-secret"
 
-{extra}
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
 
 class LoginRequest(BaseModel):
     username: str
@@ -321,9 +813,132 @@ class LoginRequest(BaseModel):
 def login(payload: LoginRequest) -> TokenResponse:
     if payload.password != "secret":
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = jwt.encode({{"sub": payload.username, "exp": datetime.utcnow() + timedelta(hours=1)}}, SECRET_KEY, algorithm="HS256")
+    token = jwt.encode({"sub": payload.username, "exp": datetime.utcnow() + timedelta(hours=1)}, SECRET_KEY, algorithm="HS256")
     return TokenResponse(access_token=token)
 """
+
+# One code delta per FEATURE_LONG_INSTRUCTIONS entry. Empty = artifact outside
+# the module (tests, Dockerfile, CI, docs, changelog); module unchanged that turn.
+FEATURE_STEPS = [
+    # 0: API shape + data models
+    '''class RefreshRequest(BaseModel):
+    refresh_token: str''',
+    # 1: token creation helper
+    '''def create_token(sub: str) -> str:
+    return jwt.encode({"sub": sub, "exp": datetime.utcnow() + timedelta(hours=1)}, SECRET_KEY, algorithm="HS256")''',
+    # 2: config object for JWT settings
+    '''@dataclass(slots=True)
+class JWTConfig:
+    secret: str = "dev-secret"
+    token_ttl_hours: int = 1''',
+    # 3: auth service with injectable signer
+    '''class AuthService:
+    def __init__(self, config: JWTConfig):
+        self.config = config
+
+    def login(self, username: str, password: str) -> TokenResponse:
+        if password != "secret":
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        return TokenResponse(access_token=create_token(username))''',
+    # 4: rate limiting
+    '''class RateLimiter:
+    def __init__(self, max_hits: int = 5, window: int = 60) -> None:
+        self.max_hits = max_hits
+        self.window = window
+
+    def allow(self, key: str) -> bool:
+        return True  # placeholder for a real token-bucket''',
+    # 5: dependency-injection layer
+    '''def get_auth_service() -> AuthService:
+    return AuthService(JWTConfig())''',
+    # 6: test suite (separate file; module unchanged)
+    "",
+    # 7: async support around refresh
+    '''async def refresh(payload: RefreshRequest) -> TokenResponse:
+    return TokenResponse(access_token=create_token("user"))''',
+    # 8: package layout (structural; module unchanged)
+    "",
+    # 9: Dockerfile (separate; module unchanged)
+    "",
+    # 10: CI workflow (separate; module unchanged)
+    "",
+    # 11: benchmark for login throughput
+    '''def benchmark_login(users: int = 1_000) -> float:
+    import time
+    svc = AuthService(JWTConfig())
+    start = time.perf_counter()
+    for i in range(users):
+        svc.login(f"u{i}", "secret")
+    return time.perf_counter() - start''',
+    # 12: documentation (module unchanged)
+    "",
+    # 13: changelog (module unchanged)
+    "",
+    # 14: harden malformed/oversized requests
+    '''def _check_request(payload: LoginRequest) -> None:
+    if not payload.username or not payload.password:
+        raise HTTPException(status_code=400, detail="missing fields")''',
+    # 15: metrics for login outcomes
+    '''@dataclass
+class AuthMetrics:
+    success: int = 0
+    failure: int = 0
+    rate_limited: int = 0''',
+    # 16: observability trace id
+    '''import uuid
+
+def bind_trace() -> str:
+    return uuid.uuid4().hex''',
+    # 17: migration from session-cookie flow
+    '''def legacy_session_login(cookie: str) -> TokenResponse:
+    return TokenResponse(access_token=create_token(cookie))''',
+    # 18: release notes (module unchanged)
+    "",
+    # 19: final cleanup pass
+    '''def active_sessions(tokens: list[str]) -> int:
+    return len([t for t in tokens if t])''',
+    # 20: streaming token refresh
+    '''def stream_refresh(tokens: list[str]) -> Iterator[TokenResponse]:
+    for t in tokens:
+        yield TokenResponse(access_token=t)''',
+    # 21: retry around external validation
+    '''import time
+
+def validate_external_with_retry(token: str, retries: int = 3) -> bool:
+    for attempt in range(retries):
+        try:
+            return _validate_external(token)
+        except OSError:
+            time.sleep(2 ** attempt)
+    return False''',
+    # 22: localization for auth errors
+    '''class Localizer:
+    def error(self, key: str) -> str:
+        return {"invalid_credentials": "Invalid credentials"}.get(key, key)''',
+    # 23: LRU cache for token validation
+    '''from functools import lru_cache
+
+@lru_cache(maxsize=1024)
+def cached_validate(token: str) -> bool:
+    return bool(token)''',
+    # 24: plugin hook for custom backends
+    '''_backends: list[Callable[[str, str], TokenResponse]] = []
+
+def register_backend(fn: Callable[[str, str], TokenResponse]) -> None:
+    _backends.append(fn)''',
+    # 25: config validation that fails fast
+    '''def validate_jwt_config(cfg: JWTConfig) -> None:
+    if not cfg.secret:
+        raise ValueError("JWT secret is required")''',
+    # 26: group helpers (module unchanged)
+    "",
+    # 27: architecture diagram (module unchanged)
+    "",
+    # 28: final replay test (module unchanged)
+    "",
+    # 29: summarize feature (module unchanged)
+    "",
+]
 
 
 FEATURE_LONG_INSTRUCTIONS = [
@@ -360,34 +975,7 @@ FEATURE_LONG_INSTRUCTIONS = [
 ]
 
 
-def _long_default_code_snippet(turn: int) -> str:
-    """Return a realistic code snippet for a long default benchmark."""
-    extra = ""
-    if turn % 3 == 0:
-        extra = """
-
-from dataclasses import dataclass
-
-@dataclass(slots=True)
-class Result:
-    value: int
-"""
-    elif turn % 3 == 1:
-        extra = """
-
-def _validate_n(n: int) -> None:
-    if n < 0:
-        raise ValueError("n must be non-negative")
-"""
-    else:
-        extra = """
-
-def main() -> None:
-    print(list(fibonacci_gen(10)))
-"""
-    return f"""from typing import Iterator
-
-{extra}
+BASE_DEFAULT_CODE = """from typing import Iterator
 
 def fibonacci(n: int) -> list[int]:
     if n <= 0:
@@ -399,13 +987,155 @@ def fibonacci(n: int) -> list[int]:
         values.append(values[-1] + values[-2])
     return values
 
-
 def fibonacci_gen(n: int) -> Iterator[int]:
     a, b = 0, 1
     for _ in range(n):
         yield a
         a, b = b, a + b
 """
+
+# One code delta per DEFAULT_LONG_INSTRUCTIONS entry. Empty = artifact outside
+# the module (tests, Dockerfile, CI, docs, changelog); module unchanged that turn.
+DEFAULT_STEPS = [
+    # 0: explain iterative + tradeoffs (docstring)
+    '''def fibonacci(n: int) -> list[int]:
+    """Iterative O(n) time, O(n) space Fibonacci."""
+    if n <= 0:
+        return []
+    if n == 1:
+        return [0]
+    values = [0, 1]
+    for _ in range(2, n):
+        values.append(values[-1] + values[-2])
+    return values''',
+    # 1: refactor into a generator (already present; add note)
+    '''def fibonacci_gen(n: int) -> Iterator[int]:
+    """Yield Fibonacci numbers one at a time (O(1) space)."""
+    a, b = 0, 1
+    for _ in range(n):
+        yield a
+        a, b = b, a + b''',
+    # 2: type hints + docstring (already applied above)
+    "",
+    # 3: config object
+    '''@dataclass(slots=True)
+class GeneratorConfig:
+    count: int = 10
+    format: str = "list"''',
+    # 4: service class with DI
+    '''class FibService:
+    def __init__(self, config: GeneratorConfig):
+        self.config = config
+
+    def run(self) -> list[int]:
+        return fibonacci(self.config.count)''',
+    # 5: structured logging
+    '''import logging
+
+logger = logging.getLogger("fib")
+
+def log_yield(value: int) -> None:
+    logger.debug(json.dumps({"value": value}))''',
+    # 6: CLI entry point
+    '''import argparse
+
+def build_cli() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Fibonacci generator")
+    p.add_argument("--count", type=int, default=10)
+    p.add_argument("--format", default="list")
+    return p''',
+    # 7: pytest suite (separate file; module unchanged)
+    "",
+    # 8: async support
+    '''import asyncio
+
+async def afibonacci_gen(n: int) -> list[int]:
+    return list(fibonacci_gen(n))''',
+    # 9: package layout (structural; module unchanged)
+    "",
+    # 10: Dockerfile (separate; module unchanged)
+    "",
+    # 11: CI workflow (separate; module unchanged)
+    "",
+    # 12: benchmark throughput
+    '''def benchmark_gen(n: int = 100_000) -> float:
+    import time
+    start = time.perf_counter()
+    _ = list(fibonacci_gen(n))
+    return time.perf_counter() - start''',
+    # 13: documentation (module unchanged)
+    "",
+    # 14: changelog (module unchanged)
+    "",
+    # 15: harden CLI against invalid args
+    '''def _parse_args(argv: list[str]) -> GeneratorConfig:
+    args = build_cli().parse_args(argv)
+    if args.count < 0:
+        raise ValueError("count must be non-negative")
+    return GeneratorConfig(count=args.count, format=args.format)''',
+    # 16: metrics
+    '''@dataclass
+class GenMetrics:
+    count: int = 0
+    duration_ms: float = 0.0''',
+    # 17: observability trace id
+    '''import uuid
+
+def bind_trace() -> str:
+    return uuid.uuid4().hex''',
+    # 18: migration from the old list API
+    '''def legacy_fibonacci(n: int) -> list[int]:
+    return fibonacci(n)''',
+    # 19: release notes (module unchanged)
+    "",
+    # 20: streaming API
+    '''def stream_fib(n: int) -> Iterator[int]:
+    yield from fibonacci_gen(n)''',
+    # 21: retry around config loading
+    '''import time
+
+def load_config_with_retry(path: str, retries: int = 3) -> GeneratorConfig:
+    for attempt in range(retries):
+        try:
+            return _load_config(path)
+        except OSError:
+            time.sleep(2 ** attempt)
+    raise OSError("config load failed")''',
+    # 22: localization
+    '''class Localizer:
+    def error(self, key: str) -> str:
+        return {"bad_count": "count must be non-negative"}.get(key, key)''',
+    # 23: rolling-pair performance optimization
+    '''def fibonacci(n: int) -> list[int]:
+    """O(n) time, O(1) space using a rolling pair."""
+    if n <= 0:
+        return []
+    if n == 1:
+        return [0]
+    a, b = 0, 1
+    out = [a]
+    for _ in range(1, n):
+        a, b = b, a + b
+        out.append(a)
+    return out''',
+    # 24: plugin hook for formatters
+    '''_formatters: dict[str, Callable[[list[int]], str]] = {}
+
+def register_formatter(name: str, fn: Callable[[list[int]], str]) -> None:
+    _formatters[name] = fn''',
+    # 25: config validation
+    '''def validate_config(cfg: GeneratorConfig) -> None:
+    if cfg.count < 0:
+        raise ValueError("count must be non-negative")''',
+    # 26: group helpers (module unchanged)
+    "",
+    # 27: architecture diagram (module unchanged)
+    "",
+    # 28: final replay test (module unchanged)
+    "",
+    # 29: summarize (module unchanged)
+    "",
+]
 
 
 DEFAULT_LONG_INSTRUCTIONS = [
@@ -442,9 +1172,60 @@ DEFAULT_LONG_INSTRUCTIONS = [
 ]
 
 
-DEBUG_LONG_TASKS = _build_long_tasks(DEBUG_LONG_INSTRUCTIONS, _long_debug_code_snippet)
-FEATURE_LONG_TASKS = _build_long_tasks(FEATURE_LONG_INSTRUCTIONS, _long_feature_code_snippet)
-DEFAULT_LONG_TASKS = _build_long_tasks(DEFAULT_LONG_INSTRUCTIONS, _long_default_code_snippet)
+DEBUG_LONG_TASKS = _build_long_tasks(DEBUG_LONG_INSTRUCTIONS, BASE_DEBUG_CODE, DEBUG_STEPS)
+FEATURE_LONG_TASKS = _build_long_tasks(FEATURE_LONG_INSTRUCTIONS, BASE_FEATURE_CODE, FEATURE_STEPS)
+DEFAULT_LONG_TASKS = _build_long_tasks(DEFAULT_LONG_INSTRUCTIONS, BASE_DEFAULT_CODE, DEFAULT_STEPS)
+
+
+# Cached fixture loader (loaded by file path so a missing fixture package can
+# never break the benchmark module import). Reused by both the `opencode`/
+# `fixtures` scenario builder and the synthetic scenario's realistic tool outputs.
+_FIXTURE_LOADER: Any = None
+_FIXTURE_LOADER_LOADED = False
+
+
+def _get_fixture_loader() -> Any:
+    """Return the fixture loader module, loading it once (cached). None on failure."""
+    global _FIXTURE_LOADER, _FIXTURE_LOADER_LOADED
+    if _FIXTURE_LOADER_LOADED:
+        return _FIXTURE_LOADER
+    _FIXTURE_LOADER_LOADED = True
+    try:
+        import importlib.util
+        from pathlib import Path
+
+        loader_path = Path(__file__).resolve().parent / "fixtures" / "loader.py"
+        spec = importlib.util.spec_from_file_location("benchmark_fixtures_loader", loader_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _FIXTURE_LOADER = module
+    except Exception:
+        _FIXTURE_LOADER = None
+    return _FIXTURE_LOADER
+
+
+def _build_opencode_scenario_tasks() -> list[list[dict]]:
+    """Build the `opencode` (and `fixtures`) scenario: OpenCode-style replay.
+
+    Each turn is a realistic agent payload — user task plus assistant tool_calls
+    and the real tool outputs (file contents, test results) read from
+    scripts/fixtures/. The `fixtures` scenario key is an alias of this builder.
+    """
+    loader = _get_fixture_loader()
+    if loader is not None:
+        try:
+            return loader.build_fixture_agentic_tasks()
+        except Exception:
+            pass
+    return [
+        [
+            {
+                "role": "user",
+                "content": "Build a small JSONL-backed user-analytics service. Start with the model.",
+            }
+        ]
+    ]
+
 
 # ---------------------------------------------------------------------------
 # Real-life coding scenarios for benchmarking
@@ -500,6 +1281,14 @@ SCENARIOS = {
     "default_long": {
         "description": "Long general coding conversation with 30 unique turns and code blocks",
         "tasks": [("user", task) for task in DEFAULT_LONG_TASKS],
+    },
+    "fixtures": {
+        "description": "OpenCode-harness replay from scripts/fixtures/ (alias of opencode: user task + tool calls + real tool outputs)",
+        "tasks": _build_opencode_scenario_tasks(),
+    },
+    "opencode": {
+        "description": "OpenCode-harness replay from scripts/fixtures/ (user task + tool calls + real tool outputs)",
+        "tasks": _build_opencode_scenario_tasks(),
     },
 }
 
@@ -600,20 +1389,44 @@ def _stop_proxy() -> None:
 
 def _apply_profile_overrides(args: argparse.Namespace) -> None:
     """Apply benchmark-level context optimization profile overrides."""
-    if args.profile != "aggressive":
-        return
-
-    overrides = {
-        "MOEPT_AGENTIC__KEEP_FULL_STEPS": "3",
-        "MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS": "12000",
-        "MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS": "3000",
-        "MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO": "0.45",
-        "MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO": "0.75",
+    # Map benchmark profile names to the proxy's quality_profile presets so the
+    # started proxy uses the matching preset (review03.md §10).
+    profile_env = {
+        "quality": {
+            "MOEPT_AGENTIC__QUALITY_PROFILE": "quality",
+            "MOEPT_AGENTIC__KEEP_FULL_STEPS": "6",
+            "MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS": "24000",
+            "MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS": "6000",
+            "MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO": "0.7",
+            "MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO": "0.9",
+            "MOEPT_AGENTIC__HIERARCHICAL_SUMMARY_ENABLED": "false",
+            "MOEPT_AGENTIC__RAG_ENABLED": "false",
+            "MOEPT_AGENTIC__CODE_SKELETON_ENABLED": "false",
+        },
+        "aggressive": {
+            "MOEPT_AGENTIC__QUALITY_PROFILE": "aggressive",
+            "MOEPT_AGENTIC__KEEP_FULL_STEPS": "2",
+            "MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS": "8000",
+            "MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS": "2000",
+            "MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO": "0.35",
+            "MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO": "0.6",
+        },
+        "balanced": {
+            "MOEPT_AGENTIC__QUALITY_PROFILE": "balanced",
+            "MOEPT_AGENTIC__KEEP_FULL_STEPS": "3",
+            "MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS": "12000",
+            "MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS": "3000",
+            "MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO": "0.45",
+            "MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO": "0.75",
+        },
     }
+    overrides = profile_env.get(args.profile)
+    if not overrides:
+        return
     for key, value in overrides.items():
         os.environ.setdefault(key, value)
 
-    _status(args, "  Context profile: aggressive (top-only eviction, 3000-token cap)")
+    _status(args, f"  Context profile: {args.profile}")
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +1503,18 @@ def _context_size_summary(messages: list[dict]) -> dict[str, int]:
 
 
 def _looks_like_cached_response(usage: dict[str, Any]) -> bool:
-    """Detect responses where usage is cache-driven or incomplete."""
+    """Detect responses where usage is cache-driven or incomplete.
+
+    A *cached* response is one the backend reports with ``cached_tokens > 0`` in
+    ``prompt_tokens_details`` (the authoritative prefix-cache signal). The old
+    heuristic ``prompt_tokens == 0 and completion_tokens > 0`` was a false-hit:
+    many backends report a normal, non-cached response with ``prompt_tokens > 0``
+    and ``completion_tokens > 0``, and the zero-prompt case is really "usage
+    missing/zeroed" rather than "cached". We now require a positive
+    ``cached_tokens`` signal, and only treat zero-prompt as cached when the
+    backend clearly still produced output (completion_tokens > 0) — i.e. usage
+    was omitted, not that the turn was served from cache.
+    """
     details = usage.get("prompt_tokens_details") or {}
     cached_tokens = int(
         details.get("cached_tokens", 0)
@@ -698,9 +1522,13 @@ def _looks_like_cached_response(usage: dict[str, Any]) -> bool:
         or usage.get("cache_hit_tokens", 0)
         or 0
     )
+    if cached_tokens > 0:
+        return True
     prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
     completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-    return prompt_tokens == 0 and (cached_tokens > 0 or completion_tokens > 0)
+    # Usage omitted/zeroed but a completion was returned: treat as missing-usage,
+    # not as a cache hit. This avoids mislabeling normal responses as cached.
+    return prompt_tokens == 0 and completion_tokens > 0
 
 
 def _resolve_prompt_tokens(
@@ -747,7 +1575,7 @@ def _calculate_timeout(turns: int, rounds: int) -> float:
     return min(300.0, base_timeout * context_growth_factor)
 
 
-def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float = 180.0) -> tuple[dict, float, dict[str, str]]:
+def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float = 180.0, tools: list[dict] | None = None) -> tuple[dict, float, dict[str, str]]:
     url = f"{LEMONADE_URL}/chat/completions"
     body = {
         "model": MODEL_ID,
@@ -756,6 +1584,28 @@ def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float 
         "stream": False,
         "max_tokens": max_tokens,
     }
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    return _request(url, body, timeout)
+
+
+def _proxy_request(
+    messages: list[dict], session_id: str | None = None, max_tokens: int = 256, timeout: float = 180.0, tools: list[dict] | None = None
+) -> tuple[dict, float, dict[str, str]]:
+    url = f"http://127.0.0.1:{MOEPT_PORT}/v1/chat/completions"
+    body = {
+        "model": MODEL_ID,
+        "messages": messages,
+        "temperature": 0.1,
+        "stream": False,
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    if session_id:
+        body["_session_id"] = session_id
     return _request(url, body, timeout)
 
 
@@ -1432,99 +2282,6 @@ def _percentile(sorted_data: list[float], pct: float) -> float:
 # Benchmark runner
 # ---------------------------------------------------------------------------
 
-def _build_conversation_turns(num_turns: int) -> list[dict]:
-    """Build a multi-turn conversation with growing context."""
-    system_prompt = (
-        "You are a helpful coding assistant. You reason carefully before answering. "
-        "Keep your reasoning concise and focus on the user's actual question."
-    )
-    messages: list[dict] = [{"role": "system", "content": system_prompt}]
-
-    # Multi-turn prompts that build context progressively
-    tasks = [
-        ("user", "What is 2+2? Answer with just the number."),
-        ("assistant", "4"),
-        ("user", "Now write a Python function to compute Fibonacci numbers iteratively."),
-        ("assistant", (
-            "Here's an iterative Fibonacci implementation:\n\n"
-            "```python\n"
-            "def fibonacci(n: int) -> list[int]:\n"
-            "    if n <= 0:\n"
-            "        return []\n"
-            "    elif n == 1:\n"
-            "        return [0]\n"
-            "    fib = [0, 1]\n"
-            "    for i in range(2, n):\n"
-            "        fib.append(fib[i-1] + fib[i-2])\n"
-            "    return fib\n"
-            "```\n\n"
-            "This runs in O(n) time and O(n) space."
-        )),
-        ("user", "Great. Now refactor it to use a generator instead of building a list."),
-        ("assistant", (
-            "Here's the generator version:\n\n"
-            "```python\n"
-            "def fibonacci_gen(n: int):\n"
-            "    a, b = 0, 1\n"
-            "    for _ in range(n):\n"
-            "        yield a\n"
-            "        a, b = b, a + b\n"
-            "```\n\n"
-            "This is O(1) space since it yields values one at a time."
-        )),
-        ("user", "Add type hints and docstrings to the generator."),
-        ("assistant", (
-            "Here's the fully typed version:\n\n"
-            "```python\n"
-            "from typing import Generator\n\n"
-            "\n"
-            "def fibonacci_gen(n: int) -> Generator[int, None, None]:\n"
-            "    '''Generate the first n Fibonacci numbers.\n\n"
-            "    Args:\n"
-            "        n: Number of Fibonacci numbers to generate.\n\n"
-            "    Yields:\n"
-            "        int: The next Fibonacci number in the sequence.\n"
-            "    '''\n"
-            "    a, b = 0, 1\n"
-            "    for _ in range(n):\n"
-            "        yield a\n"
-            "        a, b = b, a + b\n"
-            "```\n\n"
-            "This provides full type safety and documentation."
-        )),
-    ]
-
-    # Add the base conversation (6 turns: system + 5 pairs)
-    for role, content in tasks:
-        messages.append({"role": role, "content": content})
-
-    # Pad with additional turns to reach num_turns if needed
-    turn_count = len(messages) - 1  # exclude system
-    i = 0
-    while turn_count < num_turns * 2 + 1:  # each "turn" = user+assistant pair
-        messages.append({"role": "user", "content": f"Turn {i}: Remember the fibonacci generator we discussed? Now write a test suite for it using pytest."})
-        messages.append({"role": "assistant", "content": (
-            f"Here's a comprehensive test suite for turn {i}:\n\n"
-            f"```python\n"
-            f"import pytest\n"
-            f"from fib import fibonacci_gen\n\n"
-            f"@pytest.mark.parametrize('n,expected', [\n"
-            f"    (0, []),\n"
-            f"    (1, [0]),\n"
-            f"    (5, [0, 1, 1, 2, 3]),\n"
-            f"    (10, [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]),\n"
-            f"])\n"
-            f"def test_fibonacci_gen(n, expected):\n"
-            f"    assert list(fibonacci_gen(n)) == expected\n"
-            f"```\n\n"
-            f"This covers edge cases and standard sequences."
-        )})
-        turn_count += 2
-        i += 1
-
-    return messages
-
-
 def _collect_direct_conversation(
     messages: list[dict],
     num_turns: int,
@@ -1533,19 +2290,31 @@ def _collect_direct_conversation(
     request_timeout: float,
     max_tokens: int,
     turn_offset: int,
+    turn_exchanges: list[list[dict]] | None = None,
+    tools: list[dict] | None = None,
 ) -> tuple[list[TurnMetrics], list[str]]:
-    """Run a full conversation against direct Lemonade."""
+    """Run a full conversation against direct Lemonade.
+
+    When ``turn_exchanges`` is provided (OpenCode-harness / agentic mode), each
+    turn appends a full agent payload (user task + assistant tool_calls + tool
+    results) instead of a single user message, so the backend sees the same kind
+    of messages a real coding agent sends.
+    """
     direct_contents: list[str] = []
     direct_metrics: list[TurnMetrics] = []
 
     for local_turn in range(num_turns):
         turn_index = turn_offset + local_turn + 1
-        user_content = (
-            user_tasks[(turn_index - 1) % len(user_tasks)]
-            if user_tasks
-            else fallback_user_task.format(turn_index=turn_index)
-        )
-        messages.append({"role": "user", "content": user_content})
+        if turn_exchanges:
+            exchange = turn_exchanges[(turn_index - 1) % len(turn_exchanges)]
+            messages.extend(exchange)
+        else:
+            user_content = (
+                user_tasks[(turn_index - 1) % len(user_tasks)]
+                if user_tasks
+                else fallback_user_task.format(turn_index=turn_index)
+            )
+            messages.append({"role": "user", "content": user_content})
 
         direct_context = _context_size_summary(messages)
         _human_print(
@@ -1556,7 +2325,7 @@ def _collect_direct_conversation(
 
         try:
             direct_resp, direct_latency, _ = _direct_request(
-                messages, max_tokens=max_tokens, timeout=request_timeout
+                messages, max_tokens=max_tokens, timeout=request_timeout, tools=tools
             )
             d_usage = direct_resp.get("usage", {}) or {}
             d_msg = direct_resp["choices"][0]["message"]
@@ -1597,9 +2366,10 @@ def _collect_direct_conversation(
                 error=str(e)[:200],
             )
             d_content = ""
+            d_msg = {}
 
-        if d_content:
-            messages.append({"role": "assistant", "content": d_content})
+        if d_content or d_msg.get("tool_calls"):
+            _append_assistant_message(messages, d_msg)
             direct_contents.append(d_content)
         else:
             direct_contents.append("")
@@ -1618,19 +2388,29 @@ def _collect_proxy_conversation(
     request_timeout: float,
     max_tokens: int,
     turn_offset: int,
+    turn_exchanges: list[list[dict]] | None = None,
+    tools: list[dict] | None = None,
 ) -> tuple[list[TurnMetrics], list[str]]:
-    """Run a full conversation through the moeptimizer proxy."""
+    """Run a full conversation through the moeptimizer proxy.
+
+    Mirrors :func:`_collect_direct_conversation`; when ``turn_exchanges`` is set
+    each turn appends a full OpenCode-style agent payload.
+    """
     proxy_contents: list[str] = []
     proxy_metrics: list[TurnMetrics] = []
 
     for local_turn in range(num_turns):
         turn_index = turn_offset + local_turn + 1
-        user_content = (
-            user_tasks[(turn_index - 1) % len(user_tasks)]
-            if user_tasks
-            else fallback_user_task.format(turn_index=turn_index)
-        )
-        messages.append({"role": "user", "content": user_content})
+        if turn_exchanges:
+            exchange = turn_exchanges[(turn_index - 1) % len(turn_exchanges)]
+            messages.extend(exchange)
+        else:
+            user_content = (
+                user_tasks[(turn_index - 1) % len(user_tasks)]
+                if user_tasks
+                else fallback_user_task.format(turn_index=turn_index)
+            )
+            messages.append({"role": "user", "content": user_content})
 
         proxy_context = _context_size_summary(messages)
         _human_print(
@@ -1641,7 +2421,7 @@ def _collect_proxy_conversation(
 
         try:
             proxy_resp, proxy_latency, proxy_headers = _proxy_request(
-                messages, session_id=session_id, max_tokens=max_tokens, timeout=request_timeout
+                messages, session_id=session_id, max_tokens=max_tokens, timeout=request_timeout, tools=tools
             )
             p_usage = proxy_resp.get("usage", {}) or {}
             p_msg = proxy_resp["choices"][0]["message"]
@@ -1703,9 +2483,10 @@ def _collect_proxy_conversation(
                 if opt_error:
                     metrics.error = f"{metrics.error} | optimization: {opt_error}"
             p_content = ""
+            p_msg = {}
 
-        if p_content:
-            messages.append({"role": "assistant", "content": p_content})
+        if p_content or (isinstance(p_msg, dict) and p_msg.get("tool_calls")):
+            _append_assistant_message(messages, p_msg)
             proxy_contents.append(p_content)
         else:
             proxy_contents.append("")
@@ -1753,12 +2534,18 @@ def run_benchmark(
     proxy_port: int,
     budget: int | None = None,
     scenario: str = "default",
+    agentic: bool = True,
 ) -> BenchmarkReport:
     """Run the multi-turn benchmark and collect metrics.
 
     Direct Lemonade is run as a complete conversation before the proxy is run as a
     complete conversation. This keeps model cache state contiguous and avoids
     alternating direct/proxy requests from invalidating the direct benchmark.
+
+    When ``agentic`` is True (or the scenario already ships OpenCode-style
+    exchanges), each turn appends a full agent payload — user task plus assistant
+    ``tool_calls`` and the corresponding ``tool`` results — and the OpenAI ``tools``
+    schema is forwarded to the backend, exactly like a real coding client.
     """
 
     # Update module-level port so _proxy_request uses it
@@ -1784,19 +2571,41 @@ def run_benchmark(
 
     report = BenchmarkReport(config=config)
 
-    # Get scenario tasks
+    # Get scenario tasks. A scenario's tasks may be a mix of:
+    #   - ("role", "content") tuples  -> simple messages (backward compatible)
+    #   - list[dict]                  -> a full OpenCode-style agentic turn exchange
+    # The latter are collected into `turn_exchanges` and appended per turn.
     scenario_data = SCENARIOS.get(scenario, SCENARIOS["default"])
     base_tasks = scenario_data["tasks"]
 
-    system_prompt = (
-        "You are a helpful coding assistant. You reason carefully before answering. "
-        "Keep your reasoning concise and focus on the user's actual question."
-    )
+    system_prompt = SYSTEM_PROMPT
     base_messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    for role, content in base_tasks:
-        base_messages.append({"role": role, "content": content})
+    turn_exchanges: list[list[dict]] = []
+    user_tasks: list[str] = []
+    for item in base_tasks:
+        if isinstance(item, list):
+            # An agentic turn exchange (user + assistant tool_calls + tool results)
+            turn_exchanges.append(item)
+        else:
+            role, content = item
+            base_messages.append({"role": role, "content": content})
+            if role == "user":
+                user_tasks.append(content)
 
-    user_tasks = [content for role, content in base_tasks if role == "user"]
+    # --agentic wraps simple scenarios into OpenCode-style exchanges with
+    # synthesized tool outputs, so even the synthetic scenarios emit a realistic
+    # agent payload (user task + tool calls + tool results).
+    if agentic and not turn_exchanges:
+        turn_exchanges = [
+            _agentic_exchange(content, i + 1) for i, content in enumerate(user_tasks)
+        ]
+        user_tasks = []
+
+    # Forward the OpenAI tool schemas whenever we are in agentic mode, so the
+    # backend accepts the tool_calls / tool messages we send (OpenAI requires
+    # `tools` to be present alongside them).
+    tools = OPENCODE_TOOLS if (turn_exchanges or agentic) else None
+
     fallback_user_task = (
         "Turn {turn_index}: Remember the fibonacci generator we discussed? "
         "Now write a test suite for it using pytest."
@@ -1817,6 +2626,8 @@ def run_benchmark(
             request_timeout,
             max_tokens,
             turn_offset=round_num * num_turns,
+            turn_exchanges=turn_exchanges or None,
+            tools=tools,
         )
 
         _human_print(f"  Round {round_num + 1}/{rounds}: proxy conversation")
@@ -1830,6 +2641,8 @@ def run_benchmark(
             request_timeout,
             max_tokens,
             turn_offset=round_num * num_turns,
+            turn_exchanges=turn_exchanges or None,
+            tools=tools,
         )
 
         comparisons = _build_turn_comparisons(
@@ -2184,8 +2997,9 @@ def print_report(report: BenchmarkReport) -> None:
     print()
 
 
-def run_all_scenarios(args) -> None:
-    """Run all scenarios and produce aggregated metrics."""
+def run_all_scenarios(args) -> int:
+    """Run all scenarios and produce aggregated metrics. Returns the regression
+    gate exit code (0 = pass, 2 = fail, review03.md §10)."""
     all_reports: dict[str, BenchmarkReport] = {}
 
     global _HUMAN_OUTPUT_TO_STDERR
@@ -2214,6 +3028,7 @@ def run_all_scenarios(args) -> None:
                 proxy_port=args.port,
                 budget=args.budget,
                 scenario=scenario_name,
+                agentic=args.agentic,
             )
             all_reports[scenario_name] = report
 
@@ -2228,6 +3043,12 @@ def run_all_scenarios(args) -> None:
             print("  AGGREGATED BENCHMARK RESULTS (all scenarios)")
             print("=" * 72)
             _print_aggregated(aggregated)
+
+        # Regression gate across the aggregated mean (review03.md §10).
+        agg_sim = aggregated.get("aggregated", {}).get("semantic_similarity", {}).get("mean", 0.0)
+        gate = _check_similarity_gate(args, agg_sim)
+        if gate:
+            return gate
 
     finally:
         _stop_proxy()
@@ -2325,7 +3146,7 @@ def main() -> None:
     )
     parser.add_argument("--turns", type=int, default=10, help="Number of conversation turns")
     parser.add_argument("--rounds", type=int, default=1, help="Number of full conversation rounds")
-    parser.add_argument("--max-tokens", type=int, default=256, help="Max tokens per response")
+    parser.add_argument("--max-tokens", type=int, default=1024, help="Max tokens per response (realistic for agentic coding; 256 understates proxy savings)")
     parser.add_argument("--port", type=int, default=MOEPT_PORT, help="Proxy server port")
     parser.add_argument(
         "--json", action="store_true", dest="json_output",
@@ -2341,13 +3162,27 @@ def main() -> None:
     )
     parser.add_argument(
         "--profile", type=str, default="balanced",
-        choices=["balanced", "aggressive"],
-        help="Context optimization profile for the proxy. 'aggressive' favors token savings with top-only eviction.",
+        choices=["quality", "balanced", "aggressive"],
+        help="Context optimization profile for the proxy. 'quality' maximizes fidelity "
+             "(no summarization/RAG, only boundary compression); 'aggressive' favors token "
+             "savings with top-only eviction.",
+    )
+    parser.add_argument(
+        "--min-similarity", type=float, default=None,
+        help="Regression gate (review03.md §10): exit non-zero if the mean "
+             "semantic_similarity (proxy vs direct) falls below this threshold. "
+             "Use in CI to block quality regressions.",
     )
     parser.add_argument(
         "--scenario", type=str, default="default",
         choices=[*SCENARIOS.keys(), "all"],
-        help="Real-life coding scenario: debug, refactor, feature, default, or all",
+        help="Real-life coding scenario: debug, refactor, feature, default, fixtures, opencode, or all",
+    )
+    parser.add_argument(
+        "--no-agentic", dest="agentic", action="store_false",
+        help="Disable OpenCode-style agent payloads (user task + tool calls + tool "
+             "outputs); send plain user messages instead. Agentic mode is the default "
+             "for every scenario, since real coding clients send tool traffic.",
     )
     args = parser.parse_args()
 
@@ -2384,6 +3219,7 @@ def main() -> None:
             proxy_port=args.port,
             budget=args.budget,
             scenario=args.scenario,
+            agentic=args.agentic,
         )
 
         if args.json_output or not args.dump_responses:
@@ -2393,6 +3229,18 @@ def main() -> None:
                 print()
             else:
                 print_report(report)
+
+        # Regression gate (review03.md §10): fail the run if mean semantic
+        # similarity drops below the requested threshold. Intended for CI.
+        sim_mean = (
+            report.summary()
+            .get("quality", {})
+            .get("semantic_similarity", {})
+            .get("mean", 0.0)
+        )
+        gate = _check_similarity_gate(args, sim_mean)
+        if gate:
+            return gate
 
         if args.dump_responses:
             print("\n" + "=" * 72)
@@ -2443,5 +3291,24 @@ def main() -> None:
         _stop_proxy()
 
 
+def _check_similarity_gate(args: argparse.Namespace, sim_mean: float) -> int:
+    """Return 0 if the regression gate passes, 2 if it fails (review03.md §10)."""
+    if args.min_similarity is None:
+        return 0
+    if sim_mean < args.min_similarity:
+        _status(
+            args,
+            f"\n  ❌ REGRESSION GATE FAILED: mean semantic_similarity="
+            f"{sim_mean:.4f} < --min-similarity={args.min_similarity:.4f}",
+        )
+        return 2
+    _status(
+        args,
+        f"\n  ✅ Regression gate passed: mean semantic_similarity="
+        f"{sim_mean:.4f} >= --min-similarity={args.min_similarity:.4f}",
+    )
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,7 +1,13 @@
-"""Static Prefix KV-Cache Reuse for MoE models.
+"""Static-prefix fast path (NOT a real KV cache).
 
-Pre-computes and re-uses KV-cache for unchanging system/static tokens,
-reducing cache fill overhead on repeated requests with the same static prefix.
+HISTORICAL NOTE / honesty: this module was originally named and documented as a
+"KV-cache reuse" feature. It is NOT. A client-side OpenAI proxy cannot read or
+write the backend model's KV-cache tensors — there is no OpenAI field for them.
+What this module actually does is store a *text memo* (the system + first-user
+prefix bytes) and short-circuit the optimization pipeline when the incoming
+prefix is byte-identical and already under budget. The real KV reuse is done by
+the backend's own native prefix cache; this module only avoids redundant proxy
+work. See review03.md §2.1 / §9.
 """
 
 from __future__ import annotations
@@ -15,17 +21,19 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Persistence path for KV-cache entries
+# Persistence path for the prefix text memo
 _PERSISTENCE_PATH = Path.home() / ".moeptimizer" / "kv_cache.pkl"
 
 
 class StaticPrefixKVCache:
     """
-    Pre-computes and caches KV-cache for static prefix content.
+    Fast path for an unchanged static prefix (text memo, NOT model KV).
 
-    When the same static prefix (system prompt + first user message) is
-    detected across requests, the pre-computed KV-cache is reused instead
-    of recomputing, significantly reducing prefill time for MoE models.
+    When the same static prefix (system prompt + first user message) is detected
+    across requests, the pipeline can be short-circuited. This stores the prefix
+    *text*, not KV tensors, and therefore does not reuse model KV — the backend's
+    own prefix cache does that. Keep enabled for the latency win, but do not rely
+    on it for KV reuse.
     """
 
     def __init__(self, max_entries: int = 64) -> None:

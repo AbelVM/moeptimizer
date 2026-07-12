@@ -1,5 +1,14 @@
 """Pytest configuration for moeptimizer tests."""
 
+import sys
+from pathlib import Path
+
+# Make the scripts/ directory importable as a package (e.g. `scripts.benchmark`)
+# so benchmark helpers can be unit-tested without running the full harness.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent.parent / "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
 
 def pytest_addoption(parser):
     """Add custom command line options."""
