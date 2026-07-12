@@ -110,24 +110,18 @@ class AgenticConfig(BaseModel):
         description="Inject state-based RAG context only when it is enabled and useful for long/over-budget sessions.",
     )
     optimize_code_blocks: bool = Field(
-        default=False,
-        description="Run tree-sitter/NPU code-block optimization. Disabled by default to avoid proxy latency and preserve exact code.",
+        default=True,
+        description="Run tree-sitter code-block optimization (chunk dedup) on code blocks. "
+        "Budget-gated: only fires when the context exceeds the proactive trim threshold, "
+        "so lean contexts keep exact code and avoid proxy latency.",
     )
     code_skeleton_enabled: bool = Field(
         default=True,
         description="Compress large code blocks to AST/line skeletons when proactive context pressure starts.",
     )
-    semantic_dedup_enabled: bool = Field(
-        default=False,
-        description="Run embedding-based semantic deduplication when context pressure justifies it. Disabled by default because removing middle-history messages breaks KV-cache prefixes.",
-    )
     attention_sinks_enabled: bool = Field(
         default=False,
         description="Inject model-visible attention-sink markers. Disabled by default to preserve exact prompts.",
-    )
-    static_layer_alignment_enabled: bool = Field(
-        default=False,
-        description="Pad the static layer to cache-block boundaries. Disabled by default to avoid adding tokens.",
     )
     reasoning_preseed_enabled: bool = Field(
         default=False,
@@ -159,15 +153,6 @@ class AgenticConfig(BaseModel):
             "turns instead of evicting one pair every over-budget turn, so the "
             "backend's native prefix cache (cached_tokens) is reused far more. Set "
             "to 1.0 to restore trim-to-exact-budget behavior."
-        ),
-    )
-    mtp_boundary_alignment_enabled: bool = Field(
-        default=False,
-        description=(
-            "Pad the final context to an MTP prediction boundary. NON-FUNCTIONAL: "
-            "an OpenAI client proxy cannot read/write MTP hidden state, so this "
-            "only does a no-op prompt pad (review03.md §2.1/§10). Disabled by "
-            "default to avoid extra tokens."
         ),
     )
     immutable_prefix_enabled: bool = Field(
@@ -226,31 +211,12 @@ class CacheConfig(BaseModel):
     )
 
 
-class SpeculativeConfig(BaseModel):
-    """Speculative decoding settings for MTP models.
-
-    NOTE: these hints are sent as OpenAI extra_body keys and are stripped before
-    forwarding unless `native_mtp_passthrough` is enabled (review03.md §2.1/§10).
-    A client proxy cannot actually drive MTP; the only effective path is a
-    backend that natively supports speculative decoding.
-    """
-
-    enabled: bool = Field(
-        default=False,
-        description=(
-            "Enable MTP-aware speculative decoding hints. NON-FUNCTIONAL for a "
-            "client proxy: hints are stripped before send unless the backend "
-            "supports native MTP passthrough (review03.md §2.1/§10)."
-        ),
-    )
-    mtp_lookahead: int = Field(
-        default=4,
-        description="Number of tokens to predict ahead with MTP heads",
-    )
-    confidence_threshold: float = Field(
-        default=0.7,
-        description="Minimum confidence for accepting speculative tokens",
-    )
+# NOTE: client-proxy speculative decoding is non-functional by construction
+# (review03.md §2.1). The only effective speculative-decoding path is a backend
+# that natively supports it, enabled via `v050.native_mtp_passthrough` (auto
+# detected by `v050.native_mtp_autodetect`). The old `SpeculativeConfig`
+# (`MOEPT_SPECULATIVE__*`) was removed because its fields were never read and
+# implied functionality that does not exist for a client proxy.
 
 
 class V050Config(BaseModel):
@@ -318,7 +284,20 @@ class V050Config(BaseModel):
     # Hierarchical Summarization
     hierarchical_summary_enabled: bool = Field(
         default=False,
-        description="Enable hierarchical summarization of old turns. Disabled by default because middle-history summaries break contiguous KV-cache prefixes.",
+        description="Legacy alias for the cache-stable rolling-summary path (see cache_stable_summary_enabled). Disabled by default.",
+    )
+    cache_stable_summary_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable the cache-stable rolling-summary compaction (review §1/§3/§5, #7). "
+            "This is the SAFE summarization mode: older dynamic turns are folded into "
+            "a single append-only block placed right after the frozen prefix (never in "
+            "the middle of history) and protected from later front-eviction by its "
+            "_summary_id marker, so the backend's prefix cache stays valid and the "
+            "model does not re-derive constraints verbosely. Only fires under budget "
+            "pressure with cache_stable_mode on. Distinct from the legacy "
+            "hierarchical_summary_enabled flag, which is an alias for the same path."
+        ),
     )
     hierarchical_summary_max_full_turns: int = Field(
         default=5,
@@ -407,7 +386,6 @@ class AppConfig(BaseSettings):
     agentic: AgenticConfig = Field(default_factory=AgenticConfig)
     code_chunking: CodeChunkingConfig = Field(default_factory=CodeChunkingConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
-    speculative: SpeculativeConfig = Field(default_factory=SpeculativeConfig)
     v050: V050Config = Field(default_factory=V050Config)
 
     model_config = SettingsConfigDict(
@@ -441,9 +419,8 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         "rag_enabled": False,
         "reasoning_preseed_enabled": False,
         "code_skeleton_enabled": False,
-        "semantic_dedup_enabled": False,
         "attention_sinks_enabled": False,
-        "mtp_boundary_alignment_enabled": False,
+        "cache_stable_summary_enabled": False,
         "keep_full_steps": 6,
         "max_optimized_tokens": 6000,
         "max_optimized_chars": 24000,
@@ -456,9 +433,8 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         "rag_enabled": True,
         "reasoning_preseed_enabled": False,
         "code_skeleton_enabled": True,
-        "semantic_dedup_enabled": False,
         "attention_sinks_enabled": False,
-        "mtp_boundary_alignment_enabled": False,
+        "cache_stable_summary_enabled": True,
         "keep_full_steps": 3,
         "max_optimized_tokens": 3000,
         "max_optimized_chars": 12000,
@@ -472,9 +448,8 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         "rag_enabled": True,
         "reasoning_preseed_enabled": False,
         "code_skeleton_enabled": True,
-        "semantic_dedup_enabled": False,
         "attention_sinks_enabled": False,
-        "mtp_boundary_alignment_enabled": False,
+        "cache_stable_summary_enabled": True,
         "keep_full_steps": 2,
         "max_optimized_tokens": 2000,
         "max_optimized_chars": 8000,

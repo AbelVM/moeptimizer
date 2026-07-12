@@ -40,9 +40,8 @@ Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
                                 ├── StaticPrefixKVCache (internal cache-key reuse only)
                                 ├── ContextAligner (internal alignment; no prompt padding)
                                 ├── ContextCanonicalizer (newest-user-turn only)
-                                ├── SelectiveTruncator (newest-user-turn only)
-                                ├── SemanticDeduplicator (disabled in stable pipeline)
-                                ├── PatternInjector (section markers; stripped before model input)
+                                 ├── SelectiveTruncator (newest-user-turn only)
+                                 ├── PatternInjector (section markers; stripped before model input)
                                 ├── DependencyOrderer (import ordering)
                                 ├── IncrementalUpdater (cache preservation)
                                 ├── CacheAwareChunker (aligned chunking)
@@ -50,7 +49,7 @@ Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
                                 ├── CodeBlockOptimizer (tree-sitter code optimization)
                                 ├── ChunkFingerprintCache (SHA-256 chunk reuse)
                                 ├── DeltaEncoder (code delta compression)
-                                ├── HierarchicalSummarizer (cache-stable rolling-summary compaction; enabled in the stable pipeline when hierarchical_summary_enabled)
+                                 ├── HierarchicalSummarizer (cache-stable rolling-summary compaction; enabled in the stable pipeline when cache_stable_summary_enabled or the legacy hierarchical_summary_enabled)
                                 ├── TokenAwareTruncator (whole-message top-only fallback)
                                 ├── AsyncIOStage (async heavy stage offloading)
                                 └── EmbeddingService (LanceDB + embeddings model)
@@ -104,9 +103,8 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_AGENTIC__USE_TOKEN_BUDGET` | `true` | Use token-based budget enforcement |
 | `MOEPT_AGENTIC__FAST_PATH_ENABLED` | `true` | Bypass expensive transformations for contexts already under budget |
 | `MOEPT_AGENTIC__RAG_ENABLED` | `true` | Enable state-based RAG injection for long/over-budget sessions |
-| `MOEPT_AGENTIC__OPTIMIZE_CODE_BLOCKS` | `false` | Run tree-sitter code-block optimization |
+| `MOEPT_AGENTIC__OPTIMIZE_CODE_BLOCKS` | `true` | Run tree-sitter code-block optimization (chunk dedup). Budget-gated: only fires when the context exceeds the proactive trim threshold, so lean contexts keep exact code and avoid proxy latency. |
 | `MOEPT_AGENTIC__CODE_SKELETON_ENABLED` | `true` | Compress large code blocks to skeletons under context pressure |
-| `MOEPT_AGENTIC__SEMANTIC_DEDUP_ENABLED` | `false` | Enable embedding-based semantic deduplication |
 | `MOEPT_AGENTIC__ATTENTION_SINKS_ENABLED` | `false` | Inject model-visible attention-sink markers |
 | `MOEPT_AGENTIC__STATIC_LAYER_ALIGNMENT_ENABLED` | `false` | Pad static layer to cache-block boundaries |
 | `MOEPT_AGENTIC__REASONING_PRESEED_ENABLED` | `false` | Inject reasoning scaffolding into user messages |
@@ -134,17 +132,13 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 
 ### Speculative Decoding
 
-| Variable | Default | Description |
-|---|---|---|
-| `MOEPT_SPECULATIVE__ENABLED` | `false` | Enable MTP-aware speculative decoding |
-| `MOEPT_SPECULATIVE__MTP_LOOKAHEAD` | `4` | Number of tokens to predict ahead with MTP heads |
-| `MOEPT_SPECULATIVE__CONFIDENCE_THRESHOLD` | `0.7` | Minimum confidence for accepting speculative tokens |
+> Client-proxy speculative decoding is non-functional (review03.md §2.1). The only effective path is a backend with native MTP support, enabled via `MOEPT_V050__NATIVE_MTP_PASSTHROUGH` (auto-detected by `MOEPT_V050__NATIVE_MTP_AUTODETECT`). The old `MOEPT_SPECULATIVE__*` variables were removed.
 
 ### v0.5.x Optimizations
 
 | Variable | Default | Description |
 |---|---|---|
-| `MOEPT_V050__STATIC_PREFIX_KV_ENABLED` | `true` | Enable static prefix KV-cache reuse |
+| `MOEPT_V050__STATIC_PREFIX_KV_ENABLED` | `true` | Enable static prefix memo — stores the prompt *text* (NOT real KV tensors; a client proxy cannot read backend KV). It only short-circuits the pipeline when the incoming prefix is byte-identical and already under budget; the backend's own prefix cache does the real KV reuse. |
 | `MOEPT_V050__STATIC_PREFIX_KV_MAX_ENTRIES` | `64` | Max entries in static prefix KV-cache |
 | `MOEPT_V050__TOKEN_AWARE_TRUNCATION_ENABLED` | `true` | Enable token-aware truncation with tiktoken |
 | `MOEPT_V050__CACHE_STABLE_MODE` | `true` | Freeze a stable prefix block (system + first user + early turns) verbatim and never front-evict from it, so the backend reuses the KV cache across turns. Disable for backends without prefix caching to maximize token savings. |
@@ -265,9 +259,9 @@ python -m moeptimizer --check-config
 ```
 
 Severities: `ERROR` (blocks deploy), `WARN` (prefix-cache killers, e.g.
-`hierarchical_summary_enabled`, `semantic_dedup_enabled`, `attention_sinks_enabled`,
-`reasoning_preseed_enabled`), `INFO` (phantom / non-functional subsystems and
-backend-compatibility notes).
+`attention_sinks_enabled`,
+`reasoning_preseed_enabled`), `INFO` (legacy aliases, phantom / non-functional
+subsystems and backend-compatibility notes).
 
 ## Benchmarking
 

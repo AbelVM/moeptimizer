@@ -90,7 +90,6 @@ from moeptimizer.prompt_templates import (
     get_template_manager,
 )
 from moeptimizer.selective_truncator import SelectiveTruncator, get_selective_truncator
-from moeptimizer.semantic_dedup import SemanticDeduplicator, get_semantic_deduplicator
 from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
 from moeptimizer.static_prefix_kv import StaticPrefixKVCache, get_static_prefix_kv_cache
@@ -134,7 +133,6 @@ __all__ = [
     "PromptTemplateManager",
     "ScratchpadCompactor",
     "SelectiveTruncator",
-    "SemanticDeduplicator",
     "StateBasedRAG",
     "StaticPrefixKVCache",
     "SummarizeOldTurns",
@@ -177,7 +175,6 @@ __all__ = [
     "get_mtp_state_manager",
     "get_pattern_injector",
     "get_selective_truncator",
-    "get_semantic_deduplicator",
     "get_static_prefix_kv_cache",
     "get_summarize_old_turns",
     "get_template_manager",

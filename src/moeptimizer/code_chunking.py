@@ -7,21 +7,123 @@ from typing import Any
 
 from moeptimizer.config import get_config
 
-LANG_MAP: dict[str, str] = {
-    "python": "python",
-    "javascript": "javascript",
-    "typescript": "typescript",
-    "go": "go",
-    "rust": "rust",
-    "cpp": "cpp",
-    "java": "java",
-    "csharp": "c_sharp",
-    "php": "php",
-    "ruby": "ruby",
-    "html": "html",
-    "css": "css",
-    "json": "json",
+# Curated fence-tag aliases -> tree-sitter-language-pack language id.
+# Only targets that exist in the installed pack are kept (see _build_lang_map).
+_LANG_ALIASES: dict[str, str] = {
+    "py": "python",
+    "py3": "python",
+    "js": "javascript",
+    "jsx": "javascript",
+    "node": "javascript",
+    "ts": "typescript",
+    "tsx": "tsx",
+    "sh": "bash",
+    "shell": "bash",
+    "zsh": "zsh",
+    "yml": "yaml",
+    "golang": "go",
+    "cs": "csharp",
+    "c#": "csharp",
+    "kt": "kotlin",
+    "rs": "rust",
+    "rb": "ruby",
+    "rake": "ruby",
+    "pl": "perl",
+    "pm": "perl",
+    "hs": "haskell",
+    "lisp": "commonlisp",
+    "el": "elisp",
+    "erl": "erlang",
+    "ex": "elixir",
+    "exs": "elixir",
+    "ml": "ocaml",
+    "sc": "scala",
+    "scala": "scala",
+    "md": "markdown",
+    "docker": "dockerfile",
+    "tf": "terraform",
+    "sol": "solidity",
+    "gql": "graphql",
+    "graphql": "graphql",
+    "c++": "cpp",
+    "cc": "cpp",
+    "cxx": "cpp",
+    "hpp": "cpp",
+    "hxx": "cpp",
+    "h": "c",
+    "objc": "objc",
+    "objectivec": "objc",
+    "clj": "clojure",
+    "jl": "julia",
+    "nim": "nim",
+    "dart": "dart",
+    "swift": "swift",
+    "groovy": "groovy",
+    "r": "r",
+    "lua": "lua",
+    "sql": "sql",
+    "zig": "zig",
+    "vue": "vue",
+    "svelte": "svelte",
+    "proto": "proto",
+    "make": "make",
+    "cmake": "cmake",
+    "toml": "toml",
+    "ini": "ini",
+    "json5": "json5",
+    "jsonc": "json",
+    "xml": "xml",
+    "htm": "html",
+    "sass": "scss",
+    "less": "less",
+    "php3": "php",
+    "php4": "php",
+    "php5": "php",
+    "php7": "php",
+    "php8": "php",
+    "asm": "asm",
+    "nasm": "nasm",
+    "x86asm": "x86asm",
+    "bat": "batch",
+    "ps1": "powershell",
 }
+
+
+def _build_lang_map() -> dict[str, str]:
+    """Build the fence-tag -> grammar-id map.
+
+    The base is every grammar shipped by tree-sitter-language-pack (so the map
+    can never reference a non-existent grammar), then curated aliases are
+    layered on top. Falls back to a static subset if the pack is unavailable.
+    """
+    try:
+        from tree_sitter_language_pack import manifest_languages
+
+        base = {lang: lang for lang in manifest_languages()}
+    except Exception:
+        # Fallback subset: languages known to be valid without pack metadata.
+        base = {
+            "python": "python",
+            "javascript": "javascript",
+            "typescript": "typescript",
+            "go": "go",
+            "rust": "rust",
+            "cpp": "cpp",
+            "c": "c",
+            "java": "java",
+            "csharp": "csharp",
+            "php": "php",
+            "ruby": "ruby",
+            "html": "html",
+            "css": "css",
+            "json": "json",
+        }
+    # Keep only aliases whose target grammar actually exists in the pack.
+    base.update({k: v for k, v in _LANG_ALIASES.items() if v in base})
+    return base
+
+
+LANG_MAP: dict[str, str] = _build_lang_map()
 
 _parser_cache: dict[str, Any] = {}
 _lang_cache: dict[str, str] = {}

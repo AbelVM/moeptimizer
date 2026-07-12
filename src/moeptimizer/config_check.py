@@ -70,19 +70,12 @@ def check_config(config: AppConfig) -> list[ConfigIssue]:
     if v.hierarchical_summary_enabled:
         issues.append(
             ConfigIssue(
-                "WARN",
-                "summary_breaks_prefix",
-                "hierarchical_summary_enabled mutates middle history and breaks the "
-                "backend's contiguous prefix cache; reuse will drop.",
-            )
-        )
-    if a.semantic_dedup_enabled:
-        issues.append(
-            ConfigIssue(
-                "WARN",
-                "dedup_breaks_prefix",
-                "semantic_dedup_enabled removes middle-history messages and breaks the "
-                "backend's contiguous prefix cache; reuse will drop.",
+                "INFO",
+                "hierarchical_summary_legacy",
+                "hierarchical_summary_enabled is a legacy alias for the cache-stable "
+                "rolling-summary path (safe for prefix caching). Prefer "
+                "v050.cache_stable_summary_enabled. Only fires under budget pressure "
+                "with cache_stable_mode on.",
             )
         )
     if a.attention_sinks_enabled:
@@ -104,23 +97,18 @@ def check_config(config: AppConfig) -> list[ConfigIssue]:
             )
         )
 
-    # ── Phantom / non-functional subsystems (review03.md §2.1) ─────────────
-    if a.mtp_boundary_alignment_enabled:
+    # ── Speculative decoding (review03.md §2.1) ────────────────────────────
+    # A client-side OpenAI proxy cannot drive MTP/speculative decoding itself;
+    # the only effective path is a backend that natively supports it
+    # (v050.native_mtp_passthrough, auto-enabled by native_mtp_autodetect).
+    if not v.native_mtp_passthrough:
         issues.append(
             ConfigIssue(
                 "INFO",
-                "mtp_noop",
-                "mtp_boundary_alignment_enabled is a no-op for a client proxy (cannot "
-                "touch MTP hidden state); it only pads the prompt with extra tokens.",
-            )
-        )
-    if config.speculative.enabled and not v.native_mtp_passthrough:
-        issues.append(
-            ConfigIssue(
-                "INFO",
-                "speculative_stripped",
-                "speculative.enabled sends MTP hints that are stripped before send "
-                "unless v050.native_mtp_passthrough is on; effectively inert.",
+                "speculative_inert",
+                "Client-proxy speculative decoding is non-functional; the only "
+                "effective path is a backend with native MTP support "
+                "(v050.native_mtp_passthrough, auto-enabled by native_mtp_autodetect).",
             )
         )
 

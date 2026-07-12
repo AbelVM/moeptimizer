@@ -273,7 +273,6 @@ class TestAgentContextOptimizer:
         """Quality target prefers exact prompts and exact code unless explicitly enabled."""
         config = AppConfig()
         config.agentic.max_optimized_chars = 20000
-        config.agentic.static_layer_alignment_enabled = False
         config.agentic.reasoning_preseed_enabled = False
         config.agentic.optimize_code_blocks = False
         optimizer = AgentContextOptimizer(config)
@@ -296,7 +295,6 @@ class TestAgentContextOptimizer:
         config.agentic.proactive_trim_ratio = 0.001
         config.agentic.compaction_trigger_ratio = 0.9
         config.agentic.fast_path_enabled = False
-        config.agentic.semantic_dedup_enabled = False
         config.agentic.code_skeleton_enabled = True
         optimizer = AgentContextOptimizer(config)
         code = (
@@ -327,7 +325,6 @@ class TestAgentContextOptimizer:
         config.agentic.max_optimized_tokens = 1000
         config.agentic.proactive_trim_ratio = 0.001
         config.agentic.fast_path_enabled = False
-        config.agentic.semantic_dedup_enabled = False
         config.agentic.code_skeleton_enabled = True
         optimizer = AgentContextOptimizer(config)
         code = "def double(x):\n    return x * 2\n"
@@ -347,7 +344,6 @@ class TestAgentContextOptimizer:
         config.agentic.proactive_trim_ratio = 0.4
         config.agentic.compaction_trigger_ratio = 0.9
         config.agentic.fast_path_enabled = False
-        config.agentic.semantic_dedup_enabled = False
         optimizer = AgentContextOptimizer(config)
         messages = [
             {"role": "system", "content": "System"},
@@ -371,30 +367,6 @@ class TestAgentContextOptimizer:
         assert len(calls) == 1
         assert calls[0][0][1] == 400
         assert calls[0][1]["use_tokens"] is True
-
-    def test_semantic_dedup_is_disabled_for_cache_stability(self) -> None:
-        """Semantic deduplication does not remove middle-history messages."""
-        config = AppConfig()
-        config.agentic.max_optimized_tokens = 1000
-        config.agentic.proactive_trim_ratio = 0.4
-        config.agentic.compaction_trigger_ratio = 0.9
-        config.agentic.fast_path_enabled = False
-        config.agentic.semantic_dedup_enabled = True
-        optimizer = AgentContextOptimizer(config)
-        messages = [
-            {"role": "system", "content": "System"},
-            {"role": "user", "content": "word " * 700},
-            {"role": "assistant", "content": "ack"},
-        ]
-
-        with patch.object(
-            optimizer.semantic_deduplicator,
-            "deduplicate",
-            side_effect=AssertionError("semantic dedup should not run"),
-        ) as dedup:
-            optimizer.optimize_messages(messages)
-
-        dedup.assert_not_called()
 
     def test_cache_stable_mode_freezes_early_turns(self) -> None:
         """Cache-stable mode keeps the early turns verbatim and immutable.

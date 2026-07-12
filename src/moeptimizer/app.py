@@ -643,6 +643,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     )
             except Exception as exc:  # noqa: BLE001 - best-effort
                 logger.warning("MTP support auto-detection failed: %s", exc)
+        logger.info(
+            "Resolved native_mtp_passthrough=%s (autodetect=%s); the only "
+            "functional speculative-decoding path is a backend with native MTP support.",
+            backend_client.native_mtp_passthrough,
+            cfg.v050.native_mtp_autodetect,
+        )
         yield
         await embedding_service.close()
         await embed_client.close()

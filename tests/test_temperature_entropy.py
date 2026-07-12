@@ -38,7 +38,7 @@ class TestTemperatureCalibration:
         assert temp == 0.3
 
 
-class TestEntropyGuidedTrimming:
+class TestMessageEntropy:
     def test_calculate_message_entropy(self) -> None:
         """Calculate entropy of messages."""
         config = AppConfig()
@@ -53,42 +53,3 @@ class TestEntropyGuidedTrimming:
         high_entropy = "import os\nimport sys\nimport json\nimport re\nimport math\n"
         entropy = optimizer._calculate_message_entropy(high_entropy)
         assert entropy > 0.3
-
-    def test_entropy_guided_trim_preserves_assistant(self) -> None:
-        """Entropy trimming preserves assistant messages."""
-        config = AppConfig()
-        config.agentic.max_optimized_chars = 500
-        optimizer = AgentContextOptimizer(config)
-
-        messages = [
-            {"role": "system", "content": "You are helpful"},
-            {"role": "user", "content": "Task 1"},
-            {"role": "assistant", "content": "Response 1"},
-            {"role": "user", "content": "Task 2"},
-            {"role": "assistant", "content": "Response 2"},
-        ]
-        result = optimizer._entropy_guided_trim(messages)
-        # All assistant messages should be preserved
-        assistant_msgs = [m for m in result if m.get("role") == "assistant"]
-        assert len(assistant_msgs) == 2
-
-    def test_entropy_guided_trim_does_not_modify_tool_content(self) -> None:
-        """Entropy trimming does not rewrite tool output."""
-        config = AppConfig()
-        config.agentic.max_optimized_chars = 500
-        optimizer = AgentContextOptimizer(config)
-
-        # Create high-entropy tool output
-        high_entropy_tool = "x" * 600
-        messages = [
-            {"role": "system", "content": "You are helpful"},
-            {"role": "user", "content": "Task 1"},
-            {"role": "assistant", "content": "Response 1"},
-            {"role": "tool", "content": high_entropy_tool},
-        ]
-        result = optimizer._entropy_guided_trim(messages)
-        # Tool output is part of the serialized history and must not be rewritten.
-        assert result == messages
-        tool_msg = next(m for m in result if m.get("role") == "tool")
-        assert tool_msg.get("content") == high_entropy_tool
-        assert "truncated" not in tool_msg.get("content", "")

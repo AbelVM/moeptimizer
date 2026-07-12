@@ -128,6 +128,10 @@ class TestV050Integration:
         self.optimizer.static_prefix_kv = None
         self.optimizer.hit_prediction = None
         self.optimizer._config.agentic.compaction_trigger_ratio = 0.01
+        # Code-block optimization is budget-gated (only fires above the proactive
+        # trim threshold), so lower it too to ensure the path runs on this small
+        # context and populates the fingerprint cache.
+        self.optimizer._config.agentic.proactive_trim_ratio = 0.01
         self.optimizer._config.agentic.optimize_code_blocks = True
         self.optimizer._config.agentic.fast_path_enabled = False
 

@@ -4,7 +4,6 @@ Version-by-version feature history for MOE-ptimizer.
 
 ## Feature History
 
-
 ### First version (v0.1.0)
 
 - **Scratchpad Compaction** — Front-Loading Eviction for MTP head protection.
@@ -173,4 +172,76 @@ real production path on every scenario. Full test suite after changes:
   the direct baseline drops below the threshold; `GET /v1/metrics` +
   `POST /v1/metrics/reset`; dry-run/explain mode (`X-MOEPT-Optimized-Messages`
   header); `moeptimizer-config-check` CLI; and `quality`/`balanced`/`aggressive`
-  quality profiles applied at app-build time.
+   quality profiles applied at app-build time.
+- **`optimize_code_blocks` enabled by default and budget-gated.** The
+  tree-sitter code-block optimizer (`CodeBlockOptimizer`, step 10) now defaults
+  to `true` and only runs when the context exceeds the proactive trim threshold
+  (same gate as the skeleton compressor). Lean contexts keep exact code and
+  avoid per-turn parse latency; the optimizer only fires under real pressure.
+  `LANG_MAP` was also expanded to every grammar shipped by
+  `tree-sitter-language-pack` (306 languages) plus common fence-tag aliases,
+  fixing a latent `csharp -> c_sharp` bug where C# blocks fell back to generic
+  line-chunking.
+
+### v0.7.0 — Optimization inventory cleanup (2026-07-12)
+
+Follow-up to the optimization review: removed dead/no-op toggles, dropped
+orphaned config keys, and made the safe cache-stable summarization path
+independently reachable.
+
+- **Removed 6 orphaned env vars from `.env.example`.** `EMBEDDING_INVALIDATION_ENABLED`,
+  `MTP_CHECKPOINT_ENABLED`/`_MAX_ENTRIES`, `PARALLEL_EMBED_WORKERS`,
+  `SEGMENT_SPECULATIVE_ENABLED`, `TEMPLATE_SELECTOR_ENABLED`/`_EXPLORATION_RATE`,
+  and `KV_WARMUP_ENABLED`/`_MAX_ENTRIES` mapped to no `config.py` field and were
+  silently ignored. They implied functionality that does not exist; operators
+  may have believed them active. (`EMBEDDING_BATCH_SIZE` is a real field and was kept.)
+- **Removed dead no-op toggles.** `static_layer_alignment_enabled` (its
+  `_align_static_layer` was a no-op that returned messages unchanged),
+  `mtp_boundary_alignment_enabled` (its `align_prediction_boundary` was a
+  documented no-op for a client proxy), and the always-invoked-but-no-op
+  `_entropy_guided_trim` (budget pressure is already handled by top-eviction).
+  The flags, their call sites, the methods, and the `config_check`/quality-profile
+  references were all removed so operators are not misled by silent no-ops.
+- **Made the cache-stable rolling-summary path reachable.** Added
+  `v050.cache_stable_summary_enabled` (default `false`) as the dedicated, safe
+  flag for the cache-stable rolling-summary compaction (older dynamic turns folded
+  into an append-only block after the frozen prefix, protected from front-eviction
+  so the backend's prefix cache stays valid). The legacy `hierarchical_summary_enabled`
+  flag is now an explicit alias for the same safe path; `config_check` no longer
+  falsely warns that it "breaks the prefix cache" (downgraded to an INFO note).
+- **Docs.** README component tree and `config-check` severity docs updated;
+  `.env.example` documents the new flag and the legacy alias.
+
+### v0.7.1 — Optimization review follow-ups (2026-07-12)
+
+Implements the actionable items from the optimization-state review:
+
+- **Enabled the cache-stable rolling-summary path by default.** `v050.cache_stable_summary_enabled` now defaults to `true` (was `false`). This is the SAFE summarization mode (older dynamic turns folded into an append-only block after the frozen prefix, protected from front-eviction) that prevents the 2.17x verbosity regression without breaking the backend's prefix-cache reuse. It only fires under budget pressure with `cache_stable_mode` on. The `quality` profile still disables it (max-fidelity intent); `balanced`/`aggressive` enable it. `.env.example` updated accordingly.
+- **Removed the dead `SpeculativeConfig` (`MOEPT_SPECULATIVE__*`).** Client-proxy speculative decoding is non-functional by construction (review03.md §2.1); the only effective path is a backend with native MTP support via `v050.native_mtp_passthrough` (auto-detected by `v050.native_mtp_autodetect`). The old flags implied functionality that does not exist. Removed from `config.py`, `config_check.py`, `.env.example`, and `README.md`. `config_check` now emits an INFO `speculative_inert` note instead of the old `speculative_stripped` check.
+- **Made native-MTP autodetect observable.** `app.py` now logs the resolved `native_mtp_passthrough` state at startup so operators can confirm the probe flipped it for a native-MTP backend.
+
+### v0.7.2 — Remove misleading no-op and dead optimizations (2026-07-12)
+
+Follow-up to the optimization-state review; closes the two dead-code findings:
+
+- **Removed the `semantic_dedup_enabled` no-op.** The flag existed in config,
+  `QUALITY_PROFILES`, `config_check`, `.env.example`, and README, and the
+  optimizer instantiated `SemanticDeduplicator` — but the pipeline never invoked
+  it (Step 7.6 disabled it for cache-stable mode). Setting the flag did nothing,
+  which misled operators into believing dedup was active. The flag, its
+  `QUALITY_PROFILES` entries, the `config_check` warning, the `__init__` exports,
+  the README rows, and the orphaned `semantic_dedup.py` module were all removed.
+  The proxy already covers near-duplicate reduction via `SelectiveTruncator`
+  (duplicate code-block removal) and compaction.
+- **Removed dead `_apply_syntax_stable_mtp` / `_inject_syntax_markers`.** The
+  method was defined but never called from the pipeline, and the module docstring
+  falsely listed "Apply syntax-stable MTP prompt engineering" as a pipeline step.
+  Both the method and the docstring line were removed (MTP prompt engineering is
+  ineffective for a client proxy; review03 §10).
+- **Clarified the static-prefix "KV-cache" claim.** `StaticPrefixKVCache` stores
+  the prompt *text* as a memo, not real KV tensors (a client proxy cannot read
+  backend KV). The README flag description now states this explicitly so the
+  "KV-cache reuse" claim is not implied. The `mtp_state` / `expert_cache`
+  phantom subsystems remain quarantined with honest non-functional docstrings
+  (review03 §2.1).
+  

@@ -7,7 +7,6 @@ Pipeline:
   4. Optimize code blocks with Tree-Sitter + NPU ranking
   5. Enforce hard token cap for MoE context budget
   6. Apply static layer block alignment for cache optimization
-  7. Apply syntax-stable MTP prompt engineering
 
 MOE context integrity:
   - RAG context injected as SEPARATE user message (never into assistant content)
@@ -76,7 +75,6 @@ from moeptimizer.pattern_injector import get_pattern_injector
 from moeptimizer.progress_tracker import ProgressTracker
 from moeptimizer.prompt_templates import classify_and_template
 from moeptimizer.selective_truncator import get_selective_truncator
-from moeptimizer.semantic_dedup import get_semantic_deduplicator
 from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
 from moeptimizer.static_prefix_kv import get_static_prefix_kv_cache
@@ -146,7 +144,6 @@ class AgentContextOptimizer:
         self.tool_output_compressor = ToolOutputCompressor(
             max_chars=self._config.agentic.tool_output_compression_max_chars
         )
-        self.semantic_deduplicator = get_semantic_deduplicator()
         self._task_type: str = "default"
         self._last_mtp_state_key: str | None = None
         self._last_backend_extra_body: dict[str, Any] = {}
@@ -181,7 +178,18 @@ class AgentContextOptimizer:
         )
         self.chunk_fingerprint = get_chunk_fingerprint_cache(max_entries=v050.chunk_fingerprint_max_entries) if v050.chunk_fingerprint_enabled else None
         self.hit_prediction = get_hit_prediction_model(retrain_threshold=v050.hit_prediction_retrain_threshold) if v050.hit_prediction_enabled else None
-        self.hierarchical_summarizer = get_hierarchical_summarizer(max_full_turns=v050.hierarchical_summary_max_full_turns) if v050.hierarchical_summary_enabled else None
+        # The cache-stable rolling-summary path is the SAFE summarization mode
+        # (review §1/§3/§5, #7): older dynamic turns are folded into an
+        # append-only block placed right after the frozen prefix and protected
+        # from front-eviction, so the backend's prefix cache stays valid. It is
+        # enabled by the dedicated `cache_stable_summary_enabled` flag, or by the
+        # legacy `hierarchical_summary_enabled` alias.
+        self._cache_stable_summary = v050.cache_stable_summary_enabled or v050.hierarchical_summary_enabled
+        self.hierarchical_summarizer = (
+            get_hierarchical_summarizer(max_full_turns=v050.hierarchical_summary_max_full_turns)
+            if self._cache_stable_summary
+            else None
+        )
         self.delta_encoder = get_delta_encoder() if v050.delta_encoding_enabled else None
         self.async_io = get_async_io_stage(max_thread_workers=v050.async_io_max_thread_workers, max_async_concurrency=v050.async_io_max_concurrency) if v050.async_io_enabled else None
 
@@ -597,6 +605,7 @@ class AgentContextOptimizer:
         # so the leading prefix stays byte-stable and the backend reuses its cache.
         if (
             self.hierarchical_summarizer is not None
+            and self._cache_stable_summary
             and self._config.v050.cache_stable_mode
             and self.token_counter.count_messages(optimized) > proactive_threshold_tokens
         ):
@@ -610,14 +619,6 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Rolling summary compaction failed: %s", e)
 
-        # Step 8: Apply static layer block alignment only when explicitly
-        # enabled. Padding adds tokens and can change prompt semantics.
-        if self._config.agentic.static_layer_alignment_enabled and total_tokens > 500:
-            try:
-                optimized = self._align_static_layer(optimized)
-            except Exception as e:
-                logger.warning("Static layer alignment failed: %s", e)
-
         # Step 9: Pre-seed reasoning prefix only when explicitly enabled.
         # Disabled by default because direct-request semantics are the quality target.
         max_tokens = self._budget_tokens()
@@ -627,14 +628,25 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Reasoning pre-seeding failed: %s", e)
 
-        # Step 10: Optimize code blocks only when explicitly enabled.
-        # Exact code is preferred for quality; budget eviction handles leanness.
+        # Step 10: Optimize code blocks only when explicitly enabled AND the
+        # context is under real pressure. Exact code is preferred for quality,
+        # so we skip the tree-sitter parse/dedup on lean contexts (no latency
+        # cost, no risk of altering exact code when there is room). The same
+        # proactive threshold gates the skeleton compressor (step 5.7).
         if self._config.agentic.optimize_code_blocks:
             try:
-                for msg in optimized:
-                    content = msg.get("content") or ""
-                    if isinstance(content, str) and self._has_code_blocks(content):
-                        msg["content"] = self._optimize_code_block_content(content)
+                current_tokens = self.token_counter.count_messages(optimized)
+                if current_tokens > proactive_threshold_tokens:
+                    for msg in optimized:
+                        content = msg.get("content") or ""
+                        if isinstance(content, str) and self._has_code_blocks(content):
+                            msg["content"] = self._optimize_code_block_content(content)
+                else:
+                    logger.debug(
+                        "[AgentOptimizer] Code block optimization skipped: tokens=%d <= threshold=%d",
+                        current_tokens,
+                        proactive_threshold_tokens,
+                    )
             except Exception as e:
                 logger.warning("Code block optimization failed: %s", e)
 
@@ -666,13 +678,6 @@ class AgentContextOptimizer:
                 optimized = self._proactive_trim(optimized, proactive_threshold_tokens, use_tokens=True)
             except Exception as e:
                 logger.warning("Proactive trimming failed: %s", e)
-
-        # Step 11.5: Entropy-guided trimming only when context pressure exists.
-        if total_tokens > proactive_threshold_tokens:
-            try:
-                optimized = self._entropy_guided_trim(optimized)
-            except Exception as e:
-                logger.warning("Entropy-guided trimming failed: %s", e)
 
         # Step 11.6: Boundary-compress large tool/assistant outputs (headroom/
         # snip-style, review §3/§5.1). Applied once when a tool message first
@@ -712,14 +717,6 @@ class AgentContextOptimizer:
                 optimized = self._sliding_window_trim(optimized, use_tokens=True)
             except Exception as e:
                 logger.warning("Sliding window trim failed: %s", e)
-
-        # Step 11.9: Align to MTP prediction boundary only when explicitly
-        # enabled; padding increases context and is disabled by default.
-        if self._config.agentic.mtp_boundary_alignment_enabled:
-            try:
-                optimized = self.mtp_state_manager.align_prediction_boundary(optimized)
-            except Exception as e:
-                logger.warning("MTP boundary alignment failed: %s", e)
 
         # Step 12: Enforce hard token cap (calibrated token counts, #6)
         try:
@@ -1384,69 +1381,6 @@ class AgentContextOptimizer:
 
         return [m for pair in pairs for m in pair]
 
-    def _align_static_layer(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """No-op: never pad or modify the static layer sent to the model.
-
-        Cache-block alignment is useful only as an internal cache-key concept.
-        Adding newlines to system or first-user messages changes the literal
-        prompt and forces llama.cpp to re-prefill the static prefix.
-        """
-        return messages
-
-    def _apply_syntax_stable_mtp(
-        self,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Apply syntax-stable MTP prompt engineering.
-
-        Pre-seeds code-specific patterns to improve MTP prediction accuracy:
-        - Indentation level markers
-        - Type signature anchors
-        - Section markers for code structure
-        """
-        result = []
-        for msg in messages:
-            content = msg.get("content") or ""
-            if isinstance(content, str) and self._has_code_blocks(content):
-                content = self._inject_syntax_markers(content)
-            result.append({**msg, "content": content})
-        return result
-
-    def _inject_syntax_markers(self, text: str) -> str:
-        """Inject syntax markers for MTP stability.
-
-        Adds predictable patterns that help MTP heads converge faster.
-        """
-        # Add section markers for code blocks
-        lines = text.split("\n")
-        result_lines = []
-        in_code_block = False
-        code_block_lang = ""
-
-        for _i, line in enumerate(lines):
-            if line.strip().startswith("```") and not in_code_block:
-                in_code_block = True
-                code_block_lang = line.strip().replace("```", "").strip()
-                result_lines.append(line)
-            elif line.strip() == "```" and in_code_block:
-                in_code_block = False
-                code_block_lang = ""
-                result_lines.append(line)
-            elif in_code_block and code_block_lang:
-                # Inject section markers for common patterns
-                stripped = line.strip()
-                if stripped.startswith("def ") or stripped.startswith("function "):
-                    result_lines.append(f"# SECTION: function {stripped[:40]}")
-                elif stripped.startswith("class "):
-                    result_lines.append(f"# SECTION: class {stripped[:40]}")
-                elif stripped.startswith("import ") or stripped.startswith("from "):
-                    result_lines.append("# SECTION: import")
-                result_lines.append(line)
-            else:
-                result_lines.append(line)
-
-        return "\n".join(result_lines)
-
     @property
     def last_optimized_token_count(self) -> int | None:
         """Token count of the most recent optimized prompt (cached from optimize_messages)."""
@@ -1747,18 +1681,6 @@ class AgentContextOptimizer:
             result.extend(turn)
         result.extend(active_turn)
         return result
-
-    def _entropy_guided_trim(
-        self,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """No-op: do not mutate tool or user content in the middle of history.
-
-        Replacing tool output with a summary changes the serialized assistant/tool
-        turn and breaks prefix stability. Budget pressure is handled by dropping
-        whole old turns from the top instead.
-        """
-        return messages
 
     def _calculate_message_entropy(self, content: str) -> float:
         """Calculate entropy of a message.

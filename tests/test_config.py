@@ -21,10 +21,8 @@ class TestConfig:
         assert config.agentic.proactive_trim_ratio == 0.45
         assert config.agentic.compaction_trigger_ratio == 0.75
         assert config.agentic.fast_path_enabled is True
-        assert config.agentic.optimize_code_blocks is False
+        assert config.agentic.optimize_code_blocks is True
         assert config.agentic.code_skeleton_enabled is True
-        assert config.agentic.semantic_dedup_enabled is False
-        assert config.agentic.static_layer_alignment_enabled is False
         assert config.agentic.reasoning_preseed_enabled is False
         assert config.agentic.quality_profile == "balanced"
         assert config.agentic.explain_mode_enabled is False
@@ -102,14 +100,14 @@ class TestConfigCheck:
         codes = {i.code for i in issues}
         assert "trim_order" in codes
 
-    def test_summary_breaks_prefix_warns(self) -> None:
+    def test_hierarchical_summary_legacy_flag(self) -> None:
         from moeptimizer.config_check import check_config
 
         config = AppConfig()
         config.v050.hierarchical_summary_enabled = True
         issues = check_config(config)
         codes = {i.code for i in issues}
-        assert "summary_breaks_prefix" in codes
+        assert "hierarchical_summary_legacy" in codes
 
     def test_low_water_out_of_range_is_error(self) -> None:
         from moeptimizer.config_check import check_config

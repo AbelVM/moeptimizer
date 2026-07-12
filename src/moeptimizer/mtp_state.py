@@ -5,8 +5,7 @@ client-side OpenAI proxy CANNOT read or write MTP hidden states or draft tokens
 — there is no OpenAI field for them. This module therefore cannot preserve MTP
 state. It is retained only as inert scaffolding behind a disabled-by-default
 config flag so existing imports keep working; `save_state` is never called from
-the optimizer and `align_prediction_boundary` is an explicit no-op. Do not rely
-on this for any MTP optimization.
+the optimizer. Do not rely on this for any MTP optimization.
 """
 
 from __future__ import annotations
@@ -118,19 +117,6 @@ class MTPStateManager:
         except Exception:
             overlap = content[-overlap_tokens:] if len(content) > overlap_tokens else content
         return hashlib.md5(overlap.encode()).hexdigest()[:32]
-
-    def align_prediction_boundary(
-        self,
-        messages: list[dict[str, Any]],
-        target_boundary: int = 128,
-    ) -> list[dict[str, Any]]:
-        """No-op: never pad model-visible messages for MTP alignment.
-
-        Adding invisible newlines changes token IDs and violates the cache
-        stability rule against trailing whitespace variations.
-        """
-        del target_boundary
-        return messages
 
     def get_stats(self) -> dict[str, int]:
         """Get state management statistics."""
