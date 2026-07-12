@@ -65,6 +65,9 @@ class TestAgentContextOptimizer:
         # has many stages that can add content before trimming
         self.optimizer._config.agentic.keep_full_steps = 1
         self.optimizer._config.agentic.max_optimized_chars = 100
+        # Disable cache-stable mode so this test exercises pure budget eviction
+        # (the frozen early turns would otherwise be immutable).
+        self.optimizer._config.v050.cache_stable_mode = False
 
         messages = [
             {"role": "system", "content": "System"},
@@ -90,6 +93,10 @@ class TestAgentContextOptimizer:
 
         self.optimizer._config.agentic.keep_full_steps = 1
         self.optimizer._config.agentic.max_optimized_chars = 200
+        # Disable cache-stable mode: this test verifies the static-prefix KV cache
+        # does not bypass compaction of the dynamic layer, independent of the
+        # frozen early-turn prefix.
+        self.optimizer._config.v050.cache_stable_mode = False
 
         first_messages = [
             {"role": "system", "content": "You are helpful"},
@@ -336,3 +343,48 @@ class TestAgentContextOptimizer:
             optimizer.optimize_messages(messages)
 
         dedup.assert_not_called()
+
+    def test_cache_stable_mode_freezes_early_turns(self) -> None:
+        """Cache-stable mode keeps the early turns verbatim and immutable.
+
+        Regression guard for the frozen_prefix_end boundary bug: the stable
+        prefix must include the first user message AND the next
+        `frozen_prefix_turns` complete turns, not just system + first user.
+        """
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 20000
+        config.v050.cache_stable_mode = True
+        config.v050.frozen_prefix_turns = 2
+        optimizer = AgentContextOptimizer(config)
+
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "First task"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "Second task"},
+            {"role": "assistant", "content": "A2"},
+            {"role": "user", "content": "Third task"},
+            {"role": "assistant", "content": "A3"},
+            {"role": "user", "content": "Fourth task"},
+            {"role": "assistant", "content": "A4"},
+            {"role": "user", "content": "Fifth task"},
+            {"role": "assistant", "content": "A5"},
+        ]
+        # frozen_prefix_end must cover system + first user + 2 turns
+        # (Second + Third), i.e. indices 0..6 -> 7 messages.
+        assert optimizer.context_aligner.frozen_prefix_end(messages, 2) == 7
+
+        # Under a tight budget the frozen early turns must survive eviction
+        # while later turns are dropped.
+        config.agentic.max_optimized_chars = 50
+        optimizer2 = AgentContextOptimizer(config)
+        result = optimizer2.optimize_messages(messages)
+
+        # The frozen block is byte-identical to the original prefix.
+        assert [m["content"] for m in result[:7]] == [
+            m["content"] for m in messages[:7]
+        ]
+        # Early-turn content is preserved (not evicted) under budget pressure.
+        joined = "\n".join(m["content"] for m in result)
+        assert "Second task" in joined
+        assert "Third task" in joined

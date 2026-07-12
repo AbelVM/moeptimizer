@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any
 
 from moeptimizer.config import get_config
+from moeptimizer.context_aligner import ContextAligner, get_context_aligner
 
 
 class ScratchpadCompactor:
@@ -34,9 +35,23 @@ class ScratchpadCompactor:
     Evictable Body, preserving structural integrity of the conversation.
     """
 
-    def __init__(self, keep_full: int | None = None) -> None:
+    def __init__(
+        self,
+        keep_full: int | None = None,
+        cache_stable_mode: bool = False,
+        frozen_prefix_turns: int = 0,
+        context_aligner: ContextAligner | None = None,
+    ) -> None:
         config = get_config().agentic
         self.keep_full = keep_full if keep_full is not None else config.keep_full_steps
+        # Cache-stable mode (review §1/§3/§7): freeze the early complete turns as
+        # part of the immutable anchor so front-eviction never shifts the stable
+        # prefix the backend caches. The compactor runs before the optimizer's
+        # trims, so it must honor the frozen prefix or the early turns are lost
+        # before the later stages can protect them.
+        self._cache_stable_mode = cache_stable_mode
+        self._frozen_prefix_turns = frozen_prefix_turns
+        self._context_aligner = context_aligner or get_context_aligner()
 
     def compact_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """
@@ -90,10 +105,21 @@ class ScratchpadCompactor:
         if i < len(messages) and messages[i].get("role") == "assistant":
             system_anchor.append(dict(messages[i]))
             i += 1
-            # Grab any tool outputs belonging to the first assistant
-            while i < len(messages) and messages[i].get("role") == "tool":
-                system_anchor.append(dict(messages[i]))
-                i += 1
+        # Grab any tool outputs belonging to the first assistant
+        while i < len(messages) and messages[i].get("role") == "tool":
+            system_anchor.append(dict(messages[i]))
+            i += 1
+
+        # Cache-stable mode (review §1/§3/§7): also freeze the early complete
+        # turns as part of the immutable anchor so front-eviction never shifts
+        # the stable prefix. Mirrors optimizer._partition_for_budget.
+        if self._cache_stable_mode and self._frozen_prefix_turns > 0:
+            frozen_end = self._context_aligner.frozen_prefix_end(
+                messages, self._frozen_prefix_turns
+            )
+            if frozen_end > i:
+                system_anchor.extend(dict(m) for m in messages[i:frozen_end])
+                i = frozen_end
 
         # Group remaining messages into user-assistant turns.
         # Each turn starts with a user message and includes any following

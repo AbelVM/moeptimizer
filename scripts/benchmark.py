@@ -1550,8 +1550,8 @@ def _collect_direct_conversation(
         direct_context = _context_size_summary(messages)
         _human_print(
             f"  Direct turn {turn_index:02d}/{num_turns:02d}: "
-            f"ctx={direct_context['messages']} msgs/{direct_context['chars']:,} chars/"
-            f"~{direct_context['estimated_tokens']:,} tokens"
+            f"backend-facing ~{direct_context['estimated_tokens']:,} tok "
+            f"(raw {direct_context['messages']} msgs/{direct_context['chars']:,} chars, no proxy)"
         )
 
         try:
@@ -1582,6 +1582,10 @@ def _collect_direct_conversation(
                 response_chars=len(d_content),
                 finish_reason=direct_resp["choices"][0].get("finish_reason", ""),
                 content_preview=d_content[:200],
+            )
+            _human_print(
+                f"    → backend-facing: {metrics.prompt_tokens:,} tok "
+                f"(source={metrics.prompt_tokens_source}, cached={metrics.cached_tokens:,})"
             )
         except Exception as e:
             metrics = TurnMetrics(
@@ -1631,8 +1635,8 @@ def _collect_proxy_conversation(
         proxy_context = _context_size_summary(messages)
         _human_print(
             f"  Proxy turn {turn_index:02d}/{num_turns:02d}: "
-            f"ctx={proxy_context['messages']} msgs/{proxy_context['chars']:,} chars/"
-            f"~{proxy_context['estimated_tokens']:,} tokens"
+            f"raw {proxy_context['messages']} msgs/{proxy_context['chars']:,} chars/"
+            f"~{proxy_context['estimated_tokens']:,} tok (pre-optimization)"
         )
 
         try:
@@ -1679,6 +1683,11 @@ def _collect_proxy_conversation(
 
             # Check for leaked internal markers
             metrics.foreign_markers = _check_foreign_markers(p_content)
+            _human_print(
+                f"    → backend-facing: {metrics.prompt_tokens:,} tok "
+                f"(source={metrics.prompt_tokens_source}, cached={metrics.cached_tokens:,}, "
+                f"raw={metrics.chars_before_optimization:,} chars)"
+            )
         except Exception as e:
             metrics = TurnMetrics(
                 turn_index=turn_index,

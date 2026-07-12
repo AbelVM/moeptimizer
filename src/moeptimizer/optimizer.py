@@ -62,33 +62,25 @@ from moeptimizer.context_template_matcher import get_context_template_matcher
 from moeptimizer.delta_encoder import get_delta_encoder
 from moeptimizer.dependency_orderer import get_dependency_orderer
 from moeptimizer.embedding import EmbeddingService
-from moeptimizer.embedding_cache_invalidation import (
-    get_embedding_cache_with_invalidation,
-)
 from moeptimizer.expert_cache import get_expert_cache
 from moeptimizer.goal_decomposer import GoalDecomposer
 from moeptimizer.hierarchical_index import get_hierarchical_index
 from moeptimizer.hierarchical_summarizer import get_hierarchical_summarizer
 from moeptimizer.hit_prediction_model import get_hit_prediction_model
 from moeptimizer.incremental_updater import get_incremental_updater
-from moeptimizer.kv_cache_warmup import get_kv_cache_warmup
 from moeptimizer.kv_slot_tracker import get_kv_slot_tracker
 from moeptimizer.loop_detector import LoopDetector
 from moeptimizer.models import AgentStep, LoopWarning
-from moeptimizer.mtp_head_checkpoint import get_mtp_head_checkpoint
 from moeptimizer.mtp_state import get_mtp_state_manager
-from moeptimizer.parallel_embedding_lookup import get_parallel_embedding_lookup
 from moeptimizer.pattern_injector import get_pattern_injector
 from moeptimizer.progress_tracker import ProgressTracker
 from moeptimizer.prompt_templates import classify_and_template
-from moeptimizer.segment_wise_speculative import get_segment_wise_decoder
 from moeptimizer.selective_truncator import get_selective_truncator
 from moeptimizer.semantic_dedup import get_semantic_deduplicator
 from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
 from moeptimizer.static_prefix_kv import get_static_prefix_kv_cache
 from moeptimizer.symbol_index import SymbolIndex
-from moeptimizer.template_selector import get_template_selector
 from moeptimizer.thinking_preserver import ThinkingPreserver
 from moeptimizer.token_aware_truncator import TokenAwareTruncator
 from moeptimizer.token_counter import TokenCounter
@@ -101,7 +93,6 @@ _UNSUPPORTED_BACKEND_EXTRA_BODY_KEYS = {
     "mtp_heads",
     "head_temperatures",
     "expert_hints",
-    "kv_cache_warmup",
     "cache_control_hints",
 }
 _OPENAI_MESSAGE_KEYS = {
@@ -122,7 +113,13 @@ class AgentContextOptimizer:
         self._config = config or AppConfig()
         self._lock = threading.RLock()
         self.store = AgentStateStore()
-        self.compactor = ScratchpadCompactor(keep_full=self._config.agentic.keep_full_steps)
+        self.context_aligner = get_context_aligner()
+        self.compactor = ScratchpadCompactor(
+            keep_full=self._config.agentic.keep_full_steps,
+            cache_stable_mode=self._config.v050.cache_stable_mode,
+            frozen_prefix_turns=self._config.v050.frozen_prefix_turns,
+            context_aligner=self.context_aligner,
+        )
         self.thinking_preserver = ThinkingPreserver()
         self.state_rag = StateBasedRAG(self.store)
         self.loop_detector = LoopDetector(threshold=3)
@@ -134,7 +131,6 @@ class AgentContextOptimizer:
         self.symbol_index = SymbolIndex()
         self.cache_registry = get_cache_registry()
         self.cache_registry.load_from_disk()
-        self.context_aligner = get_context_aligner()
         self.context_canonicalizer = get_context_canonicalizer()
         self.context_compressor = get_context_compressor()
         self.context_template_matcher = get_context_template_matcher()
@@ -150,21 +146,37 @@ class AgentContextOptimizer:
         self._task_type: str = "default"
         self._last_mtp_state_key: str | None = None
         self._last_backend_extra_body: dict[str, Any] = {}
+        # Throttled cache_registry disk-write counter (review §10).
+        self._register_save_counter: int = 0
+        # Real cache-outcome signal used to train hit_prediction (replaces the
+        # old constant hit=True label). Set when our own static-prefix KV cache
+        # is reused; the app layer may override it with the backend's actual
+        # cached_tokens from usage.prompt_tokens_details.
+        self._last_static_prefix_hit: bool = False
+        self._last_optimized: list[dict[str, Any]] = []
+        # Token-count calibration (review §1/§9, priority fix #6). Scales the
+        # proxy's tiktoken estimate toward the backend's real tokenizer so the
+        # budget is enforced against true token counts. Learned from the backend's
+        # actual `prompt_tokens` on the previous turn; clamped to [0.5, 2.0].
+        self._token_calibration: float = 1.0
 
         # v0.5.0 components
         v050 = self._config.v050
         self.static_prefix_kv = get_static_prefix_kv_cache() if v050.static_prefix_kv_enabled else None
-        self.token_aware_truncator = TokenAwareTruncator() if v050.token_aware_truncation_enabled else None
-        self.mtp_head_checkpoint = get_mtp_head_checkpoint(max_checkpoints=v050.mtp_checkpoint_max_entries) if v050.mtp_checkpoint_enabled else None
+        self.token_aware_truncator = (
+            TokenAwareTruncator(
+                cache_stable_mode=v050.cache_stable_mode,
+                frozen_prefix_turns=v050.frozen_prefix_turns,
+                context_aligner=self.context_aligner,
+                token_calibration=self._token_calibration,
+            )
+            if v050.token_aware_truncation_enabled
+            else None
+        )
         self.chunk_fingerprint = get_chunk_fingerprint_cache(max_entries=v050.chunk_fingerprint_max_entries) if v050.chunk_fingerprint_enabled else None
-        self.embedding_invalidation = get_embedding_cache_with_invalidation() if v050.embedding_invalidation_enabled else None
-        self.parallel_embedding = get_parallel_embedding_lookup(max_workers=v050.parallel_embed_workers) if v050.parallel_embed_workers > 0 else None
-        self.segment_decoder = get_segment_wise_decoder() if v050.segment_speculative_enabled else None
         self.hit_prediction = get_hit_prediction_model(retrain_threshold=v050.hit_prediction_retrain_threshold) if v050.hit_prediction_enabled else None
-        self.template_selector = get_template_selector(exploration_rate=v050.template_selector_exploration_rate) if v050.template_selector_enabled else None
         self.hierarchical_summarizer = get_hierarchical_summarizer(max_full_turns=v050.hierarchical_summary_max_full_turns) if v050.hierarchical_summary_enabled else None
         self.delta_encoder = get_delta_encoder() if v050.delta_encoding_enabled else None
-        self.kv_warmup = get_kv_cache_warmup(max_warmups=v050.kv_warmup_max_entries) if v050.kv_warmup_enabled else None
         self.async_io = get_async_io_stage(max_thread_workers=v050.async_io_max_thread_workers, max_async_concurrency=v050.async_io_max_concurrency) if v050.async_io_enabled else None
 
     def _budget_tokens(self) -> int:
@@ -177,10 +189,41 @@ class AgentContextOptimizer:
 
         return min(char_budget, cfg.max_optimized_tokens)
 
+    def set_token_calibration(self, ratio: float | None) -> None:
+        """Learn the backend tokenizer ratio from the previous turn (review §1/§9, #6).
+
+        ``ratio`` is ``backend_prompt_tokens / proxy_estimated_tokens`` for the
+        optimized prompt we sent. Storing it lets the proxy enforce its budget
+        against the backend's true token count instead of the tiktoken estimate.
+        Clamped to [0.5, 2.0] so a single noisy measurement cannot swing the
+        budget wildly. ``None``/non-positive values are ignored (keep last ratio).
+        """
+        if ratio is None or ratio <= 0:
+            return
+        clamped = max(0.5, min(2.0, float(ratio)))
+        self._token_calibration = clamped
+        if self.token_aware_truncator is not None:
+            self.token_aware_truncator._token_calibration = clamped
+
+    def calibrated_token_count(self, messages: list[dict[str, Any]]) -> int:
+        """Return the token count scaled by the learned backend ratio (#6)."""
+        raw = self.token_counter.count_messages(messages)
+        return int(round(raw * self._token_calibration))
+
     def _register_context(self, messages: list[dict[str, Any]]) -> None:
-        """Register the optimized context and persist only when cache state changes."""
+        """Register the optimized context and persist only periodically.
+
+        `cache_registry.save_to_disk` rewrites the whole registry pickle. Doing
+        it every turn is unnecessary disk I/O (review §10). The registry already
+        skips the write when nothing changed, but the exact-context key changes
+        every turn, so we throttle to one write every
+        `cache_registry_save_every` turns. A final forced save happens on
+        process exit via the registry's own persistence if needed.
+        """
         self.cache_registry.register_context(messages)
-        self.cache_registry.save_to_disk()
+        self._register_save_counter += 1
+        if self._register_save_counter % self._config.v050.cache_registry_save_every == 0:
+            self.cache_registry.save_to_disk()
 
     def _has_nonstandard_message_fields(self, messages: list[dict[str, Any]]) -> bool:
         """Return True when messages contain internal/proxy-only fields."""
@@ -288,6 +331,7 @@ class AgentContextOptimizer:
         if self.static_prefix_kv is not None:
             kv_data = self.static_prefix_kv.get(optimized)
             if kv_data is not None:
+                self._last_static_prefix_hit = True
                 if total_tokens <= proactive_threshold_tokens:
                     logger.info("[AgentOptimizer] Static prefix KV-cache hit, skipping optimization")
                     optimized = self._strip_internal_flags(optimized)
@@ -338,9 +382,13 @@ class AgentContextOptimizer:
         total_chars = sum(len(m.get("content", "")) for m in optimized)
         optimized = self._inject_quality_anchor(optimized, proactive_threshold_tokens)
 
-        # Step 5.2: Build KV slot map for cache control
-        slot_tracker = get_kv_slot_tracker()
-        slot_tracker.build_slot_map(optimized)
+        # Step 5.2: Build KV slot map for cache control. This output is only
+        # useful when the backend actually receives cache-control hints, so skip
+        # the work unless experimental backend hints are enabled (the hints are
+        # otherwise stripped before the request is sent).
+        if self._config.v050.enable_experimental_backend_hints:
+            slot_tracker = get_kv_slot_tracker()
+            slot_tracker.build_slot_map(optimized)
 
         # Step 5.5: Apply context canonicalization only when context pressure
         # justifies normalization. Lean contexts preserve exact user/system text.
@@ -367,7 +415,12 @@ class AgentContextOptimizer:
                 self._config.agentic.code_skeleton_enabled
                 or current_tokens > compaction_threshold_tokens
             ):
-                optimized = self.context_compressor.compress(optimized)
+                if self.async_io is not None:
+                    optimized = self.async_io.run_sync_stage(
+                        self.context_compressor.compress, optimized, stage_name="compress"
+                    )
+                else:
+                    optimized = self.context_compressor.compress(optimized)
             else:
                 logger.debug(
                     "[AgentOptimizer] Context compression skipped: tokens=%d <= threshold=%d",
@@ -377,9 +430,13 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Context compression failed: %s", e)
 
-        # Step 5.9: Warm expert cache only for contexts under enough pressure to
-        # benefit from cache-local static patterns.
-        if total_chars > 1000 and total_tokens > proactive_threshold_tokens:
+        # Step 5.9: Warm expert cache only when the backend will receive the
+        # hints. Otherwise the warmed cache is discarded and the work is wasted.
+        if (
+            self._config.v050.enable_experimental_backend_hints
+            and total_chars > 1000
+            and total_tokens > proactive_threshold_tokens
+        ):
             try:
                 static_content = self._get_static_layer_content(optimized)
                 if static_content:
@@ -401,10 +458,6 @@ class AgentContextOptimizer:
             current_tokens = self.token_counter.count_messages(optimized)
             if current_tokens > proactive_threshold_tokens:
                 optimized, self._task_type = classify_and_template(optimized)
-                if self.template_selector is not None:
-                    selected_template = self.template_selector.select_template(optimized)
-                    if selected_template:
-                        self._task_type = selected_template
             else:
                 logger.debug(
                     "[AgentOptimizer] Prompt template specialization skipped: tokens=%d <= threshold=%d",
@@ -542,9 +595,28 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Post-RAG recount failed: %s", e)
 
-        # Step 8.5: Hierarchical summarization is disabled for cache-stable mode.
-        # Summary messages inserted in the middle of history change the prompt
-        # prefix and violate top-only eviction.
+        # Step 8.5: Cache-stable tiered rolling-summary compaction (review §1/§3/§5, #7).
+        # When enabled, older dynamic turns are folded into a single append-only
+        # rolling summary block placed right after the frozen prefix (never in the
+        # middle of history). The block retains constraints / the task's "don'ts"
+        # so the model does not re-derive them verbosely (the 2.17x verbosity
+        # regression). The block is protected from later front-eviction by
+        # _partition_for_budget / _sliding_window_trim via its _summary_id marker,
+        # so the leading prefix stays byte-stable and the backend reuses its cache.
+        if (
+            self.hierarchical_summarizer is not None
+            and self._config.v050.cache_stable_mode
+            and self.token_counter.count_messages(optimized) > proactive_threshold_tokens
+        ):
+            try:
+                frozen_end = self.context_aligner.frozen_prefix_end(
+                    optimized, self._config.v050.frozen_prefix_turns
+                )
+                optimized = self.hierarchical_summarizer.summarize_turns_cache_stable(
+                    optimized, frozen_end
+                )
+            except Exception as e:
+                logger.warning("Rolling summary compaction failed: %s", e)
 
         # Step 8: Apply static layer block alignment only when explicitly
         # enabled. Padding adds tokens and can change prompt semantics.
@@ -617,20 +689,23 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Tool output streaming failed: %s", e)
 
-        # Recalculate total_tokens after entropy trim
+        # Recalculate total_tokens after entropy trim (calibrated to the backend
+        # tokenizer so the budget is enforced against true token counts, #6).
         try:
-            total_tokens = self.token_counter.count_messages(optimized)
+            total_tokens = self.calibrated_token_count(optimized)
         except Exception as e:
             logger.warning("Token recount failed: %s", e)
 
-        # Step 11.7: Save MTP state before trimming for context switching
-        # This preserves prediction quality across evictions
-        try:
-            state_key = self.mtp_state_manager.get_state_key(optimized)
-            # Store the state key in the optimizer for potential restoration
-            self._last_mtp_state_key = state_key
-        except Exception as e:
-            logger.warning("MTP state key generation failed: %s", e)
+        # Step 11.7: Save MTP state before trimming for context switching.
+        # This is only meaningful when the backend receives MTP hints, so skip
+        # the bookkeeping otherwise (the result is never sent to the model).
+        if self._config.v050.enable_experimental_backend_hints:
+            try:
+                state_key = self.mtp_state_manager.get_state_key(optimized)
+                # Store the state key in the optimizer for potential restoration
+                self._last_mtp_state_key = state_key
+            except Exception as e:
+                logger.warning("MTP state key generation failed: %s", e)
 
         # Step 11.8: Apply sliding window for long contexts
         # This is the preferred method for context management with MTP state preservation
@@ -648,12 +723,12 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("MTP boundary alignment failed: %s", e)
 
-        # Step 12: Enforce hard token cap
+        # Step 12: Enforce hard token cap (calibrated token counts, #6)
         try:
-            total_tokens = self.token_counter.count_messages(optimized)
+            total_tokens = self.calibrated_token_count(optimized)
             if total_tokens > max_tokens:
                 optimized = self._trim_to_budget(optimized, use_tokens=True)
-                total_tokens = self.token_counter.count_messages(optimized)
+                total_tokens = self.calibrated_token_count(optimized)
                 if total_tokens > max_tokens and self.token_aware_truncator is not None:
                     optimized = self.token_aware_truncator.trim_messages_to_budget(
                         optimized,
@@ -675,24 +750,30 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Cache registry registration failed: %s", e)
 
-        # Step 14.6: Store static prefix KV-cache for reuse
+        # Step 14.6: Store static prefix KV-cache for reuse.
+        # Store the *stable* prefix content (not a timestamped blob) so that
+        # repeated turns with the same system+first-user prefix produce identical
+        # bytes. The put() change-detection then skips the per-turn disk write,
+        # which is the whole point of the _last_context_changed optimization.
         if self.static_prefix_kv is not None:
             try:
-                import json
-                kv_data = json.dumps({
-                    "messages": optimized[: min(3, len(optimized))],
-                    "timestamp": time.time(),
-                }).encode()
-                self.static_prefix_kv.put(optimized, kv_data)
+                prefix = self.static_prefix_kv.get_static_prefix(optimized)
+                if prefix:
+                    self.static_prefix_kv.put(optimized, prefix.encode("utf-8"))
             except Exception as e:
                 logger.warning("Static prefix KV-cache storage failed: %s", e)
 
-        # Step 14.7: Record hit prediction outcome
+        # Step 14.7: Record the real cache outcome for hit-prediction learning.
+        # The authoritative signal (backend cached_tokens) is reported by the app
+        # layer via record_cache_outcome(); if it has not arrived yet we fall back
+        # to whether our own static-prefix KV cache was reused this turn. The old
+        # constant hit=True label is gone because it trained the model on noise.
+        self._last_optimized = optimized
         if self.hit_prediction is not None:
             try:
                 self.hit_prediction.record_outcome(
                     optimized,
-                    hit=True,  # We got here, so request succeeded
+                    hit=self._last_static_prefix_hit,
                 )
             except Exception as e:
                 logger.warning("Hit prediction recording failed: %s", e)
@@ -734,22 +815,6 @@ class AgentContextOptimizer:
         duration = time.time() - start_time
         saved_tokens = max(0, original_tokens - optimized_tokens)
 
-        if self.template_selector is not None:
-            try:
-                token_savings = saved_tokens / max(original_tokens, 1)
-                semantic_similarity = (
-                    1.0
-                    if optimized_tokens <= original_tokens
-                    else original_tokens / max(optimized_tokens, 1)
-                )
-                self.template_selector.record_quality(
-                    self._task_type,
-                    max(0.0, min(1.0, semantic_similarity)),
-                    max(0.0, min(1.0, token_savings)),
-                )
-            except Exception as e:
-                logger.warning("Template quality recording failed: %s", e)
-
         logger.info(
             "[AgentOptimizer] %d -> %d chars (%d -> %d tokens, %d saved, %.3fs, %d -> %d msgs, progress: %.0f%%, loops: %d detected)",
             original_chars,
@@ -763,6 +828,26 @@ class AgentContextOptimizer:
             progress.estimated_completion * 100,
             len(loop_warnings),
         )
+
+        # Step 14.11: Freeze the stable prefix verbatim so the backend's automatic
+        # prefix cache can reuse it across turns. This is the core KV-cache
+        # preservation guarantee (review §1/§3/§7). When cache-stable mode is on,
+        # the frozen block is system + first user + the next `frozen_prefix_turns`
+        # turns (all taken verbatim from the incoming `messages`, which the client
+        # sends identically every turn). The incoming `messages` are the source of
+        # truth for the immutable prefix.
+        if self._config.agentic.immutable_prefix_enabled:
+            try:
+                frozen_turns = (
+                    self._config.v050.frozen_prefix_turns
+                    if self._config.v050.cache_stable_mode
+                    else 0
+                )
+                optimized = self.context_aligner.freeze_static_prefix(
+                    messages, optimized, frozen_prefix_turns=frozen_turns
+                )
+            except Exception as e:
+                logger.warning("Static prefix freeze failed: %s", e)
 
         return optimized
 
@@ -1033,7 +1118,15 @@ class AgentContextOptimizer:
         return text
 
     def _sync_embed_and_rank(self, base_text: str, chunks: list[str]) -> list[str]:
-        """Synchronous embedding and ranking."""
+        """Synchronous embedding and ranking (optionally offloaded to a thread pool)."""
+        if self.async_io is not None:
+            return self.async_io.run_sync_stage(
+                self._embed_and_rank_impl, base_text, chunks, stage_name="embed_rank"
+            )
+        return self._embed_and_rank_impl(base_text, chunks)
+
+    def _embed_and_rank_impl(self, base_text: str, chunks: list[str]) -> list[str]:
+        """Core embedding + cosine ranking, run on the request or worker thread."""
         query_vec = self.embedding_service._sync_get_embedding(base_text)
         vecs = self.embedding_service.embed_batch_sync(chunks)
         return self._rank_chunks(query_vec, vecs, chunks)
@@ -1100,8 +1193,8 @@ class AgentContextOptimizer:
 
         # Reserve space for non-evictable zones; remaining budget is what's available
         if use_tokens:
-            reserved = (self.token_counter.count_messages(system_anchor)
-                        + self.token_counter.count_messages(protected_tail))
+            reserved = (self.calibrated_token_count(system_anchor)
+                        + self.calibrated_token_count(protected_tail))
             evictable_budget = max(0, max_tokens - reserved)
         else:
             reserved = (sum(len(m.get("content", "")) for m in system_anchor)
@@ -1133,6 +1226,24 @@ class AgentContextOptimizer:
         if i < len(messages) and messages[i].get("role") == "user":
             system_anchor.append(messages[i])
             i += 1
+
+        # Cache-stable mode (review §1/§3/§7): also freeze the early complete
+        # turns as part of the immutable anchor so front-eviction never shifts
+        # the stable prefix. The frozen block is system + first user + the next
+        # `frozen_prefix_turns` turns; eviction below only touches what follows.
+        if self._config.v050.cache_stable_mode:
+            frozen_end = self.context_aligner.frozen_prefix_end(
+                messages, self._config.v050.frozen_prefix_turns
+            )
+            if frozen_end > i:
+                system_anchor.extend(messages[i:frozen_end])
+                i = frozen_end
+            # Keep a rolling summary block (placed right after the frozen prefix)
+            # in the immutable anchor so front-eviction never drops or moves it
+            # (review §1/§3/§5, #7). Its _summary_id marker identifies it.
+            while i < len(messages) and messages[i].get("_summary_id"):
+                system_anchor.append(messages[i])
+                i += 1
 
         # Group remaining messages into turns.
         # Each turn starts with a user message and includes following assistant/tool messages.
@@ -1323,6 +1434,28 @@ class AgentContextOptimizer:
         self._last_backend_extra_body = extra_body
         return extra_body
 
+    def record_cache_outcome(self, cached_tokens: int | None = None) -> None:
+        """Record the real backend prefix-cache outcome for hit-prediction learning.
+
+        Called by the app layer after the backend responds. Prefers the
+        authoritative backend signal (``cached_tokens`` from
+        ``usage.prompt_tokens_details``); when that is unavailable (e.g. the
+        backend does not report it, or streaming without usage) it falls back to
+        whether the proxy's own static-prefix KV cache was reused this turn, which
+        is a genuine local signal. This replaces the previous constant ``hit=True``
+        label that trained the model on noise.
+        """
+        if self.hit_prediction is None:
+            return
+        if cached_tokens is not None:
+            hit = cached_tokens > 0
+        else:
+            hit = self._last_static_prefix_hit
+        try:
+            self.hit_prediction.record_outcome(self._last_optimized, hit=hit)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("Hit prediction outcome recording failed: %s", e)
+
     def _find_static_layer_end(self, messages: list[dict[str, Any]]) -> int:
         """Find the end index of the static layer (system + first user)."""
         static_end = 0
@@ -1355,8 +1488,9 @@ class AgentContextOptimizer:
         for file_path in file_refs:
             # Get dependency context
             dep_context = self.state_rag.get_dependency_context(file_path)
-            if dep_context:
-                # Warm expert cache for dependency patterns
+            if dep_context and self._config.v050.enable_experimental_backend_hints:
+                # Warm expert cache for dependency patterns. Only when the
+                # backend receives hints; otherwise the warmed cache is discarded.
                 self.expert_cache.warm_cache_for_static_layer(dep_context)
 
     def _extract_file_references(
@@ -1490,6 +1624,21 @@ class AgentContextOptimizer:
             return messages
 
         static_end = self._find_static_layer_end(messages)
+        # Cache-stable mode (review §1/§3/§7): never evict from inside the frozen
+        # prefix block, so the stable prefix stays byte-identical across turns and
+        # the backend reuses its KV cache. Eviction below only touches the dynamic
+        # layer after the frozen block.
+        if self._config.v050.cache_stable_mode:
+            frozen_end = self.context_aligner.frozen_prefix_end(
+                messages, self._config.v050.frozen_prefix_turns
+            )
+            if frozen_end > static_end:
+                static_end = frozen_end
+        # Keep a rolling summary block (placed right after the frozen prefix) in
+        # the static region so sliding-window eviction never drops it
+        # (review §1/§3/§5, #7). Its _summary_id marker identifies it.
+        while static_end < len(messages) and messages[static_end].get("_summary_id"):
+            static_end += 1
         static_messages = messages[:static_end]
         dynamic_messages = messages[static_end:]
 

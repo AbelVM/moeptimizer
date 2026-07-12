@@ -21,6 +21,9 @@ class TestSlidingWindowContext:
         """Large context drops whole old turns while preserving active request."""
         config = AppConfig()
         config.agentic.max_optimized_chars = 10000
+        # Disable cache-stable mode so this test exercises pure sliding-window
+        # eviction (the frozen early turns would otherwise be immutable).
+        config.v050.cache_stable_mode = False
         optimizer = AgentContextOptimizer(config)
         # Create enough old dynamic turns that only complete turns can be evicted.
         large_content = "x" * 800
@@ -66,6 +69,9 @@ class TestSlidingWindowContext:
         """Sliding window keeps the newest dynamic suffix in chronological order."""
         config = AppConfig()
         optimizer = AgentContextOptimizer(config)
+        # Disable cache-stable mode: this test checks pure suffix-ordering of the
+        # dynamic layer, not the frozen early-turn prefix.
+        config.v050.cache_stable_mode = False
         messages = [
             {"role": "system", "content": "System"},
             {"role": "user", "content": "First"},

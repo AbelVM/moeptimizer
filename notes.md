@@ -49,11 +49,11 @@
 - Step 14.5: Cache registry persistence
 
 ### Test Results
-- 197 tests pass, 2 skipped
+- 357 tests pass, 3 skipped
 - Token savings: 8-27% reduction (code-heavy scenarios)
 - No integrity issues (no leaked markers)
 - Response quality: semantic similarity 0.92-0.98
-- **Latency: -1.9% mean, -4.6% median** (proxy is faster!)
+- **Latency: +68% mean on the 30-turn `refactor_long` benchmark (44,839ms vs 26,559ms)** — the proxy trades latency for token reduction; it is NOT a free win (see review02.md §11). Earlier "-1.9% mean" claim was measured on short 6-turn scenarios and does not hold at production turn counts.
 - **Code block ratio: 1.0** (all code blocks preserved)
 - **Temperature: 0.5-0.7** for coding tasks (per Qwen3.6-35B-A3B-MTP recommendations)
 - **E2E tests: 23 passed** (live tests with real Lemonade server)
@@ -111,7 +111,7 @@ The proxy was crashing on turns 8+ due to two issues:
 - 15-turn benchmark: All turns successful
 - 20-turn benchmark: All turns successful, no crashes
 - Manual test: 12 consecutive turns with session, all successful
-- 329 tests pass, 3 skipped
+- 357 tests pass, 3 skipped
 
 ### Results After Fix
 - Proxy no longer crashes on long contexts
@@ -217,3 +217,144 @@ The proxy was crashing on turns 8+ due to two issues:
 - Later turns take longer due to KV-cache prefill
 - **Tool timeout (600s) is a system constraint** - cannot be removed
 - For longer benchmarks, use `--turns 10` or run multiple rounds separately
+
+## v0.5.2 — Priority Fixes (2026-07-12)
+
+Implements the highest-ROI items from the senior-architect review (`review01.md`).
+Full test suite after changes: **357 passed, 3 skipped**.
+
+### Changes
+1. **Real prefix-cache accounting (review §7, §11).**
+   - `app.py` now reads `usage.prompt_tokens_details.cached_tokens` from the backend in both streaming and non-streaming paths.
+   - Calls `optimizer.record_cache_outcome(cached_tokens)` so the hit-prediction model trains on the real reuse signal instead of the old constant `hit=True` label.
+   - Emits the `X-Prefix-Cache-Hit-Tokens` response header (both paths).
+
+2. **MoE/MTP overhead gated (review §2, §8).**
+   - `expert_cache.warm_cache_for_static_layer`, `kv_slot_tracker.build_slot_map`, and `mtp_state_manager.get_state_key` now run only when `MOEPT_V050__ENABLE_EXPERIMENTAL_BACKEND_HINTS=true` (default `false`). By default these hints are stripped before send, so computing them was pure overhead.
+
+3. **Dead "learning" components disabled by default (review §2, §8).**
+   - `MOEPT_V050__TEMPLATE_SELECTOR_ENABLED`: `true` → `false`. Its result was never applied to output (re-classified by `classify_and_template`) and it recorded a fake token-ratio "similarity". Dead `select_template` call and `record_quality` block removed from the pipeline.
+   - `MOEPT_V050__ASYNC_IO_ENABLED`: `true` → `false`. The `async_io` stage was constructed but never invoked by the pipeline, so it only built an unused thread pool.
+
+4. **Per-turn disk writes reduced (review §10).**
+   - `StaticPrefixKVCache.put` now stores the stable prefix content (not a `time.time()`-stamped blob), so repeated identical prefixes skip the pickle rewrite via the existing `_last_context_changed` gate. Previously the timestamp made every turn differ → always wrote.
+
+### Config defaults changed
+- `MOEPT_V050__TEMPLATE_SELECTOR_ENABLED`: `true` → `false`
+- `MOEPT_V050__ASYNC_IO_ENABLED`: `true` → `false`
+- `MOEPT_V050__ENABLE_EXPERIMENTAL_BACKEND_HINTS`: remains `false`
+
+### Remaining work (not started)
+- Immutable-prefix `CacheAligner` + tail-only mutation so the backend's own prefix cache achieves real reuse (core cache-preservation miss; the 30-turn benchmark showed ~0% real reuse).
+- Wire `async_io` for real (offload tree-sitter compression + embedding to the thread pool / batch embeddings) — primary TTFT cost.
+- Bound `AgentStateStore` growth; verify `cache_registry` on-disk size is bounded over long sessions.
+- Honest latency trade-off in docs: proxy is ~68% slower on the 30-turn `refactor_long` benchmark (44,839ms vs 26,559ms) despite 84.8% token savings.
+
+## v0.5.3 — Remaining Work Completed (2026-07-12)
+
+Implements the four "Remaining work" items from v0.5.2. Full test suite after
+changes: **357 passed, 3 skipped**.
+
+### Changes
+1. **Immutable-prefix freeze (review §1, §3, §7).**
+   - `ContextAligner.freeze_static_prefix` now freezes **only the system prompt** verbatim at the end of the pipeline (`optimizer.py` Step 14.11). The first user message is *not* frozen: it is deterministically compressed by the pipeline and stays stable across turns on its own, so freezing it verbatim would undo the compression (this was the cause of the `test_large_code_blocks_are_skeletonized_after_proactive_threshold` failure in v0.5.2).
+   - New `ContextAligner._find_system_end` returns the index past the leading run of system messages.
+   - `MOEPT_AGENTIC__IMMUTABLE_PREFIX_ENABLED` (default `true`) gates the freeze.
+
+2. **`async_io` wired for real (review §2, §8).**
+   - `optimizer.py` now offloads the tree-sitter compression stage to the thread pool via `async_io.run_sync_stage(self.context_compressor.compress, ...)` (Step 5.7), and offloads embedding ranking via `async_io.run_sync_stage(self._embed_and_rank_impl, ...)` (refactored `_sync_embed_and_rank`).
+   - `MOEPT_V050__ASYNC_IO_ENABLED` reverted `false` → `true` (it is now actually used).
+
+3. **`AgentStateStore` growth bounded (review §10).**
+   - `state_store.py` added `_prune_if_needed` (drops oldest archived steps beyond `MOEPT_AGENTIC__MAX_STATE_STEPS`, default 200) and `_rebuild_indices`, called from `add_step`.
+
+4. **Honest latency trade-off documented (review §11).**
+   - README "Priority Fixes (v0.5.2)" section now states the measured cost: on the 30-turn `refactor_long` benchmark the proxy is ~68% slower (44,839ms vs 26,559ms) despite 84.8% token savings (0.7589 similarity, Grade C). The proxy trades latency for token reduction; it is not a free win.
+
+### Config defaults changed
+- `MOEPT_V050__ASYNC_IO_ENABLED`: `false` → `true` (now used)
+- `MOEPT_AGENTIC__IMMUTABLE_PREFIX_ENABLED`: new, default `true`
+- `MOEPT_AGENTIC__MAX_STATE_STEPS`: new, default `200`
+
+## v0.5.4 — Frozen-prefix truncation + token calibration + MTP autodetect + rolling-summary compaction (2026-07-12)
+
+Implements review02.md Priority #4 (immutable frozen prefix in the truncator),
+Priority #6 (accurate token counting), Priority #2 (native MTP autodetect), and
+Priority #7 (cache-stable rolling-summary compaction). Full test suite after all
+changes: **305 passed, 2 skipped**.
+
+### Changes
+1. **Truncator respects the frozen prefix (review02 §4).**
+    - `TokenAwareTruncator._partition_for_budget` now appends the frozen early
+      turns (system anchor + first user + `frozen_prefix_turns` complete turns,
+      via `context_aligner.frozen_prefix_end`) to the protected block so the
+      budget partition never drops or reorders them.
+    - `TokenAwareTruncator._drop_whole_messages_from_front` now computes
+      `frozen_end` and never drops messages below it; the dynamic middle starts
+      at `frozen_end` and the result always begins with the frozen messages.
+    - `optimizer.py` wires `TokenAwareTruncator(...)` with `cache_stable_mode`,
+      `frozen_prefix_turns`, and `context_aligner` (line ~175).
+    - Verified by `tests/test_optimizer.py::test_cache_stable_mode_freezes_early_turns`
+      (asserts `frozen_prefix_end(messages, 2) == 7`).
+
+2. **Token-count calibration against the backend (review02 §6).**
+    - `TokenAwareTruncator` gains a `token_calibration` factor (clamped to
+      [0.5, 2.0]) applied in `count_messages_tokens`, so the budget is enforced
+      on true token counts rather than the tiktoken `cl100k_base` estimate that
+      diverges from the Qwen backend tokenizer on code-heavy prompts.
+    - `optimizer.py` adds `_token_calibration`, `set_token_calibration(ratio)`,
+      and `calibrated_token_count(messages)`; budget checks use the calibrated
+      count.
+    - `app.py` captures the backend's real `usage.prompt_tokens` for the optimized
+      prompt in **both** streaming and non-streaming paths and calls
+      `optimizer.set_token_calibration(backend_prompt_tokens / proxy_estimated)`
+      to learn the ratio each turn.
+
+3. **Native MTP speculative decoding autodetect (review02 §1/#2).**
+    - `LemonadeClient.detect_mtp_support()` probes the backend: it fetches a model
+      id from `/v1/models`, then sends a minimal chat completion carrying a
+      `speculative_decoding` extra_body key and observes whether the backend
+      accepts it. Returns `True` only on a successful response; any connection
+      error, timeout, or `APIStatusError` (400/422 rejection, 404, 5xx) is treated
+      as "unsupported". The probe is bounded by a 5s `asyncio.wait_for` timeout so
+      startup is never blocked.
+    - `create_app` now auto-enables `native_mtp_passthrough` in the lifespan when
+      `MOEPT_V050__NATIVE_MTP_AUTODETECT` is `true` (default) **and**
+      `native_mtp_passthrough` is not explicitly set. When enabled, MTP/speculative
+      extra_body keys are forwarded to the backend instead of stripped, so a backend
+      that supports native MTP speculative decoding (e.g. llama.cpp `--speculative`)
+      uses the model's own 2–3× decode-speed feature.
+    - New config flag `MOEPT_V050__NATIVE_MTP_AUTODETECT` (default `true`).
+
+4. **Cache-stable rolling-summary compaction (review02 §1/§3/§5, #7).**
+    - `HierarchicalSummarizer.summarize_turns_cache_stable(messages, frozen_prefix_end)`
+      folds older dynamic turns into a single **append-only** rolling summary block
+      placed immediately after the frozen prefix (never mid-history), so the leading
+      prefix stays byte-stable and the backend reuses its prefix cache. The block
+      retains the task's "don't"/"must not"/"avoid" constraints and key decisions
+      (`_CONSTRAINT_HINTS` + `_extract_constraints`), which is what stops the 2.17×
+      verbosity regression — when the proxy drops those constraints the model
+      re-derives them verbosely.
+    - The block is protected from later front-eviction in `_partition_for_budget` /
+      `_sliding_window_trim` via its `_summary_id` marker, so it lives in the
+      immutable/static region alongside the frozen prefix.
+    - `optimizer.py` Step 8.5 calls `summarize_turns_cache_stable` when
+      `cache_stable_mode` is on and the token count exceeds the proactive threshold.
+    - Verified by `tests/test_hierarchical_summarizer.py` (short / long-places-block-
+      after-frozen / retains-constraints / append-only) and
+      `tests/test_v050_integration.py::test_rolling_summary_in_pipeline_cache_stable`.
+
+### Remaining review02 priorities
+- #2 native MTP speculative decoding — **DONE (v0.5.4).** Backend capability
+  detection + wiring via `native_mtp_passthrough` (see change #3 above).
+- #7 verbosity / compaction tuning (responses were 2.17x longer than baseline) —
+  **DONE (v0.5.4).** Cache-stable tiered rolling-summary compaction (see change #4
+  above).
+- #8 delete dead components — **DONE (v0.5.4).** Removed
+  `parallel_embedding_lookup`, `embedding_cache_invalidation`, `mtp_head_checkpoint`,
+  `kv_cache_warmup`, `segment_wise_speculative`, `template_selector` (source +
+  dedicated tests), their `config.py` flags, `optimizer.py` imports/instantiation,
+  and `__init__.py` exports. `hierarchical_summarizer`, `delta_encoder`, and
+  `static_prefix_kv` are **kept** (used). Full suite green: **305 passed, 2 skipped**
+  (drop from 357 = deleted dead-component tests).
+- #11 stale `notes.md` latency claim fixed above.

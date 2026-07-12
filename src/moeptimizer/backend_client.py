@@ -12,10 +12,12 @@ Enhanced with:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
+import openai
 from openai import AsyncOpenAI
 
 from moeptimizer.mtp_speculative import (
@@ -31,20 +33,27 @@ _UNSUPPORTED_EXTRA_BODY_KEYS = {
     "mtp_heads",
     "head_temperatures",
     "expert_hints",
-    "kv_cache_warmup",
     "cache_control_hints",
 }
 
 
-def _strip_unsupported_extra_body(params: dict[str, Any]) -> dict[str, Any]:
+def _strip_unsupported_extra_body(
+    params: dict[str, Any],
+    passthrough_mtp: bool = False,
+) -> dict[str, Any]:
     """Remove proxy-internal fields that are not part of standard OpenAI API."""
     extra_body = params.get("extra_body")
     if isinstance(extra_body, dict):
-        params["extra_body"] = {
-            key: value
-            for key, value in extra_body.items()
-            if key not in _UNSUPPORTED_EXTRA_BODY_KEYS
-        }
+        if passthrough_mtp:
+            # Keep MTP/speculative keys so a backend that supports native MTP
+            # speculative decoding (e.g. llama.cpp --speculative) receives them.
+            params["extra_body"] = extra_body
+        else:
+            params["extra_body"] = {
+                key: value
+                for key, value in extra_body.items()
+                if key not in _UNSUPPORTED_EXTRA_BODY_KEYS
+            }
     return params
 
 
@@ -157,13 +166,21 @@ class SpeculativeDecoder:
 class LemonadeClient:
     """Async client for the Lemonade NPU server using OpenAI SDK."""
 
-    def __init__(self, base_url: str, api_key: str = "lemonade", timeout: float = 300.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "lemonade",
+        timeout: float = 300.0,
+        native_mtp_passthrough: bool = False,
+    ) -> None:
         """Initialize the client.
 
         Args:
             base_url: Base URL of the Lemonade server (e.g., http://localhost:13305/api/v1)
             api_key: API key for authentication (Lemonade uses "lemonade" as default)
             timeout: Request timeout in seconds (default 300s for long contexts)
+            native_mtp_passthrough: When True, MTP/speculative extra_body keys are
+                forwarded to the backend instead of stripped (review §1/§2).
         """
         self._client = AsyncOpenAI(
             base_url=base_url,
@@ -172,6 +189,7 @@ class LemonadeClient:
             timeout=timeout,
         )
         self._speculative_decoder: SpeculativeDecoder | None = None
+        self._native_mtp_passthrough = native_mtp_passthrough
 
     def enable_speculative_decoding(
         self,
@@ -186,6 +204,78 @@ class LemonadeClient:
             mtp_lookahead=mtp_lookahead,
             confidence_threshold=confidence_threshold,
         )
+
+    def enable_native_mtp_passthrough(self) -> None:
+        """Forward MTP/speculative extra_body keys to the backend.
+
+        Used after a successful capability probe (see `detect_mtp_support`) so a
+        backend that supports native MTP speculative decoding (e.g. llama.cpp
+        --speculative) receives the client's speculative fields instead of having
+        them stripped. Idempotent.
+        """
+        self._native_mtp_passthrough = True
+
+    @property
+    def native_mtp_passthrough(self) -> bool:
+        """Whether MTP/speculative extra_body keys are forwarded to the backend."""
+        return self._native_mtp_passthrough
+
+    async def detect_mtp_support(self, model: str | None = None) -> bool:
+        """Best-effort probe for native MTP speculative decoding support.
+
+        Sends a minimal chat completion carrying an MTP/speculative extra_body
+        key and observes whether the backend accepts it. Returns ``True`` when the
+        backend appears to support native MTP speculative decoding, ``False``
+        otherwise.
+
+        Any connection error, timeout, or rejection is treated as "unsupported"
+        so startup is never blocked and non-MTP backends are left untouched. The
+        probe is bounded by a short timeout to avoid stalling application startup
+        when the backend is unreachable.
+        """
+        probe_timeout = 5.0
+
+        if model is None:
+            try:
+                models = await asyncio.wait_for(
+                    self._client.models.list(), timeout=probe_timeout
+                )
+                if not getattr(models, "data", None):
+                    return False
+                model = models.data[0].id
+            except Exception as exc:  # noqa: BLE001 - best-effort
+                logger.debug("MTP probe: model list unavailable (%s)", exc)
+                return False
+
+        probe_body = {"speculative_decoding": {"type": "MTP", "n_predict": 1}}
+        params: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "stream": False,
+            "extra_body": probe_body,
+        }
+
+        try:
+            await asyncio.wait_for(
+                self._client.chat.completions.create(
+                    **_strip_custom_session_fields(
+                        _strip_unsupported_extra_body(params, passthrough_mtp=True)
+                    )
+                ),
+                timeout=probe_timeout,
+            )
+            return True
+        except openai.APIStatusError as exc:
+            # 400/422 => backend rejected the speculative field => unsupported.
+            # Other status codes (404 model missing, 5xx) are inconclusive.
+            logger.debug(
+                "MTP probe rejected by backend (status=%s)", exc.status_code
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            logger.debug("MTP probe failed (assuming unsupported): %s", exc)
+            return False
 
     async def chat_completions_create(
         self,
@@ -276,7 +366,9 @@ class LemonadeClient:
     ) -> Any:
         """Send a chat completion request without re-entering speculative decoding."""
         response = await self._client.chat.completions.create(
-            **_strip_custom_session_fields(_strip_unsupported_extra_body(params)),
+            **_strip_custom_session_fields(
+                _strip_unsupported_extra_body(params, self._native_mtp_passthrough)
+            ),
         )
 
         # Log response summary

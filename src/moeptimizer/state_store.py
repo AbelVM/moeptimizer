@@ -51,7 +51,42 @@ class AgentStateStore:
         if subtask:
             self.subtask_index[subtask].append(step.step_id)
 
+        self._prune_if_needed()
         return step.step_id
+
+    def _prune_if_needed(self) -> None:
+        """Bound memory by dropping the oldest archived steps beyond ``max_state_steps``.
+
+        The store appends a step per ingested message and never otherwise prunes,
+        so a long agentic session would grow without bound (review §10). When the
+        step count exceeds the configured cap we drop the oldest steps from the
+        front (never the recent/protected tail) and rebuild the derived indices.
+        """
+        max_steps = self._config.max_state_steps
+        if max_steps <= 0 or len(self.steps) <= max_steps:
+            return
+        excess = len(self.steps) - max_steps
+        del self.steps[:excess]
+        self._rebuild_indices()
+
+    def _rebuild_indices(self) -> None:
+        """Recompute all derived indices after steps are pruned/shifted."""
+        self._step_index.clear()
+        self._step_hashes.clear()
+        self._step_hash_set.clear()
+        self.tool_index.clear()
+        self.subtask_index.clear()
+        for idx, step in enumerate(self.steps):
+            step.step_index = idx
+            self._step_index[step.step_id] = idx
+            fp = self.step_fingerprint(step)
+            self._step_hashes[idx] = fp
+            self._step_hash_set.add(fp)
+            if step.tool_name:
+                self.tool_index[step.tool_name].append(step.step_id)
+            subtask = step.metadata.get("subtask") or self._infer_subtask(step)
+            if subtask:
+                self.subtask_index[subtask].append(step.step_id)
 
     @staticmethod
     def step_fingerprint(step: AgentStep) -> str:

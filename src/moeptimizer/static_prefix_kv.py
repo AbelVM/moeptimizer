@@ -73,12 +73,23 @@ class StaticPrefixKVCache:
         return None
 
     def put(self, messages: list[dict[str, Any]], kv_data: bytes) -> str:
-        """Store KV-cache data for the static prefix."""
+        """Store KV-cache data for the static prefix.
+
+        Only marks the cache as changed (triggering a disk write) when the key is
+        new or the stored data actually differs, so repeated puts of an identical
+        stable prefix do not rewrite the pickle every turn.
+        """
         prefix = self.get_static_prefix(messages)
         if not prefix:
             return ""
 
         key = self.get_cache_key(prefix)
+        existing = self._cache.get(key)
+        if existing is not None and existing == kv_data:
+            # Identical prefix already cached: no change, skip the disk write.
+            self._cache.move_to_end(key)
+            return key
+
         self._cache[key] = kv_data
         self._cache.move_to_end(key)
         self._last_context_changed = True

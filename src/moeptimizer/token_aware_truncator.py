@@ -11,6 +11,8 @@ from typing import Any
 
 import tiktoken
 
+from moeptimizer.context_aligner import ContextAligner, get_context_aligner
+
 logger = logging.getLogger(__name__)
 
 
@@ -23,7 +25,14 @@ class TokenAwareTruncator:
     integrity and avoiding partial-token artifacts.
     """
 
-    def __init__(self, model_name: str = "gpt-4") -> None:
+    def __init__(
+        self,
+        model_name: str = "gpt-4",
+        cache_stable_mode: bool = False,
+        frozen_prefix_turns: int = 0,
+        context_aligner: ContextAligner | None = None,
+        token_calibration: float = 1.0,
+    ) -> None:
         self._model_name = model_name
         self._encoder: tiktoken.Encoding | None = None
         try:
@@ -36,6 +45,19 @@ class TokenAwareTruncator:
                     "Failed to initialize tiktoken encoder. "
                     "Ensure tiktoken is installed: pip install tiktoken"
                 ) from e
+        # Cache-stable mode (review §1/§3/§7): freeze the early complete turns as
+        # part of the immutable anchor so budget trimming never shifts the stable
+        # prefix the backend caches.
+        self._cache_stable_mode = cache_stable_mode
+        self._frozen_prefix_turns = frozen_prefix_turns
+        self._context_aligner = context_aligner or get_context_aligner()
+        # Token-count calibration (review §1/§9, priority fix #6). tiktoken's
+        # cl100k_base BPE diverges from the backend's real tokenizer (Qwen), so
+        # raw counts are wrong for code-heavy prompts. The proxy learns a ratio
+        # from the backend's actual `prompt_tokens` on the previous turn and scales
+        # its counts so the budget is enforced against the backend's true token
+        # count instead of an estimate.
+        self._token_calibration = max(0.5, min(2.0, float(token_calibration)))
 
     def truncate_to_token_limit(
         self,
@@ -100,13 +122,17 @@ class TokenAwareTruncator:
     def count_messages_tokens(self, messages: list[dict[str, Any]]) -> int:
         """Count total tokens across all messages.
 
+        The raw tiktoken count is scaled by ``_token_calibration`` so the budget
+        is enforced against the backend's true tokenizer (review §1/§9, #6).
+
         Args:
             messages: List of message dicts
 
         Returns:
-            Total token count
+            Calibrated total token count
         """
-        return sum(self.count_message_tokens(m) for m in messages)
+        raw = sum(self.count_message_tokens(m) for m in messages)
+        return int(round(raw * self._token_calibration))
 
     def trim_messages_to_budget(
         self,
@@ -178,6 +204,17 @@ class TokenAwareTruncator:
         if i < len(messages) and messages[i].get("role") == "user":
             system_anchor.append(messages[i])
             i += 1
+
+        # Cache-stable mode (review §1/§3/§7): also freeze the early complete
+        # turns as part of the immutable anchor so budget trimming never shifts
+        # the stable prefix. Mirrors optimizer._partition_for_budget.
+        if self._cache_stable_mode and self._frozen_prefix_turns > 0:
+            frozen_end = self._context_aligner.frozen_prefix_end(
+                messages, self._frozen_prefix_turns
+            )
+            if frozen_end > i:
+                system_anchor.extend(dict(m) for m in messages[i:frozen_end])
+                i = frozen_end
 
         # Group remaining into user-assistant pairs
         turns: list[list[dict[str, Any]]] = []
@@ -266,15 +303,17 @@ class TokenAwareTruncator:
         if not messages:
             return messages
 
-        system_anchor: list[dict[str, Any]] = []
-        start = 0
-        if messages[0].get("role") == "system":
-            system_anchor.append(messages[0])
-            start = 1
+        # Cache-stable mode (review §1/§3/§7): the frozen early-turn prefix is
+        # immutable, so it is always kept even in the last-resort fallback.
+        frozen_end = 0
+        if self._cache_stable_mode and self._frozen_prefix_turns > 0:
+            frozen_end = self._context_aligner.frozen_prefix_end(
+                messages, self._frozen_prefix_turns
+            )
 
         # Preserve the last user turn as the active request whenever possible.
         last_user_idx = -1
-        for idx in range(len(messages) - 1, start - 1, -1):
+        for idx in range(len(messages) - 1, -1, -1):
             if messages[idx].get("role") == "user":
                 last_user_idx = idx
                 break
@@ -282,11 +321,11 @@ class TokenAwareTruncator:
         protected_tail: list[dict[str, Any]] = []
         if last_user_idx >= 0:
             protected_tail = [dict(msg) for msg in messages[last_user_idx:]]
-            dynamic_middle = messages[start:last_user_idx]
+            dynamic_middle = messages[frozen_end:last_user_idx]
         else:
-            dynamic_middle = messages[start:]
+            dynamic_middle = messages[frozen_end:]
 
-        result = list(system_anchor)
+        result = [dict(msg) for msg in messages[:frozen_end]]
         for msg in dynamic_middle:
             if self.count_messages_tokens(result + [msg] + protected_tail) <= max_tokens:
                 result.append(dict(msg))

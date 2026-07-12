@@ -124,6 +124,19 @@ class AgenticConfig(BaseModel):
         default=False,
         description="Pad the final context to an MTP prediction boundary. Disabled by default to avoid extra tokens.",
     )
+    immutable_prefix_enabled: bool = Field(
+        default=True,
+        description="Freeze the system prompt verbatim across turns so the backend's automatic "
+                    "prefix cache can reuse it. The first user message is NOT frozen: it is "
+                    "deterministically compressed and stays stable on its own, so freezing it would "
+                    "undo compression. Volatile context (RAG, anchors, loop warnings) is only ever "
+                    "appended to the last user turn.",
+    )
+    max_state_steps: int = Field(
+        default=200,
+        description="Maximum steps retained in AgentStateStore per session. Oldest archived steps are "
+                    "pruned beyond this cap to bound memory growth over long agentic sessions.",
+    )
 
 
 class CodeChunkingConfig(BaseModel):
@@ -191,36 +204,19 @@ class V050Config(BaseModel):
         description="Max entries in chunk fingerprint cache",
     )
 
+    # Throttle cache_registry disk writes (review §10): the registry rewrites
+    # the whole pickle on save, so we only persist every N turns instead of
+    # every turn. The registry itself skips the write when nothing changed, but
+    # the exact-context key changes each turn, so throttling bounds disk I/O.
+    cache_registry_save_every: int = Field(
+        default=10,
+        description="Persist the cache registry to disk at most once every N turns (review §10).",
+    )
+
     # Embedding Cache Invalidation & Batching
     embedding_batch_size: int = Field(
         default=32,
         description="Batch size for embedding queries",
-    )
-    embedding_invalidation_enabled: bool = Field(
-        default=True,
-        description="Enable file mtime-based embedding invalidation",
-    )
-
-    # MTP-Head State Checkpointing
-    mtp_checkpoint_enabled: bool = Field(
-        default=True,
-        description="Enable MTP-head state checkpointing",
-    )
-    mtp_checkpoint_max_entries: int = Field(
-        default=256,
-        description="Max entries in MTP head checkpoint cache",
-    )
-
-    # Parallel Embedding Lookup
-    parallel_embed_workers: int = Field(
-        default=8,
-        description="Number of thread workers for parallel embedding",
-    )
-
-    # Segment-Wise Speculative Decoding
-    segment_speculative_enabled: bool = Field(
-        default=False,
-        description="Enable segment-wise speculative decoding",
     )
 
     # Lightweight Hit-Prediction Model
@@ -231,16 +227,6 @@ class V050Config(BaseModel):
     hit_prediction_retrain_threshold: int = Field(
         default=50,
         description="Number of new samples before retraining",
-    )
-
-    # Template Selector
-    template_selector_enabled: bool = Field(
-        default=True,
-        description="Enable template selector for cache optimization",
-    )
-    template_selector_exploration_rate: float = Field(
-        default=0.1,
-        description="Exploration rate for template selection",
     )
 
     # Hierarchical Summarization
@@ -263,25 +249,48 @@ class V050Config(BaseModel):
         description="Max code snapshots to keep",
     )
 
-    # KV-Cache Warm-Up for MTP Heads
-    kv_warmup_enabled: bool = Field(
-        default=True,
-        description="Enable KV-cache warm-up for MTP heads",
-    )
-    kv_warmup_max_entries: int = Field(
-        default=32,
-        description="Max warmup cache entries",
-    )
-
     enable_experimental_backend_hints: bool = Field(
         default=False,
         description="Send optional llama.cpp/MTP cache-control hints to the backend. Disabled by default because unsupported backends may ignore or hang on unknown extra_body fields.",
     )
 
+    # Session -> backend slot pinning (review §1, priority fix #1)
+    slot_pinning_enabled: bool = Field(
+        default=False,
+        description="Pin each session to a stable llama.cpp `id_slot` so the backend reuses the whole conversation prefix across turns. Disabled by default to stay OpenAI-transparent for non-llama.cpp backends. Requires the backend to support `id_slot` (llama.cpp/llama-server).",
+    )
+
+    # Cache-stable mode (review §1/§3/§7, priority fix #3): freeze a stable
+    # prefix block verbatim so the backend's automatic prefix cache reuses it
+    # across turns. The proxy's front-eviction (dropping old turns from the top)
+    # shifts the serialized prefix every turn, which is why measured prefix-cache
+    # reuse was ~0% even though the backend caches well. Freezing the early turns
+    # trades a little token savings (they are kept uncompressed) for large
+    # re-prefill savings, because the backend reuses the frozen prefix every turn.
+    cache_stable_mode: bool = Field(
+        default=True,
+        description="Freeze a stable prefix block (system + first user + early turns) verbatim and never front-evict from it, so the backend reuses the KV cache across turns. Enabled by default because the proxy targets a prefix-caching backend (llama.cpp/Qwen3-MTP); disable for backends without prefix caching to maximize token savings.",
+    )
+    frozen_prefix_turns: int = Field(
+        default=2,
+        description="Number of early complete user-assistant turns (after the first user message) to freeze verbatim as part of the stable prefix when cache_stable_mode is enabled.",
+    )
+
+    # Native MTP speculative decoding passthrough (review §1, priority fix #2)
+    native_mtp_passthrough: bool = Field(
+        default=False,
+        description="Do NOT strip MTP/speculative extra_body keys before forwarding to the backend, so a backend that supports native MTP speculative decoding (e.g. llama.cpp --speculative) receives them. Disabled by default because most backends reject unknown fields.",
+    )
+    native_mtp_autodetect: bool = Field(
+        default=True,
+        description="At startup, probe the backend for native MTP speculative decoding support and automatically enable `native_mtp_passthrough` when detected. Only takes effect when `native_mtp_passthrough` is False. Best-effort: a probe failure never blocks startup.",
+    )
+
     # Async I/O for Heavy Stages
     async_io_enabled: bool = Field(
         default=True,
-        description="Enable async I/O for heavy pipeline stages",
+        description="Offload CPU/I/O-bound stages (tree-sitter compression, embedding ranking) to a "
+                    "thread pool so the request/event-loop thread stays responsive under concurrent load.",
     )
     async_io_max_thread_workers: int = Field(
         default=4,

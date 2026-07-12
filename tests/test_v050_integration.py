@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer
 
@@ -34,15 +32,9 @@ class TestV050Integration:
         config.v050.static_prefix_kv_enabled = True
         config.v050.token_aware_truncation_enabled = True
         config.v050.chunk_fingerprint_enabled = True
-        config.v050.embedding_invalidation_enabled = True
-        config.v050.mtp_checkpoint_enabled = True
-        config.v050.parallel_embed_workers = 2
-        config.v050.segment_speculative_enabled = False  # Disabled by default
         config.v050.hit_prediction_enabled = True
-        config.v050.template_selector_enabled = True
         config.v050.hierarchical_summary_enabled = True
         config.v050.delta_encoding_enabled = True
-        config.v050.kv_warmup_enabled = True
         config.v050.async_io_enabled = True
 
         self.config = config
@@ -165,57 +157,6 @@ class TestV050Integration:
         stats = self.optimizer.chunk_fingerprint.get_stats()
         assert stats["entries"] >= 1
 
-    def test_embedding_cache_invalidation(self) -> None:
-        """Embedding cache with invalidation tracks and invalidates correctly."""
-        cache = self.optimizer.embedding_invalidation
-        assert cache is not None
-
-        # Put an embedding
-        cache.put("test text", [0.1, 0.2, 0.3], source_path="/tmp/test.py")
-        assert cache.get("test text", source_path="/tmp/test.py") is not None
-
-        # Invalidate by source
-        count = cache.invalidate_source("/tmp/test.py")
-        assert count == 1
-        assert cache.get("test text", source_path="/tmp/test.py") is None
-
-    def test_mtp_head_state_checkpointing(self) -> None:
-        """MTP head state checkpointing saves and loads states."""
-        checkpoint = self.optimizer.mtp_head_checkpoint
-        assert checkpoint is not None
-
-        # Save states for a signature
-        head_states = {0: b"state0", 1: b"state1", 2: b"state2"}
-        key = checkpoint.save_head_states("def foo(x: int) -> str:", head_states)
-        assert key != ""
-
-        # Load states
-        loaded = checkpoint.load_head_states("def foo(x: int) -> str:")
-        assert loaded is not None
-        assert loaded[0] == b"state0"
-
-    def test_parallel_embedding_lookup(self) -> None:
-        """Parallel embedding lookup executes in thread pool."""
-        lookup = self.optimizer.parallel_embedding
-        assert lookup is not None
-
-        results = lookup.embed_batch(["text1", "text2", "text3"], lambda t: [0.1, 0.2])
-        assert len(results) == 3
-        assert all(e == [0.1, 0.2] for e in results)
-
-    def test_segment_wise_speculative_decoding(self) -> None:
-        """Segment-wise speculative decoding splits and processes segments."""
-        decoder = self.optimizer.segment_decoder
-        # May be None if disabled in config
-        if decoder is None:
-            pytest.skip("Segment-wise speculative decoding disabled")
-
-        text = "Here is code:\n```python\ndef foo():\n    pass\n```\nAnd more text."
-        result = decoder.process_segments(text)
-        assert "segments" in result
-        assert "changed_segments" in result
-        assert len(result["segments"]) >= 2
-
     def test_hit_prediction_model(self) -> None:
         """Hit prediction model predicts and records outcomes."""
         model = self.optimizer.hit_prediction
@@ -233,42 +174,6 @@ class TestV050Integration:
         # Record outcome
         model.record_outcome(messages, hit=True)
         assert len(model._history) >= 1
-
-    def test_template_selector(self) -> None:
-        """Template selector chooses and records template quality."""
-        selector = self.optimizer.template_selector
-        assert selector is not None
-
-        messages = _build_messages(
-            ("user", "Fix this bug in my code"),
-        )
-
-        template = selector.select_template(messages)
-        assert isinstance(template, str)
-        assert template in selector._template_scores
-
-        # Record quality
-        selector.record_quality(template, 0.9, 0.8)
-        scores = selector.get_template_scores()
-        assert template in scores
-        assert scores[template]["sample_count"] >= 1
-
-    def test_template_selector_records_pipeline_quality(self) -> None:
-        """The optimizer records template quality after each run."""
-        selector = self.optimizer.template_selector
-        assert selector is not None
-
-        result = self.optimizer.optimize_messages(
-            _build_messages(
-                ("system", "System"),
-                ("user", "Fix this bug in my code"),
-                ("assistant", "The fix is straightforward."),
-            )
-        )
-
-        assert len(result) >= 2
-        scores = selector.get_template_scores()
-        assert any(score["sample_count"] >= 1 for score in scores.values())
 
     def test_hierarchical_summarization_standalone(self) -> None:
         """Hierarchical summarization remains available as a standalone utility."""
@@ -312,23 +217,6 @@ class TestV050Integration:
         # Stats
         stats = encoder.get_stats()
         assert stats["total_snapshots"] >= 2
-
-    def test_kv_cache_warmup(self) -> None:
-        """KV-cache warmup stores and retrieves warmup data."""
-        warmup = self.optimizer.kv_warmup
-        assert warmup is not None
-
-        messages = _build_messages(
-            ("system", "System"),
-            ("user", "User"),
-        )
-
-        warmup_data = {"static_tokens": 100, "kv_cache": b"data"}
-        warmup.store_warmup(messages, warmup_data)
-        assert warmup.has_warmup(messages) is True
-
-        retrieved = warmup.get_warmup_data(messages)
-        assert retrieved == warmup_data
 
     def test_async_io_stage(self) -> None:
         """Async I/O stage manages async and sync stages."""
@@ -485,19 +373,65 @@ class TestV050Integration:
         stats = self.optimizer.static_prefix_kv.get_stats()
         assert stats["entries"] >= 1
 
+    def test_rolling_summary_in_pipeline_cache_stable(self) -> None:
+        """Pipeline injects a cache-stable rolling summary that retains constraints.
+
+        With hierarchical summarization enabled, older dynamic turns are folded
+        into a single rolling summary block placed right after the frozen prefix
+        (review §1/§3/§5, #7). The frozen prefix is preserved verbatim and the
+        task's "don't" constraints survive in the summary so the model does not
+        re-derive them verbosely.
+        """
+        # High budget so compression/chunking/trim don't rewrite the summary;
+        # proactive threshold is still exceeded so Step 8.5 fires.
+        self.config.agentic.max_optimized_tokens = 6000
+        self.config.agentic.max_optimized_chars = 24000
+        self.config.agentic.proactive_trim_ratio = 0.01
+        self.config.agentic.code_skeleton_enabled = False
+        self.config.v050.hierarchical_summary_max_full_turns = 5
+
+        messages = [
+            {"role": "system", "content": "You are a careful coding assistant."},
+            {"role": "user", "content": "Build a user service."},
+            {"role": "assistant", "content": "I will scaffold the service."},
+        ]
+        # Two frozen early turns (frozen_prefix_turns default = 2).
+        for i in range(2):
+            messages.append({"role": "user", "content": f"Early turn {i}: set up the project."})
+            messages.append({"role": "assistant", "content": f"Done with early turn {i}."})
+        # Older turns carrying a hard constraint the model must keep.
+        for i in range(6):
+            messages.append({
+                "role": "user",
+                "content": f"Step {i}: refactor the module. CRITICAL: never remove the authentication middleware.",
+            })
+            messages.append({"role": "assistant", "content": f"Refactored step {i} while keeping auth middleware."})
+        # Recent turns (kept in full).
+        for i in range(5):
+            messages.append({"role": "user", "content": f"Recent {i}: add a small helper."})
+            messages.append({"role": "assistant", "content": f"Added helper {i}."})
+
+        result = self.optimizer.optimize_messages(messages)
+
+        # Frozen prefix (system + first user + 2 early turns) preserved verbatim.
+        assert result[0] == messages[0]
+        assert result[1] == messages[1]
+        assert result[2] == messages[2]
+        assert result[3] == messages[3]
+        assert result[4] == messages[4]
+
+        # A rolling summary block follows the frozen prefix.
+        summary_msgs = [m for m in result if "Context summary (rolling):" in m.get("content", "")]
+        assert summary_msgs, "expected a rolling summary block after the frozen prefix"
+        summary_content = summary_msgs[0]["content"]
+        assert "never remove the authentication middleware" in summary_content
+
     def test_all_v050_components_initialized(self) -> None:
         """All v0.5.0 components are properly initialized."""
         assert self.optimizer.static_prefix_kv is not None
         assert self.optimizer.token_aware_truncator is not None
         assert self.optimizer.chunk_fingerprint is not None
-        assert self.optimizer.embedding_invalidation is not None
-        assert self.optimizer.mtp_head_checkpoint is not None
-        assert self.optimizer.parallel_embedding is not None
         assert self.optimizer.hit_prediction is not None
-        assert self.optimizer.template_selector is not None
         assert self.optimizer.hierarchical_summarizer is not None
         assert self.optimizer.delta_encoder is not None
-        assert self.optimizer.kv_warmup is not None
         assert self.optimizer.async_io is not None
-        # segment_decoder is disabled by default
-        assert self.optimizer.segment_decoder is None

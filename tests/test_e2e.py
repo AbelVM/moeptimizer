@@ -84,8 +84,14 @@ def _check_foreign_markers(messages: list[dict]) -> list[str]:
 class TestDryRunResponseNormalization:
     """Test response normalization handles reasoning_content correctly."""
 
-    def test_empty_content_filled_from_reasoning(self) -> None:
-        """When content is empty but reasoning_content exists, merge it."""
+    def test_empty_content_preserved_from_reasoning(self) -> None:
+        """When content is empty but reasoning_content exists, echo both verbatim.
+
+        The proxy must NOT collapse reasoning_content into content (review §8.3):
+        doing so would make the client persist the reasoning as the assistant
+        `content`, so the next turn's prefix would differ from what the model
+        actually generated and break prefix-cache reuse / MTP alignment.
+        """
         from unittest.mock import AsyncMock, MagicMock
 
         from moeptimizer.app import _do_non_streaming
@@ -139,8 +145,8 @@ class TestDryRunResponseNormalization:
         data = json.loads(result.body)  # JSONResponse.body is bytes
         content = data["choices"][0]["message"]["content"]
 
-        assert content == "Thinking...\n\nAnswer is 42.", (
-            f"Content should be filled from reasoning_content, got: {content}"
+        assert content == "", (
+            f"Content must be echoed verbatim (empty), not filled from reasoning_content, got: {content!r}"
         )
         assert data["choices"][0]["message"]["reasoning_content"] == "Thinking...\n\nAnswer is 42.", (
             "reasoning_content should be preserved for cache-stable echo"

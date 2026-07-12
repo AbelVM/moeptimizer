@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -32,6 +33,19 @@ class HierarchicalSummarizer:
     Older turns are progressively summarized to keep context lean.
     """
 
+    # Keywords that mark a constraint / "don't" the model must keep in context.
+    # Retaining these in the rolling summary is what stops the 2.17x verbosity
+    # regression: when the proxy drops them, the model re-derives them verbosely.
+    _CONSTRAINT_HINTS = (
+        "don't", "do not", "doesn't", "does not", "don’t", "don’t",
+        "must not", "mustn't", "should not", "shouldn't",
+        "cannot", "can't", "can not", "won't", "will not",
+        "avoid", "never", "no longer", "not allowed", "prohibited",
+        "forbidden", "refrain", "instead of", "without", "only",
+        "make sure", "ensure", "keep", "preserve", "don't change",
+        "do not change", "don't modify", "do not modify", "unchanged",
+    )
+
     def __init__(
         self,
         max_full_turns: int = 5,
@@ -46,6 +60,12 @@ class HierarchicalSummarizer:
             "recall_tokens_created": 0,
         }
         self._last_context_changed = False
+        # Cache-stable rolling-summary state (review §1/§3/§5, #7). The rolling
+        # summary block only ever grows by appending, so its leading bytes stay
+        # byte-identical across turns and the backend reuses the prefix cache.
+        self._rolling_summary_text: str = ""
+        self._rolling_summary_id: str = ""
+        self._summarized_turn_count: int = 0
 
     def summarize_turns(
         self,
@@ -98,6 +118,153 @@ class HierarchicalSummarizer:
         self._stats["turns_compressed"] += 1
 
         return result
+
+    def summarize_turns_cache_stable(
+        self,
+        messages: list[dict[str, Any]],
+        frozen_prefix_end: int,
+    ) -> list[dict[str, Any]]:
+        """Cache-stable tiered rolling-summary compaction (review §1/§3/§5, #7).
+
+        Folds older dynamic turns into a single append-only rolling summary
+        block placed immediately after the frozen prefix. The block retains
+        constraints (the task's "don'ts") and key decisions so the model does
+        not re-derive them verbosely (the 2.17x verbosity regression). Because
+        the block only ever grows by appending, its leading bytes stay
+        byte-identical across turns, so the backend's prefix cache reuses the
+        frozen prefix + summary head instead of re-prefilling.
+
+        Args:
+            messages: Full optimized message list.
+            frozen_prefix_end: Index just past the stable prefix block
+                (system + first user + frozen early turns).
+
+        Returns:
+            Message list with older dynamic turns replaced by the rolling
+            summary block, or ``messages`` unchanged when there is nothing to
+            summarize.
+        """
+        if frozen_prefix_end < 0 or frozen_prefix_end > len(messages):
+            return messages
+
+        frozen = messages[:frozen_prefix_end]
+        rest = messages[frozen_prefix_end:]
+        if len(rest) <= self._max_full_turns:
+            # Nothing old enough to summarize; reset the rolling counter so a
+            # later long context starts fresh.
+            self._summarized_turn_count = 0
+            return messages
+
+        # Group the dynamic layer into user-led turns.
+        turns = self._group_turns(rest)
+        total_turns = len(turns)
+        keep = self._max_full_turns
+        if total_turns <= keep:
+            self._summarized_turn_count = 0
+            return messages
+
+        # Turns already folded into the rolling summary (append-only, stable).
+        end = total_turns - keep
+        start = min(self._summarized_turn_count, end)
+        new_turns = turns[start:end]
+
+        if new_turns:
+            new_text = self._extract_constraints(new_turns)
+            if new_text:
+                self._rolling_summary_text = (
+                    f"{self._rolling_summary_text}\n{new_text}"
+                    if self._rolling_summary_text
+                    else new_text
+                )
+                self._stats["turns_summarized"] += sum(len(t) for t in new_turns)
+                self._stats["turns_compressed"] += 1
+            self._summarized_turn_count = end
+
+        keep_recent = [m for t in turns[end:] for m in t]
+        return [*frozen, self._build_rolling_summary_block(), *keep_recent]
+
+    def _build_rolling_summary_block(self) -> dict[str, Any]:
+        """Return the single rolling-summary message (append-only content)."""
+        if not self._rolling_summary_id:
+            self._rolling_summary_id = hashlib.md5(
+                b"rolling-summary"
+            ).hexdigest()[:16]
+        text = self._rolling_summary_text or "Earlier context summarized."
+        return {
+            "role": "user",
+            "content": f"Context summary (rolling):\n{text}",
+            "_summary_id": self._rolling_summary_id,
+            "_summary_level": 1,
+            "_rolling_summary": True,
+        }
+
+    @staticmethod
+    def _group_turns(
+        messages: list[dict[str, Any]],
+    ) -> list[list[dict[str, Any]]]:
+        """Group a message list into user-led turns (user + following asst/tool)."""
+        turns: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role", "")
+            if role == "user":
+                if current:
+                    turns.append(current)
+                current = [msg]
+            else:
+                current.append(msg)
+        if current:
+            turns.append(current)
+        return turns
+
+    def _extract_constraints(
+        self,
+        turns: list[list[dict[str, Any]]],
+    ) -> str:
+        """Extract constraint-retaining summary text from summarized turns.
+
+        Prefers explicit "don't"/"must not"/"avoid" style constraints and key
+        decisions; falls back to a short topic line so the block is never empty
+        and the model keeps the task's intent in context.
+        """
+        constraints: list[str] = []
+        topics: list[str] = []
+        for turn in turns:
+            for msg in turn:
+                content = msg.get("content", "")
+                if not isinstance(content, str) or not content:
+                    continue
+                role = msg.get("role", "")
+                for raw_line in content.splitlines():
+                    line = raw_line.strip()
+                    low = line.lower()
+                    if 12 < len(line) < 200 and any(
+                        hint in low for hint in self._CONSTRAINT_HINTS
+                    ):
+                        constraints.append(line)
+                if role == "user":
+                    # Capture the first meaningful user request as a topic.
+                    sentences = re.split(r"[.?!]", content)
+                    for sent in sentences:
+                        sent = sent.strip()
+                        if 12 < len(sent) < 160:
+                            topics.append(sent)
+                            break
+
+        parts: list[str] = []
+        if constraints:
+            # De-duplicate while preserving order.
+            seen: set[str] = set()
+            uniq: list[str] = []
+            for c in constraints:
+                if c not in seen:
+                    seen.add(c)
+                    uniq.append(c)
+            parts.append("Constraints retained:")
+            parts.extend(f"- {c}" for c in uniq[:8])
+        if topics:
+            parts.append("Topic: " + "; ".join(topics[:2]))
+        return "\n".join(parts)
 
     def _create_hierarchical_summary(
         self,
@@ -263,6 +430,9 @@ class HierarchicalSummarizer:
             "recall_tokens_created": 0,
         }
         self._last_context_changed = True
+        self._rolling_summary_text = ""
+        self._rolling_summary_id = ""
+        self._summarized_turn_count = 0
 
     def save_to_disk(self, force: bool = False) -> None:
         """Persist summaries to disk."""

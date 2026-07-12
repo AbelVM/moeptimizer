@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -18,6 +20,7 @@ from openai import AsyncOpenAI
 from moeptimizer.backend_client import LemonadeClient
 from moeptimizer.config import AppConfig, get_config
 from moeptimizer.embedding import EmbeddingService
+from moeptimizer.optimizer import AgentContextOptimizer
 from moeptimizer.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -145,26 +148,52 @@ def _pop_custom_session_fields(body: dict[str, Any]) -> tuple[Any, Any]:
     return body.pop("_session_id", None), body.pop("_session_state", None)
 
 
-def _normalize_response_choices(data: dict) -> list[dict]:
-    """Normalize backend response choices while preserving Qwen reasoning.
+# Session -> stable backend slot mapping for prefix-cache reuse (review §1).
+# A process-wide map; slots are assigned lazily and kept for the proxy's lifetime.
+_SLOT_MAP: dict[str, int] = {}
+_SLOT_LOCK = threading.Lock()
+_NEXT_SLOT = 0
 
-    Qwen/llama.cpp can return explicit `reasoning_content`. The proxy must echo
-    that field back to the client unchanged so the next assistant message can
-    preserve the exact thinking tokens required for KV-cache stability.
+
+def _slot_for_session(session_id: str, enabled: bool) -> int | None:
+    """Return a stable backend slot id for ``session_id`` or ``None``.
+
+    Only assigns a slot when ``enabled`` is True (slot pinning is opt-in so
+    non-llama.cpp backends stay OpenAI-transparent). The same session always
+    maps to the same slot, which is what lets the backend reuse the whole
+    conversation prefix across turns.
     """
-    choices = data.get("choices", [])
-    for choice in choices:
-        message = choice.get("message", {})
-        reasoning = message.get("reasoning_content") or ""
-        if reasoning and not message.get("content"):
-            message["content"] = reasoning
-    return choices
+    if not enabled or not session_id:
+        return None
+    with _SLOT_LOCK:
+        slot = _SLOT_MAP.get(session_id)
+        if slot is None:
+            global _NEXT_SLOT
+            slot = _NEXT_SLOT
+            _SLOT_MAP[session_id] = slot
+            _NEXT_SLOT += 1
+        return slot
+
+
+def _normalize_response_choices(data: dict) -> list[dict]:
+    """Pass backend response choices through unchanged.
+
+    Qwen/llama.cpp can return explicit `reasoning_content` alongside `content`.
+    The proxy must echo BOTH fields exactly as produced. Collapsing
+    `reasoning_content` into `content` (the old behavior) made the client persist
+    the reasoning as the assistant `content`, so the next turn's prefix differed
+    from what the model actually generated — which broke prefix-cache reuse and
+    MTP alignment (review §8.3). We therefore never mutate the message here.
+    """
+    return data.get("choices", [])
 
 
 def _make_streaming_generator(
     body: dict,
     cfg: AppConfig,
     backend_client: LemonadeClient,
+    optimizer: AgentContextOptimizer | None = None,
+    id_slot: int | None = None,
 ) -> Any:
     """Create an async generator for SSE streaming using OpenAI SDK."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -185,6 +214,8 @@ def _make_streaming_generator(
         })
         yield f"data: {initial_chunk}\n\n"
 
+        cached_tokens: int | None = None
+        backend_prompt_tokens: int | None = None
         try:
             messages = body.get("messages", [])
             temperature = body.get("temperature", 0.1)
@@ -194,6 +225,23 @@ def _make_streaming_generator(
                 for key, value in body.items()
                 if key not in {"messages", "model", "temperature", "max_tokens", "stream"}
             }
+
+            # Request final-chunk usage (incl. cached_tokens) so the real prefix
+            # cache outcome is reported even in streaming (review §8.1). Preserve
+            # any caller-provided stream_options but force include_usage on.
+            existing = request_kwargs.get("stream_options")
+            if isinstance(existing, dict):
+                existing = dict(existing)
+                existing["include_usage"] = True
+                request_kwargs["stream_options"] = existing
+            else:
+                request_kwargs["stream_options"] = {"include_usage": True}
+
+            # Pin this session to a stable backend slot when slot pinning is on
+            # (review §1). id_slot is a llama.cpp extension; it is only injected
+            # when explicitly enabled so other backends stay OpenAI-transparent.
+            if id_slot is not None:
+                request_kwargs["id_slot"] = id_slot
 
             async for chunk in backend_client.chat_completions_stream(
                 messages=messages,
@@ -218,6 +266,26 @@ def _make_streaming_generator(
                             delta["reasoning_content"] = d.reasoning_content
                     if hasattr(choice, "finish_reason") and choice.finish_reason:
                         finish_reason = choice.finish_reason
+
+                # Some backends report usage (incl. cached_tokens) on the final
+                # chunk. Capture it so we can feed the real cache outcome to the
+                # hit-prediction model.
+                if hasattr(chunk, "usage") and chunk.usage is not None:
+                    usage = chunk.usage
+                    details = getattr(usage, "prompt_tokens_details", None)
+                    details = details if isinstance(details, dict) else getattr(details, "__dict__", {})
+                    cached_tokens = (
+                        getattr(usage, "cache_hit_tokens", None)
+                        or getattr(usage, "cached_tokens", None)
+                        or details.get("cached_tokens")
+                        if isinstance(details, dict)
+                        else None
+                    )
+                    # Backend's true prompt token count for the optimized prompt
+                    # we sent; used to calibrate the proxy's estimates (#6).
+                    prompt_tokens = getattr(usage, "prompt_tokens", None)
+                    if isinstance(prompt_tokens, int) and prompt_tokens > 0:
+                        backend_prompt_tokens = prompt_tokens
 
                 if not delta and finish_reason is None:
                     continue
@@ -253,6 +321,32 @@ def _make_streaming_generator(
             })
             yield f"data: {error_chunk}\n\n"
 
+        if optimizer is not None:
+            try:
+                optimizer.record_cache_outcome(cached_tokens)
+            except Exception:
+                logger.debug("Failed to record streaming cache outcome", exc_info=True)
+
+        # Calibrate the proxy's token estimates against the backend's real
+        # tokenizer (review §1/§9, priority fix #6). The backend reports its true
+        # `prompt_tokens` for the optimized prompt we sent; the ratio between that
+        # and our tiktoken estimate lets the budget be enforced on true token
+        # counts instead of an estimate that diverges for code-heavy prompts.
+        if optimizer is not None and isinstance(backend_prompt_tokens, int) and backend_prompt_tokens > 0:
+            try:
+                proxy_estimated = optimizer.token_counter.count_messages(messages)
+                if proxy_estimated > 0:
+                    optimizer.set_token_calibration(backend_prompt_tokens / proxy_estimated)
+            except Exception:
+                logger.debug("Streaming token calibration failed", exc_info=True)
+
+        # HTTP response headers are already sent when streaming begins, so the
+        # real cache-hit signal cannot be exposed as an X- header here. Emit it
+        # as an SSE comment line instead (valid SSE, ignored by clients but
+        # visible to tooling) so the streaming path also surfaces reuse (review §8.2).
+        if cached_tokens is not None:
+            yield f": X-Prefix-Cache-Hit-Tokens: {cached_tokens}\n\n"
+
         yield "data: [DONE]\n\n"
 
     return stream_generator
@@ -265,6 +359,8 @@ async def _do_non_streaming(
     backend_client: LemonadeClient,
     response_headers: dict[str, str] | None = None,
     optimization_error: str | None = None,
+    optimizer: AgentContextOptimizer | None = None,
+    id_slot: int | None = None,
 ) -> JSONResponse:
     """Execute non-streaming backend call using LemonadeClient (OpenAI SDK)."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -287,6 +383,7 @@ async def _do_non_streaming(
             temperature=temperature,
             stream=False,
             max_tokens=max_tokens,
+            id_slot=id_slot,
             **request_kwargs,
         )
 
@@ -331,6 +428,35 @@ async def _do_non_streaming(
             registry = get_cache_registry()
             registry.record_cache_hit(messages, cache_hit_tokens)
 
+        # Feed the real backend cache outcome to the hit-prediction model so it
+        # learns from actual reuse instead of a constant hit=True label.
+        if optimizer is not None:
+            try:
+                optimizer.record_cache_outcome(cache_hit_tokens)
+            except Exception:
+                logger.debug("Failed to record cache outcome", exc_info=True)
+
+        # Calibrate the proxy's token estimates against the backend's real
+        # tokenizer (review §1/§9, priority fix #6). The backend reports its true
+        # `prompt_tokens` for the optimized prompt we sent; the ratio between that
+        # and our tiktoken estimate lets the budget be enforced on true token
+        # counts instead of an estimate that diverges for code-heavy prompts.
+        if optimizer is not None:
+            try:
+                backend_prompt_tokens = usage_dict.get("prompt_tokens")
+                if isinstance(backend_prompt_tokens, int) and backend_prompt_tokens > 0:
+                    proxy_estimated = optimizer.token_counter.count_messages(messages)
+                    if proxy_estimated > 0:
+                        optimizer.set_token_calibration(
+                            backend_prompt_tokens / proxy_estimated
+                        )
+            except Exception:
+                logger.debug("Token calibration failed", exc_info=True)
+
+        response_headers = dict(response_headers or {})
+        if isinstance(cache_hit_tokens, int):
+            response_headers["X-Prefix-Cache-Hit-Tokens"] = str(cache_hit_tokens)
+
         return JSONResponse(
             content={
                 "id": completion_id,
@@ -374,6 +500,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         base_url=cfg.server.url,
         api_key="lemonade",
         timeout=cfg.server.timeout,
+        native_mtp_passthrough=cfg.v050.native_mtp_passthrough,
     )
     embed_client = AsyncOpenAI(
         base_url=cfg.server.embed_url,
@@ -388,6 +515,20 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await embedding_service.initialize()
+        # Auto-detect backend native MTP speculative decoding support (review
+        # §1 / priority fix #2). If the backend understands MTP/speculative
+        # extra_body keys, forward them instead of stripping them so the model's
+        # own decode-speed feature is used. Best-effort: never blocks startup.
+        if not cfg.v050.native_mtp_passthrough and cfg.v050.native_mtp_autodetect:
+            try:
+                if await backend_client.detect_mtp_support():
+                    backend_client.enable_native_mtp_passthrough()
+                    logger.info(
+                        "Backend supports native MTP speculative decoding; "
+                        "enabling MTP extra_body passthrough."
+                    )
+            except Exception as exc:  # noqa: BLE001 - best-effort
+                logger.warning("MTP support auto-detection failed: %s", exc)
         yield
         await embedding_service.close()
         await embed_client.close()
@@ -485,11 +626,22 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         optimized_messages = messages
         optimization_error: str | None = None
         try:
-            optimized_messages = optimizer.optimize_messages(messages)
+            # Run the (CPU-bound, synchronous) optimizer in a worker thread so the
+            # asyncio event loop stays free for concurrent sessions. Previously the
+            # optimizer ran inline on the event loop, so one long session blocked
+            # all others (review §2/§4/§5).
+            optimized_messages = await asyncio.get_running_loop().run_in_executor(
+                None, optimizer.optimize_messages, messages
+            )
         except Exception as e:
             logger.exception("Context optimization failed, falling back to recent-turn context")
             optimization_error = f"{type(e).__name__}: {e}"
             optimized_messages = _fallback_optimized_messages(messages, cfg.agentic.keep_full_steps)
+
+        # Pin this session to a stable backend slot when slot pinning is enabled
+        # (review §1). A stable slot lets the backend reuse the whole conversation
+        # prefix across turns instead of re-prefilling every turn.
+        id_slot = _slot_for_session(session_id, cfg.v050.slot_pinning_enabled)
 
         # Debug logging for long contexts
         if len(optimized_messages) > 10:
@@ -558,13 +710,13 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
         if is_streaming:
             return StreamingResponse(
-                _make_streaming_generator(body, cfg, backend_client),
+                _make_streaming_generator(body, cfg, backend_client, optimizer, id_slot),
                 media_type="text/event-stream",
                 headers=response_headers,
             )
         else:
             return await _do_non_streaming(
-                body, session_state, cfg, backend_client, response_headers, optimization_error
+                body, session_state, cfg, backend_client, response_headers, optimization_error, optimizer, id_slot
             )
 
     @app.get("/v1/models")

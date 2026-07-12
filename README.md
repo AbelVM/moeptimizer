@@ -14,7 +14,7 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 - **Loop Detection** — Detects repeated tool calls, actions, and thinking loops
 - **Progress Tracking** — Heuristic-based goal completion tracking with subtask decomposition
 - **Token Budget Enforcement** — Character-aware trimming to stay within context limits
-- **Code Chunking** — Tree-Sitter aware code splitting with language detection and NPU-based relevance ranking
+- **Code Chunking** — Tree-Sitter aware code splitting with language detection and relevance ranking
 - **LanceDB Integration** — Persistent semantic index over agent turns for cross-session context
 
 ### Advanced Optimizations (v0.2.0)
@@ -95,6 +95,26 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 - **Top-Only Eviction** – Drops old complete turns from the front and avoids content slicing, middle summaries, semantic deduplication, or entropy rewrites.
 - **Stable Anonymous Sessions** – Derives anonymous session identity from the first user message so cache state remains consistent across turns.
 
+### Priority Fixes (v0.5.2 / v0.5.3 / v0.5.4)
+
+Implements the highest-ROI items from the senior-architect review (`review01.md`):
+
+- **Real prefix-cache accounting.** The proxy now reads `usage.prompt_tokens_details.cached_tokens` from the backend and exposes it via the `X-Prefix-Cache-Hit-Tokens` response header (both streaming and non-streaming paths). The hit-prediction model is now trained on this real signal instead of the previous constant `hit=True` label, so its early-exit gate reflects actual cache reuse.
+- **MoE/MTP overhead gated.** `expert_cache` warm-up, `kv_slot_tracker` slot-map, and `mtp_state_manager` key generation now run only when `MOEPT_V050__ENABLE_EXPERIMENTAL_BACKEND_HINTS=true`. By default these hints are stripped before the request is sent, so computing them was pure overhead.
+- **Per-turn disk writes reduced.** `StaticPrefixKVCache.put` now stores the stable prefix content (not a timestamped blob), so repeated identical prefixes skip the pickle rewrite via the existing `_last_context_changed` gate.
+- **Immutable-prefix freeze (v0.5.3).** `ContextAligner.freeze_static_prefix` freezes only the **system prompt** verbatim at the end of the pipeline, so the backend's automatic prefix cache can reuse it across turns. The first user message is *not* frozen — it is deterministically compressed and stays stable on its own, so freezing it would undo the compression. Gated by `MOEPT_AGENTIC__IMMUTABLE_PREFIX_ENABLED` (default `true`).
+- **`async_io` wired for real (v0.5.3).** The tree-sitter compression stage and embedding ranking are now offloaded to the thread pool via `async_io.run_sync_stage`. `MOEPT_V050__ASYNC_IO_ENABLED` reverted to `true` (it is now actually used).
+- **`AgentStateStore` growth bounded (v0.5.3).** Oldest archived steps beyond `MOEPT_AGENTIC__MAX_STATE_STEPS` (default 200) are pruned.
+- **Frozen-prefix truncation (v0.5.4).** `TokenAwareTruncator` now respects the frozen prefix set by `ContextAligner.frozen_prefix_end` (system + first user + `MOEPT_V050__FROZEN_PREFIX_TURNS` early turns) in both `_partition_for_budget` and `_drop_whole_messages_from_front`. Front-eviction never drops or reorders the frozen block, so the serialized prefix stays byte-stable across turns and the backend's prefix cache actually hits. Gated by `MOEPT_V050__CACHE_STABLE_MODE` (default `true`).
+- **Accurate token counting (v0.5.4).** The proxy now calibrates its tiktoken (`cl100k_base`) token estimates against the backend's real tokenizer. Each turn `app.py` reads the backend's true `usage.prompt_tokens` for the optimized prompt (both streaming and non-streaming paths) and feeds the ratio to `optimizer.set_token_calibration`, which scales the budget via `calibrated_token_count`. The calibration factor is clamped to `[0.5, 2.0]` so one noisy measurement cannot swing the budget. This closes the gap where code-heavy prompts were undercounted and the hard token budget was enforced against wrong numbers (review02 §1/§6/§9).
+- **Native MTP speculative decoding autodetect (v0.5.4).** `LemonadeClient.detect_mtp_support()` probes the backend (fetches a model from `/v1/models`, then sends a minimal chat completion carrying a `speculative_decoding` extra_body key) and returns whether the backend accepts it. `create_app` auto-enables `native_mtp_passthrough` at startup when `MOEPT_V050__NATIVE_MTP_AUTODETECT` is `true` (default) and `native_mtp_passthrough` is not explicitly set, so a backend that supports native MTP speculative decoding (e.g. llama.cpp `--speculative`) receives the client's speculative fields instead of having them stripped. The probe is best-effort and bounded by a timeout so startup is never blocked (review02 §1/#2).
+- **Cache-stable rolling-summary compaction (v0.5.4).** `HierarchicalSummarizer.summarize_turns_cache_stable` folds older dynamic turns into a single append-only rolling summary block placed immediately after the frozen prefix (never mid-history), so the leading prefix stays byte-stable and the backend reuses its prefix cache. The block retains the task's "don't"/"must not"/"avoid" constraints and key decisions, which is what stops the 2.17× verbosity regression. It is protected from later front-eviction via its `_summary_id` marker and is wired into `optimizer.py` Step 8.5 (fires when `cache_stable_mode` is on and the token count exceeds the proactive threshold) (review02 §1/§3/§5, #7).
+- **Dead components deleted (v0.5.4).** Removed `parallel_embedding_lookup`, `embedding_cache_invalidation`, `mtp_head_checkpoint`, `kv_cache_warmup`, `segment_wise_speculative`, and `template_selector` (source + dedicated tests), their `config.py` flags, `optimizer.py` imports/instantiation, and `__init__.py` exports. `hierarchical_summarizer`, `delta_encoder`, and `static_prefix_kv` are kept (used) (review02 #8).
+
+**Honest latency trade-off.** The proxy is a *token-reduction* proxy, not a speed win. On the 30-turn `refactor_long` benchmark the proxy is **~68% slower** (44,839 ms vs 26,559 ms direct) despite **84.8% token savings** (0.7589 semantic similarity, Grade C). It trades TTFT for token reduction; enable it when token cost dominates latency cost.
+
+**Response headers added:** `X-Prefix-Cache-Hit-Tokens` (backend-reported cached prompt tokens for the turn).
+
 ## Architecture
 
 ```
@@ -116,14 +136,12 @@ Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
                                 ├── ProgressTracker
                                 ├── PromptTemplateManager (task classification)
                                 │   └── ContextTemplateMatcher (template matching)
-                                ├── TemplateSelector (quality-based template selection)
                                 ├── AttentionSinkManager (internal cache hint only; no model-visible markers)
                                 ├── ExpertRoutingCache (MoE routing cache)
                                 ├── CacheKeyRegistry (hit prediction)
                                 │   └── HitPredictionModel (XGBoost early-exit)
                                 ├── KVSlotTracker (explicit cache control)
                                 ├── StaticPrefixKVCache (internal cache-key reuse only)
-                                ├── KVCacheWarmup (MTP head warm-up)
                                 ├── ContextAligner (internal alignment; no prompt padding)
                                 ├── ContextCanonicalizer (newest-user-turn only)
                                 ├── SelectiveTruncator (newest-user-turn only)
@@ -136,14 +154,10 @@ Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
                                 ├── CodeBlockOptimizer (tree-sitter code optimization)
                                 ├── ChunkFingerprintCache (SHA-256 chunk reuse)
                                 ├── DeltaEncoder (code delta compression)
-                                ├── HierarchicalSummarizer (standalone only; disabled in stable pipeline)
+                                ├── HierarchicalSummarizer (cache-stable rolling-summary compaction; enabled in the stable pipeline when hierarchical_summary_enabled)
                                 ├── TokenAwareTruncator (whole-message top-only fallback)
-                                ├── MTPHeadStateCheckpoint (per-head state reuse)
-                                ├── SegmentWiseSpeculativeDecoder (per-segment drafting)
-                                ├── ParallelEmbeddingLookup (thread-pool embedding)
-                                ├── EmbeddingCacheWithInvalidation (mtime-based invalidation)
                                 ├── AsyncIOStage (async heavy stage offloading)
-                                └── EmbeddingService (LanceDB + NPU)
+                                └── EmbeddingService (LanceDB + embeddings model)
 ```
 
 ## Installation
@@ -194,13 +208,15 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_AGENTIC__USE_TOKEN_BUDGET` | `true` | Use token-based budget enforcement |
 | `MOEPT_AGENTIC__FAST_PATH_ENABLED` | `true` | Bypass expensive transformations for contexts already under budget |
 | `MOEPT_AGENTIC__RAG_ENABLED` | `true` | Enable state-based RAG injection for long/over-budget sessions |
-| `MOEPT_AGENTIC__OPTIMIZE_CODE_BLOCKS` | `false` | Run tree-sitter/NPU code-block optimization |
+| `MOEPT_AGENTIC__OPTIMIZE_CODE_BLOCKS` | `false` | Run tree-sitter code-block optimization |
 | `MOEPT_AGENTIC__CODE_SKELETON_ENABLED` | `true` | Compress large code blocks to skeletons under context pressure |
 | `MOEPT_AGENTIC__SEMANTIC_DEDUP_ENABLED` | `false` | Enable embedding-based semantic deduplication |
 | `MOEPT_AGENTIC__ATTENTION_SINKS_ENABLED` | `false` | Inject model-visible attention-sink markers |
 | `MOEPT_AGENTIC__STATIC_LAYER_ALIGNMENT_ENABLED` | `false` | Pad static layer to cache-block boundaries |
 | `MOEPT_AGENTIC__REASONING_PRESEED_ENABLED` | `false` | Inject reasoning scaffolding into user messages |
 | `MOEPT_AGENTIC__MTP_BOUNDARY_ALIGNMENT_ENABLED` | `false` | Pad final context to an MTP prediction boundary |
+| `MOEPT_AGENTIC__IMMUTABLE_PREFIX_ENABLED` | `true` | Freeze the system prompt verbatim across turns so the backend's automatic prefix cache can reuse it. The first user message is not frozen (it is deterministically compressed and stays stable on its own). |
+| `MOEPT_AGENTIC__MAX_STATE_STEPS` | `200` | Maximum steps retained in AgentStateStore per session; oldest archived steps are pruned beyond this cap |
 
 ### Code Chunking
 
@@ -233,26 +249,21 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_V050__STATIC_PREFIX_KV_ENABLED` | `true` | Enable static prefix KV-cache reuse |
 | `MOEPT_V050__STATIC_PREFIX_KV_MAX_ENTRIES` | `64` | Max entries in static prefix KV-cache |
 | `MOEPT_V050__TOKEN_AWARE_TRUNCATION_ENABLED` | `true` | Enable token-aware truncation with tiktoken |
+| `MOEPT_V050__CACHE_STABLE_MODE` | `true` | Freeze a stable prefix block (system + first user + early turns) verbatim and never front-evict from it, so the backend reuses the KV cache across turns. Disable for backends without prefix caching to maximize token savings. |
+| `MOEPT_V050__FROZEN_PREFIX_TURNS` | `2` | Number of early complete user-assistant turns (after the first user message) to freeze verbatim as part of the stable prefix when cache-stable mode is enabled. |
 | `MOEPT_V050__CHUNK_FINGERPRINT_ENABLED` | `true` | Enable chunk fingerprinting and reuse |
 | `MOEPT_V050__CHUNK_FINGERPRINT_MAX_ENTRIES` | `2048` | Max entries in chunk fingerprint cache |
 | `MOEPT_V050__EMBEDDING_BATCH_SIZE` | `32` | Batch size for embedding queries |
-| `MOEPT_V050__EMBEDDING_INVALIDATION_ENABLED` | `true` | Enable file mtime-based embedding invalidation |
-| `MOEPT_V050__MTP_CHECKPOINT_ENABLED` | `true` | Enable MTP-head state checkpointing |
-| `MOEPT_V050__MTP_CHECKPOINT_MAX_ENTRIES` | `256` | Max entries in MTP head checkpoint cache |
-| `MOEPT_V050__PARALLEL_EMBED_WORKERS` | `8` | Number of thread workers for parallel embedding |
-| `MOEPT_V050__SEGMENT_SPECULATIVE_ENABLED` | `false` | Enable segment-wise speculative decoding |
 | `MOEPT_V050__HIT_PREDICTION_ENABLED` | `true` | Enable lightweight hit-prediction model |
 | `MOEPT_V050__HIT_PREDICTION_RETRAIN_THRESHOLD` | `50` | New samples before retraining |
-| `MOEPT_V050__TEMPLATE_SELECTOR_ENABLED` | `true` | Enable template selector for cache optimization |
-| `MOEPT_V050__TEMPLATE_SELECTOR_EXPLORATION_RATE` | `0.1` | Exploration rate for template selection |
 | `MOEPT_V050__HIERARCHICAL_SUMMARY_ENABLED` | `false` | Enable hierarchical summarization of old turns |
 | `MOEPT_V050__HIERARCHICAL_SUMMARY_MAX_FULL_TURNS` | `5` | Max recent turns to keep in full |
 | `MOEPT_V050__DELTA_ENCODING_ENABLED` | `true` | Enable delta-encoding of code snapshots |
 | `MOEPT_V050__DELTA_ENCODING_MAX_SNAPSHOTS` | `100` | Max code snapshots to keep |
-| `MOEPT_V050__KV_WARMUP_ENABLED` | `true` | Enable KV-cache warm-up for MTP heads |
-| `MOEPT_V050__KV_WARMUP_MAX_ENTRIES` | `32` | Max warmup cache entries |
 | `MOEPT_V050__ENABLE_EXPERIMENTAL_BACKEND_HINTS` | `false` | Send optional llama.cpp/MTP cache-control hints |
-| `MOEPT_V050__ASYNC_IO_ENABLED` | `true` | Enable async I/O for heavy pipeline stages |
+| `MOEPT_V050__NATIVE_MTP_PASSTHROUGH` | `false` | Forward MTP/speculative `extra_body` keys to the backend instead of stripping them, so a backend that supports native MTP speculative decoding (e.g. llama.cpp `--speculative`) uses the model's own 2–3× decode-speed feature. Disabled by default because most backends reject unknown fields. |
+| `MOEPT_V050__NATIVE_MTP_AUTODETECT` | `true` | At startup, probe the backend for native MTP speculative decoding support and automatically enable `native_mtp_passthrough` when detected. Best-effort and bounded by a timeout, so startup is never blocked. |
+| `MOEPT_V050__ASYNC_IO_ENABLED` | `true` | Enable async I/O for heavy pipeline stages. Offloads tree-sitter compression and embedding ranking to a thread pool (primary TTFT cost). |
 | `MOEPT_V050__ASYNC_IO_MAX_THREAD_WORKERS` | `4` | Max thread workers for CPU-bound stages |
 | `MOEPT_V050__ASYNC_IO_MAX_CONCURRENCY` | `16` | Max concurrent async tasks |
 
@@ -283,7 +294,7 @@ Conversation continuity is OpenAI-compatible by default. Clients can set the sta
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions (proxy + optimize) |
-| `POST` | `/v1/embeddings` | OpenAI-compatible embeddings (proxy to NPU) |
+| `POST` | `/v1/embeddings` | OpenAI-compatible embeddings (proxy to embeddings) |
 | `GET` | `/v1/models` | List available models |
 | `GET` | `/v1/health` | Health check |
 | `POST` | `/v1/agent/state` | Get agent session state |
@@ -319,6 +330,9 @@ python scripts/benchmark.py --turns 20 --json > report.json 2> benchmark.log
 
 # Dump full response pairs
 python scripts/benchmark.py --turns 10 --dump-responses
+
+# Complete example
+python benchmark.py --scenario refactor_long --turns 30 --json > benchmark_refactor_long_30_12.json 2> benchmark_refactor_long_30_12.log
 ```
 
 You might need to run the benchmark as background task to avoid hitting command timeouts. Progress and per-turn information is dumped to stderr.
