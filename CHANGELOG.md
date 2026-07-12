@@ -123,3 +123,54 @@ Implements the highest-ROI UX items from the second senior-architect review (`re
 **Honest latency trade-off.** The proxy is a *token-reduction* proxy, not a speed win. On the 30-turn `refactor_long` benchmark the proxy is **~68% slower** (44,839 ms vs 26,559 ms direct) despite **84.8% token savings** (0.7589 semantic similarity, Grade C). It trades TTFT for token reduction; enable it when token cost dominates latency cost.
 
 **Response headers added:** `X-Prefix-Cache-Hit-Tokens` (backend-reported cached prompt tokens for the turn).
+
+### v0.6.0 — Agentic benchmark by default + tool-output compression (2026-07-12)
+
+Implements the highest-ROI benchmark/agentic items so the harness exercises the
+real production path on every scenario. Full test suite after changes:
+**336 passed, 2 skipped**.
+
+- **All benchmark scenarios are agentic by default.** Every scenario
+  (`debug`/`refactor`/`feature`/`default` ±`_long`, `fixtures`, `opencode`) now
+  runs as an OpenCode-style harness: each turn sends a real agent payload — the
+  user task plus assistant `tool_calls` and the corresponding `tool` results —
+  and the OpenAI `tools` schema is forwarded to the backend, exactly like a
+  production coding client. `--no-agentic` opts back to plain user messages.
+- **`fixtures`/`opencode` deduped.** Both scenario keys now call a single
+  canonical `_build_opencode_scenario_tasks()` (which delegates to
+  `scripts/fixtures/loader.py::build_fixture_agentic_tasks()`); `fixtures` is an
+  alias of `opencode`. The fixture loader is imported by file path via
+  `importlib` (`_get_fixture_loader`) so a missing fixture package can never
+  break the benchmark module import.
+- **Tool-output compression (optimizer step 11.6).** New
+  `tool_output_compressor.py` (`ToolOutputCompressor` + `compress_tool_messages`)
+  boundary-compresses large `tool`/`assistant` outputs (truncate head+tail,
+  collapse 3+ repeated lines / stack-frame blocks, strip ANSI) when they exceed
+  `agentic.tool_output_compression_max_chars` (default 4000). Gated by
+  `agentic.tool_output_compression_enabled` (default `true`). The transform is
+  cheap and idempotent, so the compressed form is frozen into the stable leading
+  prefix and the backend's prefix cache stays byte-stable. Small outputs (e.g.
+  file reads under the threshold) are forwarded verbatim to preserve response
+  quality.
+- **Compression fires on every scenario.** Synthetic scenarios previously
+  emitted placeholder tool outputs (a 56-char `run_command` string) that never
+  crossed the threshold, so compression only ran on the fixture replay.
+  `_agentic_exchange` now synthesizes a realistic >4k-char `run_command` log
+  (reusing `agent_log_output` from the fixture loader, with a `_FALLBACK_AGENT_LOG`
+  if the loader is unavailable) and a real fixture `read_file`, so the proxy's
+  `ToolOutputCompressor` path is exercised on all benchmark traffic.
+- **Frozen prefix sourced from the optimized (compressed) messages.** The
+  `freeze_static_prefix` step now freezes from the *optimized* list instead of
+  the raw `messages`, so step-11.6 compression is no longer undone by the freeze
+  and survives into the cache-stable prefix.
+- **None-content crashes fixed.** `.get("content") or ""` guards added across
+  `optimizer.py`, `context_aligner.py`, `selective_truncator.py`,
+  `attention_sink.py`, and `app.py` so `None` tool/assistant contents (common in
+  agentic `tool_calls` payloads) no longer raise. `goal_text` now uses
+  `(msg.get("content") or "")[:500]` precedence.
+- **Regression gate + ops (from review03.md §10, shipped in this release).**
+  `--min-similarity <float>` makes a run exit `2` if mean semantic similarity to
+  the direct baseline drops below the threshold; `GET /v1/metrics` +
+  `POST /v1/metrics/reset`; dry-run/explain mode (`X-MOEPT-Optimized-Messages`
+  header); `moeptimizer-config-check` CLI; and `quality`/`balanced`/`aggressive`
+  quality profiles applied at app-build time.

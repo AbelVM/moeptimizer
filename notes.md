@@ -49,7 +49,7 @@
 - Step 14.5: Cache registry persistence
 
 ### Test Results
-- 357 tests pass, 3 skipped
+- 336 tests pass, 2 skipped
 - Token savings: 8-27% reduction (code-heavy scenarios)
 - No integrity issues (no leaked markers)
 - Response quality: semantic similarity 0.92-0.98
@@ -358,3 +358,63 @@ changes: **305 passed, 2 skipped**.
   `static_prefix_kv` are **kept** (used). Full suite green: **305 passed, 2 skipped**
   (drop from 357 = deleted dead-component tests).
 - #11 stale `notes.md` latency claim fixed above.
+
+## v0.6.0 — Agentic benchmark by default + tool-output compression (2026-07-12)
+
+Full test suite after changes: **336 passed, 2 skipped**.
+
+### Changes
+1. **All benchmark scenarios are agentic by default.** Every scenario
+   (`debug`/`refactor`/`feature`/`default` ±`_long`, `fixtures`, `opencode`) now
+   runs as an OpenCode-style harness: each turn sends a real agent payload — the
+   user task plus assistant `tool_calls` and the corresponding `tool` results —
+   and the OpenAI `tools` schema is forwarded to the backend, exactly like a
+   production coding client. `--no-agentic` opts back to plain user messages.
+2. **`fixtures`/`opencode` deduped.** Both scenario keys call a single canonical
+   `_build_opencode_scenario_tasks()` (delegating to
+   `scripts/fixtures/loader.py::build_fixture_agentic_tasks()`); `fixtures` is an
+   alias of `opencode`. The fixture loader is imported by file path via
+   `importlib` (`_get_fixture_loader`) so a missing fixture package can never
+   break the benchmark module import.
+3. **Tool-output compression (optimizer step 11.6).** New
+   `tool_output_compressor.py` (`ToolOutputCompressor` + `compress_tool_messages`)
+   boundary-compresses large `tool`/`assistant` outputs (truncate head+tail,
+   collapse 3+ repeated lines / stack-frame blocks, strip ANSI) when they exceed
+   `agentic.tool_output_compression_max_chars` (default 4000). Gated by
+   `agentic.tool_output_compression_enabled` (default `true`). Cheap and
+   idempotent, so the compressed form is frozen into the stable leading prefix
+   and the backend's prefix cache stays byte-stable. Small outputs (file reads
+   under the threshold) are forwarded verbatim to preserve response quality.
+4. **Compression fires on every scenario.** Synthetic scenarios previously
+   emitted placeholder tool outputs (a 56-char `run_command` string) that never
+   crossed the threshold, so compression only ran on the fixture replay.
+   `_agentic_exchange` now synthesizes a realistic >4k-char `run_command` log
+   (reusing `agent_log_output` from the fixture loader, with a `_FALLBACK_AGENT_LOG`
+   if the loader is unavailable) and a real fixture `read_file`, so the proxy's
+   `ToolOutputCompressor` path is exercised on all benchmark traffic.
+5. **Frozen prefix sourced from the optimized (compressed) messages.** The
+   `freeze_static_prefix` step now freezes from the *optimized* list instead of
+   the raw `messages`, so step-11.6 compression is no longer undone by the freeze
+   and survives into the cache-stable prefix.
+6. **None-content crashes fixed.** `.get("content") or ""` guards added across
+   `optimizer.py`, `context_aligner.py`, `selective_truncator.py`,
+   `attention_sink.py`, and `app.py` so `None` tool/assistant contents (common in
+   agentic `tool_calls` payloads) no longer raise. `goal_text` now uses
+   `(msg.get("content") or "")[:500]` precedence.
+7. **Regression gate + ops (review03.md §10, shipped in this release).**
+   `--min-similarity <float>` makes a run exit `2` if mean semantic similarity to
+   the direct baseline drops below the threshold; `GET /v1/metrics` +
+   `POST /v1/metrics/reset`; dry-run/explain mode (`X-MOEPT-Optimized-Messages`
+   header); `moeptimizer-config-check` CLI; and `quality`/`balanced`/`aggressive`
+   quality profiles applied at app-build time.
+
+### Config defaults (new in v0.6.0)
+- `MOEPT_AGENTIC__TOOL_OUTPUT_COMPRESSION_ENABLED`: new, default `true`
+- `MOEPT_AGENTIC__TOOL_OUTPUT_COMPRESSION_MAX_CHARS`: new, default `4000`
+
+### Remaining work (not started)
+- Run a full 30-turn all-scenario benchmark to confirm the regression gate holds
+  (A≥0.88, B≥0.82, C≥0.75, D≥0.68, F<0.68) now that compression fires on every
+  scenario.
+- Consider surfacing per-turn `tool_output_compression` savings in the metrics
+  endpoint.

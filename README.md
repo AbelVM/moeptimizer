@@ -340,8 +340,8 @@ You might need to run the benchmark as background task to avoid hitting command 
 | `feature_long` | 30-turn real-life feature conversation with evolving code blocks and context growth beyond 32k tokens |
 | `default` | General coding conversation (Fibonacci example) |
 | `default_long` | 30-turn general coding conversation with evolving code blocks and context growth beyond 32k tokens |
-| `fixtures` | OpenCode-harness replay of the real `scripts/fixtures/` project: each turn reads a real fixture file and runs a realistic test/lint/build log. The log exceeds the 4k-char compression threshold, so the proxy's `ToolOutputCompressor` fires on benchmark traffic. |
-| `opencode` | Same OpenCode-harness replay as `fixtures` (user task + `tool_calls` + real tool outputs). Always agentic. |
+| `fixtures` | **Alias of `opencode`** — OpenCode-harness replay of the real `scripts/fixtures/` project: each turn reads a real fixture file and runs a realistic test/lint/build log. |
+| `opencode` | OpenCode-harness replay of the real `scripts/fixtures/` project (user task + `tool_calls` + real tool outputs). Always agentic. `fixtures` is an alias of this scenario. |
 
 All scenarios are agentic by default. `--no-agentic` sends plain user messages
 instead of agent payloads. `--profile` selects the optimization preset
@@ -358,8 +358,14 @@ chars). Cheap, idempotent transforms (truncate, collapse repeated lines/frames,
 strip ANSI) run once when a tool message first appears, so the compressed form
 is frozen into the stable leading prefix and the backend's prefix cache stays
 valid. Small outputs (e.g. file reads under the threshold) are forwarded
-verbatim to preserve response quality. The `fixtures`/`opencode` scenarios ship
-a >4k-char `run_command` log specifically to exercise this path.
+verbatim to preserve response quality. **Every scenario ships a >4k-char
+`run_command` log**, so the proxy's `ToolOutputCompressor` fires on all
+benchmark traffic — not just the fixture replay. The `fixtures`/`opencode`
+replay reads a real fixture log (`agent_log_output` in `scripts/fixtures/loader.py`);
+the synthetic scenarios (`debug`/`refactor`/`feature`/`default` ±`_long`) synthesize
+one via `_agentic_exchange` in `scripts/benchmark.py` (with a `_FALLBACK_AGENT_LOG`
+if the fixture loader is unavailable). File-read outputs stay under the threshold
+and are forwarded verbatim.
 
 ### Metrics Collected
 
