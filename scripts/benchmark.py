@@ -216,10 +216,36 @@ _FALLBACK_AGENT_LOG = "\n".join(
 )
 
 
+def _extract_code_block(text: str) -> str | None:
+    """Return the first fenced code block in *text*, or None if there is none."""
+    import re
+
+    match = re.search(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
+    return match.group(1).rstrip() if match else None
+
+
+def _synthetic_run_log(turn_index: int) -> str:
+    """A realistic, per-turn-varying test/lint/build log (>4k chars).
+
+    Each turn gets a distinct log (turn-tagged header + varying heartbeat count)
+    so the synthetic agent payloads are not byte-identical across turns, while
+    still being large enough to trigger the proxy's tool-output compression.
+    """
+    loader = _get_fixture_loader()
+    base = loader.agent_log_output(True) if loader is not None else _FALLBACK_AGENT_LOG
+    heartbeats = "\n".join(
+        f"DEBUG worker heartbeat ok seq={turn_index}:{i}"
+        for i in range(180 + (turn_index * 7) % 60)
+    )
+    return f"$ python -m pytest -q  # turn {turn_index}\n{base}\n{heartbeats}"
+
+
 def _agentic_exchange(
     user_content: str,
     turn_index: int,
     tool_outputs: list[dict] | None = None,
+    read_path: str | None = None,
+    read_content_override: str | None = None,
 ) -> list[dict]:
     """Build one OpenCode-style agentic turn as a list of messages.
 
@@ -227,29 +253,48 @@ def _agentic_exchange(
     ``tool_calls`` and the corresponding ``tool`` results. ``tool_outputs`` is a
     list of ``{"name", "arguments", "content"}`` describing the tool calls the
     agent makes this turn and their (already-computed) results. When omitted, a
-    default ``read_file`` + ``run_command`` pair is synthesized with *realistic*
-    content (a real fixture file plus a >4k-char test/lint/build log) so even the
+    default ``read_file`` + ``run_command`` pair is synthesized so even the
     synthetic scenarios emit a believable agent payload and exercise the proxy's
     tool-output compression path.
+
+    When ``read_path`` is given, the ``read_file`` result is the scenario's own
+    current module so the tool output is coherent with the task. By default the
+    module is extracted from the fenced code block in ``user_content`` (the
+    long scenarios paste the growing module each turn). ``read_content_override``
+    lets a caller supply the module directly — used by the short scenarios,
+    whose tasks carry no code block, so they would otherwise fall back to a
+    placeholder string and produce an incoherent agent payload. The
+    ``run_command`` log varies per turn. When ``read_path`` is omitted the
+    exchange falls back to reading a real fixture file (whole-project scenarios).
     """
     if tool_outputs is None:
-        loader = _get_fixture_loader()
-        if loader is not None:
-            read_content = loader.read_fixture_file("users/repository.py")
-            run_content = loader.agent_log_output(True)
+        run_content = _synthetic_run_log(turn_index)
+        if read_path is not None:
+            # Prefer an explicit override (e.g. the scenario's base module) so the
+            # tool output stays coherent even when the user task has no code block.
+            read_content = (
+                read_content_override
+                if read_content_override is not None
+                else _extract_code_block(user_content)
+            )
         else:
-            read_content = None
-            run_content = _FALLBACK_AGENT_LOG
+            loader = _get_fixture_loader()
+            read_path = "users/repository.py"
+            read_content = (
+                loader.read_fixture_file("users/repository.py")
+                if loader is not None
+                else None
+            )
         tool_outputs = [
             {
                 "name": "read_file",
-                "arguments": {"path": "users/repository.py"},
+                "arguments": {"path": read_path},
                 "content": read_content
                 or "(current file contents would be returned here by the harness)",
             },
             {
                 "name": "run_command",
-                "arguments": {"command": "python -m pytest -q users"},
+                "arguments": {"command": "python -m pytest -q"},
                 "content": run_content,
             },
         ]
@@ -323,6 +368,89 @@ def _append_assistant_message(messages: list[dict], msg: dict) -> None:
 # static file), which is what makes older turns become stale and lets the proxy's
 # cache-stable summarization / front-eviction behave like in production.
 
+import re as _re_mod
+
+# Top-level definition matcher (def / async def / class) at column 0.
+_DEF_NAME_RE = _re_mod.compile(r"^(?:async\s+)?def\s+(\w+)|^class\s+(\w+)", _re_mod.MULTILINE)
+
+
+def _split_top_level_blocks(text: str) -> list[str]:
+    """Split a module into top-level blocks.
+
+    A block is a maximal run of lines that starts at column 0 (or with a
+    decorator ``@``) and continues through indented lines, the ``def`` /
+    ``class`` line that immediately follows a decorator, and blank lines that
+    occur *inside* a definition body. A new top-level block starts only at a
+    column-0 line that is neither a decorator nor directly preceded by one.
+
+    This matters because some steps (e.g. ``DEFAULT_STEPS[4]``'s ``FibService``)
+    contain a blank line between methods; a naive blank-line split would orphan
+    the later method as a separate top-level block and corrupt the merge.
+    """
+    blocks: list[str] = []
+    cur: list[str] = []
+    prev_was_decorator = False
+    for line in text.splitlines():
+        if line.strip() == "":
+            if cur:
+                cur.append(line)
+            prev_was_decorator = False
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.lstrip()
+        is_decorator = stripped.startswith("@")
+        starts_new = (
+            indent == 0
+            and not is_decorator
+            and not prev_was_decorator
+        )
+        if not cur or starts_new:
+            if cur:
+                blocks.append("\n".join(cur))
+            cur = [line]
+        else:
+            cur.append(line)
+        prev_was_decorator = is_decorator
+    if cur:
+        blocks.append("\n".join(cur))
+    return blocks
+
+
+def _defined_names(block: str) -> set[str]:
+    """Return the set of top-level def/class names declared in *block*."""
+    names: set[str] = set()
+    for m in _DEF_NAME_RE.finditer(block):
+        names.add(m.group(1) or m.group(2))
+    return names
+
+
+def _merge_modules_last_def_wins(parts: list[str]) -> str:
+    """Concatenate module parts, keeping only the last definition of each name.
+
+    Some code steps are *replacements* of a function the base (or an earlier
+    step) already defines — e.g. ``DEFAULT_STEPS`` redefines ``fibonacci`` and
+    ``fibonacci_gen``. A naive cumulative append would paste the same name
+    twice, producing an incoherent (and for a real agent, impossible) "current
+    module". Last-def-wins keeps each top-level name exactly once, matching
+    what an agent's actual file would contain.
+    """
+    blocks: list[str] = []
+    for part in parts:
+        if part and part.strip():
+            blocks.extend(_split_top_level_blocks(part))
+    last_index: dict[str, int] = {}
+    for i, blk in enumerate(blocks):
+        for name in _defined_names(blk):
+            last_index[name] = i
+    kept = [
+        blk
+        for i, blk in enumerate(blocks)
+        if not _defined_names(blk)
+        or all(i == last_index[name] for name in _defined_names(blk))
+    ]
+    return "\n\n".join(kept)
+
+
 def _cumulative_code(base: str, steps: list[str], index: int) -> str:
     """Return the module state after applying code steps 0..index (capped).
 
@@ -332,6 +460,10 @@ def _cumulative_code(base: str, steps: list[str], index: int) -> str:
     grows turn-over-turn (instead of re-pasting a static file). This is what
     makes older turns become stale and lets the proxy's cache-stable
     summarization / front-eviction behave like in production.
+
+    Replacement-style steps (a step that redefines a name the base or an
+    earlier step already defined) are merged last-def-wins so the pasted
+    "current module" never contains duplicate top-level definitions.
     """
     if not steps:
         return base
@@ -339,7 +471,7 @@ def _cumulative_code(base: str, steps: list[str], index: int) -> str:
     applied = [s for s in steps[: idx + 1] if s.strip()]
     if not applied:
         return base.rstrip()
-    return base.rstrip() + "\n\n" + "\n\n".join(applied)
+    return _merge_modules_last_def_wins([base.rstrip(), *applied])
 
 
 def _build_long_tasks(
@@ -569,11 +701,11 @@ def register_validator(fn: Callable[[User], None]) -> None:
 
 
 LONG_REFACTOR_INSTRUCTIONS = [
-    "Start by turning this into a typed, testable module with dataclasses and a clear separation between IO and business logic.",
-    "Now add a `UserRepository` class that reads from a JSONL file, validates the schema, and returns `User` objects instead of raw dicts.",
-    "Next, introduce a `Config` dataclass that loads from environment variables and supports a `dry_run` flag.",
-    "Refactor the summarizer into a service class with dependency injection so tests can swap in a fake repository.",
-    "Add structured logging to the service so each step emits a compact event object.",
+    "Expose the public API via `__all__` and add a `__main__` guard that loads users.jsonl and prints the summary.",
+    "Add a `UserSchemaError` and a `_parse_row` helper that validates each JSONL row and raises on missing id/name.",
+    "Introduce a `Config` dataclass loaded from environment variables with a `dry_run` flag.",
+    "Refactor the summarizer into a `SummarizerService` with dependency injection so tests can swap in a fake repository.",
+    "Add structured logging so each step emits a compact JSON event object.",
     "Please add a CLI entry point that accepts `--input`, `--output`, and `--dry-run`.",
     "Now add a pytest suite that covers happy path, missing file, invalid JSONL, and dry-run behavior.",
     "Add async support with `aiofiles` for the repository and a small async wrapper around the CLI path.",
@@ -760,35 +892,35 @@ def register_validator(fn: Callable[[Item], None]) -> None:
 
 
 DEBUG_LONG_INSTRUCTIONS = [
-    "Start by diagnosing the IndexError in the helper and explain the failing path.",
-    "Now fix the off-by-one bug and add a regression test for empty input.",
-    "Add clearer validation for malformed records and return structured error details.",
-    "Introduce logging around the failing section so the next incident is easier to trace.",
-    "Add a retry wrapper around the file read path and keep the public API stable.",
-    "Refactor the error handling into a small helper that can be reused across endpoints.",
+    "Add a safe indexing helper `_safe_get` that wraps list access and avoids the IndexError.",
+    "Fix the off-by-one in the list handling and guard against empty input with a `_normalize` helper.",
+    "Add an `ItemSchemaError` and a `_validate` helper for malformed records.",
+    "Add logging around the failing section via a `log_failure` helper.",
+    "Add a retry wrapper `read_with_retry` around the file read path and keep the public API stable.",
+    "Refactor the error handling into a small `handle_error` helper that can be reused across endpoints.",
     "Add a unit test for the retry path using a fake file object.",
-    "Make the API return a consistent error shape for validation failures.",
+    "Make the API return a consistent `ErrorResponse` shape for validation failures.",
     "Add a CLI smoke test that exercises the failing path end to end.",
-    "Refactor the module so the pure logic is separated from FastAPI plumbing.",
-    "Add a timeout around the file read path and document the tradeoff.",
-    "Introduce a small metrics object that counts successful and failed parses.",
-    "Add structured logging for every request and include the trace id in the response.",
-    "Harden the endpoint against oversized payloads without changing the happy path.",
-    "Add a compatibility shim for clients that still send the old dict format.",
+    "Refactor the module so the pure logic is separated from FastAPI plumbing via `parse_items`.",
+    "Add a timeout `read_with_timeout` around the file read path and document the tradeoff.",
+    "Introduce a small `Metrics` object that counts successful and failed parses.",
+    "Add structured logging for every request and include the trace id in the response via `bind_trace`.",
+    "Harden the endpoint against oversized payloads with a `_check_size` guard without changing the happy path.",
+    "Add a compatibility shim `legacy_create` for clients that still send the old dict format.",
     "Refactor the retry logic to use exponential backoff with jitter.",
     "Add a test that verifies the endpoint rejects negative quantities.",
-    "Add a small benchmark fixture that measures the debug path on 10k rows.",
+    "Add a small benchmark fixture `benchmark_parse` that measures the debug path on 10k rows.",
     "Add documentation for the new error contract and retry behavior.",
     "Do a final cleanup pass to remove dead code and tighten type hints.",
-    "Add a streaming variant that yields parsed items one at a time.",
-    "Add localization support for user-facing error messages.",
-    "Add a plugin hook for custom validators that can be registered at startup.",
+    "Add a streaming variant `stream_items` that yields parsed items one at a time.",
+    "Add localization support for user-facing error messages via a `Localizer`.",
+    "Add a plugin hook `register_validator` for custom validators that can be registered at startup.",
     "Add config validation so bad environment variables fail fast.",
     "Add a final refactor that groups related helpers into small modules.",
     "Add a short architecture diagram in text form and explain the data flow.",
     "Add a final test that replays the debug session against the package.",
     "Finish by summarizing the fix, remaining risks, and next hardening step.",
-    "Add a small observability hook that exports request duration and parse errors.",
+    "Add a small observability hook `record_duration` that exports request duration and parse errors.",
     "Add a final release note that explains the bug fix and the new safeguards.",
 ]
 
@@ -942,32 +1074,32 @@ def register_backend(fn: Callable[[str, str], TokenResponse]) -> None:
 
 
 FEATURE_LONG_INSTRUCTIONS = [
-    "Start by sketching the authentication API shape and the data models it needs.",
-    "Add a login endpoint that validates credentials and returns a bearer token.",
-    "Introduce a config object for JWT settings and keep the public API stable.",
-    "Refactor token creation into a small service so tests can swap the signer.",
-    "Add rate limiting to the login endpoint without changing the response shape.",
-    "Add a dependency injection layer so the auth service can use a fake repository.",
+    "Add a `RefreshRequest` model for token refresh.",
+    "Extract a `create_token` helper that mints a JWT for a given subject.",
+    "Introduce a `JWTConfig` dataclass for the JWT settings.",
+    "Refactor token creation into an `AuthService` with an injectable signer.",
+    "Add a `RateLimiter` to the login endpoint without changing the response shape.",
+    "Add a dependency-injection layer `get_auth_service` so the auth service can use a fake repository.",
     "Add a test suite for login success, invalid credentials, and expired tokens.",
     "Add async support around the token refresh path while preserving sync behavior.",
     "Refactor the package layout so auth logic lives in its own module.",
     "Add a Dockerfile that runs the API and mounts a config file.",
     "Add a CI workflow that runs lint, type checks, and auth tests.",
-    "Add a lightweight benchmark for login throughput on a warm token cache.",
+    "Add a lightweight benchmark `benchmark_login` for login throughput on a warm token cache.",
     "Add documentation for the auth API, config, and token lifecycle.",
     "Add a changelog entry for the authentication feature.",
-    "Harden the endpoint against malformed payloads and oversized requests.",
-    "Add metrics for login success, failure, and rate-limit hits.",
-    "Add observability hooks that propagate a trace id through auth responses.",
-    "Add a migration path from the old session cookie flow to bearer tokens.",
+    "Harden the endpoint against malformed payloads and oversized requests with `_check_request`.",
+    "Add `AuthMetrics` for login success, failure, and rate-limit hits.",
+    "Add observability hooks that propagate a trace id through auth responses via `bind_trace`.",
+    "Add a migration path `legacy_session_login` from the old session cookie flow to bearer tokens.",
     "Add release notes that explain the new auth flow and breaking changes.",
     "Do a final cleanup pass to remove dead code and tighten type hints.",
-    "Add a streaming token refresh endpoint that yields refresh events.",
-    "Add retry logic around external token validation with bounded backoff.",
-    "Add localization support for user-facing auth errors.",
-    "Add a performance optimization for token validation using an LRU cache.",
-    "Add a plugin hook for custom auth backends.",
-    "Add config validation so bad JWT settings fail fast.",
+    "Add a streaming token refresh endpoint `stream_refresh` that yields refresh events.",
+    "Add retry logic `validate_external_with_retry` around external token validation with bounded backoff.",
+    "Add localization support for user-facing auth errors via a `Localizer`.",
+    "Add a performance optimization for token validation using an LRU cache `cached_validate`.",
+    "Add a plugin hook `register_backend` for custom auth backends.",
+    "Add config validation `validate_jwt_config` so bad JWT settings fail fast.",
     "Add a final refactor that groups related auth helpers into small modules.",
     "Add a short architecture diagram in text form and explain the auth flow.",
     "Add a final test that simulates the full feature conversation against the package.",
@@ -992,6 +1124,34 @@ def fibonacci_gen(n: int) -> Iterator[int]:
     for _ in range(n):
         yield a
         a, b = b, a + b
+"""
+
+# Coherent base modules for the *short* (non-long) scenarios, used as the
+# read_file tool result so the agent payload stays coherent with the task the
+# user actually pastes. The long scenarios paste their own cumulative module,
+# so they do not use these. Each mirrors the code the corresponding short
+# scenario's first user message shows.
+SHORT_DEBUG_CODE = """def process_items(items):
+    result = []
+    for i in range(len(items)):
+        result.append(items[i + 1])
+    return result
+"""
+
+SHORT_REFACTOR_CODE = """def calculate_stats(data):
+    total = 0
+    count = 0
+    for item in data:
+        total += item
+        count += 1
+    avg = total / count
+
+    variance = 0
+    for item in data:
+        variance += (item - avg) ** 2
+    std = variance / count
+
+    return avg, std
 """
 
 # One code delta per DEFAULT_LONG_INSTRUCTIONS entry. Empty = artifact outside
@@ -1139,33 +1299,33 @@ def register_formatter(name: str, fn: Callable[[list[int]], str]) -> None:
 
 
 DEFAULT_LONG_INSTRUCTIONS = [
-    "Start by explaining the simplest iterative Fibonacci implementation and its tradeoffs.",
-    "Refactor the helper into a generator that yields one value at a time.",
-    "Add type hints and a small docstring while preserving the public API.",
-    "Introduce a config object that controls the sequence length and output format.",
-    "Refactor the generator into a service class with dependency injection for tests.",
-    "Add structured logging around each yielded value and keep the output stable.",
+    "Document the iterative `fibonacci` with its O(n) time / O(n) space tradeoffs.",
+    "Document the `fibonacci_gen` generator as O(1) space, yielding one value at a time.",
+    "Add type hints and a small docstring to the helpers while preserving the public API.",
+    "Introduce a `GeneratorConfig` that controls the sequence length and output format.",
+    "Refactor the generator into a `FibService` with dependency injection for tests.",
+    "Add structured logging around each yielded value via `log_yield` and keep the output stable.",
     "Add a CLI entry point that accepts `--count` and `--format`.",
     "Add a pytest suite for zero, one, many, and negative inputs.",
-    "Add async support with a small wrapper around the generator.",
+    "Add async support with a small `afibonacci_gen` wrapper around the generator.",
     "Refactor the code into a package layout with `src/`, `tests/`, and `pyproject.toml`.",
     "Add a Dockerfile that runs the CLI against a mounted config file.",
     "Add a GitHub Actions workflow that runs formatting, linting, and tests.",
-    "Add a lightweight benchmark that measures generator throughput on large n.",
+    "Add a lightweight benchmark `benchmark_gen` that measures generator throughput on large n.",
     "Add documentation for usage, config, and the generator contract.",
     "Add a changelog entry for the generator refactor and CLI.",
-    "Harden the CLI against invalid arguments and malformed config files.",
-    "Add metrics for count, duration, and yielded values.",
-    "Add observability hooks that propagate a trace id through CLI output.",
-    "Add a migration path from the old list API to the new generator API.",
+    "Harden the CLI against invalid arguments and malformed config files via `_parse_args`.",
+    "Add `GenMetrics` for count, duration, and yielded values.",
+    "Add observability hooks that propagate a trace id through CLI output via `bind_trace`.",
+    "Add a migration path `legacy_fibonacci` from the old list API to the new generator API.",
     "Add release notes that explain the new generator and CLI behavior.",
     "Do a final cleanup pass to remove dead code and tighten type hints.",
-    "Add a streaming API variant that yields formatted lines one at a time.",
-    "Add retry logic around config loading with bounded backoff.",
-    "Add localization support for user-facing CLI errors.",
-    "Add a performance optimization for large n using a rolling pair.",
-    "Add a plugin hook for custom formatters.",
-    "Add config validation so invalid settings fail fast.",
+    "Add a streaming API variant `stream_fib` that yields formatted lines one at a time.",
+    "Add retry logic `load_config_with_retry` around config loading with bounded backoff.",
+    "Add localization support for user-facing CLI errors via a `Localizer`.",
+    "Add a performance optimization for large n using a rolling pair in `fibonacci`.",
+    "Add a plugin hook `register_formatter` for custom formatters.",
+    "Add config validation `validate_config` so invalid settings fail fast.",
     "Add a final refactor that groups related helpers into small modules.",
     "Add a short architecture diagram in text form and explain the data flow.",
     "Finish by summarizing the refactor, remaining risks, and next hardening step.",
@@ -1231,6 +1391,10 @@ def _build_opencode_scenario_tasks() -> list[list[dict]]:
 # Real-life coding scenarios for benchmarking
 # ---------------------------------------------------------------------------
 
+# The OpenCode-harness replay is identical for both the `fixtures` and
+# `opencode` scenario keys, so build it once at import instead of twice.
+_OPENCODE_SCENARIO_TASKS = _build_opencode_scenario_tasks()
+
 SCENARIOS = {
     "debug": {
         "description": "Debugging session with error analysis",
@@ -1272,10 +1436,10 @@ SCENARIOS = {
     "default": {
         "description": "General coding conversation",
         "tasks": [
-            ("user", "What is 2+2? Answer with just the number."),
-            ("user", "Now write a Python function to compute Fibonacci numbers iteratively."),
-            ("user", "Great. Now refactor it to use a generator instead of building a list."),
+            ("user", "Write a Python function to compute Fibonacci numbers iteratively and return them as a list."),
+            ("user", "Now refactor it to use a generator instead of building a list."),
             ("user", "Add type hints and docstrings to the generator."),
+            ("user", "Add a CLI entry point that accepts a --count argument and prints the sequence."),
         ],
     },
     "default_long": {
@@ -1284,11 +1448,11 @@ SCENARIOS = {
     },
     "fixtures": {
         "description": "OpenCode-harness replay from scripts/fixtures/ (alias of opencode: user task + tool calls + real tool outputs)",
-        "tasks": _build_opencode_scenario_tasks(),
+        "tasks": _OPENCODE_SCENARIO_TASKS,
     },
     "opencode": {
         "description": "OpenCode-harness replay from scripts/fixtures/ (user task + tool calls + real tool outputs)",
-        "tasks": _build_opencode_scenario_tasks(),
+        "tasks": _OPENCODE_SCENARIO_TASKS,
     },
 }
 
@@ -1554,33 +1718,27 @@ def _resolve_prompt_tokens(
 
 
 def _calculate_timeout(turns: int, rounds: int) -> float:
-    """Calculate timeout based on turns and rounds.
+    """Calculate the per-request timeout based on expected context growth.
 
-    Context-size dependent logic:
-    - Short contexts (<1000 tokens): 60-120s
-    - Medium contexts (1000-3000 tokens): 120-180s
-    - Long contexts (>3000 tokens): 180-300s
-
-    This scales timeout with expected context growth per turn.
+    Each turn appends a user task plus (in agentic mode) assistant tool_calls
+    and tool results, so the context -- and thus per-request latency -- grows
+    roughly linearly with the number of turns. We scale the base timeout by
+    ``1 + turns * 0.15`` (about +15% per turn) and cap it at 300s, so a
+    10-turn run already reaches the cap and longer runs stay bounded.
+    ``rounds`` is accepted for API symmetry but does not change the per-request
+    timeout.
     """
-    # Base timeout per request
     base_timeout = 120.0  # 2 minutes in seconds
-
-    # Scale with turns: later turns have more context
-    # Each turn adds ~100-150 tokens of context
-    # Context grows: 200 → 500+ tokens over 10-15 turns
-    # Timeout should scale: 120s → 300s
-    context_growth_factor = 1 + (turns * 0.15)  # 15% increase per turn
-
+    context_growth_factor = 1 + (turns * 0.15)  # ~15% more headroom per turn
     return min(300.0, base_timeout * context_growth_factor)
 
 
-def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float = 180.0, tools: list[dict] | None = None) -> tuple[dict, float, dict[str, str]]:
+def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0) -> tuple[dict, float, dict[str, str]]:
     url = f"{LEMONADE_URL}/chat/completions"
     body = {
         "model": MODEL_ID,
         "messages": messages,
-        "temperature": 0.1,
+        "temperature": temperature,
         "stream": False,
         "max_tokens": max_tokens,
     }
@@ -1591,35 +1749,19 @@ def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float 
 
 
 def _proxy_request(
-    messages: list[dict], session_id: str | None = None, max_tokens: int = 256, timeout: float = 180.0, tools: list[dict] | None = None
+    messages: list[dict], session_id: str | None = None, max_tokens: int = 256, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0
 ) -> tuple[dict, float, dict[str, str]]:
     url = f"http://127.0.0.1:{MOEPT_PORT}/v1/chat/completions"
     body = {
         "model": MODEL_ID,
         "messages": messages,
-        "temperature": 0.1,
+        "temperature": temperature,
         "stream": False,
         "max_tokens": max_tokens,
     }
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
-    if session_id:
-        body["_session_id"] = session_id
-    return _request(url, body, timeout)
-
-
-def _proxy_request(
-    messages: list[dict], session_id: str | None = None, max_tokens: int = 256, timeout: float = 180.0
-) -> tuple[dict, float, dict[str, str]]:
-    url = f"http://127.0.0.1:{MOEPT_PORT}/v1/chat/completions"
-    body = {
-        "model": MODEL_ID,
-        "messages": messages,
-        "temperature": 0.1,
-        "stream": False,
-        "max_tokens": max_tokens,
-    }
     if session_id:
         body["_session_id"] = session_id
     return _request(url, body, timeout)
@@ -1771,34 +1913,37 @@ def _code_block_preservation(direct_content: str, proxy_content: str) -> dict[st
             if direct_has_code and proxy_has_code:
                 preserved += 1
 
-    # Also check if proxy has code fences (structure preservation)
-    proxy_has_fences = "```" in proxy_content
-    if not proxy_blocks and proxy_has_fences:
-        # Proxy has code fences but we couldn't extract - might be different format
-        # Check if there's any code-like content
-        if re.search(r"def |class |import |return |for |while ", proxy_content):
-            preserved = len(direct_blocks)  # Assume preserved
-    elif not proxy_blocks:
-        # No code blocks in proxy - check if code-like content exists
-        key_elements = ["def ", "class ", "import ", "return ", "if ", "for ", "while "]
-        proxy_has_code = any(kw in proxy_content for kw in key_elements)
-        if proxy_has_code:
-            # Proxy has code-like content but no fences - check word overlap
-            for dblock in direct_blocks:
-                clean = re.sub(r"\s+", " ", dblock.strip()).strip()
-                if len(clean) < 3:
-                    preserved += 1
-                    continue
-                direct_words = set(clean.split())
-                proxy_words = set(proxy_content.split())
-                overlap = len(direct_words & proxy_words) / max(len(direct_words), 1)
-                if overlap >= 0.5:
-                    preserved += 1
+    # If the proxy produced no extractable fenced blocks, fall back to a
+    # content heuristic instead of assuming full preservation.
+    if not proxy_blocks:
+        proxy_has_code = any(
+            kw in proxy_content
+            for kw in ("def ", "class ", "import ", "return ", "if ", "for ", "while ")
+        )
+        if not proxy_has_code:
+            # No fences and no code-like content: treat as loss.
+            return {
+                "block_ratio": 0.0,
+                "has_code_direct": True,
+                "has_code_proxy": False,
+            }
+        # Code-like content but no fences: score by word overlap per block.
+        preserved = 0
+        for dblock in direct_blocks:
+            clean = re.sub(r"\s+", " ", dblock.strip()).strip()
+            if len(clean) < 3:
+                preserved += 1
+                continue
+            direct_words = set(clean.split())
+            proxy_words = set(proxy_content.split())
+            overlap = len(direct_words & proxy_words) / max(len(direct_words), 1)
+            if overlap >= 0.5:
+                preserved += 1
 
     return {
         "block_ratio": round(preserved / max(len(direct_blocks), 1), 6),
         "has_code_direct": True,
-        "has_code_proxy": bool(proxy_blocks) or proxy_has_fences,
+        "has_code_proxy": bool(proxy_blocks) or ("```" in proxy_content),
     }
 
 
@@ -1926,19 +2071,23 @@ def _compute_quality_metrics(direct_content: str, proxy_content: str) -> dict[st
     except Exception:
         metrics["semantic_similarity"] = None
 
-    # ── MTP-specific metrics ───────────────────────────────────────────────
-    # These are computed from the response content to assess MTP performance
-    metrics["mtp_stability"] = _assess_mtp_stability(direct_content, proxy_content)
-    metrics["syntax_consistency"] = _assess_syntax_consistency(direct_content, proxy_content)
+    # ── Response structure / code-structure consistency ──────────────────
+    # These are computed from the response content to assess how closely the
+    # proxy's response preserves the direct response's structure (code-fence
+    # counts, reasoning markers, and code keywords) — not MTP-specific.
+    metrics["response_stability"] = _assess_response_stability(direct_content, proxy_content)
+    metrics["code_structure_consistency"] = _assess_code_structure_consistency(direct_content, proxy_content)
 
     return metrics
 
 
-def _assess_mtp_stability(direct_content: str, proxy_content: str) -> float:
-    """Assess MTP prediction stability.
+def _assess_response_stability(direct_content: str, proxy_content: str) -> float:
+    """Assess response-structure stability.
 
-    Compares the structure and flow of responses to detect MTP-related issues.
-    High similarity = stable MTP predictions.
+    Compares the structure and flow of responses to detect proxy-induced
+    disruption. High similarity = stable structure. This looks at code-fence
+    counts and reasoning markers; it is a generic structure signal, not an
+    MTP-specific measurement.
     """
     # Check for consistent code block structure
     import re
@@ -1957,10 +2106,10 @@ def _assess_mtp_stability(direct_content: str, proxy_content: str) -> float:
     return round((code_score + thought_score) / 2, 4)
 
 
-def _assess_syntax_consistency(direct_content: str, proxy_content: str) -> float:
-    """Assess syntax consistency between responses.
+def _assess_code_structure_consistency(direct_content: str, proxy_content: str) -> float:
+    """Assess code-structure consistency between responses.
 
-    Checks if code structure and formatting are preserved.
+    Checks if code structure and formatting are preserved (keyword sets).
     """
     import re
 
@@ -2015,7 +2164,7 @@ class TurnMetrics:
     completion_tokens: int = 0
     total_tokens: int = 0
     cached_tokens: int = 0
-    cache_hit_rate: float = 0.0
+    cache_hit_rate: float | None = None  # None when no real cached-token signal
     latency_ms: float = 0.0
     response_chars: int = 0
     finish_reason: str = ""
@@ -2030,6 +2179,7 @@ class TurnComparison:
     """Side-by-side metrics for one turn."""
 
     turn_index: int = 0
+    round_index: int = 0  # which benchmark round this turn belongs to
     direct: TurnMetrics = field(default_factory=TurnMetrics)
     proxy: TurnMetrics = field(default_factory=TurnMetrics)
     latency_delta_ms: float = 0.0  # proxy - direct (positive = slower)
@@ -2261,7 +2411,58 @@ class BenchmarkReport:
                 "compaction_triggered_at_turns": compaction_turns if compaction_turns else None,
                 "eviction_triggered_at_turns": eviction_turns if eviction_turns else None,
             },
+            "per_round": _per_round_summary(self.turns, total_direct_prompt, total_proxy_prompt),
         }
+
+
+def _per_round_summary(
+    turns: list[TurnComparison],
+    total_direct_prompt: int,
+    total_proxy_prompt: int,
+) -> dict[str, Any]:
+    """Aggregate quality/token metrics per benchmark round.
+
+    Rounds are isolated proxy sessions, so per-round stats expose run-to-run
+    variance (e.g. from a flaky backend) that the pooled mean would hide. This
+    is what the regression gate should reason about instead of the pooled mean.
+    """
+    by_round: dict[int, list[TurnComparison]] = {}
+    for t in turns:
+        by_round.setdefault(t.round_index, []).append(t)
+
+    rounds_out: dict[str, Any] = {}
+    for rnd, rturns in sorted(by_round.items()):
+        sims = [
+            t.quality["semantic_similarity"]
+            for t in rturns
+            if t.quality and t.quality.get("semantic_similarity") is not None
+        ]
+        d_tok = sum(t.direct.prompt_tokens for t in rturns)
+        p_tok = sum(t.proxy.prompt_tokens for t in rturns)
+        savings = (
+            round((d_tok - p_tok) / max(d_tok, 1) * 100, 2) if d_tok > 0 else 0.0
+        )
+        rounds_out[str(rnd)] = {
+            "turns": len(rturns),
+            "semantic_similarity": {
+                "mean": round(statistics.mean(sims), 4) if sims else None,
+                "min": round(min(sims), 4) if sims else None,
+                "max": round(max(sims), 4) if sims else None,
+            },
+            "token_savings_pct": savings,
+        }
+
+    # Pooled per-round mean/min of semantic similarity, used by the gate so a
+    # single noisy round cannot swing the decision.
+    if rounds_out:
+        round_means = [v["semantic_similarity"]["mean"] for v in rounds_out.values() if v["semantic_similarity"]["mean"] is not None]
+        round_mins = [v["semantic_similarity"]["min"] for v in rounds_out.values() if v["semantic_similarity"]["min"] is not None]
+        rounds_out["_pooled"] = {
+            "round_mean_of_means": round(statistics.mean(round_means), 4) if round_means else None,
+            "round_min_of_means": round(min(round_means), 4) if round_means else None,
+            "round_min_of_mins": round(min(round_mins), 4) if round_mins else None,
+        }
+    return rounds_out
 
 
 def _percentile(sorted_data: list[float], pct: float) -> float:
@@ -2292,6 +2493,7 @@ def _collect_direct_conversation(
     turn_offset: int,
     turn_exchanges: list[list[dict]] | None = None,
     tools: list[dict] | None = None,
+    temperature: float = 0.0,
 ) -> tuple[list[TurnMetrics], list[str]]:
     """Run a full conversation against direct Lemonade.
 
@@ -2325,7 +2527,7 @@ def _collect_direct_conversation(
 
         try:
             direct_resp, direct_latency, _ = _direct_request(
-                messages, max_tokens=max_tokens, timeout=request_timeout, tools=tools
+                messages, max_tokens=max_tokens, timeout=request_timeout, tools=tools, temperature=temperature
             )
             d_usage = direct_resp.get("usage", {}) or {}
             d_msg = direct_resp["choices"][0]["message"]
@@ -2346,7 +2548,7 @@ def _collect_direct_conversation(
                 completion_tokens=int(d_usage.get("completion_tokens", 0) or 0),
                 total_tokens=int(d_usage.get("total_tokens", 0) or 0),
                 cached_tokens=_d_cached,
-                cache_hit_rate=round(_d_cached / max(_d_prompt, 1), 2),
+                cache_hit_rate=round(_d_cached / max(_d_prompt, 1), 2) if _d_cached > 0 else None,
                 latency_ms=round(direct_latency, 2),
                 response_chars=len(d_content),
                 finish_reason=direct_resp["choices"][0].get("finish_reason", ""),
@@ -2390,6 +2592,7 @@ def _collect_proxy_conversation(
     turn_offset: int,
     turn_exchanges: list[list[dict]] | None = None,
     tools: list[dict] | None = None,
+    temperature: float = 0.0,
 ) -> tuple[list[TurnMetrics], list[str]]:
     """Run a full conversation through the moeptimizer proxy.
 
@@ -2421,7 +2624,7 @@ def _collect_proxy_conversation(
 
         try:
             proxy_resp, proxy_latency, proxy_headers = _proxy_request(
-                messages, session_id=session_id, max_tokens=max_tokens, timeout=request_timeout, tools=tools
+                messages, session_id=session_id, max_tokens=max_tokens, timeout=request_timeout, tools=tools, temperature=temperature
             )
             p_usage = proxy_resp.get("usage", {}) or {}
             p_msg = proxy_resp["choices"][0]["message"]
@@ -2453,7 +2656,7 @@ def _collect_proxy_conversation(
                 completion_tokens=int(p_usage.get("completion_tokens", 0) or 0),
                 total_tokens=int(p_usage.get("total_tokens", 0) or 0),
                 cached_tokens=_p_cached,
-                cache_hit_rate=round(_p_cached / max(_p_prompt, 1), 2),
+                cache_hit_rate=round(_p_cached / max(_p_prompt, 1), 2) if _p_cached > 0 else None,
                 latency_ms=round(proxy_latency, 2),
                 response_chars=len(p_content),
                 finish_reason=proxy_resp["choices"][0].get("finish_reason", ""),
@@ -2535,16 +2738,20 @@ def run_benchmark(
     budget: int | None = None,
     scenario: str = "default",
     agentic: bool = True,
+    temperature: float = 0.0,
 ) -> BenchmarkReport:
     """Run the multi-turn benchmark and collect metrics.
 
-    Direct Lemonade is run as a complete conversation before the proxy is run as a
-    complete conversation. This keeps model cache state contiguous and avoids
-    alternating direct/proxy requests from invalidating the direct benchmark.
+    The proxy conversation runs first against a cold backend, then the direct
+    Lemonade conversation runs as its own full, continuous session. Each stays a
+    contiguous multi-turn conversation (we do NOT interleave direct/proxy
+    requests). Running the proxy first means its prefix-cache hits (turns 2..N)
+    reflect the proxy's own stable prefix rather than a warm cache left by a
+    prior direct run, so the cache/latency comparison is not confounded.
 
     When ``agentic`` is True (or the scenario already ships OpenCode-style
-    exchanges), each turn appends a full agent payload — user task plus assistant
-    ``tool_calls`` and the corresponding ``tool`` results — and the OpenAI ``tools``
+    exchanges), each turn appends a full agent payload -- user task plus assistant
+    ``tool_calls`` and the corresponding ``tool`` results -- and the OpenAI ``tools``
     schema is forwarded to the backend, exactly like a real coding client.
     """
 
@@ -2582,22 +2789,73 @@ def run_benchmark(
     base_messages: list[dict] = [{"role": "system", "content": system_prompt}]
     turn_exchanges: list[list[dict]] = []
     user_tasks: list[str] = []
+    # Simple (tuple) scenarios get wrapped into agentic exchanges below. When that
+    # happens we must NOT also seed base_messages with the plain user messages,
+    # otherwise every task would be sent twice (once plain, once as an
+    # agentic user+tool_calls+tool payload) and the baseline context would be
+    # inflated. We only seed base_messages for the non-agentic path.
+    will_wrap_agentic = agentic and not any(isinstance(t, list) for t in base_tasks)
     for item in base_tasks:
         if isinstance(item, list):
             # An agentic turn exchange (user + assistant tool_calls + tool results)
             turn_exchanges.append(item)
         else:
             role, content = item
-            base_messages.append({"role": role, "content": content})
             if role == "user":
                 user_tasks.append(content)
+            if not will_wrap_agentic:
+                base_messages.append({"role": role, "content": content})
 
     # --agentic wraps simple scenarios into OpenCode-style exchanges with
     # synthesized tool outputs, so even the synthetic scenarios emit a realistic
-    # agent payload (user task + tool calls + tool results).
+    # agent payload (user task + tool calls + tool results). The read_file tool
+    # returns the scenario's own current module so the tool output is coherent
+    # with the task being worked on. For the short scenarios the tasks carry no
+    # code block, so we pass the scenario's BASE module as the read content
+    # instead of letting it fall back to a placeholder string.
     if agentic and not turn_exchanges:
+        scenario_read_paths = {
+            "debug": "app/items.py",
+            "debug_long": "app/items.py",
+            "refactor": "users/repository.py",
+            "refactor_long": "users/repository.py",
+            "feature": "auth/service.py",
+            "feature_long": "auth/service.py",
+            "default": "fib.py",
+            "default_long": "fib.py",
+        }
+        # Base module per short scenario, used as the coherent read_file result
+        # when the task carries no code block of its own.
+        scenario_base_code = {
+            "debug": SHORT_DEBUG_CODE,
+            "refactor": SHORT_REFACTOR_CODE,
+            "feature": BASE_FEATURE_CODE,
+            "default": BASE_DEFAULT_CODE,
+        }
+        # For the long scenarios the user task pastes the *cumulative* module
+        # (base + every prior step), so read_file must return that same
+        # cumulative code -- not the static base -- to stay coherent with the
+        # task. Map scenario -> (base, steps) and recompute it per turn.
+        scenario_long_data = {
+            "refactor_long": (BASE_REFACTOR_CODE, REFACTOR_STEPS),
+            "debug_long": (BASE_DEBUG_CODE, DEBUG_STEPS),
+            "feature_long": (BASE_FEATURE_CODE, FEATURE_STEPS),
+            "default_long": (BASE_DEFAULT_CODE, DEFAULT_STEPS),
+        }
+        long_pair = scenario_long_data.get(scenario)
+        read_path = scenario_read_paths.get(scenario)
         turn_exchanges = [
-            _agentic_exchange(content, i + 1) for i, content in enumerate(user_tasks)
+            _agentic_exchange(
+                content,
+                i + 1,
+                read_path=read_path,
+                read_content_override=(
+                    _cumulative_code(long_pair[0], long_pair[1], i)
+                    if long_pair
+                    else scenario_base_code.get(scenario)
+                ),
+            )
+            for i, content in enumerate(user_tasks)
         ]
         user_tasks = []
 
@@ -2616,20 +2874,13 @@ def run_benchmark(
         # leak into the next benchmark round.
         session_id = f"benchmark-{int(time.time())}-{round_num}-{uuid.uuid4().hex[:8]}"
 
-        _human_print(f"  Round {round_num + 1}/{rounds}: direct conversation")
-        direct_messages: list[dict] = [dict(msg) for msg in base_messages]
-        direct_metrics, direct_contents = _collect_direct_conversation(
-            direct_messages,
-            num_turns,
-            user_tasks,
-            fallback_user_task,
-            request_timeout,
-            max_tokens,
-            turn_offset=round_num * num_turns,
-            turn_exchanges=turn_exchanges or None,
-            tools=tools,
-        )
-
+        # Run the PROXY conversation first against a cold backend so its
+        # prefix-cache hits (turns 2..N) reflect the proxy's own stable
+        # prefix rather than a warm cache left by a prior direct run. The
+        # direct conversation follows as its own full, continuous session; any
+        # cache hits it sees are its own natural prefix reuse, not borrowed
+        # from the proxy. (We deliberately do NOT interleave the two, so each
+        # stays a contiguous multi-turn conversation.)
         _human_print(f"  Round {round_num + 1}/{rounds}: proxy conversation")
         proxy_messages: list[dict] = [dict(msg) for msg in base_messages]
         proxy_metrics, proxy_contents = _collect_proxy_conversation(
@@ -2643,6 +2894,22 @@ def run_benchmark(
             turn_offset=round_num * num_turns,
             turn_exchanges=turn_exchanges or None,
             tools=tools,
+            temperature=temperature,
+        )
+
+        _human_print(f"  Round {round_num + 1}/{rounds}: direct conversation")
+        direct_messages: list[dict] = [dict(msg) for msg in base_messages]
+        direct_metrics, direct_contents = _collect_direct_conversation(
+            direct_messages,
+            num_turns,
+            user_tasks,
+            fallback_user_task,
+            request_timeout,
+            max_tokens,
+            turn_offset=round_num * num_turns,
+            turn_exchanges=turn_exchanges or None,
+            tools=tools,
+            temperature=temperature,
         )
 
         comparisons = _build_turn_comparisons(
@@ -2651,6 +2918,8 @@ def run_benchmark(
             direct_contents,
             proxy_contents,
         )
+        for _c in comparisons:
+            _c.round_index = round_num
         report.turns.extend(comparisons)
 
         for comparison in comparisons:
@@ -2670,7 +2939,7 @@ def run_benchmark(
                 f" proxy={comparison.proxy.latency_ms:.0f}ms/{comparison.proxy.prompt_tokens:,}tok/"
                 f"{comparison.proxy.chars_before_optimization:,}chars_raw/{comparison.proxy.response_chars:,}chars"
                 f" delta={comparison.latency_delta_ms:+.0f}ms/{comparison.token_delta:+,}tok"
-                f" cache={comparison.proxy.cached_tokens:,}/{comparison.proxy.cache_hit_rate:.2f} "
+                f" cache={comparison.proxy.cached_tokens:,}/{comparison.proxy.cache_hit_rate if comparison.proxy.cache_hit_rate is not None else 'n/a'} "
                 f"{' '.join(quality_parts)}"
                 f"{direct_error}{proxy_error}"
             )
@@ -2687,7 +2956,7 @@ def _fmt_table(headers: list[str], rows: list[list[str]]) -> str:
     """Render a simple ASCII table."""
     widths = [max(len(h), max((len(r[i]) for r in rows), default=0)) for i, h in enumerate(headers)]
     pad = 2
-    header_line = "  ".join(_fmt_table.__code__.co_consts[1:3]) if False else "".join(
+    header_line = "".join(
         h.ljust(w + pad) for h, w in zip(headers, widths, strict=True)
     )
     sep = "-" * len(header_line)
@@ -2809,6 +3078,37 @@ def print_report(report: BenchmarkReport) -> None:
             ["Budget eviction triggered at turns", ", ".join(str(t) for t in ev.get("eviction_triggered_at_turns") or []) or "never"],
         ]
         print(_fmt_table(["Metric", "Value"], ev_rows))
+    # ── Per-round variance ────────────────────────────────────────────
+    per_round = summary.get("per_round", {})
+    pooled = per_round.get("_pooled") if per_round else None
+    if per_round and pooled is not None:
+        print("\n" + "-" * 72)
+        print("  PER-ROUND VARIANCE (isolated proxy sessions)")
+        print("-" * 72)
+        pr_headers = ["Round", "Turns", "Sim mean", "Sim min", "Sim max", "Token savings %"]
+        pr_rows: list[list[str]] = []
+        for rnd in sorted(per_round.keys()):
+            if rnd == "_pooled":
+                continue
+            rv = per_round[rnd]
+            sim = rv.get("semantic_similarity", {})
+            pr_rows.append([
+                rnd,
+                str(rv.get("turns", "N/A")),
+                f"{sim.get('mean', 'N/A')}",
+                f"{sim.get('min', 'N/A')}",
+                f"{sim.get('max', 'N/A')}",
+                f"{rv.get('token_savings_pct', 'N/A')}",
+            ])
+        pr_rows.append([
+            "pooled",
+            "-",
+            f"{pooled.get('round_mean_of_means', 'N/A')}",
+            f"{pooled.get('round_min_of_means', 'N/A')}",
+            f"{pooled.get('round_min_of_mins', 'N/A')}",
+            "-",
+        ])
+        print(_fmt_table(pr_headers, pr_rows))
     # ── Response quality ──────────────────────────────────────────────
     qual = summary.get("quality", {})
     print("\n" + "-" * 72)
@@ -2828,8 +3128,8 @@ def print_report(report: BenchmarkReport) -> None:
         ("markdown_structure_similarity", "Markdown structure"),
         ("length_ratio", "Length ratio"),
         ("vocabulary_richness_delta", "Vocab richness delta"),
-        ("mtp_stability", "MTP stability"),
-        ("syntax_consistency", "Syntax consistency"),
+        ("response_stability", "Response stability"),
+        ("code_structure_consistency", "Code structure"),
     ]
 
     for key, label in quality_metric_keys:
@@ -3019,7 +3319,14 @@ def run_all_scenarios(args) -> int:
     _start_proxy(args.port)
 
     try:
+        # `opencode` is an alias of `fixtures` (both bind the same
+        # `_OPENCODE_SCENARIO_TASKS`), so running it in the "all" loop would
+        # execute the identical scenario twice and double-weight it in the
+        # aggregated mean / regression gate. Skip the alias here; `--scenario
+        # opencode` still works as a standalone invocation.
         for scenario_name in SCENARIOS:
+            if scenario_name == "opencode":
+                continue
             print(f"\n  Running scenario: {scenario_name}")
             report = run_benchmark(
                 num_turns=args.turns,
@@ -3029,6 +3336,7 @@ def run_all_scenarios(args) -> int:
                 budget=args.budget,
                 scenario=scenario_name,
                 agentic=args.agentic,
+                temperature=args.temperature,
             )
             all_reports[scenario_name] = report
 
@@ -3045,8 +3353,9 @@ def run_all_scenarios(args) -> int:
             _print_aggregated(aggregated)
 
         # Regression gate across the aggregated mean (review03.md §10).
-        agg_sim = aggregated.get("aggregated", {}).get("semantic_similarity", {}).get("mean", 0.0)
-        gate = _check_similarity_gate(args, agg_sim)
+        agg = aggregated.get("aggregated", {})
+        gate_value, gate_metric = _select_aggregated_gate(agg)
+        gate = _check_similarity_gate(args, gate_value, gate_metric)
         if gate:
             return gate
 
@@ -3069,6 +3378,8 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
     # Collect all metrics
     all_latencies: list[float] = []
     all_semantic: list[float] = []
+    all_rouge: list[float] = []
+    all_jaccard: list[float] = []
     all_token_savings: list[float] = []
 
     for name, report in reports.items():
@@ -3077,6 +3388,8 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
             "num_turns": summary.get("num_turns", 0),
             "latency_mean_ms": summary.get("latency_ms", {}).get("proxy", {}).get("mean", 0),
             "semantic_similarity_mean": summary.get("quality", {}).get("semantic_similarity", {}).get("mean", 0),
+            "rouge_l_f1_mean": summary.get("quality", {}).get("rouge_l_f1", {}).get("mean", 0),
+            "token_jaccard_mean": summary.get("quality", {}).get("token_jaccard", {}).get("mean", 0),
             "token_savings_pct": summary.get("tokens", {}).get("token_savings_pct", 0),
         }
 
@@ -3088,6 +3401,14 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
         sem = summary.get("quality", {}).get("semantic_similarity", {}).get("mean", 0)
         if sem:
             all_semantic.append(sem)
+
+        rg = summary.get("quality", {}).get("rouge_l_f1", {}).get("mean", 0)
+        if rg:
+            all_rouge.append(rg)
+
+        jc = summary.get("quality", {}).get("token_jaccard", {}).get("mean", 0)
+        if jc:
+            all_jaccard.append(jc)
 
         ts = summary.get("tokens", {}).get("token_savings_pct", 0)
         all_token_savings.append(ts)
@@ -3105,6 +3426,20 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
             "mean": round(statistics.mean(all_semantic), 4),
             "min": round(min(all_semantic), 4),
             "max": round(max(all_semantic), 4),
+        }
+
+    if all_rouge:
+        aggregated["aggregated"]["rouge_l_f1"] = {
+            "mean": round(statistics.mean(all_rouge), 4),
+            "min": round(min(all_rouge), 4),
+            "max": round(max(all_rouge), 4),
+        }
+
+    if all_jaccard:
+        aggregated["aggregated"]["token_jaccard"] = {
+            "mean": round(statistics.mean(all_jaccard), 4),
+            "min": round(min(all_jaccard), 4),
+            "max": round(max(all_jaccard), 4),
         }
 
     aggregated["aggregated"]["token_savings_pct"] = {
@@ -3179,6 +3514,13 @@ def main() -> None:
         help="Real-life coding scenario: debug, refactor, feature, default, fixtures, opencode, or all",
     )
     parser.add_argument(
+        "--temperature", type=float, default=0.0,
+        help="Sampling temperature for both direct and proxy runs. Defaults to 0 "
+             "(deterministic) so quality metrics are reproducible and the "
+             "regression gate is not confounded by model sampling variance. "
+             "Raise only to stress-test nondeterminism.",
+    )
+    parser.add_argument(
         "--no-agentic", dest="agentic", action="store_false",
         help="Disable OpenCode-style agent payloads (user task + tool calls + tool "
              "outputs); send plain user messages instead. Agentic mode is the default "
@@ -3220,6 +3562,7 @@ def main() -> None:
             budget=args.budget,
             scenario=args.scenario,
             agentic=args.agentic,
+            temperature=args.temperature,
         )
 
         if args.json_output or not args.dump_responses:
@@ -3230,15 +3573,14 @@ def main() -> None:
             else:
                 print_report(report)
 
-        # Regression gate (review03.md §10): fail the run if mean semantic
+        # Regression gate (review03.md §10): fail the run if semantic
         # similarity drops below the requested threshold. Intended for CI.
-        sim_mean = (
-            report.summary()
-            .get("quality", {})
-            .get("semantic_similarity", {})
-            .get("mean", 0.0)
-        )
-        gate = _check_similarity_gate(args, sim_mean)
+        # Gate on the mean-of-round-means (per-round means averaged) so a single
+        # noisy round cannot swing the decision, while a systematic regression
+        # across rounds still fails. Falls back to the pooled mean for 1 round.
+        _summary = report.summary()
+        gate_value, gate_metric = _select_quality_gate(_summary)
+        gate = _check_similarity_gate(args, gate_value, gate_metric)
         if gate:
             return gate
 
@@ -3264,7 +3606,7 @@ def main() -> None:
                 if t.quality:
                     q = t.quality
                     parts = []
-                    for key in ["semantic_similarity", "token_jaccard", "rouge_l_f1", "edit_similarity", "code_block_ratio", "length_ratio", "mtp_stability", "syntax_consistency"]:
+                    for key in ["semantic_similarity", "token_jaccard", "rouge_l_f1", "edit_similarity", "code_block_ratio", "length_ratio", "response_stability", "code_structure_consistency"]:
                         val = q.get(key)
                         if val is not None:
                             parts.append(f"{key}={val:.4f}")
@@ -3291,21 +3633,77 @@ def main() -> None:
         _stop_proxy()
 
 
-def _check_similarity_gate(args: argparse.Namespace, sim_mean: float) -> int:
-    """Return 0 if the regression gate passes, 2 if it fails (review03.md §10)."""
+def _select_quality_gate(summary: dict[str, Any]) -> tuple[float, str]:
+    """Pick the best available quality metric for the regression gate.
+
+    Prefers robust *lexical* signals (ROUGE-L F1, token Jaccard, code-block
+    preservation, edit similarity) over embedding cosine similarity. Embeddings
+    are weak on code — two equivalent code blocks with renamed variables score
+    low cosine similarity while two verbose-but-wrong answers score high — so
+    ``semantic_similarity`` is treated as informational and only used as a
+    fallback when no lexical signal is available. Returns ``(value, metric_name)``.
+    """
+    qual = summary.get("quality", {})
+
+    # Lexical battery first (most robust for code).
+    for metric in ("rouge_l_f1", "token_jaccard", "code_block_ratio", "edit_similarity"):
+        val = (qual.get(metric) or {}).get("mean")
+        if val is not None and val > 0:
+            return val, metric
+
+    # Fallback to semantic similarity (informational only), using the robust
+    # round-mean-of-means when multiple rounds were run.
+    per_round = summary.get("per_round", {})
+    pooled = per_round.get("_pooled", {}) if per_round else {}
+    sem_robust = pooled.get("round_mean_of_means") if pooled else None
+    if sem_robust is not None and sem_robust > 0:
+        return sem_robust, "semantic_similarity"
+    sem_pooled = (qual.get("semantic_similarity") or {}).get("mean")
+    if sem_pooled is not None and sem_pooled > 0:
+        return sem_pooled, "semantic_similarity"
+
+    return 0.0, "none"
+
+
+def _select_aggregated_gate(agg: dict[str, Any]) -> tuple[float, str]:
+    """Pick the best available aggregated quality metric for the regression gate.
+
+    Mirrors :func:`_select_quality_gate`: prefers lexical signals
+    (``rouge_l_f1``, ``token_jaccard``) over embedding cosine similarity, which
+    is weak on code, so ``semantic_similarity`` is only a fallback.
+    """
+    for metric in ("rouge_l_f1", "token_jaccard"):
+        val = (agg.get(metric) or {}).get("mean")
+        if val is not None and val > 0:
+            return val, metric
+    sem = (agg.get("semantic_similarity") or {}).get("mean")
+    if sem is not None and sem > 0:
+        return sem, "semantic_similarity"
+    return 0.0, "none"
+
+
+def _check_similarity_gate(
+    args: argparse.Namespace, gate_value: float, gate_metric: str = "semantic_similarity"
+) -> int:
+    """Return 0 if the regression gate passes, 2 if it fails (review03.md §10).
+
+    ``gate_value`` is the robust statistic the gate is evaluated against and
+    ``gate_metric`` names which quality metric it came from (so a lexical
+    fallback is transparent when embeddings are unavailable).
+    """
     if args.min_similarity is None:
         return 0
-    if sim_mean < args.min_similarity:
+    if gate_value < args.min_similarity:
         _status(
             args,
-            f"\n  ❌ REGRESSION GATE FAILED: mean semantic_similarity="
-            f"{sim_mean:.4f} < --min-similarity={args.min_similarity:.4f}",
+            f"\n  ❌ REGRESSION GATE FAILED: {gate_metric}={gate_value:.4f} "
+            f"< --min-similarity={args.min_similarity:.4f}",
         )
         return 2
     _status(
         args,
-        f"\n  ✅ Regression gate passed: mean semantic_similarity="
-        f"{sim_mean:.4f} >= --min-similarity={args.min_similarity:.4f}",
+        f"\n  ✅ Regression gate passed: {gate_metric}={gate_value:.4f} "
+        f">= --min-similarity={args.min_similarity:.4f}",
     )
     return 0
 

@@ -322,7 +322,7 @@ python scripts/benchmark.py --turns 20 --json > report.json 2> benchmark.log
 python scripts/benchmark.py --turns 10 --dump-responses
 
 # Complete example
-python scripts/benchmark.py --scenario refactor_long --turns 30 --json > benchmark_refactor_long_30_12.json 2> benchmark_refactor_long_30_12.log
+python scripts/benchmark.py --scenario refactor_long --turns 30 --json > benchmark_refactor_long_30.json 2> benchmark_refactor_long_30.log
 ```
 
 You might need to run the benchmark as background task to avoid hitting command timeouts. Progress and per-turn information is dumped to stderr.
