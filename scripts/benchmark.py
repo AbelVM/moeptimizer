@@ -1808,7 +1808,11 @@ def _stream_request(
         if not choices:
             continue
         delta = choices[0].get("delta") or {}
-        if delta.get("content") is not None:
+        # Truthy check (not just `is not None`): some servers emit an opening
+        # chunk with `content: ""` (e.g. the proxy's initial SSE chunk), which
+        # would otherwise be mis-counted as the first generated token and make
+        # TTFT collapse to ~0ms. Only non-empty content starts the TTFT clock.
+        if delta.get("content"):
             if ttft_ms is None:
                 ttft_ms = (time.monotonic() - t0) * 1000
             content_parts.append(delta["content"])

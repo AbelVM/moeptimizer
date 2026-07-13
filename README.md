@@ -322,8 +322,8 @@ python scripts/benchmark.py --turns 10 --dump-responses
 # Disable with --no-measure-ttft if you must use the non-streaming path.
 python scripts/benchmark.py --scenario refactor_long --turns 30 --no-measure-ttft
 
-# Complete example
-python scripts/benchmark.py --scenario refactor_long --turns 30 --json > benchmark_refactor_long_30.json 2> benchmark_refactor_long_30.log
+# Complete example 
+python scripts/benchmark.py --scenario opencode --json > benchmark_opencode_10_5.json 2> benchmark_opencode_10_5.log
 ```
 
 > **Rounds default is 3** (was 1). Run at least 3 rounds so per-round variance

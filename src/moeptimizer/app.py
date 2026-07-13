@@ -387,8 +387,11 @@ def _make_streaming_generator(
                 })
                 yield f"data: {sse_chunk}\n\n"
 
-                if finish_reason is not None:
-                    break
+                # Do NOT break on finish_reason. With stream_options.include_usage=True
+                # the backend emits the authoritative usage chunk (incl. cached_tokens)
+                # *after* the finish_reason chunk. Breaking here would skip the real
+                # prefix-cache outcome, so we let the loop run until the stream ends
+                # and capture usage on the trailing chunk below.
 
         except Exception as e:
             logger.exception("Streaming error in chat completions")
