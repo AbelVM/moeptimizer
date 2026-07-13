@@ -2506,9 +2506,24 @@ class BenchmarkReport:
         if not self.turns:
             return {"error": "no data"}
 
-        direct_latencies = [t.direct.latency_ms for t in self.turns]
-        proxy_latencies = [t.proxy.latency_ms for t in self.turns]
-        latency_deltas = [t.latency_delta_ms for t in self.turns]
+        # Direct turns whose usage was omitted/zeroed (prompt_tokens_source ==
+        # "estimated_missing_usage") were served from the backend's prefix cache
+        # and the benchmark cannot time a real generation — their latency_ms is
+        # just the ~4ms round-trip, not a comparable generation time. Including
+        # them in the latency comparison understates the proxy's true penalty, so
+        # we exclude them from latency stats/deltas and report the count.
+        _artifact_turns = [
+            t.turn_index
+            for t in self.turns
+            if t.direct.prompt_tokens_source == "estimated_missing_usage"
+        ]
+        _timed_turns = [
+            t for t in self.turns if t.turn_index not in _artifact_turns
+        ]
+
+        direct_latencies = [t.direct.latency_ms for t in _timed_turns]
+        proxy_latencies = [t.proxy.latency_ms for t in _timed_turns]
+        latency_deltas = [t.latency_delta_ms for t in _timed_turns]
 
         def _stats(values: list[float]) -> dict[str, float]:
             if not values:
@@ -2745,6 +2760,7 @@ class BenchmarkReport:
                 "delta_proxy_minus_direct_ms": _stats(latency_deltas),
                 "delta_ci95_ms": {"low": delta_ci[0], "high": delta_ci[1]},
                 "delta_sign_test": {"proxy_slower_turns": delta_pos, "proxy_faster_turns": delta_neg},
+                "excluded_cached_artifact_turns": _artifact_turns,
             },
             "ttft_ms": {
                 "direct": _stats(direct_ttft),
@@ -3143,6 +3159,16 @@ def _collect_proxy_conversation(
                 p_usage,
                 optimized_prompt_tokens=_p_optimized_prompt_tokens,
             )
+            # The proxy rewrites the prompt, so the backend's KV-cache hit count
+            # for the proxy path is (correctly) ~0 — the optimized prompt is a
+            # novel token sequence to the model, so its prefix cache cannot match.
+            # The proxy's *own* cache reuse is surfaced via X-Prefix-Cache-Hit-Tokens.
+            # Report that as the proxy's cached_tokens so the benchmark reflects the
+            # proxy's real cache efficiency; otherwise total_cached_tokens collapses
+            # to 0 and the proxy looks cache-less even though it reused ~129k tokens.
+            # Fall back to the backend signal only when the proxy reports no hits.
+            _p_cached_tokens = p_prefix_hit if p_prefix_hit > 0 else _p_cached
+            _p_cached_response = _p_cached_response or (p_prefix_hit > 0)
             # Measure total chars before proxy optimization (for eviction tracking)
             _chars_before = sum(len(_message_text(m.get("content", ""))) for m in messages)
             metrics = TurnMetrics(
@@ -3155,8 +3181,8 @@ def _collect_proxy_conversation(
                 cached_response=_p_cached_response,
                 completion_tokens=int(p_usage.get("completion_tokens", 0) or 0),
                 total_tokens=int(p_usage.get("total_tokens", 0) or 0),
-                cached_tokens=_p_cached,
-                cache_hit_rate=round(_p_cached / max(_p_prompt, 1), 2) if _p_cached > 0 else None,
+                cached_tokens=_p_cached_tokens,
+                cache_hit_rate=round(_p_cached_tokens / max(_p_prompt, 1), 2) if _p_cached_tokens > 0 else None,
                 latency_ms=round(p_latency, 2),
                 ttft_ms=round(p_ttft, 2) if p_ttft is not None else None,
                 prefix_cache_hit_tokens=p_prefix_hit,
