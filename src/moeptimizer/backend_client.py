@@ -408,7 +408,7 @@ class LemonadeClient:
         Yields:
             ChatCompletionChunk objects
         """
-        stream = self.chat_completions_create(
+        stream = await self.chat_completions_create(
             messages=messages,
             model=model,
             temperature=temperature,

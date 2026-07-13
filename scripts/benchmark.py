@@ -54,8 +54,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
+import random
+import re
 import statistics
 import subprocess
 import sys
@@ -240,6 +243,114 @@ def _synthetic_run_log(turn_index: int) -> str:
     return f"$ python -m pytest -q  # turn {turn_index}\n{base}\n{heartbeats}"
 
 
+def _synthetic_grep_output(turn_index: int, read_content: str | None) -> str:
+    """A realistic, per-turn-varying grep result (>4k chars).
+
+    Real agents grep the repo constantly; the matches differ every turn as the
+    search target or the codebase changes. Large enough to trigger the proxy's
+    tool-output compression, like a real multi-file search would.
+    """
+    files = [
+        "src/users/repository.py", "src/users/service.py", "src/users/schema.py",
+        "tests/test_users.py", "tests/test_service.py", "src/api/routes.py",
+        "src/cli.py", "src/config.py", "src/metrics.py", "src/logging_utils.py",
+    ]
+    symbols = [
+        "def load", "def summarize", "class User", "def _parse_row",
+        "async def load", "def build_cli", "def validate_config", "def stream_users",
+    ]
+    lines = [
+        f"{files[i % len(files)]}:{10 + (i * 7 + turn_index * 3) % 400}:"
+        f"{(symbols[(i + turn_index) % len(symbols)])}(self, ...):"
+        for i in range(220)
+    ]
+    return "\n".join(lines)
+
+
+def _synthetic_edit_output(turn_index: int) -> str:
+    """A realistic, per-turn-varying edit confirmation / unified diff (>4k chars)."""
+    header = (
+        f"Applied 1 edit to module.py (turn {turn_index})\n"
+        "--- a/module.py\n+++ b/module.py\n"
+    )
+    hunks = []
+    for i in range(120):
+        ln = 20 + i
+        hunks.append(f"@@ -{ln},{ln + 2} +{ln},{ln + 2} @@")
+        hunks.append(f"-    result = compute_legacy(items, seed={i})")
+        hunks.append(f"+    result = compute(items, seed={i}, turn={turn_index})")
+        hunks.append("     return result")
+    return header + "\n".join(hunks)
+
+
+def _synthetic_list_output(turn_index: int) -> str:
+    """A realistic, per-turn-varying directory listing (>4k chars)."""
+    entries = []
+    roots = ["src", "tests", "scripts", "docs", "config"]
+    for r in roots:
+        for i in range(40):
+            kind = "d" if (i + turn_index) % 5 == 0 else "f"
+            entries.append(f"{kind} {r}/{r}_{i:03d}.py")
+    return "\n".join(entries)
+
+
+def _synthetic_tool_outputs(
+    turn_index: int,
+    read_path: str | None,
+    read_content: str | None,
+) -> list[dict]:
+    """Build a realistic, turn-varying set of agent tool calls + results.
+
+    Real coding agents interleave many tool types (grep, edit_file, list_files,
+    multiple reads/commands) and vary the call count per turn; the synthetic
+    scenarios previously emitted the identical ``read_file`` + ``run_command``
+    pair every turn, which under-exercises the proxy's tool-output compression
+    path and is unrepresentative. This rotates through a few believable tool
+    mixes so each turn's payload differs in shape and content (grep hits, edit
+    diffs, file listings, build/lint logs) while keeping the ``read_file`` result
+    coherent with the task when a module is supplied.
+    """
+    run_content = _synthetic_run_log(turn_index)
+    read_result = read_content or "(current file contents would be returned here by the harness)"
+    read_tool = {
+        "name": "read_file",
+        "arguments": {"path": read_path or "src/module.py"},
+        "content": read_result,
+    }
+    grep_tool = {
+        "name": "grep",
+        "arguments": {"pattern": r"def \w+|class \w+", "path": read_path or "src"},
+        "content": _synthetic_grep_output(turn_index, read_content),
+    }
+    edit_tool = {
+        "name": "edit_file",
+        "arguments": {
+            "path": read_path or "src/module.py",
+            "edits": [{"old": "    pass", "new": "    return result"}],
+        },
+        "content": _synthetic_edit_output(turn_index),
+    }
+    list_tool = {
+        "name": "list_files",
+        "arguments": {"path": "."},
+        "content": _synthetic_list_output(turn_index),
+    }
+    cmd_tool = {
+        "name": "run_command",
+        "arguments": {"command": "python -m pytest -q"},
+        "content": run_content,
+    }
+    # Rotate the mix so the shape varies turn-to-turn (2-3 calls, different tools).
+    mix = turn_index % 4
+    if mix == 0:
+        return [read_tool, cmd_tool]
+    if mix == 1:
+        return [grep_tool, read_tool]
+    if mix == 2:
+        return [edit_tool, cmd_tool]
+    return [list_tool, grep_tool, cmd_tool]
+
+
 def _agentic_exchange(
     user_content: str,
     turn_index: int,
@@ -253,9 +364,11 @@ def _agentic_exchange(
     ``tool_calls`` and the corresponding ``tool`` results. ``tool_outputs`` is a
     list of ``{"name", "arguments", "content"}`` describing the tool calls the
     agent makes this turn and their (already-computed) results. When omitted, a
-    default ``read_file`` + ``run_command`` pair is synthesized so even the
-    synthetic scenarios emit a believable agent payload and exercise the proxy's
-    tool-output compression path.
+    turn-varying mix of tool calls (read_file / grep / edit_file / list_files /
+    run_command) is synthesized via :func:`_synthetic_tool_outputs` so even the
+    synthetic scenarios emit a believable, non-repetitive agent payload and
+    exercise the proxy's tool-output compression path across varied content
+    types (grep hits, edit diffs, file listings, build/lint logs).
 
     When ``read_path`` is given, the ``read_file`` result is the scenario's own
     current module so the tool output is coherent with the task. By default the
@@ -268,7 +381,6 @@ def _agentic_exchange(
     exchange falls back to reading a real fixture file (whole-project scenarios).
     """
     if tool_outputs is None:
-        run_content = _synthetic_run_log(turn_index)
         if read_path is not None:
             # Prefer an explicit override (e.g. the scenario's base module) so the
             # tool output stays coherent even when the user task has no code block.
@@ -285,19 +397,10 @@ def _agentic_exchange(
                 if loader is not None
                 else None
             )
-        tool_outputs = [
-            {
-                "name": "read_file",
-                "arguments": {"path": read_path},
-                "content": read_content
-                or "(current file contents would be returned here by the harness)",
-            },
-            {
-                "name": "run_command",
-                "arguments": {"command": "python -m pytest -q"},
-                "content": run_content,
-            },
-        ]
+        # Vary the tool mix per turn so the synthetic agent payloads resemble
+        # real OpenCode-harness traffic (interleaved grep/edit/list/read/run
+        # calls) instead of the identical read_file + run_command every turn.
+        tool_outputs = _synthetic_tool_outputs(turn_index, read_path, read_content)
     msgs: list[dict] = [{"role": "user", "content": user_content}]
     for i, tool in enumerate(tool_outputs):
         call_id = f"call_{turn_index}_{i}"
@@ -1598,6 +1701,34 @@ def _apply_profile_overrides(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_request_body(
+    messages: list[dict],
+    max_tokens: int = 1024,
+    tools: list[dict] | None = None,
+    temperature: float = 0.0,
+    session_id: str | None = None,
+    stream: bool = False,
+) -> dict:
+    """Build the OpenAI-compatible chat/completions request body.
+
+    Shared by the non-streaming and streaming paths so both send identical
+    payloads (same messages/tools/session) — only ``stream`` differs.
+    """
+    body: dict = {
+        "model": MODEL_ID,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": stream,
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    if session_id:
+        body["_session_id"] = session_id
+    return body
+
+
 def _request(url: str, body: dict, timeout: float = 180.0) -> tuple[dict, float, dict[str, str]]:
     """Send a POST request and return (response_json, elapsed_ms, headers)."""
     import requests
@@ -1611,6 +1742,105 @@ def _request(url: str, body: dict, timeout: float = 180.0) -> tuple[dict, float,
         raise requests.HTTPError(f"{e}: {detail}") from e
     elapsed_ms = (time.monotonic() - t0) * 1000
     return resp.json(), elapsed_ms, dict(resp.headers)
+
+
+def _stream_request(
+    url: str, body: dict, timeout: float = 180.0
+) -> tuple[str, str, dict, float | None, float, dict[str, str], int, list[dict] | None]:
+    """Streaming POST for TTFT measurement.
+
+    Returns
+        (content, reasoning_content, usage, ttft_ms, elapsed_ms, headers,
+         prefix_cache_hit_tokens, tool_calls)
+
+    Reconstructs the assistant message from SSE deltas. The proxy surfaces its
+    authoritative prefix-cache hit count as an SSE comment
+    (``: X-Prefix-Cache-Hit-Tokens: N``) and the optimized prompt token count as
+    a response header; Lemonade/Direct surfaces ``usage`` (incl. cached_tokens)
+    on the final usage chunk when ``stream_options.include_usage`` is set.
+    """
+    import requests
+
+    stream_body = dict(body)
+    stream_body["stream"] = True
+    stream_opts = dict(stream_body.get("stream_options") or {})
+    stream_opts["include_usage"] = True
+    stream_body["stream_options"] = stream_opts
+
+    t0 = time.monotonic()
+    ttft_ms: float | None = None
+    resp = requests.post(url, json=stream_body, timeout=timeout, stream=True)
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        detail = (resp.text or "")[:1000]
+        raise requests.HTTPError(f"{e}: {detail}") from e
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls_acc: dict[int, dict] = {}
+    usage: dict = {}
+    prefix_cache_hit_tokens = 0
+    headers = dict(resp.headers)
+
+    for raw_line in resp.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        if raw_line.startswith(":"):
+            # SSE comment — proxy emits `: X-Prefix-Cache-Hit-Tokens: N`
+            m = re.search(r"X-Prefix-Cache-Hit-Tokens:\s*(\d+)", raw_line)
+            if m:
+                prefix_cache_hit_tokens = int(m.group(1))
+            continue
+        if not raw_line.startswith("data:"):
+            continue
+        data = raw_line[len("data:"):].strip()
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+            continue
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        if delta.get("content") is not None:
+            if ttft_ms is None:
+                ttft_ms = (time.monotonic() - t0) * 1000
+            content_parts.append(delta["content"])
+        if delta.get("reasoning_content") is not None:
+            reasoning_parts.append(delta["reasoning_content"])
+        for tc in delta.get("tool_calls") or []:
+            idx = int(tc.get("index", 0))
+            acc = tool_calls_acc.setdefault(idx, {"id": None, "name": "", "arguments": ""})
+            if tc.get("id"):
+                acc["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                acc["name"] = fn["name"]
+            if fn.get("arguments"):
+                acc["arguments"] += fn["arguments"]
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    tool_calls: list[dict] | None = None
+    if tool_calls_acc:
+        tool_calls = []
+        for idx in sorted(tool_calls_acc):
+            acc = tool_calls_acc[idx]
+            tool_calls.append(
+                {
+                    "id": acc["id"] or f"call_{idx}",
+                    "type": "function",
+                    "function": {"name": acc["name"], "arguments": acc["arguments"]},
+                }
+            )
+    return content, reasoning, usage, ttft_ms, elapsed_ms, headers, prefix_cache_hit_tokens, tool_calls
 
 
 def _message_text(content: Any) -> str:
@@ -1733,38 +1963,77 @@ def _calculate_timeout(turns: int, rounds: int) -> float:
     return min(300.0, base_timeout * context_growth_factor)
 
 
-def _direct_request(messages: list[dict], max_tokens: int = 256, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0) -> tuple[dict, float, dict[str, str]]:
+def _direct_request(messages: list[dict], max_tokens: int = 1024, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0) -> tuple[dict, float, dict[str, str]]:
     url = f"{LEMONADE_URL}/chat/completions"
-    body = {
-        "model": MODEL_ID,
-        "messages": messages,
-        "temperature": temperature,
-        "stream": False,
-        "max_tokens": max_tokens,
-    }
-    if tools:
-        body["tools"] = tools
-        body["tool_choice"] = "auto"
+    body = _build_request_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature)
     return _request(url, body, timeout)
 
 
 def _proxy_request(
-    messages: list[dict], session_id: str | None = None, max_tokens: int = 256, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0
+    messages: list[dict], session_id: str | None = None, max_tokens: int = 1024, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0
 ) -> tuple[dict, float, dict[str, str]]:
     url = f"http://127.0.0.1:{MOEPT_PORT}/v1/chat/completions"
-    body = {
-        "model": MODEL_ID,
-        "messages": messages,
-        "temperature": temperature,
-        "stream": False,
-        "max_tokens": max_tokens,
-    }
-    if tools:
-        body["tools"] = tools
-        body["tool_choice"] = "auto"
-    if session_id:
-        body["_session_id"] = session_id
+    body = _build_request_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature, session_id=session_id)
     return _request(url, body, timeout)
+
+
+def _direct_stream_request(messages: list[dict], max_tokens: int = 1024, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0):
+    url = f"{LEMONADE_URL}/chat/completions"
+    body = _build_request_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature)
+    return _stream_request(url, body, timeout)
+
+
+def _proxy_stream_request(
+    messages: list[dict], session_id: str | None = None, max_tokens: int = 1024, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0,
+):
+    url = f"http://127.0.0.1:{MOEPT_PORT}/v1/chat/completions"
+    body = _build_request_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature, session_id=session_id)
+    return _stream_request(url, body, timeout)
+
+
+def _reset_proxy_metrics(port: int) -> None:
+    """Reset the proxy's process-wide metrics counters for per-round isolation."""
+    import requests
+
+    try:
+        requests.post(f"http://127.0.0.1:{port}/v1/metrics/reset", timeout=10.0)
+    except Exception:
+        pass
+
+
+def _fetch_proxy_metrics(port: int) -> dict | None:
+    """Fetch the proxy's process-wide metrics snapshot, or None on failure."""
+    import requests
+
+    try:
+        resp = requests.get(f"http://127.0.0.1:{port}/v1/metrics", timeout=10.0)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _warm_up_backend(timeout: float = 60.0) -> None:
+    """Send one throwaway request to the backend so both benchmark conversations
+    start against a warm model (loaded weights, warm KV cache) rather than the
+    proxy conversation paying the full cold-start cost while the direct
+    conversation rides a warm backend.
+
+    This keeps each side a complete, contiguous, sorted conversation (we never
+    interleave direct and proxified requests) while removing the systematic
+    cold-start advantage the direct run would otherwise enjoy. Failures are
+    ignored — warm-up is best-effort and the benchmark still runs without it.
+    """
+    import requests
+
+    try:
+        body = _build_request_body(
+            [{"role": "user", "content": "Reply with the single word: ok"}],
+            max_tokens=8,
+        )
+        requests.post(f"{LEMONADE_URL}/chat/completions", json=body, timeout=timeout)
+    except Exception:
+        pass
 
 
 def _check_foreign_markers(content: str) -> list[str]:
@@ -1808,16 +2077,16 @@ def _token_jaccard(text_a: str, text_b: str) -> float:
     return round(intersection / max(union, 1), 6)
 
 
-def _rouge_l(text_a: str, text_b: str) -> float:
-    """Compute ROUGE-L F1 score (longest common subsequence)."""
-    words_a = text_a.lower().split()
-    words_b = text_b.lower().split()
+def _lcs_len(words_a: list[str], words_b: list[str]) -> int:
+    """Length of the longest common subsequence of two token lists.
+
+    Space-optimized DP (last two rows). Shared by the ROUGE-L helpers so the
+    LCS table is computed in exactly one place.
+    """
     m, n = len(words_a), len(words_b)
-
     if m == 0 or n == 0:
-        return 0.0
+        return 0
 
-    # LCS table (space-optimized to last two rows)
     prev = [0] * (n + 1)
     curr = [0] * (n + 1)
     for i in range(1, m + 1):
@@ -1827,8 +2096,19 @@ def _rouge_l(text_a: str, text_b: str) -> float:
             else:
                 curr[j] = max(prev[j], curr[j - 1])
         prev, curr = curr[:], [0] * (n + 1)
+    return prev[n]
 
-    lcs_len = prev[n]
+
+def _rouge_l(text_a: str, text_b: str) -> float:
+    """Compute ROUGE-L F1 score (longest common subsequence)."""
+    words_a = text_a.lower().split()
+    words_b = text_b.lower().split()
+    m, n = len(words_a), len(words_b)
+
+    if m == 0 or n == 0:
+        return 0.0
+
+    lcs_len = _lcs_len(words_a, words_b)
     precision = lcs_len / m if m > 0 else 0.0
     recall = lcs_len / n if n > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
@@ -1851,21 +2131,33 @@ def _rouge_l_precision_recall(text_a: str, text_b: str) -> dict[str, float]:
     if m == 0 or n == 0:
         return {"precision": 0.0, "recall": 0.0}
 
-    # LCS via space-optimized DP
-    prev = [0] * (n + 1)
-    curr = [0] * (n + 1)
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            if words_a[i - 1] == words_b[j - 1]:
-                curr[j] = prev[j - 1] + 1
-            else:
-                curr[j] = max(prev[j], curr[j - 1])
-        prev, curr = curr[:], [0] * (n + 1)
-
-    lcs_len = prev[n]
+    lcs_len = _lcs_len(words_a, words_b)
     precision = lcs_len / m if m > 0 else 0.0
     recall = lcs_len / n if n > 0 else 0.0
     return {"precision": round(precision, 6), "recall": round(recall, 6)}
+
+
+def _code_syntax_validity(content: str) -> float:
+    """Fraction of fenced ```python code blocks in *content* that parse with ast.parse.
+
+    Returns 1.0 when there are no python code blocks (nothing to validate). This
+    is a hard correctness signal the embedding/lexical metrics cannot capture:
+    the proxy must not emit syntactically broken code as a side effect of
+    optimization (boundary compression, summarization, eviction).
+    """
+    import re
+
+    blocks = re.findall(r"```(?:python|py)\n(.*?)```", content, re.DOTALL)
+    if not blocks:
+        return 1.0
+    valid = 0
+    for block in blocks:
+        try:
+            ast.parse(block)
+            valid += 1
+        except SyntaxError:
+            pass
+    return round(valid / len(blocks), 6)
 
 
 def _code_block_preservation(direct_content: str, proxy_content: str) -> dict[str, float]:
@@ -2057,6 +2349,11 @@ def _compute_quality_metrics(direct_content: str, proxy_content: str) -> dict[st
     metrics["has_code_direct"] = 1.0 if code["has_code_direct"] else 0.0
     metrics["has_code_proxy"] = 1.0 if code["has_code_proxy"] else 0.0
 
+    # ── Syntactic validity of generated python code (hard correctness) ─
+    # The proxy's emitted code must still parse; lexical/embedding metrics
+    # cannot catch a broken `def`/`class` introduced by optimization.
+    metrics["code_syntax_validity"] = _code_syntax_validity(proxy_content)
+
     # ── Markdown structure similarity ─────────────────────────────────
     metrics["markdown_structure_similarity"] = _markdown_structure_similarity(direct_content, proxy_content)
 
@@ -2172,6 +2469,9 @@ class TurnMetrics:
     error: str | None = None
     content_preview: str = ""  # First 200 chars for dump
     chars_before_optimization: int = 0  # Total chars in messages before proxy optimization
+    prefix_cache_hit_tokens: int = 0  # Proxy's authoritative prefix-cache hit count (X-Prefix-Cache-Hit-Tokens)
+    proxy_process_ms: float | None = None  # Proxy's own optimization/forwarding overhead (X-Proxy-Process-Ms), if emitted
+    ttft_ms: float | None = None  # Time to first token (streaming / --measure-ttft path only)
 
 
 @dataclass
@@ -2185,6 +2485,7 @@ class TurnComparison:
     latency_delta_ms: float = 0.0  # proxy - direct (positive = slower)
     token_delta: int = 0  # proxy prompt - direct prompt
     quality: dict[str, float | None] = field(default_factory=dict)
+    quality_computed: bool = True  # False when one side errored/empty and quality was skipped
 
 
 @dataclass
@@ -2193,6 +2494,7 @@ class BenchmarkReport:
 
     config: dict = field(default_factory=dict)
     turns: list[TurnComparison] = field(default_factory=list)
+    cache_reuse: list[dict] = field(default_factory=list)  # per-round proxy /v1/metrics snapshots
 
     def summary(self) -> dict[str, Any]:
         """Return a flat summary dict for JSON output."""
@@ -2233,30 +2535,64 @@ class BenchmarkReport:
 
         # Context window growth: prompt_tokens at each turn vs theoretical full context
         final_turn = self.turns[-1]
-        max_context_window = 262144  # model default (Qwen3.6-35B-MTP)
+        max_context_window = int(self.config.get("context_window", 262144))
         final_proxy_prompt_tokens = final_turn.proxy.prompt_tokens
         final_proxy_ctx_pct = round(final_proxy_prompt_tokens / max_context_window * 100, 2)
 
+        # Completion-token sums (for cost modeling).
+        direct_completion = [t.direct.completion_tokens for t in self.turns]
+        proxy_completion = [t.proxy.completion_tokens for t in self.turns]
+        total_direct_completion = sum(direct_completion)
+        total_proxy_completion = sum(proxy_completion)
+
         # ── Quality metrics aggregation ───────────────────────────────
-        quality_metrics = [
-            "semantic_similarity", "token_jaccard", "rouge_l_f1", "trigram_overlap",
-            "length_ratio", "edit_similarity", "code_block_ratio",
-            "markdown_structure_similarity", "vocabulary_richness_delta",
-            "rouge_l_precision", "rouge_l_recall",
+        # HEADLINE = the non-redundant, robust signals we gate/report on.
+        # SECONDARY = correlated/redundant overlap signals, kept for deep
+        #   inspection but excluded from the headline summary.
+        # semantic_similarity is demoted to its own informational key: the
+        #   embed-gemma-300m-FLM embedder is weak on code, so it must not sit
+        #   in the headline quality block (review §11.1 fix #5).
+        headline_quality_metrics = [
+            "rouge_l_f1", "token_jaccard", "code_block_ratio", "edit_similarity",
+            "length_ratio", "code_syntax_validity",
         ]
-        quality_summary: dict[str, Any] = {}
-        for qm in quality_metrics:
-            values = [t.quality.get(qm) for t in self.turns if t.quality and t.quality.get(qm) is not None]
-            if values:
-                s = sorted(values)
-                quality_summary[qm] = {
-                    "mean": round(statistics.mean(s), 4),
-                    "median": round(statistics.median(s), 4),
-                    "min": round(min(s), 4),
-                    "max": round(max(s), 4),
-                }
-            else:
-                quality_summary[qm] = None
+        secondary_quality_metrics = [
+            "trigram_overlap", "markdown_structure_similarity", "vocabulary_richness_delta",
+            "rouge_l_precision", "rouge_l_recall", "response_stability",
+            "code_structure_consistency", "has_code_direct", "has_code_proxy",
+        ]
+
+        def _aggregate_quality(metric_names: list[str]) -> dict[str, Any]:
+            out: dict[str, Any] = {}
+            for qm in metric_names:
+                values = [t.quality.get(qm) for t in self.turns if t.quality and t.quality.get(qm) is not None]
+                if values:
+                    s = sorted(values)
+                    out[qm] = {
+                        "mean": round(statistics.mean(s), 4),
+                        "median": round(statistics.median(s), 4),
+                        "min": round(min(s), 4),
+                        "max": round(max(s), 4),
+                    }
+                else:
+                    out[qm] = None
+            return out
+
+        quality_summary = _aggregate_quality(headline_quality_metrics)
+        secondary_quality_summary = _aggregate_quality(secondary_quality_metrics)
+
+        # semantic_similarity (informational only — weak on code)
+        sem_values = [t.quality.get("semantic_similarity") for t in self.turns if t.quality and t.quality.get("semantic_similarity") is not None]
+        semantic_summary = (
+            {
+                "mean": round(statistics.mean(sem_values), 4),
+                "median": round(statistics.median(sem_values), 4),
+                "min": round(min(sem_values), 4),
+                "max": round(max(sem_values), 4),
+            }
+            if sem_values
+            else None
+        )
 
         # Count turns with low similarity (potential degradation)
         low_semantic_count = sum(
@@ -2268,6 +2604,11 @@ class BenchmarkReport:
             and t.quality["token_jaccard"] < 0.40
         )
 
+        # Turns where quality was NOT computed because one side errored or
+        # returned empty. These are excluded from quality means, which can bias
+        # the aggregate upward; we surface the count so the reader knows.
+        quality_skipped_count = sum(1 for t in self.turns if not t.quality_computed)
+
         # ── Response length analysis ────────────────────────────────────
         length_ratios = [t.quality.get("length_ratio") for t in self.turns if t.quality and t.quality.get("length_ratio") is not None]
         truncation_count = sum(1 for r in length_ratios if r < 0.5) if length_ratios else 0
@@ -2276,6 +2617,14 @@ class BenchmarkReport:
         # ── Code block preservation analysis ────────────────────────────
         code_block_ratios = [t.quality.get("code_block_ratio") for t in self.turns if t.quality and t.quality.get("code_block_ratio") is not None]
         code_loss_count = sum(1 for r in code_block_ratios if r < 1.0) if code_block_ratios else 0
+
+        # ── Syntactic validity of generated python code ─────────────────
+        invalid_code_turns = [
+            t.turn_index
+            for t in self.turns
+            if t.quality and t.quality.get("code_syntax_validity") is not None
+            and t.quality["code_syntax_validity"] < 1.0
+        ]
 
         # ── ROUGE precision/recall gap (directionality of degradation) ──
         rouge_prec_values = [t.quality.get("rouge_l_precision") for t in self.turns if t.quality and t.quality.get("rouge_l_precision") is not None]
@@ -2322,14 +2671,20 @@ class BenchmarkReport:
         vocab_deltas = [t.quality.get("vocabulary_richness_delta") for t in self.turns if t.quality and t.quality.get("vocabulary_richness_delta") is not None]
 
         # ── Eviction tracking ───────────────────────────────────────────
+        # `char_budget` is the proxy's POST-optimization target
+        # (MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS), so raw input exceeding it is
+        # expected for long scenarios and is NOT an eviction/failure. We report
+        # it as informational (`raw_exceeds_optimized_target`) and treat the
+        # real eviction signal as `compaction_triggered` (proxy sent strictly
+        # fewer tokens than direct this turn).
         budget = self.config.get("char_budget")
         chars_before = [t.proxy.chars_before_optimization for t in self.turns]
         total_chars_before = sum(chars_before)
-        budget_exceeded_turns: list[int] = []
+        raw_exceeds_target_turns: list[int] = []
         compaction_turns: list[int] = []
         eviction_turns: list[int] = []
         if budget is not None and chars_before:
-            budget_exceeded_turns = [
+            raw_exceeds_target_turns = [
                 t.turn_index
                 for t in self.turns
                 if t.proxy.chars_before_optimization > budget
@@ -2346,6 +2701,37 @@ class BenchmarkReport:
                 and t.direct.prompt_tokens > t.proxy.prompt_tokens
             ]
 
+        # ── Cache-reuse trend (proxy prefix-cache hits) ────────────────
+        prefix_hits = [t.proxy.prefix_cache_hit_tokens for t in self.turns]
+        cache_reuse_trend: dict[str, Any] = {
+            "per_turn_prefix_cache_hit_tokens": _stats(prefix_hits) if prefix_hits else {},
+            "total_prefix_cache_hit_tokens": sum(prefix_hits),
+        }
+        if self.cache_reuse:
+            cache_reuse_trend["per_round_proxy_metrics"] = self.cache_reuse
+
+        # ── TTFT aggregation (streaming / --measure-ttft path) ──────────
+        direct_ttft = [t.direct.ttft_ms for t in self.turns if t.direct.ttft_ms is not None]
+        proxy_ttft = [t.proxy.ttft_ms for t in self.turns if t.proxy.ttft_ms is not None]
+
+        # ── Proxy overhead (X-Proxy-Process-Ms, when the proxy emits it) ─
+        proxy_process = [t.proxy.proxy_process_ms for t in self.turns if t.proxy.proxy_process_ms is not None]
+
+        # ── Latency delta confidence interval + sign test ───────────────
+        # Bootstrap CI on the per-turn proxy-minus-direct latency delta, plus a
+        # paired sign test, so we can tell a real slowdown from backend noise.
+        delta_ci = _bootstrap_ci(latency_deltas) if len(latency_deltas) >= 2 else (0.0, 0.0)
+        delta_pos, delta_neg = _paired_sign_test(latency_deltas)
+
+        # ── Cost model (USD) ────────────────────────────────────────────
+        price_in = float(self.config.get("price_in_usd_per_1m", 0.0) or 0.0)
+        price_out = float(self.config.get("price_out_usd_per_1m", 0.0) or 0.0)
+        direct_cost = (total_direct_prompt * price_in + total_direct_completion * price_out) / 1_000_000
+        proxy_cost = (total_proxy_prompt * price_in + total_proxy_completion * price_out) / 1_000_000
+        cost_savings_pct = (
+            round((direct_cost - proxy_cost) / direct_cost * 100, 2) if direct_cost > 0 else 0.0
+        )
+
         return {
             "config": self.config,
             "num_turns": n,
@@ -2353,7 +2739,14 @@ class BenchmarkReport:
                 "direct": _stats(direct_latencies),
                 "proxy": _stats(proxy_latencies),
                 "delta_proxy_minus_direct_ms": _stats(latency_deltas),
+                "delta_ci95_ms": {"low": delta_ci[0], "high": delta_ci[1]},
+                "delta_sign_test": {"proxy_slower_turns": delta_pos, "proxy_faster_turns": delta_neg},
             },
+            "ttft_ms": {
+                "direct": _stats(direct_ttft),
+                "proxy": _stats(proxy_ttft),
+            },
+            "proxy_overhead_ms": _stats(proxy_process) if proxy_process else {},
             "tokens": {
                 "total_direct_prompt": total_direct_prompt,
                 "total_proxy_prompt": total_proxy_prompt,
@@ -2362,6 +2755,14 @@ class BenchmarkReport:
                 "per_turn_direct": _stats(direct_tokens),
                 "per_turn_proxy": _stats(proxy_tokens),
                 "per_turn_cached": _stats(cached),
+            },
+            "cost_usd": {
+                "price_in_per_1m": price_in,
+                "price_out_per_1m": price_out,
+                "direct_total": round(direct_cost, 6),
+                "proxy_total": round(proxy_cost, 6),
+                "savings_pct": cost_savings_pct,
+                "savings_usd": round(direct_cost - proxy_cost, 6),
             },
             "context_window": {
                 "final_prompt_tokens": final_proxy_prompt_tokens,
@@ -2395,8 +2796,12 @@ class BenchmarkReport:
                 "truncation_count": truncation_count,
                 "verbosity_count": verbosity_count,
                 "code_block_loss_turns": code_loss_count,
+                "code_syntax_invalid_turns": invalid_code_turns if invalid_code_turns else None,
                 "rouge_precision_recall_gap_mean": rouge_gap_mean,
+                "quality_skipped_turns": quality_skipped_count,
             },
+            "secondary_quality": secondary_quality_summary,
+            "semantic_similarity": semantic_summary,
             "quality_trend": quality_trend if quality_trend else {},
             "vocab_richness": {
                 "mean_delta": round(statistics.mean(vocab_deltas), 4) if vocab_deltas else None,
@@ -2406,11 +2811,12 @@ class BenchmarkReport:
             "eviction": {
                 "char_budget": budget,
                 "total_chars_before_optimization": total_chars_before,
-                "turns_exceeding_budget": len(budget_exceeded_turns),
-                "budget_exceeded_at_turns": budget_exceeded_turns if budget_exceeded_turns else None,
+                "turns_raw_exceeds_optimized_target": len(raw_exceeds_target_turns),
+                "raw_exceeds_optimized_target_at_turns": raw_exceeds_target_turns if raw_exceeds_target_turns else None,
                 "compaction_triggered_at_turns": compaction_turns if compaction_turns else None,
                 "eviction_triggered_at_turns": eviction_turns if eviction_turns else None,
             },
+            "cache_reuse": cache_reuse_trend,
             "per_round": _per_round_summary(self.turns, total_direct_prompt, total_proxy_prompt),
         }
 
@@ -2479,6 +2885,40 @@ def _percentile(sorted_data: list[float], pct: float) -> float:
     return round(d0 + d1, 2)
 
 
+def _bootstrap_ci(values: list[float], pct: float = 95.0, n: int = 2000) -> tuple[float, float]:
+    """Bootstrap confidence interval (percentile method) for the mean.
+
+    Returns (low, high) at the requested confidence level. Used to report
+    uncertainty on latency/quality means so a single noisy run cannot be
+    over-interpreted. Falls back to (0, 0) on insufficient data.
+    """
+    if len(values) < 2:
+        return (0.0, 0.0)
+    rng = random.Random(0xC0FFEE)
+    estimates: list[float] = []
+    size = len(values)
+    for _ in range(n):
+        sample = [values[rng.randrange(size)] for _ in range(size)]
+        estimates.append(statistics.mean(sample))
+    estimates.sort()
+    alpha = (100.0 - pct) / 2.0
+    low = _percentile(estimates, alpha)
+    high = _percentile(estimates, 100.0 - alpha)
+    return (low, high)
+
+
+def _paired_sign_test(diffs: list[float]) -> tuple[int, int]:
+    """Paired sign test over per-turn differences (proxy - direct).
+
+    Returns (pos, neg) counts of strictly-positive / strictly-negative diffs.
+    A large imbalance indicates the latency delta is systematic, not noise.
+    Ties (zero diffs) are excluded.
+    """
+    pos = sum(1 for d in diffs if d > 0)
+    neg = sum(1 for d in diffs if d < 0)
+    return (pos, neg)
+
+
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -2494,6 +2934,7 @@ def _collect_direct_conversation(
     turn_exchanges: list[list[dict]] | None = None,
     tools: list[dict] | None = None,
     temperature: float = 0.0,
+    stream: bool = False,
 ) -> tuple[list[TurnMetrics], list[str]]:
     """Run a full conversation against direct Lemonade.
 
@@ -2526,12 +2967,33 @@ def _collect_direct_conversation(
         )
 
         try:
-            direct_resp, direct_latency, _ = _direct_request(
-                messages, max_tokens=max_tokens, timeout=request_timeout, tools=tools, temperature=temperature
-            )
-            d_usage = direct_resp.get("usage", {}) or {}
-            d_msg = direct_resp["choices"][0]["message"]
-            d_content = (d_msg.get("content") or "") + (d_msg.get("reasoning_content") or "")
+            if stream:
+                d_content, d_reasoning, d_usage, d_ttft, d_latency, _, _, d_tool_calls = _direct_stream_request(
+                    messages, max_tokens=max_tokens, timeout=request_timeout, tools=tools, temperature=temperature
+                )
+                d_usage = d_usage or {}
+                d_msg = {"role": "assistant", "content": d_content}
+                if d_reasoning:
+                    d_msg["reasoning_content"] = d_reasoning
+                if d_tool_calls:
+                    d_msg["tool_calls"] = d_tool_calls
+                d_finish_reason = ""
+                # Mirror the non-streaming path (line ~2887): the quality/preview
+                # text includes the reasoning trace, so quality is computed even
+                # when the model emits only `reasoning_content` and no final
+                # `content` (typical for reasoning-heavy models at small
+                # max_tokens). Without this, streaming runs report quality_sem=n/a
+                # while non-streaming runs compute it -- an inconsistency.
+                d_content = (d_content or "") + (d_reasoning or "")
+            else:
+                direct_resp, d_latency, _ = _direct_request(
+                    messages, max_tokens=max_tokens, timeout=request_timeout, tools=tools, temperature=temperature
+                )
+                d_usage = direct_resp.get("usage", {}) or {}
+                d_msg = direct_resp["choices"][0]["message"]
+                d_content = (d_msg.get("content") or "") + (d_msg.get("reasoning_content") or "")
+                d_ttft = None
+                d_finish_reason = direct_resp["choices"][0].get("finish_reason", "")
 
             _d_prompt_raw = int(d_usage.get("prompt_tokens", 0) or 0)
             _d_cached = int((d_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
@@ -2549,9 +3011,10 @@ def _collect_direct_conversation(
                 total_tokens=int(d_usage.get("total_tokens", 0) or 0),
                 cached_tokens=_d_cached,
                 cache_hit_rate=round(_d_cached / max(_d_prompt, 1), 2) if _d_cached > 0 else None,
-                latency_ms=round(direct_latency, 2),
+                latency_ms=round(d_latency, 2),
+                ttft_ms=round(d_ttft, 2) if d_ttft is not None else None,
                 response_chars=len(d_content),
-                finish_reason=direct_resp["choices"][0].get("finish_reason", ""),
+                finish_reason=d_finish_reason,
                 content_preview=d_content[:200],
             )
             _human_print(
@@ -2593,6 +3056,7 @@ def _collect_proxy_conversation(
     turn_exchanges: list[list[dict]] | None = None,
     tools: list[dict] | None = None,
     temperature: float = 0.0,
+    stream: bool = False,
 ) -> tuple[list[TurnMetrics], list[str]]:
     """Run a full conversation through the moeptimizer proxy.
 
@@ -2623,18 +3087,50 @@ def _collect_proxy_conversation(
         )
 
         try:
-            proxy_resp, proxy_latency, proxy_headers = _proxy_request(
-                messages, session_id=session_id, max_tokens=max_tokens, timeout=request_timeout, tools=tools, temperature=temperature
-            )
-            p_usage = proxy_resp.get("usage", {}) or {}
-            p_msg = proxy_resp["choices"][0]["message"]
-            p_content = (p_msg.get("content") or "") + (p_msg.get("reasoning_content") or "")
+            if stream:
+                p_content, p_reasoning, p_usage, p_ttft, p_latency, p_headers, p_prefix_hit, p_tool_calls = _proxy_stream_request(
+                    messages, session_id=session_id, max_tokens=max_tokens, timeout=request_timeout, tools=tools, temperature=temperature
+                )
+                p_usage = p_usage or {}
+                p_msg = {"role": "assistant", "content": p_content}
+                if p_reasoning:
+                    p_msg["reasoning_content"] = p_reasoning
+                if p_tool_calls:
+                    p_msg["tool_calls"] = p_tool_calls
+                p_finish_reason = ""
+                # Mirror the non-streaming path (line ~3000): include the reasoning
+                # trace in the quality/preview text so quality is computed even
+                # when the model emits only `reasoning_content` (no final
+                # `content`). Keeps streaming and non-streaming consistent.
+                p_content = (p_content or "") + (p_reasoning or "")
+            else:
+                proxy_resp, p_latency, p_headers = _proxy_request(
+                    messages, session_id=session_id, max_tokens=max_tokens, timeout=request_timeout, tools=tools, temperature=temperature
+                )
+                p_usage = proxy_resp.get("usage", {}) or {}
+                p_msg = proxy_resp["choices"][0]["message"]
+                p_content = (p_msg.get("content") or "") + (p_msg.get("reasoning_content") or "")
+                p_ttft = None
+                # Non-streaming: the proxy surfaces its authoritative prefix-cache
+                # hit count as a response header (app.py: X-Prefix-Cache-Hit-Tokens).
+                p_prefix_hit = int(
+                    p_headers.get("X-Prefix-Cache-Hit-Tokens")
+                    or p_headers.get("x-prefix-cache-hit-tokens")
+                    or 0
+                )
+                p_finish_reason = proxy_resp["choices"][0].get("finish_reason", "")
+
+            # Proxy's own optimization/forwarding overhead, surfaced as a header
+            # when the proxy emits it. Lets us separate proxy cost from backend
+            # latency. None when the proxy does not report it.
+            _p_process_ms = p_headers.get("X-Proxy-Process-Ms") or p_headers.get("x-proxy-process-ms")
+            _p_process_ms = float(_p_process_ms) if _p_process_ms else None
 
             _p_prompt_raw = int(p_usage.get("prompt_tokens", 0) or 0)
             _p_cached = int((p_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
             _p_optimized_prompt_tokens = int(
-                proxy_headers.get("X-Optimized-Prompt-Tokens")
-                or proxy_headers.get("x-optimized-prompt-tokens")
+                p_headers.get("X-Optimized-Prompt-Tokens")
+                or p_headers.get("x-optimized-prompt-tokens")
                 or 0
             )
             _p_prompt, _p_prompt_source, _p_cached_response = _resolve_prompt_tokens(
@@ -2657,9 +3153,12 @@ def _collect_proxy_conversation(
                 total_tokens=int(p_usage.get("total_tokens", 0) or 0),
                 cached_tokens=_p_cached,
                 cache_hit_rate=round(_p_cached / max(_p_prompt, 1), 2) if _p_cached > 0 else None,
-                latency_ms=round(proxy_latency, 2),
+                latency_ms=round(p_latency, 2),
+                ttft_ms=round(p_ttft, 2) if p_ttft is not None else None,
+                prefix_cache_hit_tokens=p_prefix_hit,
+                proxy_process_ms=round(_p_process_ms, 2) if _p_process_ms is not None else None,
                 response_chars=len(p_content),
-                finish_reason=proxy_resp["choices"][0].get("finish_reason", ""),
+                finish_reason=p_finish_reason,
                 content_preview=p_content[:200],
                 chars_before_optimization=_chars_before,
             )
@@ -2669,6 +3168,7 @@ def _collect_proxy_conversation(
             _human_print(
                 f"    → backend-facing: {metrics.prompt_tokens:,} tok "
                 f"(source={metrics.prompt_tokens_source}, cached={metrics.cached_tokens:,}, "
+                f"prefix_hits={metrics.prefix_cache_hit_tokens:,}, "
                 f"raw={metrics.chars_before_optimization:,} chars)"
             )
         except Exception as e:
@@ -2725,9 +3225,53 @@ def _build_turn_comparisons(
             latency_delta_ms=round(proxy.latency_ms - direct.latency_ms, 2),
             token_delta=proxy.prompt_tokens - direct.prompt_tokens,
             quality=quality,
+            quality_computed=bool(d_content and p_content),
         )
         comparisons.append(comparison)
     return comparisons
+
+
+def _validate_conversation_invariant(
+    proxy_metrics: list[TurnMetrics],
+    direct_metrics: list[TurnMetrics],
+    num_turns: int,
+    round_num: int,
+) -> None:
+    """Enforce the benchmark's core invariant: each side is a complete, sorted,
+    non-interleaved multi-turn conversation.
+
+    - Both conversations must contain exactly ``num_turns`` turns (complete).
+    - Each must be sorted by ``turn_index`` with no gaps or duplicates (sorted).
+    - The proxy conversation is collected fully before the direct one by call
+      order in :func:`run_benchmark`; this guard catches any future regression
+      that would interleave or truncate either side.
+    """
+    for label, metrics in (("proxy", proxy_metrics), ("direct", direct_metrics)):
+        if len(metrics) != num_turns:
+            raise AssertionError(
+                f"Round {round_num}: {label} conversation incomplete "
+                f"({len(metrics)}/{num_turns} turns) -- non-interleaving "
+                f"invariant violated."
+            )
+        indices = [m.turn_index for m in metrics]
+        if indices != sorted(indices):
+            raise AssertionError(
+                f"Round {round_num}: {label} turns not sorted by turn_index "
+                f"({indices}) -- non-interleaving invariant violated."
+            )
+        if len(set(indices)) != len(indices):
+            raise AssertionError(
+                f"Round {round_num}: {label} has duplicate turn indices "
+                f"({indices}) -- non-interleaving invariant violated."
+            )
+    # Proxy and direct must describe the same turn set (1:1, no interleaving).
+    if {m.turn_index for m in proxy_metrics} != {m.turn_index for m in direct_metrics}:
+        raise AssertionError(
+            f"Round {round_num}: proxy/direct turn sets differ "
+            f"({[m.turn_index for m in proxy_metrics]} vs "
+            f"{[m.turn_index for m in direct_metrics]}) -- non-interleaving "
+            f"invariant violated."
+        )
 
 
 def run_benchmark(
@@ -2739,6 +3283,11 @@ def run_benchmark(
     scenario: str = "default",
     agentic: bool = True,
     temperature: float = 0.0,
+    measure_ttft: bool = True,
+    context_window: int = 262144,
+    price_in: float = 0.0,
+    price_out: float = 0.0,
+    max_wall_seconds: float | None = None,
 ) -> BenchmarkReport:
     """Run the multi-turn benchmark and collect metrics.
 
@@ -2774,6 +3323,11 @@ def run_benchmark(
         "scenario": scenario,
         "request_timeout": request_timeout,
         "execution_order": "direct_full_conversation_then_proxy_full_conversation",
+        "measure_ttft": measure_ttft,
+        "context_window": context_window,
+        "price_in_usd_per_1m": price_in,
+        "price_out_usd_per_1m": price_out,
+        "max_wall_seconds": max_wall_seconds,
     }
 
     report = BenchmarkReport(config=config)
@@ -2869,7 +3423,22 @@ def run_benchmark(
         "Now write a test suite for it using pytest."
     )
 
+    # One-time backend warm-up so both conversations start warm (see
+    # _warm_up_backend). Keeps each side complete and sorted; only removes the
+    # cold-start bias that would otherwise advantage the direct run.
+    _warm_up_backend(request_timeout)
+
+    _wall_start = time.monotonic()
     for round_num in range(rounds):
+        # Wall-clock guard: abort remaining rounds if we exceed the budget so a
+        # long --scenario all run cannot hang indefinitely.
+        if max_wall_seconds is not None and (time.monotonic() - _wall_start) > max_wall_seconds:
+            _human_print(
+                f"  Wall-clock budget {max_wall_seconds:.0f}s reached; "
+                f"stopping after round {round_num}/{rounds}."
+            )
+            break
+
         # Each round gets an isolated proxy session so prior-round state cannot
         # leak into the next benchmark round.
         session_id = f"benchmark-{int(time.time())}-{round_num}-{uuid.uuid4().hex[:8]}"
@@ -2881,6 +3450,11 @@ def run_benchmark(
         # cache hits it sees are its own natural prefix reuse, not borrowed
         # from the proxy. (We deliberately do NOT interleave the two, so each
         # stays a contiguous multi-turn conversation.)
+        if measure_ttft:
+            # Isolate this round's proxy metrics so the /v1/metrics snapshot
+            # reflects only this round's prefix-cache reuse.
+            _reset_proxy_metrics(proxy_port)
+
         _human_print(f"  Round {round_num + 1}/{rounds}: proxy conversation")
         proxy_messages: list[dict] = [dict(msg) for msg in base_messages]
         proxy_metrics, proxy_contents = _collect_proxy_conversation(
@@ -2895,7 +3469,13 @@ def run_benchmark(
             turn_exchanges=turn_exchanges or None,
             tools=tools,
             temperature=temperature,
+            stream=measure_ttft,
         )
+
+        if measure_ttft:
+            snap = _fetch_proxy_metrics(proxy_port)
+            if snap is not None:
+                report.cache_reuse.append({"round": round_num, **snap})
 
         _human_print(f"  Round {round_num + 1}/{rounds}: direct conversation")
         direct_messages: list[dict] = [dict(msg) for msg in base_messages]
@@ -2910,6 +3490,14 @@ def run_benchmark(
             turn_exchanges=turn_exchanges or None,
             tools=tools,
             temperature=temperature,
+            stream=measure_ttft,
+        )
+
+        # Enforce the non-interleaving invariant: each side is a complete,
+        # sorted, non-interleaved multi-turn conversation (proxy fully before
+        # direct). Catches any future regression that would interleave/truncate.
+        _validate_conversation_invariant(
+            proxy_metrics, direct_metrics, num_turns, round_num
         )
 
         comparisons = _build_turn_comparisons(
@@ -3015,6 +3603,35 @@ def print_report(report: BenchmarkReport) -> None:
 
     print(_fmt_table(headers, rows))
 
+    # Latency delta confidence interval + sign test (is the slowdown real?)
+    delta_ci = lat.get("delta_ci95_ms", {})
+    sign = lat.get("delta_sign_test", {})
+    if delta_ci:
+        print(f"  Latency delta 95% CI: [{delta_ci.get('low', 0):.0f}, {delta_ci.get('high', 0):.0f}] ms")
+    if sign:
+        print(
+            f"  Paired sign test: proxy slower on {sign.get('proxy_slower_turns', 0)} turns, "
+            f"faster on {sign.get('proxy_faster_turns', 0)} turns"
+        )
+
+    # TTFT (time-to-first-token) — only present when --measure-ttft (default)
+    ttft = summary.get("ttft_ms", {})
+    if ttft.get("direct") or ttft.get("proxy"):
+        print("\n  TIME TO FIRST TOKEN (ms)")
+        ttft_headers = ["Metric", "Direct", "Proxy"]
+        ttft_rows: list[list[str]] = []
+        for stat in ["mean", "median", "p95"]:
+            d_val = f"{ttft['direct'].get(stat, 'N/A'):,.0f}" if ttft.get("direct") else "N/A"
+            p_val = f"{ttft['proxy'].get(stat, 'N/A'):,.0f}" if ttft.get("proxy") else "N/A"
+            ttft_rows.append([stat.capitalize(), d_val, p_val])
+        print(_fmt_table(ttft_headers, ttft_rows))
+
+    # Proxy overhead (X-Proxy-Process-Ms) when the proxy reports it
+    overhead = summary.get("proxy_overhead_ms")
+    if overhead:
+        print(f"  Proxy overhead (own processing): mean {overhead.get('mean', 0):.0f} ms, "
+              f"p95 {overhead.get('p95', 0):.0f} ms")
+
     # ── Token usage ───────────────────────────────────────────────────
     tok = summary["tokens"]
     print("\n" + "-" * 72)
@@ -3030,6 +3647,21 @@ def print_report(report: BenchmarkReport) -> None:
     ]
 
     print(_fmt_table(token_headers, token_rows))
+
+    # ── Cost model ─────────────────────────────────────────────────────
+    cost = summary.get("cost_usd", {})
+    if cost.get("price_in_per_1m") or cost.get("price_out_per_1m"):
+        print("\n" + "-" * 72)
+        print("  ESTIMATED COST (USD)")
+        print("-" * 72)
+        cost_rows: list[list[str]] = [
+            ["Price in ($/1M tok)", f"{cost.get('price_in_per_1m', 0):.2f}"],
+            ["Price out ($/1M tok)", f"{cost.get('price_out_per_1m', 0):.2f}"],
+            ["Direct total", f"${cost.get('direct_total', 0):.4f}"],
+            ["Proxy total", f"${cost.get('proxy_total', 0):.4f}"],
+            ["Savings", f"${cost.get('savings_usd', 0):.4f} ({cost.get('savings_pct', 0)}%)"],
+        ]
+        print(_fmt_table(["Metric", "Value"], cost_rows))
 
     # Per-turn breakdown
     if tok.get("per_turn_direct"):
@@ -3072,8 +3704,8 @@ def print_report(report: BenchmarkReport) -> None:
         print("-" * 72)
         ev_rows: list[list[str]] = [
             ["Total chars before optimization", f"{ev.get('total_chars_before_optimization', 0):,}"],
-            ["Turns exceeding budget", str(ev.get("turns_exceeding_budget", 0))],
-            ["Budget exceeded at turns", ", ".join(str(t) for t in ev.get("budget_exceeded_at_turns") or []) or "never"],
+            ["Turns raw exceeds optimized target", str(ev.get("turns_raw_exceeds_optimized_target", 0))],
+            ["Raw exceeds target at turns", ", ".join(str(t) for t in ev.get("raw_exceeds_optimized_target_at_turns") or []) or "never"],
             ["Compaction triggered at turns", ", ".join(str(t) for t in ev.get("compaction_triggered_at_turns") or []) or "never"],
             ["Budget eviction triggered at turns", ", ".join(str(t) for t in ev.get("eviction_triggered_at_turns") or []) or "never"],
         ]
@@ -3166,8 +3798,13 @@ def print_report(report: BenchmarkReport) -> None:
     verbosity_count = qual.get("verbosity_count", 0)
     code_loss = qual.get("code_block_loss_turns", 0)
     rouge_gap = qual.get("rouge_precision_recall_gap_mean", 0.0)
+    quality_skipped = qual.get("quality_skipped_turns", 0)
 
     degradation_notes: list[str] = []
+    if quality_skipped > 0:
+        degradation_notes.append(
+            f"{quality_skipped} turn(s) excluded from quality (one side errored/empty) — means may be optimistic"
+        )
     if low_semantic > 0:
         degradation_notes.append(f"{low_semantic} turn(s) low semantic similarity (<0.75)")
     if low_jaccard > 0:
@@ -3281,10 +3918,12 @@ def print_report(report: BenchmarkReport) -> None:
 
         ctx_turns = t.direct.total_turns_at_request if hasattr(t.direct, 'total_turns_at_request') else "?"
         chars_in = f"{t.proxy.chars_before_optimization:,}" if hasattr(t.proxy, 'chars_before_optimization') and t.proxy.chars_before_optimization > 0 else "-"
-        budget_val = report.config.get("char_budget")
+        # Eviction = the proxy actually sent fewer tokens than direct this turn
+        # (real compaction/optimization), not merely raw input exceeding the
+        # post-optimization target (which is expected for long scenarios).
         eviction_flag = ""
-        if budget_val is not None and hasattr(t.proxy, 'chars_before_optimization'):
-            eviction_flag = "YES ⚠️" if t.proxy.chars_before_optimization > budget_val else "no"
+        if hasattr(t.direct, 'prompt_tokens') and hasattr(t.proxy, 'prompt_tokens'):
+            eviction_flag = "YES ⚠️" if t.proxy.prompt_tokens < t.direct.prompt_tokens else "no"
         detail_rows.append([
             str(t.turn_index),
             str(ctx_turns),
@@ -3337,6 +3976,11 @@ def run_all_scenarios(args) -> int:
                 scenario=scenario_name,
                 agentic=args.agentic,
                 temperature=args.temperature,
+                measure_ttft=args.measure_ttft,
+                context_window=args.context_window,
+                price_in=args.price_in,
+                price_out=args.price_out,
+                max_wall_seconds=args.max_wall_seconds,
             )
             all_reports[scenario_name] = report
 
@@ -3358,6 +4002,30 @@ def run_all_scenarios(args) -> int:
         gate = _check_similarity_gate(args, gate_value, gate_metric)
         if gate:
             return gate
+
+        # Baseline regression gate (optional, --baseline): diff the aggregated
+        # means against a prior --json report. The aggregated dict carries
+        # token_savings_pct and the headline quality means in the same shape
+        # the gate expects, so we adapt it into a synthetic summary.
+        if args.baseline:
+            baseline = _load_baseline(args.baseline)
+            if baseline is not None:
+                current = {
+                    "tokens": {
+                        "token_savings_pct": agg.get("token_savings_pct", {}).get("mean", 0.0)
+                    },
+                    "cost_usd": {
+                        "savings_pct": agg.get("cost_savings_pct", {}).get("mean", 0.0)
+                    },
+                    "quality": {
+                        qm: agg.get(qm, {}).get("mean", 0.0)
+                        for qm in ("rouge_l_f1", "token_jaccard", "code_block_ratio", "edit_similarity")
+                    },
+                }
+                _print_baseline_diff(current, baseline)
+                bgate = _check_baseline_gate(args, current, baseline)
+                if bgate:
+                    return bgate
 
     finally:
         _stop_proxy()
@@ -3381,16 +4049,28 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
     all_rouge: list[float] = []
     all_jaccard: list[float] = []
     all_token_savings: list[float] = []
+    all_ttft: list[float] = []
+    all_proxy_overhead: list[float] = []
+    all_cost_savings: list[float] = []
+    all_quality_skipped: list[int] = []
+    all_code_block: list[float] = []
+    all_edit_sim: list[float] = []
 
     for name, report in reports.items():
         summary = report.summary()
         aggregated["per_scenario"][name] = {
             "num_turns": summary.get("num_turns", 0),
             "latency_mean_ms": summary.get("latency_ms", {}).get("proxy", {}).get("mean", 0),
-            "semantic_similarity_mean": summary.get("quality", {}).get("semantic_similarity", {}).get("mean", 0),
+            "semantic_similarity_mean": summary.get("semantic_similarity", {}).get("mean", 0),
             "rouge_l_f1_mean": summary.get("quality", {}).get("rouge_l_f1", {}).get("mean", 0),
             "token_jaccard_mean": summary.get("quality", {}).get("token_jaccard", {}).get("mean", 0),
+            "code_block_ratio_mean": summary.get("quality", {}).get("code_block_ratio", {}).get("mean", 0),
+            "edit_similarity_mean": summary.get("quality", {}).get("edit_similarity", {}).get("mean", 0),
             "token_savings_pct": summary.get("tokens", {}).get("token_savings_pct", 0),
+            "ttft_proxy_mean_ms": summary.get("ttft_ms", {}).get("proxy", {}).get("mean", 0),
+            "proxy_overhead_mean_ms": summary.get("proxy_overhead_ms", {}).get("mean", 0),
+            "cost_savings_pct": summary.get("cost_usd", {}).get("savings_pct", 0),
+            "quality_skipped_turns": summary.get("quality", {}).get("quality_skipped_turns", 0),
         }
 
         # Collect for aggregation
@@ -3410,8 +4090,31 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
         if jc:
             all_jaccard.append(jc)
 
+        cb = summary.get("quality", {}).get("code_block_ratio", {}).get("mean", 0)
+        if cb:
+            all_code_block.append(cb)
+
+        es = summary.get("quality", {}).get("edit_similarity", {}).get("mean", 0)
+        if es:
+            all_edit_sim.append(es)
+
         ts = summary.get("tokens", {}).get("token_savings_pct", 0)
         all_token_savings.append(ts)
+
+        ttft = summary.get("ttft_ms", {}).get("proxy", {}).get("mean", 0)
+        if ttft:
+            all_ttft.append(ttft)
+
+        pov = summary.get("proxy_overhead_ms", {}).get("mean", 0)
+        if pov:
+            all_proxy_overhead.append(pov)
+
+        cs = summary.get("cost_usd", {}).get("savings_pct", 0)
+        if cs:
+            all_cost_savings.append(cs)
+
+        qs = summary.get("quality", {}).get("quality_skipped_turns", 0)
+        all_quality_skipped.append(qs)
 
     # Compute aggregated stats
     if all_latencies:
@@ -3442,10 +4145,50 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
             "max": round(max(all_jaccard), 4),
         }
 
+    if all_code_block:
+        aggregated["aggregated"]["code_block_ratio"] = {
+            "mean": round(statistics.mean(all_code_block), 4),
+            "min": round(min(all_code_block), 4),
+            "max": round(max(all_code_block), 4),
+        }
+
+    if all_edit_sim:
+        aggregated["aggregated"]["edit_similarity"] = {
+            "mean": round(statistics.mean(all_edit_sim), 4),
+            "min": round(min(all_edit_sim), 4),
+            "max": round(max(all_edit_sim), 4),
+        }
+
     aggregated["aggregated"]["token_savings_pct"] = {
         "mean": round(statistics.mean(all_token_savings), 2),
         "min": round(min(all_token_savings), 2),
         "max": round(max(all_token_savings), 2),
+    }
+
+    if all_ttft:
+        aggregated["aggregated"]["ttft_ms"] = {
+            "mean": round(statistics.mean(all_ttft), 2),
+            "min": round(min(all_ttft), 2),
+            "max": round(max(all_ttft), 2),
+        }
+
+    if all_proxy_overhead:
+        aggregated["aggregated"]["proxy_overhead_ms"] = {
+            "mean": round(statistics.mean(all_proxy_overhead), 2),
+            "min": round(min(all_proxy_overhead), 2),
+            "max": round(max(all_proxy_overhead), 2),
+        }
+
+    if all_cost_savings:
+        aggregated["aggregated"]["cost_savings_pct"] = {
+            "mean": round(statistics.mean(all_cost_savings), 2),
+            "min": round(min(all_cost_savings), 2),
+            "max": round(max(all_cost_savings), 2),
+        }
+
+    aggregated["aggregated"]["quality_skipped_turns"] = {
+        "total": sum(all_quality_skipped),
+        "mean": round(statistics.mean(all_quality_skipped), 2),
     }
 
     return aggregated
@@ -3459,6 +4202,14 @@ def _print_aggregated(aggregated: dict[str, Any]) -> None:
         print(f"      Latency: {data.get('latency_mean_ms', 0):.0f}ms")
         print(f"      Semantic similarity: {data.get('semantic_similarity_mean', 0):.4f}")
         print(f"      Token savings: {data.get('token_savings_pct', 0):.1f}%")
+        if data.get("ttft_proxy_mean_ms"):
+            print(f"      TTFT (proxy): {data.get('ttft_proxy_mean_ms', 0):.0f}ms")
+        if data.get("proxy_overhead_mean_ms"):
+            print(f"      Proxy overhead: {data.get('proxy_overhead_mean_ms', 0):.0f}ms")
+        if data.get("cost_savings_pct"):
+            print(f"      Cost savings: {data.get('cost_savings_pct', 0):.1f}%")
+        if data.get("quality_skipped_turns"):
+            print(f"      Quality-skipped turns: {data.get('quality_skipped_turns', 0)}")
 
     print("\n  Aggregated Metrics:")
     agg = aggregated.get("aggregated", {})
@@ -3468,6 +4219,14 @@ def _print_aggregated(aggregated: dict[str, Any]) -> None:
         print(f"    Semantic similarity (mean): {agg['semantic_similarity']['mean']:.4f}")
     if "token_savings_pct" in agg:
         print(f"    Token savings (mean): {agg['token_savings_pct']['mean']:.1f}%")
+    if "ttft_ms" in agg:
+        print(f"    TTFT (proxy, mean): {agg['ttft_ms']['mean']:.0f}ms")
+    if "proxy_overhead_ms" in agg:
+        print(f"    Proxy overhead (mean): {agg['proxy_overhead_ms']['mean']:.0f}ms")
+    if "cost_savings_pct" in agg:
+        print(f"    Cost savings (mean): {agg['cost_savings_pct']['mean']:.1f}%")
+    if "quality_skipped_turns" in agg:
+        print(f"    Quality-skipped turns (total): {agg['quality_skipped_turns']['total']}")
 
 
 # ---------------------------------------------------------------------------
@@ -3480,7 +4239,13 @@ def main() -> None:
         description="Multi-turn benchmark: direct Lemonade vs moeptimizer proxy"
     )
     parser.add_argument("--turns", type=int, default=10, help="Number of conversation turns")
-    parser.add_argument("--rounds", type=int, default=1, help="Number of full conversation rounds")
+    parser.add_argument("--rounds", type=int, default=5, help="Number of full conversation rounds (default 5; run >=5 so per-round variance and bootstrap CIs are stable)")
+    parser.add_argument("--context-window", type=int, default=262144, help="Model context-window size in tokens (used for utilization %%). Defaults to 262144 (Qwen3.6-35B-MTP).")
+    parser.add_argument("--price-in", type=float, default=0.0, dest="price_in", help="Input token price in USD per 1M tokens. Enables the estimated-cost section.")
+    parser.add_argument("--price-out", type=float, default=0.0, dest="price_out", help="Output token price in USD per 1M tokens. Enables the estimated-cost section.")
+    parser.add_argument("--max-wall-seconds", type=float, default=None, dest="max_wall_seconds", help="Abort remaining rounds (or scenarios, with --scenario all) once this wall-clock budget is exceeded.")
+    parser.add_argument("--baseline", type=str, default=None, help="Path to a prior JSON report (from --json) to diff against. Prints per-metric deltas and fails the regression gate if token-savings or quality regress beyond --baseline-tolerance.")
+    parser.add_argument("--baseline-tolerance", type=float, default=0.05, dest="baseline_tolerance", help="Absolute tolerance for baseline diffs (e.g. 0.05 = quality mean may drop by 0.05 before the gate fails).")
     parser.add_argument("--max-tokens", type=int, default=1024, help="Max tokens per response (realistic for agentic coding; 256 understates proxy savings)")
     parser.add_argument("--port", type=int, default=MOEPT_PORT, help="Proxy server port")
     parser.add_argument(
@@ -3526,6 +4291,14 @@ def main() -> None:
              "outputs); send plain user messages instead. Agentic mode is the default "
              "for every scenario, since real coding clients send tool traffic.",
     )
+    parser.add_argument(
+        "--no-measure-ttft", dest="measure_ttft", action="store_false",
+        help="Disable TTFT measurement and per-turn prefix-cache hit capture. By "
+             "default the benchmark streams responses to measure time-to-first-token "
+             "(TTFT) and capture the proxy's per-turn prefix-cache hit count; "
+             "conversations stay contiguous (full multi-turn sessions), only the "
+             "transport switches to SSE. Pass this to fall back to non-streaming.",
+    )
     args = parser.parse_args()
 
     # Handle "all" scenario - run all individual scenarios
@@ -3563,6 +4336,11 @@ def main() -> None:
             scenario=args.scenario,
             agentic=args.agentic,
             temperature=args.temperature,
+            measure_ttft=args.measure_ttft,
+            context_window=args.context_window,
+            price_in=args.price_in,
+            price_out=args.price_out,
+            max_wall_seconds=args.max_wall_seconds,
         )
 
         if args.json_output or not args.dump_responses:
@@ -3583,6 +4361,16 @@ def main() -> None:
         gate = _check_similarity_gate(args, gate_value, gate_metric)
         if gate:
             return gate
+
+        # Baseline regression gate (optional, --baseline): diff against a prior
+        # --json report and fail if token/cost savings or quality regress.
+        if args.baseline:
+            baseline = _load_baseline(args.baseline)
+            if baseline is not None:
+                _print_baseline_diff(_summary, baseline)
+                bgate = _check_baseline_gate(args, _summary, baseline)
+                if bgate:
+                    return bgate
 
         if args.dump_responses:
             print("\n" + "=" * 72)
@@ -3658,7 +4446,7 @@ def _select_quality_gate(summary: dict[str, Any]) -> tuple[float, str]:
     sem_robust = pooled.get("round_mean_of_means") if pooled else None
     if sem_robust is not None and sem_robust > 0:
         return sem_robust, "semantic_similarity"
-    sem_pooled = (qual.get("semantic_similarity") or {}).get("mean")
+    sem_pooled = (summary.get("semantic_similarity") or {}).get("mean")
     if sem_pooled is not None and sem_pooled > 0:
         return sem_pooled, "semantic_similarity"
 
@@ -3669,10 +4457,11 @@ def _select_aggregated_gate(agg: dict[str, Any]) -> tuple[float, str]:
     """Pick the best available aggregated quality metric for the regression gate.
 
     Mirrors :func:`_select_quality_gate`: prefers lexical signals
-    (``rouge_l_f1``, ``token_jaccard``) over embedding cosine similarity, which
-    is weak on code, so ``semantic_similarity`` is only a fallback.
+    (``rouge_l_f1``, ``token_jaccard``, ``code_block_ratio``, ``edit_similarity``)
+    over embedding cosine similarity, which is weak on code, so
+    ``semantic_similarity`` is only a fallback.
     """
-    for metric in ("rouge_l_f1", "token_jaccard"):
+    for metric in ("rouge_l_f1", "token_jaccard", "code_block_ratio", "edit_similarity"):
         val = (agg.get(metric) or {}).get("mean")
         if val is not None and val > 0:
             return val, metric
@@ -3705,6 +4494,112 @@ def _check_similarity_gate(
         f"\n  ✅ Regression gate passed: {gate_metric}={gate_value:.4f} "
         f">= --min-similarity={args.min_similarity:.4f}",
     )
+    return 0
+
+
+def _load_baseline(path: str) -> dict[str, Any] | None:
+    """Load a prior JSON report produced by ``--json``. Returns None on failure."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"  ⚠️  Could not read baseline report {path!r}: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict):
+        print(f"  ⚠️  Baseline report {path!r} is not a JSON object", file=sys.stderr)
+        return None
+    return data
+
+
+def _baseline_get(d: dict[str, Any], *keys) -> float | None:
+    """Drill into a nested summary dict and return a numeric value, or None."""
+    cur: Any = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    if isinstance(cur, dict):
+        cur = cur.get("mean")
+    return cur if isinstance(cur, (int, float)) else None
+
+
+def _print_baseline_diff(current: dict[str, Any], baseline: dict[str, Any]) -> None:
+    """Print a concise delta table of key metrics vs the baseline."""
+    rows = [
+        ("token_savings_pct", "tokens", "token_savings_pct", "{:.2f}pp", 1.0),
+        ("cost_savings_pct", "cost_usd", "savings_pct", "{:.2f}pp", 1.0),
+        ("rouge_l_f1", "quality", "rouge_l_f1", "{:.4f}", 1.0),
+        ("token_jaccard", "quality", "token_jaccard", "{:.4f}", 1.0),
+        ("code_block_ratio", "quality", "code_block_ratio", "{:.4f}", 1.0),
+        ("edit_similarity", "quality", "edit_similarity", "{:.4f}", 1.0),
+        ("semantic_similarity", "semantic_similarity", "mean", "{:.4f}", 1.0),
+        ("proxy_latency_mean_ms", "latency_ms", "proxy", "mean", "{:.1f}ms", 1.0),
+        ("ttft_proxy_mean_ms", "ttft_ms", "proxy", "mean", "{:.1f}ms", 1.0),
+    ]
+    print("\n  Baseline diff (current vs baseline):")
+    print(f"    {'metric':<24}{'baseline':>14}{'current':>14}{'delta':>14}")
+    print("    " + "-" * 64)
+    for label, *keys, fmt, _scale in rows:
+        base = _baseline_get(baseline, *keys)
+        cur = _baseline_get(current, *keys)
+        if base is None and cur is None:
+            continue
+        b_str = fmt.format(base) if base is not None else "n/a"
+        c_str = fmt.format(cur) if cur is not None else "n/a"
+        if base is not None and cur is not None:
+            delta = cur - base
+            d_str = (("+" if delta >= 0 else "") + fmt.format(delta))
+        else:
+            d_str = "n/a"
+        print(f"    {label:<24}{b_str:>14}{c_str:>14}{d_str:>14}")
+
+
+def _check_baseline_gate(
+    args: argparse.Namespace,
+    current: dict[str, Any],
+    baseline: dict[str, Any],
+) -> int:
+    """Diff *current* against *baseline* and fail the regression gate on
+    unacceptable regressions (token/cost savings or headline quality).
+
+    ``--baseline-tolerance`` is expressed on the 0..1 quality scale (e.g. 0.05 =
+    a quality mean may drop by 0.05). Token/cost savings are in percentage
+    points, so the same tolerance is applied as ``tol * 100`` pp. Returns 0 if
+    within tolerance, 2 if a regression exceeds it.
+    """
+    tol = args.baseline_tolerance
+    failures: list[str] = []
+
+    # Token & cost savings (higher is better; a drop is a regression).
+    for key, *bkeys in (
+        ("token_savings_pct", "tokens", "token_savings_pct"),
+        ("cost savings_pct", "cost_usd", "savings_pct"),
+    ):
+        cur = _baseline_get(current, *bkeys) or 0.0
+        base = _baseline_get(baseline, *bkeys) or 0.0
+        drop = base - cur
+        if base > 0 and drop > tol * 100:
+            failures.append(
+                f"{key} regressed {drop:.2f}pp (baseline {base:.2f} -> {cur:.2f}, tol {tol*100:.2f}pp)"
+            )
+
+    # Headline quality metrics (lower is a regression).
+    for qm in ("rouge_l_f1", "token_jaccard", "code_block_ratio", "edit_similarity"):
+        cur = _baseline_get(current, "quality", qm) or 0.0
+        base = _baseline_get(baseline, "quality", qm) or 0.0
+        drop = base - cur
+        if drop > tol:
+            failures.append(
+                f"{qm} regressed {drop:.4f} (baseline {base:.4f} -> {cur:.4f}, tol {tol:.4f})"
+            )
+
+    if failures:
+        _status(args, "\n  ❌ BASELINE REGRESSION GATE FAILED:")
+        for f in failures:
+            _status(args, f"    - {f}")
+        return 2
+
+    _status(args, f"\n  ✅ Baseline regression gate passed (tolerance {tol:.4f})")
     return 0
 
 

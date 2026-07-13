@@ -847,8 +847,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             )
 
         if is_streaming:
+            # _make_streaming_generator returns a factory; invoke it to get the
+            # async generator (an async iterator) that StreamingResponse expects.
+            # Passing the bare factory function made Starlette do
+            # `async for chunk in <function>` -> TypeError: 'function' object is
+            # not iterable, which killed the stream and made clients see a
+            # truncated response ("Response ended prematurely").
             return StreamingResponse(
-                _make_streaming_generator(body, cfg, backend_client, optimizer, id_slot, _turn_start),
+                _make_streaming_generator(body, cfg, backend_client, optimizer, id_slot, _turn_start)(),
                 media_type="text/event-stream",
                 headers=response_headers,
             )

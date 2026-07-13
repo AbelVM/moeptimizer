@@ -315,9 +315,38 @@ python scripts/benchmark.py --turns 20 --json > report.json 2> benchmark.log
 # Dump full response pairs
 python scripts/benchmark.py --turns 10 --dump-responses
 
+# TTFT measurement and per-turn prefix-cache hit capture are ON by default
+# (the benchmark streams responses via SSE but keeps each side's multi-turn
+# conversation fully contiguous; only the transport changes). Per-round
+# /v1/metrics snapshots are recorded for cache-reuse trend analysis.
+# Disable with --no-measure-ttft if you must use the non-streaming path.
+python scripts/benchmark.py --scenario refactor_long --turns 30 --no-measure-ttft
+
 # Complete example
 python scripts/benchmark.py --scenario refactor_long --turns 30 --json > benchmark_refactor_long_30.json 2> benchmark_refactor_long_30.log
 ```
+
+> **Rounds default is 3** (was 1). Run at least 3 rounds so per-round variance
+> is observable and the regression gate can use the robust round-mean-of-means
+> instead of a single noisy sample. Override with `--rounds N`.
+
+### Benchmark Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--turns` | `10` | Number of conversation turns per round. |
+| `--rounds` | `3` | Number of full conversation rounds (run ≥3 so per-round variance is observable and the regression gate can use the robust round-mean-of-means). |
+| `--max-tokens` | `1024` | Max tokens per response (realistic for agentic coding; `256` understates proxy savings). |
+| `--port` | `8080` | Proxy server port. |
+| `--json` | off | Output the report as JSON to stdout. |
+| `--dump-responses` | off | Print direct vs proxy response pairs for quality inspection. |
+| `--budget` | unset | Override `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` (char budget); eviction triggers when context exceeds this. |
+| `--profile` | `balanced` | Context optimization profile: `quality` (max fidelity, no summarization/RAG), `balanced` (default), `aggressive` (max token savings, top-only eviction). |
+| `--min-similarity` | unset | Regression gate (review03.md §10): exit `2` if the mean semantic similarity (proxy vs direct) falls below this threshold. Use in CI to block quality regressions. |
+| `--scenario` | `default` | Real-life coding scenario: `debug`, `debug_long`, `refactor`, `refactor_long`, `feature`, `feature_long`, `default`, `default_long`, `fixtures`, `opencode`, or `all`. |
+| `--temperature` | `0.0` | Sampling temperature for both direct and proxy runs. `0` is deterministic so quality metrics are reproducible; raise only to stress-test nondeterminism. |
+| `--no-agentic` | off (agentic on) | Send plain user messages instead of OpenCode-style agent payloads (user task + `tool_calls` + tool outputs). Agentic mode is the default for every scenario. |
+| `--no-measure-ttft` | off (TTFT on) | Disable TTFT measurement and per-turn prefix-cache hit capture. By default the benchmark streams responses (SSE) to measure time-to-first-token and record per-round `/v1/metrics` snapshots; conversations stay contiguous, only the transport changes. |
 
 You might need to run the benchmark as background task to avoid hitting command timeouts. Progress and per-turn information is dumped to stderr.
 
@@ -343,43 +372,51 @@ instead of agent payloads. `--profile` selects the optimization preset
 <float>` makes the run exit `2` if the mean semantic similarity to the direct
 baseline falls below the threshold (regression gate).
 
-### Tool-output compression
-
-The proxy boundary-compresses large `tool`/`assistant` outputs at optimizer
-step 11.6 (`ToolOutputCompressor`, gated by `tool_output_compression_enabled`,
-default `true`, threshold `agentic.tool_output_compression_max_chars` = 4000
-chars). Cheap, idempotent transforms (truncate, collapse repeated lines/frames,
-strip ANSI) run once when a tool message first appears, so the compressed form
-is frozen into the stable leading prefix and the backend's prefix cache stays
-valid. Small outputs (e.g. file reads under the threshold) are forwarded
-verbatim to preserve response quality. **Every scenario ships a >4k-char
-`run_command` log**, so the proxy's `ToolOutputCompressor` fires on all
-benchmark traffic — not just the fixture replay. The `fixtures`/`opencode`
-replay reads a real fixture log (`agent_log_output` in `scripts/fixtures/loader.py`);
-the synthetic scenarios (`debug`/`refactor`/`feature`/`default` ±`_long`) synthesize
-one via `_agentic_exchange` in `scripts/benchmark.py` (with a `_FALLBACK_AGENT_LOG`
-if the fixture loader is unavailable). File-read outputs stay under the threshold
-and are forwarded verbatim.
-
 ### Metrics Collected
 
-- **Latency**: Direct vs proxy response times (mean, median, p95)
+- **Latency**: Direct vs proxy response times (mean, median, p95). **TTFT**
+  (time to first token, ms) is captured per turn via the streaming path by
+  default (disable with `--no-measure-ttft`).
 - **Token Usage**: Prompt tokens, cached tokens, token savings percentage
 - **Context Window**: Final utilization percentage
-- **Response Quality**: Compares proxy-optimized responses against the direct Lemonade baseline. Similarity metrics are reported on a 0–1 scale, where `1.0` is the perfect score; they are not percentages, so `0.99` means near-perfect alignment against the 1.0 top score. Exceptions are called out below.
-  - **Semantic similarity**: Embedding cosine similarity. Higher is better; it means the proxy response preserves the same meaning even if wording differs.
+- **Prefix-cache reuse**: The proxy's authoritative prefix-cache hit count per
+  turn (`X-Prefix-Cache-Hit-Tokens`, surfaced as a response header in
+  non-streaming and an SSE comment when streaming). By default the benchmark
+  records a per-round `/v1/metrics` snapshot (`cache_hit_rate`,
+  `prefix_cache_reuse_ratio`, `total_cached_tokens`) for cache-reuse trend
+  analysis (disable with `--no-measure-ttft`).
+- **Response Quality**: Compares proxy-optimized responses against the direct
+  Lemonade baseline. Similarity metrics are reported on a 0–1 scale, where `1.0`
+  is the perfect score; they are not percentages, so `0.99` means near-perfect
+  alignment against the 1.0 top score. Exceptions are called out below.
+
+  The quality block is split into **headline** (the non-redundant, robust
+  signals the regression gate reasons about) and **secondary** (correlated /
+  redundant overlap signals, kept for deep inspection only). `semantic_similarity`
+  is reported as its own informational key — the `embed-gemma-300m-FLM` embedder
+  is weak on code, so it must not sit in the headline block.
+
+  - **Headline**: `rouge_l_f1`, `token_jaccard`, `code_block_ratio`,
+    `edit_similarity`, `length_ratio`, `code_syntax_validity`.
+  - **Secondary**: `trigram_overlap`, `markdown_structure_similarity`,
+    `vocabulary_richness_delta`, `rouge_l_precision`, `rouge_l_recall`,
+    `response_stability`, `code_structure_consistency`, `has_code_direct`,
+    `has_code_proxy`.
+  - **Semantic similarity** (informational): Embedding cosine similarity. Higher
+    is better; it means the proxy response preserves the same meaning even if
+    wording differs. Weak on code, so it is not a headline/gate metric.
   - **Token Jaccard**: Word-set overlap between proxy and baseline responses. Higher is better; it indicates shared vocabulary/content coverage.
   - **ROUGE-L F1**: Longest common subsequence overlap between proxy and baseline text. Higher is better; it rewards shared wording and ordering.
-  - **Trigram overlap**: Shared three-character sequence overlap. Higher is better; it indicates surface-level similarity in wording and local structure.
   - **Edit similarity**: Normalized longest-common-subsequence edit similarity. Higher is better; it means fewer insertions, deletions, or rewrites are needed to transform one response into the other.
   - **Code block ratio**: Fraction of baseline code blocks preserved by the proxy response. Higher is better; 1.0 means all baseline code blocks were preserved or no baseline code blocks existed.
+  - **Code syntax validity**: Fraction of fenced `python` code blocks in the proxy response that parse with `ast.parse`. Higher is better; `1.0` means no syntactically broken code was emitted as a side effect of optimization (boundary compression, summarization, eviction). This is a hard correctness signal the embedding/lexical metrics cannot catch.
   - **Markdown structure similarity**: Jaccard similarity of markdown structural elements such as headings, lists, code fences, and blockquotes. Higher is better.
   - **Length ratio**: Proxy response length divided by baseline response length. Closer to 1.0 is better; `<0.5` flags severe truncation and `>2.0` flags verbosity inflation.
   - **Vocabulary richness delta**: Absolute difference in type-token ratio between proxy and baseline. Lower is better; 0 means identical vocabulary diversity.
   - **MTP stability**: Proxy preservation of baseline code-block and thinking-tag structure. Higher is better; it indicates stable MTP-style response structure.
   - **Syntax consistency**: Similarity of code-structure keywords preserved in code blocks. Higher is better; it indicates the proxy kept similar code constructs when code was present.
 - **MTP Stability**: Code block preservation, syntax consistency
-- **Eviction**: Turns triggering context eviction, chars before optimization
+- **Eviction**: Two distinct signals. `raw_exceeds_optimized_target` (informational) counts turns whose raw input exceeded the proxy's post-optimization char budget (`MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS`) — expected for long scenarios, **not** a failure. The real eviction signal is `compaction_triggered`: turns where the proxy actually sent strictly fewer prompt tokens to the backend than the direct baseline (i.e. real compaction/optimization happened). The per-turn detail table flags eviction as `proxy.prompt_tokens < direct.prompt_tokens`.
 
 ## Development
 
