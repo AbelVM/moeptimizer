@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MOEptimizer Benchmark Dashboard</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --border:#30363d;
+    --text:#c9d1d9; --muted:#8b949e; --accent:#58a6ff;
+    --direct:#58a6ff; --proxy:#f78166; --sem:#3fb950; --jaccard:#d2a8ff;
+    --rouge:#e3b341; --pos:#3fb950; --neg:#f85149; --cache:#39c5cf;
+    --good:#3fb950; --warn:#e3b341; --bad:#f85149;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:14px;line-height:1.45}
+  a{color:var(--accent)}
+  header{padding:18px 22px;border-bottom:1px solid var(--border);
+    display:flex;flex-wrap:wrap;align-items:center;gap:14px;justify-content:space-between}
+  header h1{font-size:18px;margin:0;font-weight:600;letter-spacing:.2px}
+  header .sub{color:var(--muted);font-size:12px;margin-top:2px}
+  .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  #dropzone{border:1.5px dashed var(--border);border-radius:10px;padding:14px 18px;
+    text-align:center;color:var(--muted);cursor:pointer;transition:.15s;background:var(--panel)}
+  #dropzone.hover{border-color:var(--accent);background:var(--panel2);color:var(--text)}
+  #dropzone b{color:var(--text)}
+  select,button{background:var(--panel2);color:var(--text);border:1px solid var(--border);
+    border-radius:7px;padding:7px 11px;font-size:13px;cursor:pointer}
+  select:hover,button:hover{border-color:var(--accent)}
+  main{padding:20px 22px;max-width:1500px;margin:0 auto}
+  .empty{text-align:center;color:var(--muted);padding:60px 20px;font-size:15px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:22px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+  .card .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+  .card .value{font-size:26px;font-weight:650;margin-top:6px}
+  .card .delta{font-size:12px;margin-top:3px;color:var(--muted)}
+  .card .value.good{color:var(--good)} .card .value.bad{color:var(--bad)} .card .value.warn{color:var(--warn)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:18px}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px 8px}
+  .panel h2{font-size:14px;margin:0 0 4px;font-weight:600}
+  .panel .hint{color:var(--muted);font-size:11.5px;margin:0 0 8px}
+  canvas{width:100%;height:260px;display:block}
+  .legend{display:flex;flex-wrap:wrap;gap:12px;margin:6px 2px 2px;font-size:12px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .legend i{width:11px;height:11px;border-radius:3px;display:inline-block}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px}
+  th,td{padding:6px 8px;text-align:right;border-bottom:1px solid var(--border)}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--muted);font-weight:600;cursor:pointer;user-select:none;position:sticky;top:0;background:var(--panel)}
+  th:hover{color:var(--text)}
+  tbody tr:hover{background:var(--panel2)}
+  .pos{color:var(--pos)} .neg{color:var(--neg)} .na{color:var(--muted)}
+  .section-title{font-size:15px;font-weight:600;margin:26px 0 12px;border-left:3px solid var(--accent);padding-left:9px}
+  .tablewrap{max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:10px;background:var(--panel)}
+  .tablewrap table{margin:0}
+  .pill{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;border:1px solid var(--border)}
+  .pill.ok{color:var(--good);border-color:var(--good)}
+  .pill.warn{color:var(--warn);border-color:var(--warn)}
+  .pill.bad{color:var(--bad);border-color:var(--bad)}
+  .meta{color:var(--muted);font-size:12px;margin:2px 0 0}
+  #tooltip{position:fixed;pointer-events:none;background:#0b0f16;border:1px solid var(--border);
+    border-radius:8px;padding:8px 10px;font-size:12px;color:var(--text);z-index:50;display:none;
+    box-shadow:0 6px 20px rgba(0,0,0,.5);max-width:280px}
+  #tooltip .tt-title{color:var(--muted);margin-bottom:4px;font-weight:600}
+  #tooltip .tt-row{display:flex;justify-content:space-between;gap:14px}
+  #tooltip .tt-row b{font-weight:600}
+  .filebar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px;font-size:12.5px}
+  .filebar .f{background:var(--panel);border:1px solid var(--border);border-radius:7px;padding:5px 10px}
+  .filebar .f b{color:var(--text)} .filebar .f.miss{color:var(--warn);border-color:var(--warn)}
+  .filebar .f.ok{color:var(--good);border-color:var(--good)}
+  .err{color:var(--bad);background:var(--panel);border:1px solid var(--bad);border-radius:8px;padding:10px 14px;margin-bottom:14px}
+  .coupling{margin-bottom:14px;padding:11px 14px;border-radius:9px;font-size:13px;border:1px solid var(--border);background:var(--panel)}
+  .coupling.ok{border-color:var(--good);color:var(--good);background:rgba(63,185,80,.08)}
+  .coupling.warn{border-color:var(--warn);color:var(--warn);background:rgba(227,179,65,.08)}
+  .coupling.error{border-color:var(--bad);color:var(--bad);background:rgba(248,81,73,.08)}
+  .coupling.info{border-color:var(--accent);color:var(--muted);background:var(--panel)}
+  .coupling ul{margin:8px 0 0;padding-left:20px}
+  .coupling li{margin:3px 0;color:var(--text)}
+  .coupling .cf{display:inline-block;min-width:130px;color:var(--text);font-weight:600}
+  .coupling code{background:#0b0f16;border:1px solid var(--border);border-radius:4px;padding:1px 5px;font-size:12px}
+  .coupling .cw{margin-top:6px;color:var(--muted)}
+  .foot{color:var(--muted);font-size:11.5px;text-align:center;padding:24px 0 8px}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>MOEptimizer Benchmark Dashboard</h1>
+    <div class="sub">Coupled <code>.json</code> report + <code>.log</code> trace &middot; drag &amp; drop or pick files</div>
+  </div>
+  <div class="controls">
+    <div id="dropzone">Drop <b>benchmark_*.json</b> + <b>benchmark_*.log</b> here<br><span style="font-size:11px">or click to choose</span></div>
+    <input id="fileInput" type="file" accept=".json,.log,.txt" multiple hidden />
+    <select id="runSelect" style="display:none"></select>
+  </div>
+</header>
+<main>
+  <div id="errbox"></div>
+  <div id="content" class="empty">No benchmark loaded. Drop a coupled JSON + LOG pair (they share a basename, e.g. <code>benchmark_opencode_10_5.json</code> / <code>.log</code>).</div>
+</main>
+<div id="tooltip"></div>
+
+<script>
+"use strict";
+/* ============================ utilities ============================ */
+const $ = (s,r=document)=>r.querySelector(s);
+const el = (t,c)=>{const e=document.createElement(t); if(c) e.className=c; return e;};
+const num = s => { if(s==null) return NaN; s=String(s).trim(); if(s===''||s==='n/a'||s==='NaN') return NaN; return parseFloat(s.replace(/,/g,'')); };
+const isNum = v => typeof v==='number' && !isNaN(v);
+const fmt = n => isNum(n) ? Math.round(n).toLocaleString('en-US') : '—';
+const fmt1 = n => isNum(n) ? n.toFixed(1) : '—';
+const fmt2 = n => isNum(n) ? n.toFixed(2) : '—';
+const fmtPct = n => isNum(n) ? n.toFixed(1)+'%' : '—';
+const fmtMs = ms => { if(!isNum(ms)) return '—'; if(ms>=1000) return (ms/1000).toFixed(1)+'s'; return Math.round(ms)+'ms'; };
+const fmtSec = ms => isNum(ms) ? (ms/1000).toFixed(1)+'s' : '—';
+const baseName = f => f.replace(/\.[^.]+$/,'');
+
+/* ============================ JSON parser ============================ */
+function parseJSON(text){
+  const d = JSON.parse(text);
+  const out = { raw:d, config:d.config||{}, meta:{} };
+  const get = (path)=>{ let c=d; for(const k of path){ if(c==null) return undefined; c=c[k]; } return c; };
+  out.latency = get(['latency_ms'])||{};
+  out.ttft = get(['ttft_ms'])||{};
+  out.tokens = get(['tokens'])||{};
+  out.quality = get(['quality'])||{};
+  out.secondary = get(['secondary_quality'])||{};
+  out.semantic = get(['semantic_similarity'])||{};
+  out.context = get(['context_window'])||{};
+  out.eviction = get(['eviction'])||{};
+  out.cache = get(['cache_reuse'])||{};
+  out.correctness = get(['correctness'])||{};
+  out.cost = get(['cost_usd'])||{};
+  out.perRound = get(['per_round'])||{};
+  out.qualityTrend = get(['quality_trend'])||{};
+  out.vocab = get(['vocab_richness'])||{};
+  return out;
+}
+
+/* ============================ LOG parser ============================ */
+const RE_TURN = /^  Turn (\d+):\s*direct=([\d.]+)ms\/([\d,]+)tok\/([\d,]+)chars\s*proxy=([\d.]+)ms\/([\d,]+)tok\/([\d,]+)chars_raw\/([\d,]+)chars\s*delta=([+-]?[\d.]+)ms\/([+-]?[\d,]+)tok\s*cache=([\d,]+|n\/a)\/([\d,]+|n\/a)\s*quality_sem=([\d.]+|n\/a)\s*jaccard=([\d.]+|n\/a)\s*rouge=([\d.]+|n\/a)/;
+const RE_PTURN = /^  Proxy turn (\d+)\/(\d+): raw (\d+) msgs\/([\d,]+) chars\/~?([\d,]+) tok \(pre-optimization\)/;
+const RE_PBACK = /^    → backend-facing: ([\d,]+) tok \(source=([\w_]+), cached=([\d,]+), prefix_hits=([\d,]+), raw=([\d,]+) chars\)/;
+const RE_DTURN = /^  Direct turn (\d+)\/(\d+): backend-facing ~?([\d,]+) tok \(raw (\d+) msgs\/([\d,]+) chars, no proxy\)/;
+const RE_DBACK = /^    → backend-facing: ([\d,]+) tok \(source=([\w_]+), cached=([\d,]+)\)/;
+const RE_ROUND = /^  Round (\d+)\/(\d+):/;
+const RE_META = /^  (Starting benchmark|Scenario|Model|Lemonade|Proxy|Context profile|Starting moeptimizer proxy on port|Proxy ready on port):?\s*(.*)$/;
+
+function parseLog(text){
+  const lines = text.split(/\r?\n/);
+  const turns = {};        // global turn index -> combined
+  const proxyTurns = {};   // global idx -> {rawMsgs,rawChars,rawTok,backendTok,source,cached,prefixHits,round}
+  const directTurns = {};  // global idx -> {rawMsgs,rawChars,backendTok,source,cached,round}
+  const meta = {};
+  let pendingProxy=null, pendingDirect=null, currentRound=0;
+
+  for(const line of lines){
+    let m;
+    if((m=RE_ROUND.exec(line))){
+      currentRound=+m[1];
+    } else if((m=RE_TURN.exec(line))){
+      const i=+m[1];
+      turns[i] = {
+        turn:i, round:currentRound,
+        direct_ms:num(m[2]), direct_tok:num(m[3]), direct_chars:num(m[4]),
+        proxy_ms:num(m[5]), proxy_tok:num(m[6]), proxy_raw_chars:num(m[7]), proxy_chars:num(m[8]),
+        delta_ms:num(m[9]), delta_tok:num(m[10]),
+        cache_hit:(m[11]==='n/a'?NaN:num(m[11])), cache_miss:(m[12]==='n/a'?NaN:num(m[12])),
+        sem:num(m[13]), jaccard:num(m[14]), rouge:num(m[15])
+      };
+    } else if((m=RE_PTURN.exec(line))){
+      const i=+m[1];
+      pendingProxy=i;
+      proxyTurns[i]={rawMsgs:+m[3], rawChars:num(m[4]), rawTok:num(m[5]), round:currentRound};
+    } else if((m=RE_PBACK.exec(line)) && pendingProxy!=null){
+      const t=proxyTurns[pendingProxy]||(proxyTurns[pendingProxy]={});
+      t.backendTok=num(m[1]); t.source=m[2]; t.cached=num(m[3]); t.prefixHits=num(m[4]);
+      pendingProxy=null;
+    } else if((m=RE_DTURN.exec(line))){
+      const i=+m[1];
+      pendingDirect=i;
+      directTurns[i]={rawMsgs:+m[4], rawChars:num(m[5]), backendTok:num(m[3]), round:currentRound};
+    } else if((m=RE_DBACK.exec(line)) && pendingDirect!=null){
+      const t=directTurns[pendingDirect]||(directTurns[pendingDirect]={});
+      t.backendTok=num(m[1]); t.source=m[2]; t.cached=num(m[3]);
+      pendingDirect=null;
+    } else if((m=RE_META.exec(line))){
+      meta[m[1]] = m[2].trim();
+    }
+  }
+  const turnList = Object.keys(turns).map(Number).sort((a,b)=>a-b).map(i=>turns[i]);
+  // derive round structure from the "Starting benchmark" meta line if present
+  let numTurns=NaN, rounds=NaN;
+  if(meta['Starting benchmark']){
+    const mm=/(\d+)\s+turns?\s+x\s+(\d+)\s+round/i.exec(meta['Starting benchmark']);
+    if(mm){ numTurns=+mm[1]; rounds=+mm[2]; }
+  }
+  return { turns, turnList, proxyTurns, directTurns, meta, count:turnList.length, numTurns, rounds };
+}
+
+/* ============================ pairing ============================ */
+function pairFiles(files){
+  const jsons=[], logs=[];
+  for(const f of files){
+    const n=f.name.toLowerCase();
+    if(n.endsWith('.json')) jsons.push(f);
+    else if(n.endsWith('.log')||n.endsWith('.txt')) logs.push(f);
+  }
+  const pairs=[];
+  const usedLog=new Set();
+  for(const j of jsons){
+    const base=baseName(j.name);
+    const lg=logs.find(l=>baseName(l.name)===base && !usedLog.has(l.name));
+    if(lg){ usedLog.add(lg.name); pairs.push({name:base, json:j, log:lg}); }
+    else pairs.push({name:base, json:j, log:null});
+  }
+  for(const l of logs){ if(!usedLog.has(l.name)) pairs.push({name:baseName(l.name), json:null, log:l}); }
+  return pairs;
+}
+
+/* ============================ round structure ============================ */
+// Derive the (turnsPerRound, rounds) shape from JSON config and/or log meta.
+// The benchmark is organized as `rounds` independent conversations of
+// `num_turns` turns each (e.g. 10 turns x 5 rounds = 50 global turns), NOT a
+// single flat 50-turn run.
+function getRoundInfo(J, L){
+  let numTurns = J && J.config && J.config.num_turns;
+  let rounds   = J && J.config && J.config.rounds;
+  if((!isNum(numTurns) || !isNum(rounds)) && L){
+    if(isNum(L.numTurns)) numTurns = L.numTurns;
+    if(isNum(L.rounds))   rounds   = L.rounds;
+  }
+  numTurns = isNum(numTurns) && numTurns>0 ? numTurns : NaN;
+  rounds   = isNum(rounds)   && rounds>0   ? rounds   : NaN;
+  return { numTurns, rounds };
+}
+
+/* ============================ coupling verification ============================ */
+// Confirm a JSON report and LOG trace describe the SAME benchmark run by comparing
+// shared metadata (turns/round, rounds, scenario, model, endpoints) and reconciling
+// the per-turn token totals. Returns {ok, issues:[{field,json,log,severity}]}.
+// `ok` is false only when a critical (error-severity) mismatch is found.
+function verifyCoupling(J, L){
+  if(!J || !L) return {ok:true, partial:true, issues:[]};
+  const cfg=J.config||{}, meta=(L.meta)||{};
+  const issues=[];
+  const add=(field, jv, lv, sev, fmtFn)=>{
+    if(jv==null || lv==null) return;            // can't compare a missing side
+    const jn = fmtFn?fmtFn(jv):jv, ln = fmtFn?fmtFn(lv):lv;
+    if(String(jn)===String(ln)) return;
+    issues.push({field, json:jn, log:ln, severity:sev||'warn'});
+  };
+  const s = v => isNum(v)?String(v):'—';
+  // structural metadata (JSON config vs log header)
+  add('turns/round', cfg.num_turns, L.numTurns, 'error', s);
+  add('rounds',      cfg.rounds,   L.rounds,   'error', s);
+  add('model',       cfg.model,     meta['Model'], 'error');
+  add('scenario',    cfg.scenario,  meta['Scenario']?meta['Scenario'].split(/\s+/)[0]:null, 'warn');
+  add('lemonade_url',cfg.lemonade_url, meta['Lemonade'], 'warn');
+  const lp = meta['Proxy'] ? (meta['Proxy'].match(/:(\d+)(?=\/|$)/)||[])[1] : null;
+  add('proxy_port',  cfg.proxy_port, lp?+lp:null, 'warn', s);
+  // counts & token totals (strongest signal of a wrong pairing)
+  const expectedTurns = (isNum(cfg.num_turns)&&isNum(cfg.rounds)) ? cfg.num_turns*cfg.rounds : null;
+  add('turn count',  expectedTurns, L.count, 'error', s);
+  const sumTok = key => L.turnList.reduce((a,t)=>a+(isNum(t[key])?t[key]:0),0);
+  add('total_direct_prompt', J.tokens&&J.tokens.total_direct_prompt, sumTok('direct_tok'), 'error', fmt);
+  add('total_proxy_prompt',  J.tokens&&J.tokens.total_proxy_prompt,  sumTok('proxy_tok'),  'error', fmt);
+  const ok = !issues.some(i=>i.severity==='error');
+  return {ok, issues};
+}
+
+// Render a prominent coupling verdict banner. Alerts (red) on critical mismatches,
+// warns (yellow) on metadata drift, confirms (green) when fully coupled, and notes
+// when only one file is present so the check can't run.
+function renderCouplingBanner(root, J, L){
+  const box=el('div','coupling');
+  if(!J || !L){
+    box.className+=' info';
+    box.innerHTML=`<b>Coupling not verifiable.</b> Only ${J?'the JSON report':'the LOG trace'} is loaded — pair it with its matching ${J?'.log':'.json'} (same basename) to confirm they describe the same run.`;
+    root.appendChild(box); return;
+  }
+  const {ok, issues}=verifyCoupling(J,L);
+  const errs=issues.filter(i=>i.severity==='error');
+  const warns=issues.filter(i=>i.severity==='warn');
+  if(issues.length===0){
+    box.className+=' ok';
+    box.innerHTML=`<b>&#10003; Files coupled.</b> Metadata and token totals match across the JSON report and LOG trace — they describe the same run.`;
+  } else if(errs.length){
+    box.className+=' error';
+    let html=`<b>&#10007; Files are NOT coupled.</b> ${errs.length} critical mismatch(es) between the JSON report and LOG trace:`;
+    html+=`<ul>${errs.map(i=>`<li><span class="cf">${i.field}</span> JSON <code>${i.json}</code> vs LOG <code>${i.log}</code></li>`).join('')}</ul>`;
+    if(warns.length) html+=`<div class="cw">Also ${warns.length} minor difference(s): ${warns.map(i=>`${i.field} (JSON ${i.json} / LOG ${i.log})`).join('; ')}.</div>`;
+    box.innerHTML=html;
+  } else {
+    box.className+=' warn';
+    box.innerHTML=`<b>&#9888; Files coupled, but ${warns.length} metadata field(s) differ:</b> ${warns.map(i=>`${i.field} (JSON <code>${i.json}</code> / LOG <code>${i.log}</code>)`).join('; ')}.`;
+  }
+  root.appendChild(box);
+}
+
+/* ============================ chart engine ============================ */
+const PALETTE = { direct:'#58a6ff', proxy:'#f78166', sem:'#3fb950', jaccard:'#d2a8ff',
+  rouge:'#e3b341', pos:'#3fb950', neg:'#f85149', cache:'#39c5cf', raw:'#8b949e' };
+
+function setupCanvas(canvas){
+  const dpr=window.devicePixelRatio||1;
+  const rect=canvas.getBoundingClientRect();
+  const w=rect.width||canvas.clientWidth||440, h=rect.height||260;
+  canvas.width=Math.round(w*dpr); canvas.height=Math.round(h*dpr);
+  const ctx=canvas.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx,w,h};
+}
+
+// cfg: {labels, datasets:[{label,color,data,axis?,type?,fill?}], yFmt, dual?, title, yMin?, yMax?}
+function renderChart(canvas, cfg, hover){
+  const {ctx,w,h}=setupCanvas(canvas);
+  ctx.clearRect(0,0,w,h);
+  const padL=52, padR=cfg.dual?58:18, padT=14, padB=34;
+  const plotW=w-padL-padR, plotH=h-padT-padB;
+  const labels=cfg.labels||[];
+  const n=labels.length;
+  const barSets = cfg.datasets.filter(ds=>ds.type==='bar');
+  const hasBars = barSets.length>0;
+  // bar categories occupy slots of width plotW/n, centered (so the last group
+  // never overflows the right edge the way xAt(i)=padL+plotW would)
+  const xBarCenter = i => padL + plotW*(i+0.5)/n;
+  const axes={y:{min:Infinity,max:-Infinity}, y1:{min:Infinity,max:-Infinity}};
+  for(const ds of cfg.datasets){
+    const ax=ds.axis==='y1'?'y1':'y';
+    for(const v of ds.data){ if(isNum(v)){ axes[ax].min=Math.min(axes[ax].min,v); axes[ax].max=Math.max(axes[ax].max,v);} }
+  }
+  if(!isFinite(axes.y.min)){ axes.y.min=0; axes.y.max=1; }
+  if(cfg.yMin!=null) axes.y.min=cfg.yMin; if(cfg.yMax!=null) axes.yMax=cfg.yMax;
+  if(cfg.dual && !isFinite(axes.y1.min)){ axes.y1.min=0; axes.y1.max=1; }
+  // pad
+  const pad=(mx,mn)=> (mx-mn)*0.08 || 1;
+  axes.y.min=Math.min(axes.y.min, cfg.yMin!=null?cfg.yMin:axes.y.min-pad(axes.y.max-axes.y.min));
+  axes.y.max=axes.y.max+pad(axes.y.max-axes.y.min);
+  if(cfg.dual){ axes.y1.min=Math.min(axes.y1.min,0); axes.y1.max=axes.y1.max+pad(axes.y1.max-axes.y1.min); }
+  // bar charts encode magnitude: anchor the value axis at zero for honest comparison
+  if(cfg.datasets.some(ds=>ds.type==='bar')){
+    axes.y.min=0;
+    if(cfg.dual && cfg.datasets.some(ds=>ds.type==='bar'&&ds.axis==='y1')) axes.y1.min=0;
+  }
+
+  const xAt = i => n<=1 ? padL+plotW/2 : padL + (plotW*i/(n-1));
+  const yAt = (v,ax) => { const A=ax==='y1'?axes.y1:axes.y; return padT + plotH*(1-(v-A.min)/(A.max-A.min||1)); };
+
+  // grid + y ticks
+  ctx.font='11px -apple-system,Segoe UI,Roboto,sans-serif';
+  ctx.textBaseline='middle';
+  const ticks=5;
+  for(let t=0;t<=ticks;t++){
+    const v=axes.y.min+(axes.y.max-axes.y.min)*t/ticks;
+    const y=padT+plotH*(1-t/ticks);
+    ctx.strokeStyle='rgba(255,255,255,0.06)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(padL+plotW,y); ctx.stroke();
+    ctx.fillStyle='#8b949e'; ctx.textAlign='right';
+    ctx.fillText((cfg.yFmt||fmt)(v), padL-6, y);
+    if(cfg.dual){
+      const v1=axes.y1.min+(axes.y1.max-axes.y1.min)*t/ticks;
+      ctx.textAlign='left'; ctx.fillStyle='#8b949e';
+      ctx.fillText((cfg.yFmt1||cfg.yFmt||fmt)(v1), padL+plotW+6, y);
+    }
+  }
+  // x labels (sparse)
+  ctx.fillStyle='#8b949e'; ctx.textAlign='center'; ctx.textBaseline='top';
+  const step=Math.max(1,Math.ceil(n/10));
+  const xLabelAt = hasBars ? xBarCenter : xAt;
+  for(let i=0;i<n;i+=step){ ctx.fillText(labels[i], xLabelAt(i), padT+plotH+6); }
+  if(n>0) ctx.fillText(labels[n-1], xLabelAt(n-1), padT+plotH+6);
+
+  // datasets (grouped bars + lines)
+  const groupW = Math.max(2, plotW/n*0.72);
+  const bw = barSets.length>1 ? Math.max(1.5, groupW/barSets.length) : groupW;
+  for(let di=0; di<cfg.datasets.length; di++){
+    const ds=cfg.datasets[di];
+    const ax=ds.axis==='y1'?'y1':'y';
+    const color=ds.color||PALETTE[ds.label.toLowerCase().replace(/[^a-z]/g,'')]||'#58a6ff';
+    if(ds.type==='bar'){
+      const bi=barSets.indexOf(ds);
+      const off=(bi-barSets.length/2)*bw;
+      for(let i=0;i<n;i++){ const v=ds.data[i]; if(!isNum(v))continue;
+        const x=xBarCenter(i)+off, y=yAt(v,ax); const bh=padT+plotH-y;
+        ctx.fillStyle = ds.colorFn ? ds.colorFn(v) : color; ctx.globalAlpha=0.85;
+        ctx.fillRect(x,y,bw,bh); ctx.globalAlpha=1;
+      }
+    } else {
+      ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
+      let started=false;
+      for(let i=0;i<n;i++){ const v=ds.data[i]; if(!isNum(v)){started=false;continue;}
+        const x=xAt(i), y=yAt(v,ax);
+        if(!started){ctx.moveTo(x,y);started=true;} else ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+      if(ds.fill){ ctx.lineTo(xAt(n-1),padT+plotH); ctx.lineTo(xAt(0),padT+plotH); ctx.closePath();
+        ctx.fillStyle=color; ctx.globalAlpha=0.10; ctx.fill(); ctx.globalAlpha=1; }
+      // points
+      for(let i=0;i<n;i++){ const v=ds.data[i]; if(!isNum(v))continue;
+        ctx.fillStyle=color; ctx.beginPath(); ctx.arc(xAt(i),yAt(v,ax),2.2,0,7); ctx.fill(); }
+    }
+  }
+  // round separators (turns are grouped into rounds of cfg.roundSize)
+  if(cfg.roundSize && cfg.roundSize>1 && n>cfg.roundSize){
+    const rs=cfg.roundSize;
+    ctx.font='10px -apple-system,Segoe UI,Roboto,sans-serif';
+    ctx.textBaseline='top'; ctx.textAlign='center';
+    let r=0;
+    for(let i=0;i<n;i+=rs){
+      r++;
+      if(i>0){
+        const x=xAt(i);
+        ctx.strokeStyle='rgba(255,255,255,0.16)'; ctx.lineWidth=1; ctx.setLineDash([2,3]);
+        ctx.beginPath(); ctx.moveTo(x,padT); ctx.lineTo(x,padT+plotH); ctx.stroke(); ctx.setLineDash([]);
+      }
+      const segEnd=Math.min(i+rs-1,n-1);
+      const xc=(xAt(i)+xAt(segEnd))/2;
+      ctx.fillStyle='#8b949e';
+      ctx.fillText('R'+r, xc, padT+1);
+    }
+  }
+
+  // hover guide
+  if(hover!=null && hover>=0 && hover<n){
+    const x=xAt(hover);
+    ctx.strokeStyle='rgba(255,255,255,0.25)'; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(x,padT); ctx.lineTo(x,padT+plotH); ctx.stroke(); ctx.setLineDash([]);
+  }
+  canvas._geom={padL,padR,padT,padB,plotW,plotH,n,xAt,labels,cfg};
+}
+
+// Radar / spider chart — multivariate comparison on a shared 0..1 (or yMin..yMax) scale.
+// Used for the Quality metrics panel (FT Visual Vocabulary: "part-to-whole" / multivariate).
+function renderRadar(canvas, cfg, hover){
+  const {ctx,w,h}=setupCanvas(canvas);
+  ctx.clearRect(0,0,w,h);
+  const padL=48, padR=48, padT=20, padB=20;
+  const plotW=w-padL-padR, plotH=h-padT-padB;
+  const labels=cfg.labels||[];
+  const n=labels.length;
+  const vMin = cfg.yMin!=null?cfg.yMin:0;
+  const vMax = cfg.yMax!=null?cfg.yMax:1;
+  const cx=padL+plotW/2, cy=padT+plotH/2;
+  const R=Math.min(plotW,plotH)/2 - 40;
+  const angle = i => -Math.PI/2 + (n<=1?0:i*2*Math.PI/n);
+  const ptAt = (i,v)=>{ const r=R*((v-vMin)/((vMax-vMin)||1)); const a=angle(i); return [cx+r*Math.cos(a), cy+r*Math.sin(a)]; };
+
+  // concentric grid rings
+  const rings=4;
+  ctx.font='10px -apple-system,Segoe UI,Roboto,sans-serif';
+  for(let g=1;g<=rings;g++){
+    const lvl=vMin+(vMax-vMin)*g/rings;
+    ctx.beginPath();
+    for(let i=0;i<n;i++){ const [x,y]=ptAt(i,lvl); if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+    ctx.closePath();
+    ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.lineWidth=1; ctx.stroke();
+  }
+  // axis spokes + labels
+  ctx.fillStyle='#8b949e'; ctx.textBaseline='middle';
+  for(let i=0;i<n;i++){
+    const [ox,oy]=ptAt(i,vMax);
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(ox,oy);
+    ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.lineWidth=1; ctx.stroke();
+    const a=angle(i); const lx=cx+(R+13)*Math.cos(a), ly=cy+(R+13)*Math.sin(a);
+    ctx.textAlign = Math.abs(Math.cos(a))<0.3 ? 'center' : (Math.cos(a)>0?'left':'right');
+    ctx.fillText(labels[i], lx, ly);
+  }
+  // datasets (polygons)
+  for(const ds of cfg.datasets){
+    const color=ds.color||PALETTE[ds.label.toLowerCase().replace(/[^a-z]/g,'')]||'#58a6ff';
+    ctx.beginPath();
+    let started=false;
+    for(let i=0;i<n;i++){ const v=ds.data[i]; if(!isNum(v))continue; const [x,y]=ptAt(i,v); if(!started){ctx.moveTo(x,y);started=true;} else ctx.lineTo(x,y); }
+    if(started){ ctx.closePath();
+      ctx.fillStyle=color; ctx.globalAlpha=0.18; ctx.fill(); ctx.globalAlpha=1;
+      ctx.strokeStyle=color; ctx.lineWidth=2; ctx.stroke();
+    }
+    for(let i=0;i<n;i++){ const v=ds.data[i]; if(!isNum(v))continue; const [x,y]=ptAt(i,v);
+      ctx.fillStyle=color; ctx.beginPath(); ctx.arc(x,y,2.6,0,7); ctx.fill(); }
+  }
+  // hover spoke
+  if(hover!=null && hover>=0 && hover<n){
+    const [hx,hy]=ptAt(hover, vMax);
+    ctx.strokeStyle='rgba(255,255,255,0.4)'; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(hx,hy); ctx.stroke(); ctx.setLineDash([]);
+  }
+  canvas._geom={padL,padR,padT,padB,plotW,plotH,n,labels,cfg,radar:true,cx,cy,R,angle};
+}
+
+function attachHover(canvas){
+  if(canvas._hoverBound) return; canvas._hoverBound=true;
+  const tip=$('#tooltip');
+  canvas.addEventListener('mousemove',e=>{
+    const g=canvas._geom; if(!g) return;
+    const rect=canvas.getBoundingClientRect();
+    const x=e.clientX-rect.left, y=e.clientY-rect.top;
+    if(g.radar){
+      const dx=x-g.cx, dy=y-g.cy;
+      if(Math.hypot(dx,dy) > g.R+34){ tip.style.display='none'; renderRadar(canvas,g.cfg,null); return; }
+      const ma=Math.atan2(dy,dx);
+      let best=0,bestd=Infinity;
+      for(let i=0;i<g.n;i++){ const diff=Math.atan2(Math.sin(ma-g.angle(i)),Math.cos(ma-g.angle(i))); const d=Math.abs(diff); if(d<bestd){bestd=d;best=i;} }
+      renderRadar(canvas,g.cfg,best);
+      let html=`<div class="tt-title">${g.labels[best]}</div>`;
+      for(const ds of g.cfg.datasets){
+        const v=ds.data[best];
+        const col=ds.color||PALETTE[ds.label.toLowerCase().replace(/[^a-z]/g,'')]||'#58a6ff';
+        const f=g.cfg.yFmt||fmt2;
+        html+=`<div class="tt-row"><span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${col};margin-right:5px"></i>${ds.label}</span><b>${f?f(v):fmt(v)}</b></div>`;
+      }
+      tip.innerHTML=html; tip.style.display='block';
+      tip.style.left=Math.min(e.clientX+14, window.innerWidth-tip.offsetWidth-10)+'px';
+      tip.style.top=(e.clientY+14)+'px';
+      return;
+    }
+    if(x<g.padL||x>g.padL+g.plotW||g.n<=1){ tip.style.display='none'; renderChart(canvas,g.cfg,null); return; }
+    let idx=Math.round((x-g.padL)/g.plotW*(g.n-1));
+    idx=Math.max(0,Math.min(g.n-1,idx));
+    renderChart(canvas,g.cfg,idx);
+    // build tooltip
+    let html=`<div class="tt-title">${g.labels[idx]}</div>`;
+    for(const ds of g.cfg.datasets){
+      const v=ds.data[idx];
+      const col=ds.color||PALETTE[ds.label.toLowerCase().replace(/[^a-z]/g,'')]||'#58a6ff';
+      const f=ds.axis==='y1'?(g.cfg.yFmt1||g.cfg.yFmt):g.cfg.yFmt;
+      html+=`<div class="tt-row"><span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${col};margin-right:5px"></i>${ds.label}</span><b>${f?f(v):fmt(v)}</b></div>`;
+    }
+    tip.innerHTML=html; tip.style.display='block';
+    tip.style.left=Math.min(e.clientX+14, window.innerWidth-tip.offsetWidth-10)+'px';
+    tip.style.top=(e.clientY+14)+'px';
+  });
+  canvas.addEventListener('mouseleave',()=>{ tip.style.display='none'; if(canvas._geom) (canvas._geom.radar?renderRadar:renderChart)(canvas,canvas._geom.cfg,null); });
+}
+
+/* ============================ state ============================ */
+const state={ pairs:[], active:0 };
+
+function loadFiles(fileList){
+  const pairs=pairFiles(Array.from(fileList));
+  if(!pairs.length){ showErr('No .json or .log files recognized.'); return; }
+  const readers=pairs.map(p=>new Promise(res=>{
+    const r={name:p.name, jsonName:p.json&&p.json.name, logName:p.log&&p.log.name};
+    const read=f=> f? f.text().catch(()=>null): Promise.resolve(null);
+    Promise.all([read(p.json),read(p.log)]).then(([jt,lt])=>{
+      try{ r.json = jt? parseJSON(jt): null; }catch(e){ r.jsonErr=e.message; }
+      try{ r.log = lt? parseLog(lt): null; }catch(e){ r.logErr=e.message; }
+      res(r);
+    });
+  }));
+  Promise.all(readers).then(results=>{
+    state.pairs=results; state.active=0;
+    const sel=$('#runSelect');
+    if(results.length>1){ sel.style.display=''; sel.innerHTML='';
+      results.forEach((r,i)=>{ const o=el('option'); o.value=i; o.textContent=r.name; sel.appendChild(o); });
+      sel.onchange=()=>{ state.active=+sel.value; render(); };
+    } else sel.style.display='none';
+    render();
+  });
+}
+
+function showErr(msg){ const b=$('#errbox'); b.innerHTML=`<div class="err">${msg}</div>`; }
+function clearErr(){ $('#errbox').innerHTML=''; }
+
+/* ============================ render ============================ */
+function render(){
+  clearErr();
+  const p=state.pairs[state.active];
+  if(!p){ $('#content').className='empty'; $('#content').textContent='No benchmark loaded.'; return; }
+  const root=$('#content'); root.className=''; root.innerHTML='';
+
+  // file status bar
+  const fb=el('div','filebar');
+  const fj=el('div','f '+(p.json?'ok':'miss')); fj.innerHTML=`<b>JSON:</b> ${p.jsonName||'missing'}`; fb.appendChild(fj);
+  const fl=el('div','f '+(p.log?'ok':'miss')); fl.innerHTML=`<b>LOG:</b> ${p.logName||'missing'}`; fb.appendChild(fl);
+  if(p.jsonErr) fb.appendChild(Object.assign(el('div','f miss'),{textContent:'JSON parse error: '+p.jsonErr}));
+  if(p.logErr) fb.appendChild(Object.assign(el('div','f miss'),{textContent:'LOG parse error: '+p.logErr}));
+  if(p.json && p.log){
+    const jt=p.json.tokens.total_direct_prompt, lt=p.log.count;
+    const ri=getRoundInfo(p.json,p.log);
+    let txt=`${lt} log turns`;
+    if(isNum(ri.numTurns) && isNum(ri.rounds)) txt+=` · ${ri.numTurns} turns × ${ri.rounds} rounds`;
+    else if(isNum(ri.numTurns)) txt+=` · ${ri.numTurns} turns/round`;
+    const note=el('div','f'); note.innerHTML=`<b>Coupled:</b> ${txt}`; fb.appendChild(note);
+  }
+  root.appendChild(fb);
+
+  // coupling verification (alerts the user if the JSON + LOG are not the same run)
+  renderCouplingBanner(root, p.json, p.log);
+
+  if(!p.json && !p.log){ root.appendChild(Object.assign(el('div','empty'),{textContent:'Neither file could be parsed.'})); return; }
+
+  const ri=getRoundInfo(p.json,p.log);
+  if(p.json) renderJSONView(root,p.json,p.log,ri);
+  if(p.log) renderLogView(root,p.log,ri);
+}
+
+function renderJSONView(root,J,L,ri){
+  const c=J.config, tok=J.tokens, lat=J.latency, ttft=J.ttft, q=J.quality, sem=J.semantic, sec=J.secondary, ctxw=J.context, cache=J.cache, ev=J.eviction, pr=J.perRound;
+
+  // ---- summary cards ----
+  const cards=el('div','cards');
+  const card=(label,value,cls,delta)=>{ const d=el('div','card');
+    d.appendChild(Object.assign(el('div','label'),{textContent:label}));
+    d.appendChild(Object.assign(el('div','value '+(cls||'')),{textContent:value}));
+    if(delta) d.appendChild(Object.assign(el('div','delta'),{textContent:delta}));
+    return d; };
+  cards.appendChild(card('Token savings', fmtPct(tok.token_savings_pct), tok.token_savings_pct>0?'good':'bad',
+    `${fmt(tok.total_direct_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok`));
+  const latD = lat.delta_proxy_minus_direct_ms;
+  cards.appendChild(card('Mean latency (proxy)', fmtSec(lat.proxy&&lat.proxy.mean), latD&&latD.mean>0?'bad':'good',
+    `direct ${fmtSec(lat.direct&&lat.direct.mean)} · Δ ${latD?fmtSec(latD.mean):'—'}`));
+  cards.appendChild(card('Mean semantic sim', fmt2(sem.mean), sem.mean>=0.7?'good':sem.mean>=0.5?'warn':'bad',
+    `min ${fmt2(sem.min)} · median ${fmt2(sem.median)}`));
+  const cacheRate = cache.per_round_proxy_metrics && cache.per_round_proxy_metrics[0] ? cache.per_round_proxy_metrics[0].cache_hit_rate : NaN;
+  cards.appendChild(card('Prefix cache hit rate', fmtPct(cacheRate*100), cacheRate>=0.9?'good':cacheRate>0?'warn':'bad',
+    `${fmt(cache.total_prefix_cache_hit_tokens)} hit tok`));
+  cards.appendChild(card('Context utilization', fmtPct(ctxw.utilization_pct), ctxw.utilization_pct<50?'good':'warn',
+    `final ${fmt(ctxw.final_prompt_tokens)} / ${fmt(ctxw.max_context_window)} tok`));
+  const qskip = q.quality_skipped_turns||0;
+  cards.appendChild(card('Quality-skipped turns', fmt(qskip), qskip===0?'good':'warn',
+    `low-sem ${q.low_semantic_similarity_turns||0} · trunc ${q.truncation_count||0}`));
+  root.appendChild(cards);
+
+  // ---- charts grid ----
+  const grid=el('div','grid');
+
+  // Latency percentiles (direct vs proxy)
+  if(lat.direct&&lat.proxy){
+    const keys=['mean','median','p90','p95','p99'];
+    const labels=keys.map(k=>k.toUpperCase());
+    grid.appendChild(panel('Latency percentiles (direct vs proxy)','ms',
+      lineBarCfg(labels,[
+        {label:'Direct',color:PALETTE.direct,type:'bar',data:keys.map(k=>lat.direct[k])},
+        {label:'Proxy',color:PALETTE.proxy,type:'bar',data:keys.map(k=>lat.proxy[k])}
+      ], fmtSec), 'Grouped by percentile. Proxy is slower on average but with heavy tail variance.'));
+  }
+
+  // Token usage per turn (from log) OR aggregate
+  if(J.raw.tokens && J.raw.tokens.per_turn_direct && J.raw.tokens.per_turn_proxy){
+    const pd=J.raw.tokens.per_turn_direct, pp=J.raw.tokens.per_turn_proxy;
+    const labels=pd.mean!=null?['mean','median','p90','p95','p99','min','max']:Object.keys(pd);
+    grid.appendChild(panel('Prompt tokens / turn (distribution)','tok',
+      lineBarCfg(labels,[
+        {label:'Direct',color:PALETTE.direct,type:'bar',data:labels.map(k=>pd[k])},
+        {label:'Proxy',color:PALETTE.proxy,type:'bar',data:labels.map(k=>pp[k])}
+      ], fmt), 'Per-turn prompt token distribution. Proxy keeps each turn small.'));
+  }
+
+  // Quality metrics — radar (multivariate 0–1 comparison)
+  if(q.rouge_l_f1||q.token_jaccard||q.edit_similarity||sem.mean!=null){
+    const labels=['ROUGE-L F1','Token Jaccard','Edit similarity','Code blocks','Syntax valid','Semantic sim'];
+    const mk=(o)=>o&&o.mean!=null?o.mean:NaN;
+    grid.appendChild(panel('Quality metrics (mean, 0–1)','score',
+      {type:'radar', labels,
+        datasets:[
+          {label:'Quality (proxy vs direct)',color:PALETTE.sem,data:[mk(q.rouge_l_f1),mk(q.token_jaccard),mk(q.edit_similarity),mk(q.code_block_ratio),mk(q.code_syntax_validity),mk(sem)]}
+        ], yFmt:fmt2, yMin:0, yMax:1},
+      'Mean quality scores across measured turns (1.0 = identical to direct). Axes: ROUGE-L F1 = n-gram overlap with the direct response; Token Jaccard = token-set overlap; Edit similarity = Levenshtein-based; Code blocks = fraction of code blocks preserved; Syntax valid = fraction of code blocks that still parse; Semantic sim = embedding cosine similarity with the direct response.'));
+  }
+
+  // Per-round token savings + semantic
+  if(pr && pr._pooled==null && Object.keys(pr).length){
+    const rounds=Object.keys(pr).filter(k=>k!=='_pooled').map(Number).sort((a,b)=>a-b);
+    if(rounds.length){
+      const labels=rounds.map(r=>'R'+(r+1));
+      grid.appendChild(panel('Per-round: token savings % & semantic sim','',
+        lineBarCfg(labels,[
+          {label:'Token savings %',color:PALETTE.proxy,type:'bar',data:rounds.map(r=>pr[r].token_savings_pct)},
+          {label:'Semantic sim',color:PALETTE.sem,data:rounds.map(r=>pr[r].semantic_similarity&&pr[r].semantic_similarity.mean)}
+        ], v=>isNum(v)?(v<=1.5?v.toFixed(2):v.toFixed(1)+'%'):'—', 0, null), 'Bars = token savings %, line = mean semantic similarity per round.'));
+    }
+  }
+
+  // Cache reuse per round
+  if(cache.per_round_proxy_metrics && cache.per_round_proxy_metrics.length){
+    const m=cache.per_round_proxy_metrics;
+    const labels=m.map(r=>'R'+(r.round+1));
+    grid.appendChild(panel('Cache reuse per round (proxy)','',
+      lineBarCfg(labels,[
+        {label:'Cache hit rate',color:PALETTE.cache,type:'bar',data:m.map(r=>r.cache_hit_rate*100)},
+        {label:'Reuse ratio',color:PALETTE.sem,data:m.map(r=>r.prefix_cache_reuse_ratio)}
+      ], v=>isNum(v)?(v<=1.5?v.toFixed(2):v.toFixed(1)+'%'):'—', 0, null), 'Prefix-cache hit rate (%) and reuse ratio per round.'));
+  }
+
+  // Eviction / compaction — per-turn TOKEN SAVINGS (proxy vs direct prompt tokens).
+  // Derived from the same per-turn token counts as "Prompt tokens per turn", but
+  // shows the savings magnitude per turn rather than the two raw series.
+  if(ev && ev.total_chars_before_optimization){
+    const exceed = ev.turns_raw_exceeds_optimized_target != null ? ev.turns_raw_exceeds_optimized_target : 0;
+    const evict = ev.eviction_triggered_at_turns ? ev.eviction_triggered_at_turns.length : 0;
+    const desc = `Budget ${fmt(ev.char_budget)} chars/turn · ${exceed} turns exceeded target · ${evict} evictions triggered · ${fmt(ev.total_chars_before_optimization)} raw chars total. Savings % = (direct − proxy prompt tokens) ÷ direct × 100 per turn.`;
+    const pt = (L && L.turnList) ? L.turnList.filter(t=>isNum(t.direct_tok)&&isNum(t.proxy_tok)&&t.direct_tok>0) : [];
+    if(pt.length){
+      const cfg={labels:pt.map(t=>'T'+t.turn), roundSize:isNum(ri.numTurns)?ri.numTurns:null,
+        datasets:[
+          {label:'Token savings %',color:PALETTE.proxy,data:pt.map(t=>(t.direct_tok-t.proxy_tok)/t.direct_tok*100)}
+        ], yFmt:v=>isNum(v)?v.toFixed(1)+'%':'—', yMin:0};
+      grid.appendChild(panel('Token savings per turn (proxy vs direct)','%',
+        cfg, desc));
+    } else {
+      const sp = isNum(J.tokens.token_savings_pct) ? J.tokens.token_savings_pct : NaN;
+      grid.appendChild(panel('Token savings (aggregate)','%',
+        {labels:['Savings %'],
+          datasets:[
+            {label:'Token savings %',color:PALETTE.proxy,type:'bar',data:[sp]}
+          ], yFmt:v=>isNum(v)?v.toFixed(1)+'%':'—', yMin:0      }, desc));
+    }
+  }
+
+  // Secondary quality metrics — radar (meaningful 0–1 structural/lexical metrics)
+  if(sec.trigram_overlap||sec.markdown_structure_similarity||sec.rouge_l_precision||sec.rouge_l_recall||sec.response_stability||sec.code_structure_consistency){
+    const labels=['Trigram overlap','Markdown struct','ROUGE-L prec','ROUGE-L rec','Resp. stability','Code struct'];
+    const mk=(o)=>o&&o.mean!=null?o.mean:NaN;
+    grid.appendChild(panel('Secondary quality metrics (mean, 0–1)','score',
+      {type:'radar', labels,
+        datasets:[
+          {label:'Secondary quality (proxy vs direct)',color:PALETTE.rouge,data:[mk(sec.trigram_overlap),mk(sec.markdown_structure_similarity),mk(sec.rouge_l_precision),mk(sec.rouge_l_recall),mk(sec.response_stability),mk(sec.code_structure_consistency)]}
+        ], yFmt:fmt2, yMin:0, yMax:1},
+      'Mean secondary quality scores across measured turns (1.0 = identical to direct). Axes: Trigram overlap = 3-gram token overlap; Markdown struct = heading/list/code-block structure similarity; ROUGE-L prec/rec = longest-common-subsequence precision/recall vs the direct response; Resp. stability = consistency of response shape; Code struct = code-block structural consistency.'));
+  }
+
+  root.appendChild(grid);
+
+  // ---- config + per-round tables ----
+  root.appendChild(sectionTitle('Run configuration'));
+  root.appendChild(kvTable('Config', Object.entries(c).map(([k,v])=>[k, typeof v==='object'?JSON.stringify(v):String(v)])));
+
+  if(pr && Object.keys(pr).length){
+    root.appendChild(sectionTitle('Per-round summary'));
+    const rounds=Object.keys(pr).filter(k=>k!=='_pooled').map(Number).sort((a,b)=>a-b);
+    const rows=rounds.map(r=>{ const o=pr[r]; return {
+      'Round':r+1, 'Turns':o.turns, 'Token savings %':fmtPct(o.token_savings_pct),
+      'Sem mean':fmt2(o.semantic_similarity&&o.semantic_similarity.mean),
+      'Sem min':fmt2(o.semantic_similarity&&o.semantic_similarity.min),
+      'Sem max':fmt2(o.semantic_similarity&&o.semantic_similarity.max) }; });
+    if(pr._pooled) rows.push({'Round':'pooled','Turns':'','Token savings %':'',
+      'Sem mean':fmt2(pr._pooled.round_mean_of_means),'Sem min':fmt2(pr._pooled.round_min_of_mins),'Sem max':''});
+    root.appendChild(dataTable(rows));
+  }
+
+  // quality detail table
+  root.appendChild(sectionTitle('Quality detail (JSON aggregates)'));
+  const qrows=[];
+  const addQ=(name,o)=>{ if(o&&o.mean!=null) qrows.push({Metric:name,'Mean':fmt2(o.mean),'Median':fmt2(o.median),'Min':fmt2(o.min),'Max':fmt2(o.max)}); };
+  addQ('ROUGE-L F1',q.rouge_l_f1); addQ('Token Jaccard',q.token_jaccard); addQ('Edit similarity',q.edit_similarity);
+  addQ('Code block ratio',q.code_block_ratio); addQ('Code syntax validity',q.code_syntax_validity);
+  addQ('Semantic sim',sem);
+  addQ('Length ratio',q.length_ratio); addQ('Trigram overlap',J.secondary.trigram_overlap);
+  addQ('Markdown struct',J.secondary.markdown_structure_similarity); addQ('Vocab richness Δ',J.secondary.vocabulary_richness_delta);
+  addQ('ROUGE precision',J.secondary.rouge_l_precision); addQ('ROUGE recall',J.secondary.rouge_l_recall);
+  addQ('Response stability',J.secondary.response_stability); addQ('Code struct consist.',J.secondary.code_structure_consistency);
+  if(qrows.length) root.appendChild(dataTable(qrows));
+}
+
+function renderLogView(root,L,ri){
+  const rs = (ri && isNum(ri.numTurns) && ri.numTurns>1) ? ri.numTurns : null;
+  const roundTag = (isNum(ri.numTurns)&&isNum(ri.rounds)) ? ` — ${ri.numTurns} turns × ${ri.rounds} rounds` : '';
+  root.appendChild(sectionTitle('Per-turn trace (from log)'+roundTag));
+  if(L.meta && Object.keys(L.meta).length){
+    const m=L.meta;
+    const line=el('div','meta');
+    line.innerHTML=[m['Scenario'],m['Model'],m['Lemonade']?'Lemonade '+m['Lemonade']:'',m['Context profile']?'profile: '+m['Context profile']:'']
+      .filter(Boolean).join(' &middot; ');
+    root.appendChild(line);
+  }
+  const tl=L.turnList;
+  if(!tl.length){ root.appendChild(Object.assign(el('div','meta'),{textContent:'No "Turn NN:" lines parsed from log.'})); return; }
+
+  // charts from log
+  const grid=el('div','grid');
+  const labels=tl.map(t=>'T'+t.turn);
+
+  // latency per turn
+  grid.appendChild(panel('Latency per turn (direct vs proxy)','ms',
+    lineBarCfg(labels,[
+      {label:'Direct',color:PALETTE.direct,data:tl.map(t=>t.direct_ms)},
+      {label:'Proxy',color:PALETTE.proxy,data:tl.map(t=>t.proxy_ms)}
+    ], fmtSec, null, null, rs), 'Wall-clock per turn. Note the direct=4ms artifacts (missing usage) in the last turns of each round.'));
+
+  // delta latency per turn (signed bars)
+  grid.appendChild(panel('Latency delta per turn (proxy − direct)','ms',
+    {labels, roundSize:rs, datasets:[{label:'Δ latency',color:'#888',data:tl.map(t=>t.delta_ms),
+      colorFn:v=>v>=0?PALETTE.neg:PALETTE.pos, type:'bar'}], yFmt:fmtSec},
+    'Red = proxy slower, green = proxy faster. Huge variance turn-to-turn.'));
+
+  // token usage per turn (direct vs proxy prompt)
+  grid.appendChild(panel('Prompt tokens per turn (direct vs proxy)','tok',
+    lineBarCfg(labels,[
+      {label:'Direct',color:PALETTE.direct,data:tl.map(t=>t.direct_tok)},
+      {label:'Proxy',color:PALETTE.proxy,data:tl.map(t=>t.proxy_tok)}
+    ], fmt, null, null, rs), 'Proxy keeps each turn\'s prompt tokens far smaller than direct.'));
+
+  // quality per turn
+  grid.appendChild(panel('Quality per turn (sem / jaccard / rouge)','score',
+    lineBarCfg(labels,[
+      {label:'Semantic',color:PALETTE.sem,data:tl.map(t=>t.sem)},
+      {label:'Jaccard',color:PALETTE.jaccard,data:tl.map(t=>t.jaccard)},
+      {label:'ROUGE',color:PALETTE.rouge,data:tl.map(t=>t.rouge)}
+    ], fmt2, 0, 1, rs), 'Per-turn similarity to the direct response. Gaps = where compaction changed output.'));
+
+  // cache prefix hits per turn (from proxyTurns)
+  const phKeys=Object.keys(L.proxyTurns).map(Number).sort((a,b)=>a-b).filter(k=>isNum(L.proxyTurns[k].prefixHits));
+  if(phKeys.length){
+    grid.appendChild(panel('Prefix-cache hits per turn (proxy)','tok',
+      lineBarCfg(phKeys.map(k=>'T'+k),[{label:'Prefix hits',color:PALETTE.cache,data:phKeys.map(k=>L.proxyTurns[k].prefixHits)}], fmt, null, null, rs),
+      'Tokens reused from the KV prefix cache each proxy turn.'));
+  }
+  root.appendChild(grid);
+
+  // per-turn table
+  root.appendChild(sectionTitle('Per-turn table'));
+  const rows=tl.map(t=>({
+    'Turn':t.turn, 'Round':t.round,
+    'Direct ms':t.direct_ms, 'Proxy ms':t.proxy_ms,
+    'Δ ms':t.delta_ms,
+    'Direct tok':t.direct_tok, 'Proxy tok':t.proxy_tok, 'Δ tok':t.delta_tok,
+    'Raw chars':t.proxy_raw_chars, 'Cache':isNum(t.cache_hit)?t.cache_hit:'n/a',
+    'Sem':t.sem, 'Jacc':t.jaccard, 'Rouge':t.rouge
+  }));
+  const cols=[
+    {k:'Turn',f:v=>fmt(v)},
+    {k:'Round',f:v=>isNum(v)?'R'+fmt(v):'—'},
+    {k:'Direct ms',f:v=>fmtMs(v)},
+    {k:'Proxy ms',f:v=>fmtMs(v)},
+    {k:'Δ ms',f:v=>cls(v,fmtMs(v),v<0)},
+    {k:'Direct tok',f:v=>fmt(v)},
+    {k:'Proxy tok',f:v=>fmt(v)},
+    {k:'Δ tok',f:v=>cls(v,fmt(v),v<0)},
+    {k:'Raw chars',f:v=>fmt(v)},
+    {k:'Cache',f:v=>isNum(v)?fmt(v):'n/a'},
+    {k:'Sem',f:v=>isNum(v)?fmt2(v):'n/a'},
+    {k:'Jacc',f:v=>isNum(v)?fmt2(v):'n/a'},
+    {k:'Rouge',f:v=>isNum(v)?fmt2(v):'n/a'}
+  ];
+  root.appendChild(dataTable(rows,cols));
+}
+
+/* ============================ chart/table helpers ============================ */
+function lineBarCfg(labels, datasets, yFmt, yMin, yMax, roundSize){
+  return {labels, datasets, yFmt, yMin, yMax, roundSize};
+}
+function cls(v,text,neg){ return {html:`<span class="${neg?'neg':'pos'}">${text}</span>`}; }
+
+function panel(title,hint,cfg,desc){
+  const p=el('div','panel');
+  p.appendChild(Object.assign(el('h2'),{textContent:title}));
+  if(desc) p.appendChild(Object.assign(el('div','hint'),{textContent:desc}));
+  const cv=el('canvas'); p.appendChild(cv);
+  // legend
+  const lg=el('div','legend');
+  for(const ds of cfg.datasets){ const s=el('span'); s.innerHTML=`<i style="background:${ds.color||'#58a6ff'}"></i>${ds.label}`; lg.appendChild(s); }
+  p.appendChild(lg);
+  // render after attach to DOM (needs width)
+  requestAnimationFrame(()=>{
+    if(cfg.type==='radar'){ renderRadar(cv,cfg,null); attachHover(cv); }
+    else { renderChart(cv,cfg,null); attachHover(cv); }
+  });
+  return p;
+}
+
+function sectionTitle(t){ return Object.assign(el('div','section-title'),{textContent:t}); }
+
+function kvTable(title, pairs){
+  const wrap=el('div','tablewrap'); const tb=el('table');
+  const h=el('tr'); h.innerHTML='<th>'+title+'</th><th>Value</th>'; tb.appendChild(h);
+  for(const [k,v] of pairs){ const r=el('tr'); r.innerHTML=`<td>${k}</td><td style="text-align:left">${escapeHtml(v)}</td>`; tb.appendChild(r); }
+  wrap.appendChild(tb); return wrap;
+}
+
+function dataTable(rows, cols){
+  const wrap=el('div','tablewrap'); const tb=el('table');
+  if(!rows.length){ wrap.appendChild(Object.assign(el('div'),{textContent:'—'})); return wrap; }
+  const keys = cols? cols.map(c=>c.k) : Object.keys(rows[0]);
+  const thead=el('tr');
+  for(const k of keys){ const th=el('th'); th.textContent=k; th.dataset.k=k; thead.appendChild(th); }
+  tb.appendChild(thead);
+  const tbody=el('tbody');
+  for(const row of rows){
+    const tr=el('tr');
+    for(const k of keys){
+      const td=el('td');
+      if(cols){ const c=cols.find(c=>c.k===k); const out=c.f(row[k]); td.innerHTML = out&&out.html!=null?out.html:escapeHtml(out==null?'':String(out)); }
+      else { const v=row[k]; td.innerHTML = (v&&v.html!=null)?v.html:escapeHtml(v==null?'':String(v)); }
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  tb.appendChild(tbody); wrap.appendChild(tb);
+  // sortable
+  thead.querySelectorAll('th').forEach(th=>{
+    th.onclick=()=>{ const k=th.dataset.k; const asc=!th._asc; th._asc=asc;
+      rows.sort((a,b)=>{ let x=a[k],y=b[k];
+        if(isNum(x)&&isNum(y)) return asc?x-y:y-x; return asc?String(x).localeCompare(String(y)):String(y).localeCompare(String(x)); });
+      tbody.innerHTML=''; for(const row of rows){ const tr=el('tr'); for(const k of keys){ const td=el('td');
+        if(cols){const c=cols.find(c=>c.k===k); const out=c.f(row[k]); td.innerHTML=out&&out.html!=null?out.html:escapeHtml(out==null?'':String(out));}
+        else {const v=row[k]; td.innerHTML=(v&&v.html!=null)?v.html:escapeHtml(v==null?'':String(v));}
+        tr.appendChild(td);} tbody.appendChild(tr); }
+    };
+  });
+  return wrap;
+}
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+/* ============================ wiring ============================ */
+const dz=$('#dropzone'), fi=$('#fileInput');
+dz.addEventListener('click',()=>fi.click());
+fi.addEventListener('change',e=>{ if(e.target.files.length) loadFiles(e.target.files); fi.value=''; });
+['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('hover');}));
+['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('hover');}));
+dz.addEventListener('drop',e=>{ if(e.dataTransfer.files.length) loadFiles(e.dataTransfer.files); });
+window.addEventListener('beforeunload',()=>{});
+</script>
+</body>
+</html>
