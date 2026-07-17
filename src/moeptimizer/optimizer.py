@@ -162,6 +162,9 @@ class AgentContextOptimizer:
         # budget is enforced against true token counts. Learned from the backend's
         # actual `prompt_tokens` on the previous turn; clamped to [0.5, 2.0].
         self._token_calibration: float = 1.0
+        # Set once the calibration ratio has been anchored to the backend's exact
+        # tokenizer (native /tokenize) so the seed is not re-fetched every turn.
+        self._calibration_seeded: bool = False
 
         # v0.5.0 components
         v050 = self._config.v050
@@ -223,6 +226,23 @@ class AgentContextOptimizer:
         """Return the token count scaled by the learned backend ratio (#6)."""
         raw = self.token_counter.count_messages(messages)
         return int(round(raw * self._token_calibration))
+
+    def seed_token_calibration(self, sample_text: str, exact_tokens: int) -> None:
+        """Seed the calibration ratio from an EXACT reference count (#6).
+
+        Unlike ``set_token_calibration`` (learned from the backend's per-turn
+        ``prompt_tokens`` after a response), this anchors the ratio *before* the
+        first turn using the backend's own exact tokenizer (native ``/tokenize``)
+        on a representative ``sample_text``. This removes turn-1 budget error even
+        when the local tokenizer is only the tiktoken fallback. Best-effort and
+        idempotent: ignored for empty samples or non-positive counts.
+        """
+        if not sample_text or exact_tokens <= 0:
+            return
+        local = self.token_counter.count(sample_text)
+        if local > 0:
+            self.set_token_calibration(exact_tokens / local)
+            self._calibration_seeded = True
 
     def _register_context(self, messages: list[dict[str, Any]]) -> None:
         """Register the optimized context and persist only periodically.

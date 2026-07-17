@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "moeptimizer"
-version = "0.7.2"
+version = "0.7.4"
 description = "Transparent OpenAI API proxy that optimizes context for MoE + MTP models in multi-turns agentic tasks."
 readme = "README.md"
 license = { text = "MIT" }

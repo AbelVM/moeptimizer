@@ -34,6 +34,35 @@ class TestAgentContextOptimizer:
         assert goal is not None
         assert "REST API" in goal.original_prompt
 
+    def test_set_token_calibration_clamps_and_scales(self) -> None:
+        # ratio clamped to [0.5, 2.0]
+        self.optimizer.set_token_calibration(10.0)
+        assert self.optimizer._token_calibration == 2.0
+        self.optimizer.set_token_calibration(0.01)
+        assert self.optimizer._token_calibration == 0.5
+        # None / non-positive ignored (keeps last)
+        self.optimizer.set_token_calibration(None)
+        assert self.optimizer._token_calibration == 0.5
+        self.optimizer.set_token_calibration(-1.0)
+        assert self.optimizer._token_calibration == 0.5
+
+    def test_seed_token_calibration_anchors_from_exact_count(self) -> None:
+        sample = "hello world test"
+        local = self.optimizer.token_counter.count(sample)
+        assert local > 0
+        assert self.optimizer._calibration_seeded is False
+        # exact backend count = 2x local -> ratio 2.0 (also the clamp ceiling)
+        self.optimizer.seed_token_calibration(sample, local * 2)
+        assert self.optimizer._calibration_seeded is True
+        assert self.optimizer._token_calibration == 2.0
+
+    def test_seed_token_calibration_ignores_bad_input(self) -> None:
+        self.optimizer.seed_token_calibration("", 5)
+        assert self.optimizer._calibration_seeded is False
+        self.optimizer.seed_token_calibration("text", 0)
+        assert self.optimizer._calibration_seeded is False
+        assert self.optimizer._token_calibration == 1.0
+
     def test_aggressive_defaults_use_top_only_eviction(self) -> None:
         """Default aggressive settings evict old complete turns without mutating history."""
         config = AppConfig()

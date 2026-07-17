@@ -305,6 +305,55 @@ class TestDryRunMessageValidation:
         _validate_messages(messages)
 
 
+class TestSlotAssignment:
+    """Slot pinning must never send an out-of-range or single-slot id_slot.
+
+    Regression guard for the v0.7.3 backend 500s ("Failed to parse tool call
+    arguments as JSON ... missing closing quote"): sending an id_slot the backend
+    does not have truncated long tool-call generations mid-stream.
+    """
+
+    def _reset(self) -> None:
+        import moeptimizer.app as app_mod
+
+        app_mod._SLOT_MAP.clear()
+        app_mod._NEXT_SLOT = 0
+
+    def test_disabled_returns_none(self) -> None:
+        from moeptimizer.app import _slot_for_session
+
+        self._reset()
+        assert _slot_for_session("sess-a", enabled=False, total_slots=4) is None
+
+    def test_single_slot_backend_skips_pinning(self) -> None:
+        from moeptimizer.app import _slot_for_session
+
+        self._reset()
+        # total_slots <= 1: pinning cannot isolate sessions -> no id_slot.
+        assert _slot_for_session("sess-a", enabled=True, total_slots=1) is None
+        assert _slot_for_session("sess-a", enabled=True, total_slots=0) is None
+
+    def test_slot_is_stable_per_session(self) -> None:
+        from moeptimizer.app import _slot_for_session
+
+        self._reset()
+        first = _slot_for_session("sess-a", enabled=True, total_slots=4)
+        second = _slot_for_session("sess-a", enabled=True, total_slots=4)
+        assert first == second
+
+    def test_slot_ids_are_clamped_to_total_slots(self) -> None:
+        from moeptimizer.app import _slot_for_session
+
+        self._reset()
+        total = 4
+        slots = {
+            _slot_for_session(f"sess-{i}", enabled=True, total_slots=total)
+            for i in range(20)
+        }
+        assert slots  # non-empty
+        assert all(0 <= s < total for s in slots)
+
+
 class TestDryRunSessionResolution:
     """Test standard OpenAI-compatible session continuity."""
 
@@ -548,23 +597,33 @@ class TestDryRunStreamingGenerator:
         assert events[-1].strip() == "data: [DONE]"
 
     def test_stream_error_provides_graceful_handling(self) -> None:
-        """Streaming errors produce error chunk and [DONE] terminator."""
+        """A generic stream error yields a well-formed error chunk + [DONE].
+
+        The error is surfaced as an OpenAI-style ``error`` object with
+        ``finish_reason='error'`` and NO fake assistant content injected, then
+        the stream is closed with the ``[DONE]`` sentinel.
+        """
+        import json as _json
         from unittest.mock import MagicMock
 
-        from moeptimizer.app import _make_streaming_generator
+        from moeptimizer.app import PROXY_METRICS, _make_streaming_generator
         from moeptimizer.config import AppConfig
 
         cfg = AppConfig()
         cfg.server.llm_model = MODEL_ID
 
-        async def failing_stream():
+        async def failing_stream(*args: object, **kwargs: object):
             raise RuntimeError("backend down")
+            yield  # pragma: no cover - makes this an async generator
 
         mock_backend_client = MagicMock()
         mock_backend_client.chat_completions_stream = failing_stream
 
+        PROXY_METRICS.reset()
         body = {"model": MODEL_ID, "messages": [{"role": "user", "content": "Hi"}]}
-        gen_func = _make_streaming_generator(body, cfg, mock_backend_client)
+        gen_func = _make_streaming_generator(
+            body, cfg, mock_backend_client, session_id="sess-err"
+        )
         gen = gen_func()
 
         async def collect():
@@ -578,6 +637,80 @@ class TestDryRunStreamingGenerator:
         loop.close()
 
         assert events[-1].strip() == "data: [DONE]"
+
+        # An error chunk with finish_reason='error' and an error object is emitted.
+        error_events = [
+            e for e in events if e.startswith("data: ") and '"error"' in e
+        ]
+        assert error_events, "expected a well-formed error chunk"
+        payload = _json.loads(error_events[-1][len("data: "):].strip())
+        assert payload["choices"][0]["finish_reason"] == "error"
+        assert payload["choices"][0]["delta"] == {}  # no fake assistant content
+        assert payload["error"]["type"] == "proxy_error"
+
+        # The failed turn is counted as a backend error, NOT a successful turn.
+        snap = PROXY_METRICS.snapshot()
+        assert snap["backend_errors"] == 1
+        assert snap["requests"] == 0
+
+    def test_backend_500_stream_error_is_graceful(self) -> None:
+        """A backend HTTP 500 (e.g. truncated tool call) degrades gracefully."""
+        import json as _json
+        from unittest.mock import MagicMock
+
+        import httpx
+        from openai import APIStatusError
+
+        from moeptimizer.app import PROXY_METRICS, _make_streaming_generator
+        from moeptimizer.config import AppConfig
+
+        cfg = AppConfig()
+        cfg.server.llm_model = MODEL_ID
+
+        async def failing_stream(*args: object, **kwargs: object):
+            request = httpx.Request("POST", "http://backend/v1/chat/completions")
+            response = httpx.Response(500, request=request)
+            raise APIStatusError(
+                "Failed to parse tool call arguments as JSON",
+                response=response,
+                body=None,
+            )
+            yield  # pragma: no cover - async generator
+
+        mock_backend_client = MagicMock()
+        mock_backend_client.chat_completions_stream = failing_stream
+
+        PROXY_METRICS.reset()
+        body = {"model": MODEL_ID, "messages": [{"role": "user", "content": "Hi"}]}
+        gen_func = _make_streaming_generator(
+            body, cfg, mock_backend_client, session_id="sess-500"
+        )
+        gen = gen_func()
+
+        async def collect():
+            events = []
+            async for event in gen:
+                events.append(event)
+            return events
+
+        loop = asyncio.new_event_loop()
+        events = loop.run_until_complete(collect())
+        loop.close()
+
+        assert events[-1].strip() == "data: [DONE]"
+        error_events = [
+            e for e in events if e.startswith("data: ") and '"error"' in e
+        ]
+        assert error_events
+        payload = _json.loads(error_events[-1][len("data: "):].strip())
+        assert payload["error"]["type"] == "backend_error"
+        assert payload["error"]["code"] == 500
+        assert payload["choices"][0]["finish_reason"] == "error"
+
+        snap = PROXY_METRICS.snapshot()
+        assert snap["backend_errors"] == 1
+        assert snap["requests"] == 0
+        assert snap["sessions"]["sess-500"]["backend_errors"] == 1
 
 
 class TestDryRunFrontLoadingEviction:
@@ -812,6 +945,56 @@ class TestDryRunHealthAndModels:
         assert data["total_saved_tokens"] == 200
         assert data["avg_latency_ms"] == 50.0
         assert data["prefix_cache_reuse_ratio"] == 0.1
+
+    def test_metrics_per_session_breakdown(self) -> None:
+        from moeptimizer.app import PROXY_METRICS
+
+        PROXY_METRICS.reset()
+        # Two turns for session A (one hit, one miss), one hit for session B.
+        PROXY_METRICS.record_turn(session_id="A", cached_tokens=80, prompt_tokens=200, saved_tokens=50, latency_ms=30.0)
+        PROXY_METRICS.record_turn(session_id="A", cached_tokens=0, prompt_tokens=200, saved_tokens=0, latency_ms=50.0)
+        PROXY_METRICS.record_turn(session_id="B", cached_tokens=100, prompt_tokens=100, saved_tokens=10, latency_ms=20.0)
+        # A turn with no session id must not create a per-session entry.
+        PROXY_METRICS.record_turn(cached_tokens=5, prompt_tokens=5)
+
+        snap = PROXY_METRICS.snapshot()
+        sessions = snap["sessions"]
+        assert set(sessions) == {"A", "B"}
+
+        a = sessions["A"]
+        assert a["requests"] == 2
+        assert a["cache_hits"] == 1
+        assert a["cache_misses"] == 1
+        assert a["cache_hit_rate"] == 0.5
+        assert a["total_cached_tokens"] == 80
+        assert a["total_prompt_tokens"] == 400
+        assert a["prefix_cache_reuse_ratio"] == 0.2
+        assert a["avg_latency_ms"] == 40.0
+
+        b = sessions["B"]
+        assert b["requests"] == 1
+        assert b["cache_hits"] == 1
+        assert b["total_cached_tokens"] == 100
+        assert b["prefix_cache_reuse_ratio"] == 1.0
+
+        # Process-wide totals still include the session-less turn.
+        assert snap["requests"] == 4
+
+    def test_metrics_per_session_lru_bounded(self) -> None:
+        from moeptimizer.app import PROXY_METRICS
+
+        PROXY_METRICS.reset()
+        PROXY_METRICS._max_sessions_tracked = 3
+        try:
+            for i in range(10):
+                PROXY_METRICS.record_turn(session_id=f"s{i}", cached_tokens=1, prompt_tokens=1)
+            sessions = PROXY_METRICS.snapshot()["sessions"]
+            # Only the most recent 3 sessions are retained.
+            assert len(sessions) == 3
+            assert set(sessions) == {"s7", "s8", "s9"}
+        finally:
+            PROXY_METRICS._max_sessions_tracked = 512
+            PROXY_METRICS.reset()
 
     def test_metrics_reset_endpoint(self) -> None:
         from moeptimizer.app import PROXY_METRICS

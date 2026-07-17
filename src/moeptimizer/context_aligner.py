@@ -9,8 +9,6 @@ import hashlib
 import json
 from typing import Any
 
-from moeptimizer.cache import get_block_size
-
 # Cache block size for Qwen models (default, can be overridden)
 CACHE_BLOCK_SIZE = 128
 
@@ -27,47 +25,10 @@ class ContextAligner:
         self,
         block_size: int | None = None,
     ) -> None:
-        self._block_size = block_size or get_block_size()
-
-    def align_context(
-        self,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Align context to cache block boundaries.
-
-        Returns optimized message list with aligned static layer.
-        """
-        if not messages:
-            return messages
-
-        # Find static layer end
-        static_end = self._find_static_layer_end(messages)
-        if static_end == 0:
-            return messages
-
-        # Calculate current static layer size
-        static_chars = sum(
-            len(m.get("content") or "") for m in messages[:static_end]
-        )
-
-        # Check if alignment is needed
-        remainder = static_chars % self._block_size
-        if remainder == 0:
-            return messages
-
-        # Add padding to align to next block boundary
-        padding_needed = self._block_size - remainder
-        if padding_needed > 100:  # Don't add excessive padding
-            return messages
-
-        # Create aligned copy
-        result = [dict(m) for m in messages]
-        result[static_end - 1] = {
-            **result[static_end - 1],
-            "content": result[static_end - 1].get("content", "") + "\n" * padding_needed,
-        }
-
-        return result
+        # ``block_size`` is retained for API compatibility; the live pipeline
+        # freezes the stable prefix verbatim (freeze_static_prefix) rather than
+        # padding to a block boundary, so it is no longer used internally.
+        self._block_size = block_size or CACHE_BLOCK_SIZE
 
     def _find_static_layer_end(
         self,
@@ -85,17 +46,6 @@ class ContextAligner:
                 static_end = i + 1
                 break
         return static_end
-
-    def optimize_block_boundaries(
-        self,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Optimize message boundaries to align with cache blocks.
-
-        Groups related messages to minimize cache fragmentation.
-        """
-        # For now, just return the aligned context
-        return self.align_context(messages)
 
     def prefix_signature(self, messages: list[dict[str, Any]]) -> str:
         """Return a stable hash of the static prefix (system + first user).

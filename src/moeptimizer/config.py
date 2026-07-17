@@ -97,6 +97,12 @@ class AgenticConfig(BaseModel):
         default=3600,
         description="Session inactivity timeout in seconds",
     )
+    max_sessions: int = Field(
+        default=256,
+        description="Hard cap on concurrently tracked sessions. When exceeded, the "
+                    "least-recently-active session is evicted (LRU) to bound memory. "
+                    "Set to 0 to disable the cap.",
+    )
     use_token_budget: bool = Field(
         default=True,
         description="Use token-based budget enforcement instead of character-based",
@@ -333,7 +339,30 @@ class V050Config(BaseModel):
     # Session -> backend slot pinning (review §1, priority fix #1)
     slot_pinning_enabled: bool = Field(
         default=False,
-        description="Pin each session to a stable llama.cpp `id_slot` so the backend reuses the whole conversation prefix across turns. Disabled by default to stay OpenAI-transparent for non-llama.cpp backends. Requires the backend to support `id_slot` (llama.cpp/llama-server).",
+        description="Pin each session to a stable llama.cpp `id_slot` so the backend reuses the whole conversation prefix across turns. Disabled by default to stay OpenAI-transparent for non-llama.cpp backends. When `capability_autodetect` is on, live detection can ENABLE this automatically on backends/devices that expose `/slots` (e.g. the GPU/llama.cpp runtime) and SKIP it when the active device has no slots (e.g. NPU); this flag then acts as a manual force-on override. Requires the backend to support `id_slot` (llama.cpp/llama-server).",
+    )
+
+    # Live, device-aware capability auto-detection (NPU<->GPU aware).
+    capability_autodetect: bool = Field(
+        default=True,
+        description=(
+            "Probe the live backend for its actual capabilities (active device, "
+            "slot pinning via /slots, native MTP/speculative, exact remote /tokenize, "
+            "tokenizer id from the model checkpoint) and use them to drive slot "
+            "pinning, MTP passthrough, and token counting. Re-checked on a TTL so "
+            "capabilities follow the active device when the backend hot-swaps "
+            "between NPU and GPU. Manual flags (slot_pinning_enabled, "
+            "native_mtp_passthrough) act as force-on overrides. Best-effort: probe "
+            "failures never block startup or requests."
+        ),
+    )
+    capability_probe_ttl_seconds: float = Field(
+        default=30.0,
+        description="How long (seconds) a live capability snapshot is cached before re-probing, so NPU<->GPU device swaps are picked up without restart.",
+    )
+    remote_tokenize_enabled: bool = Field(
+        default=True,
+        description="When the active backend exposes an exact remote tokenizer (llama.cpp /tokenize), use it for exact whole-prompt token counts (cached by content fingerprint) instead of the local tiktoken/Qwen estimate. Falls back to local counting + backend prompt_tokens calibration when unavailable (e.g. NPU device). Only takes effect with capability_autodetect on.",
     )
 
     # Cache-stable mode (review §1/§3/§7, priority fix #3): freeze a stable

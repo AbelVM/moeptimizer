@@ -29,6 +29,7 @@ class SessionManager:
         self._sessions: dict[str, AgentContextOptimizer] = {}
         self._session_timestamps: dict[str, float] = {}
         self._session_timeout = session_timeout or agentic.session_timeout
+        self._max_sessions = agentic.max_sessions
         self._lock = threading.RLock()
 
     def _make_optimizer(self) -> AgentContextOptimizer:
@@ -46,6 +47,7 @@ class SessionManager:
             if session_id not in self._sessions:
                 self._sessions[session_id] = self._make_optimizer()
                 self._session_timestamps[session_id] = now
+                self._enforce_cap()
 
             self._session_timestamps[session_id] = time.time()
             return self._sessions[session_id]
@@ -111,6 +113,24 @@ class SessionManager:
             if now - ts > self._session_timeout
         ]
         for sid in expired:
+            self._sessions.pop(sid, None)
+            self._session_timestamps.pop(sid, None)
+
+    def _enforce_cap(self) -> None:
+        """Evict least-recently-active sessions when over the max-session cap.
+
+        Only fires when ``max_sessions > 0`` and the live session count exceeds
+        the cap. Eviction is LRU by last-activity timestamp; the just-created
+        session is never evicted in the same call.
+        """
+        if self._max_sessions <= 0:
+            return
+        over = len(self._sessions) - self._max_sessions
+        if over <= 0:
+            return
+        # Oldest timestamps first; evict up to `over` of them.
+        ordered = sorted(self._session_timestamps.items(), key=lambda kv: kv[1])
+        for sid, _ in ordered[:over]:
             self._sessions.pop(sid, None)
             self._session_timestamps.pop(sid, None)
 

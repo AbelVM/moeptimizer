@@ -326,6 +326,16 @@ class LemonadeClient:
             if value is not None and key not in _CUSTOM_SESSION_FIELDS:
                 params[key] = value
 
+        # id_slot is a llama.cpp-native extension (slot pinning), not part of the
+        # OpenAI schema, so the SDK rejects it as a top-level kwarg. Route it
+        # through extra_body so it is sent in the JSON request body instead. Other
+        # backends simply ignore an unknown body field, keeping us transparent.
+        id_slot = params.pop("id_slot", None)
+        if id_slot is not None:
+            extra_body = dict(params.get("extra_body") or {})
+            extra_body.setdefault("id_slot", id_slot)
+            params["extra_body"] = extra_body
+
         params = _strip_custom_session_fields(params)
 
         logger.debug("Sending request to Lemonade: model=%s, messages=%d, stream=%s",

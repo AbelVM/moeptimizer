@@ -244,4 +244,106 @@ Follow-up to the optimization-state review; closes the two dead-code findings:
   "KV-cache reuse" claim is not implied. The `mtp_state` / `expert_cache`
   phantom subsystems remain quarantined with honest non-functional docstrings
   (review03 §2.1).
-  
+
+### v0.7.3 — Bounded sessions, per-session metrics, dead-code cleanup (2026-07-16)
+
+Follow-up to the architecture-review action list (items #7/#8 closed; #4 confirmed
+already done; #5/#6 deferred as cache-risky/low-win pending benchmark evidence).
+Full test suite after changes: **351 passed, 2 skipped**.
+
+- **Bounded session tracking (LRU cap).** `SessionManager` previously grew
+  `_sessions` with timeout-only expiry and no cap. It now enforces a hard
+  `MOEPT_AGENTIC__MAX_SESSIONS` cap (default `256`, `0` disables) via
+  `_enforce_cap`, evicting the least-recently-active session (LRU by
+  last-activity timestamp) when the cap is exceeded. This closes the last
+  unbounded process-lifetime dict; all other caches were already bounded
+  (`chunk_fingerprint` 2048, `cache_registry` 1000, `static_prefix_kv` 64,
+  `expert_cache` 4096; `AgentStateStore` pruned to `max_state_steps`).
+- **Per-session metrics in `/v1/metrics`.** The metrics snapshot now includes a
+  `sessions{}` breakdown (per session: `requests`, `cache_hits`/`cache_misses`,
+  `cache_hit_rate`, `total_cached_tokens`, `total_prompt_tokens`,
+  `prefix_cache_reuse_ratio`, `total_saved_tokens`, `avg_latency_ms`) in addition
+  to the process-wide aggregate. `session_id` is threaded through both the
+  streaming and non-streaming completion paths into `record_turn`. The
+  per-session map is itself bounded by an LRU (`_max_sessions_tracked=512`) so it
+  can never grow without limit under a flood of distinct session ids. Turns
+  without a session id still count toward the process-wide totals only.
+- **Dead-code removal.** Deleted `ScratchpadCompactor._evict_from_front` (0 call
+  sites) and the unused `_summarize_message`/`_extract_tool_outcome` pair from
+  `compactor.py`.
+- **Vestigial whitespace padding removed.** `ContextAligner.align_context` /
+  `optimize_block_boundaries` (which appended `"\n"*N` to a 128-char block
+  boundary and were reachable only from tests) were removed; the live freeze path
+  (`freeze_static_prefix`) already copies the stable prefix byte-verbatim with no
+  padding, which is the cache-safe behavior. `_find_static_layer_end` is retained
+  (used by `prefix_signature`). Obsolete padding tests were removed and 4 new
+  tests added (session LRU cap + disabled cap; per-session metrics breakdown +
+  LRU bound).
+- **Deferred (documented in `ARCHITECTURE_REVIEW.md`).** Live-zone differential
+  compression (#5) and declarative YAML tool-output rules (#6) both rewrite
+  model-visible historical content — the exact change class that broke
+  prefix-cache reuse before — and are intentionally deferred until the live
+  benchmark confirms the P0 cache/MTP/tokenizer fixes yield
+  `total_cached_tokens > 0`.
+
+### v0.7.4 — Slot-clamp fix, backend-error resilience, realistic benchmark budget (2026-07-16)
+
+Correctness follow-up after the v0.7.3 live benchmark surfaced backend
+`500 "Failed to parse tool call arguments as JSON … missing closing quote"`
+errors on large-artifact tail turns. Full test suite: **352 passed, 2 skipped**.
+
+- **Fix (regression): clamp `id_slot` to the backend's real slot count.**
+  Once the B7 fix made slot pinning actually reach the backend, `_slot_for_session`
+  was still handing out slot ids from an unbounded counter (`0, 1, 2, …`, one per
+  session) with no clamp to the backend's `total_slots`. Against a single-slot
+  llama.cpp server this sent out-of-range/colliding `id_slot` values, which
+  truncated long tool-call generations mid-stream and made the backend fail to
+  parse the (now-unterminated) `arguments` as JSON — surfacing as backend
+  `500 "Failed to parse tool call arguments as JSON … missing closing quote"`
+  on the large-artifact tail turns. `id_slot` is now clamped to
+  `_NEXT_SLOT % total_slots`, and pinning is **skipped entirely when the backend
+  exposes `<= 1` slot** (no isolation benefit, only collision risk). This cut the
+  errors from 8 → 2 in the follow-up run and recovered code-syntax validity
+  (0.83 → 0.98). Regression tests: `test_e2e.py::TestSlotAssignment`.
+- **Backend-error resilience (graceful mid-stream 500 handling).** When the
+  backend returns an error mid-stream (e.g. the truncated-tool-call 500 above),
+  the proxy previously let the raw SDK exception propagate and injected a fake
+  `[Stream interrupted: …]` assistant content chunk. It now catches
+  `APIStatusError`/`APIError`, emits a **well-formed OpenAI `error` object** with
+  `finish_reason="error"` and an empty delta (no fake content), then closes the
+  stream cleanly with `[DONE]`. Failed turns are counted as `backend_errors`
+  (not as successful turns) and excluded from cache-outcome recording and token
+  calibration. The non-streaming path likewise preserves the backend status code
+  and returns a structured `backend_error`. `/v1/metrics` now exposes a
+  `backend_errors` count both process-wide and per session. New tests:
+  `test_e2e.py` graceful generic-error and backend-500 cases.
+- **Realistic benchmark `max_tokens` (root cause of the truncation).** The
+  truncated tool calls were ultimately a generation-budget problem: the harness
+  sent `max_tokens=1024`, but an agentic coding turn may rewrite a whole source
+  file inside a single tool-call argument. The largest fixture (`loader.py`,
+  ~21KB ≈ 6.2K tokens) needs ~7.6–8.3K output tokens once JSON-string escaping
+  and a short reasoning preamble are included. `benchmark.py`'s `--max-tokens`
+  default is raised **1024 → 8192** (still negligible against the 262K context
+   window), with a help string documenting why. This is a benchmark-harness
+   change, not a proxy change: the proxy forwards the client's `max_tokens`
+   unchanged and never overrides it.
+- **Benchmark round comparability (scenario slice per round).** Each round is
+  meant to be a repetition of the same conversation, but scenario content was
+  selected by the *global* turn index (`(turn_offset+local_turn) % len`). When
+  the scenario's exchange count did not divide evenly into `rounds×num_turns`
+  (the `opencode` scenario has 30 exchanges over 5×10=50 turns), each round
+  replayed a *different* slice: R1/R4 got the small exchanges 0-9 while R2/R3/R5
+  got the large 10-29. That produced the "weird" R1/R4 per-turn shapes (small,
+  flat prompt-token/quality/cache/savings curves) that looked like a proxy
+  anomaly but were purely a different input workload. Content is now selected by
+  the *within-round* position (`local_turn % len`), so every round replays the
+  same first `num_turns` turns of the scenario (wrapping if `num_turns` exceeds
+  the scenario length). Turn labels remain global (T1..T50) so the dashboard's
+  round grouping is unaffected.
+- **Dashboard flags failed/estimated turns.** `benchmark_dashboard.html` now
+  detects turns whose direct-side result failed or was estimated (JSON
+  `excluded_cached_artifact_turns`, plus log heuristics: empty direct response,
+  `estimated_missing_usage` token source, or uncomputable `n/a` quality) and, in
+  every per-turn chart, shades the column, marks it with a red ✕, and omits it
+  from the drawn series so fabricated points are never read as real
+  measurements. The per-turn table highlights and annotates those rows.

@@ -51,6 +51,9 @@
   th{color:var(--muted);font-weight:600;cursor:pointer;user-select:none;position:sticky;top:0;background:var(--panel)}
   th:hover{color:var(--text)}
   tbody tr:hover{background:var(--panel2)}
+  tbody tr.badrow{background:rgba(248,81,73,0.10)}
+  tbody tr.badrow:hover{background:rgba(248,81,73,0.16)}
+  tbody tr.badrow td:first-child{box-shadow:inset 3px 0 0 var(--bad)}
   .pos{color:var(--pos)} .neg{color:var(--neg)} .na{color:var(--muted)}
   .section-title{font-size:15px;font-weight:600;margin:26px 0 12px;border-left:3px solid var(--accent);padding-left:9px}
   .tablewrap{max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:10px;background:var(--panel)}
@@ -140,7 +143,7 @@ function parseJSON(text){
 }
 
 /* ============================ LOG parser ============================ */
-const RE_TURN = /^  Turn (\d+):\s*direct=([\d.]+)ms\/([\d,]+)tok\/([\d,]+)chars\s*proxy=([\d.]+)ms\/([\d,]+)tok\/([\d,]+)chars_raw\/([\d,]+)chars\s*delta=([+-]?[\d.]+)ms\/([+-]?[\d,]+)tok\s*cache=([\d,]+|n\/a)\/([\d,]+|n\/a)\s*quality_sem=([\d.]+|n\/a)\s*jaccard=([\d.]+|n\/a)\s*rouge=([\d.]+|n\/a)/;
+const RE_TURN = /^  Turn (\d+):\s*direct=([\d.]+)ms\/([\d,]+)tok\/([\d,]+)chars\s*proxy=([\d.]+)ms\/([\d,]+)tok\/([\d,]+)chars_raw\/([\d,]+)chars\s*raw_input=([\d,]+)tok\s*delta=([+-]?[\d.]+)ms\/([+-]?[\d,]+)tok\s*cache=([\d,.]+|n\/a)\/([\d,.]+|n\/a)\s*quality_sem=([+-]?[\d.]+|n\/a)\s*jaccard=([+-]?[\d.]+|n\/a)\s*rouge=([+-]?[\d.]+|n\/a)\s*faith=([+-]?[\d.]+|n\/a)\s*evict=([+-]?[\d.]+|n\/a)/;
 const RE_PTURN = /^  Proxy turn (\d+)\/(\d+): raw (\d+) msgs\/([\d,]+) chars\/~?([\d,]+) tok \(pre-optimization\)/;
 const RE_PBACK = /^    → backend-facing: ([\d,]+) tok \(source=([\w_]+), cached=([\d,]+), prefix_hits=([\d,]+), raw=([\d,]+) chars\)/;
 const RE_DTURN = /^  Direct turn (\d+)\/(\d+): backend-facing ~?([\d,]+) tok \(raw (\d+) msgs\/([\d,]+) chars, no proxy\)/;
@@ -154,7 +157,15 @@ function parseLog(text){
   const proxyTurns = {};   // global idx -> {rawMsgs,rawChars,rawTok,backendTok,source,cached,prefixHits,round}
   const directTurns = {};  // global idx -> {rawMsgs,rawChars,backendTok,source,cached,round}
   const meta = {};
-  let pendingProxy=null, pendingDirect=null, currentRound=0;
+  let pendingProxy=null, pendingDirect=null, currentRound=0, perRound=NaN;
+
+  // Pre-scan the "Starting benchmark" header for turns/round so the per-round ->
+  // global index mapping is available DURING the main loop (the Round line's
+  // denominator is the ROUNDS count, not turns/round, so it cannot be used).
+  for(const line of lines){
+    const mm=/(\d+)\s+turns?\s+x\s+(\d+)\s+round/i.exec(line);
+    if(mm){ perRound=+mm[1]; break; }
+  }
 
   for(const line of lines){
     let m;
@@ -166,12 +177,17 @@ function parseLog(text){
         turn:i, round:currentRound,
         direct_ms:num(m[2]), direct_tok:num(m[3]), direct_chars:num(m[4]),
         proxy_ms:num(m[5]), proxy_tok:num(m[6]), proxy_raw_chars:num(m[7]), proxy_chars:num(m[8]),
-        delta_ms:num(m[9]), delta_tok:num(m[10]),
-        cache_hit:(m[11]==='n/a'?NaN:num(m[11])), cache_miss:(m[12]==='n/a'?NaN:num(m[12])),
-        sem:num(m[13]), jaccard:num(m[14]), rouge:num(m[15])
+        raw_input_tok:num(m[9]),
+        delta_ms:num(m[10]), delta_tok:num(m[11]),
+        cache_hit:(m[12]==='n/a'?NaN:num(m[12])), cache_miss:(m[13]==='n/a'?NaN:num(m[13])),
+        sem:num(m[14]), jaccard:num(m[15]), rouge:num(m[16]),
+        faith:num(m[17]), evict:num(m[18])
       };
     } else if((m=RE_PTURN.exec(line))){
-      const i=+m[1];
+      // New benchmark: numerator is the WITHIN-ROUND position (1..perRound).
+      // Derive the global turn index so it joins with the `Turn NN:` summary.
+      const local=+m[1];
+      const i = isNum(perRound) ? (currentRound-1)*perRound + local : local;
       pendingProxy=i;
       proxyTurns[i]={rawMsgs:+m[3], rawChars:num(m[4]), rawTok:num(m[5]), round:currentRound};
     } else if((m=RE_PBACK.exec(line)) && pendingProxy!=null){
@@ -179,7 +195,8 @@ function parseLog(text){
       t.backendTok=num(m[1]); t.source=m[2]; t.cached=num(m[3]); t.prefixHits=num(m[4]);
       pendingProxy=null;
     } else if((m=RE_DTURN.exec(line))){
-      const i=+m[1];
+      const local=+m[1];
+      const i = isNum(perRound) ? (currentRound-1)*perRound + local : local;
       pendingDirect=i;
       directTurns[i]={rawMsgs:+m[4], rawChars:num(m[5]), backendTok:num(m[3]), round:currentRound};
     } else if((m=RE_DBACK.exec(line)) && pendingDirect!=null){
@@ -235,6 +252,51 @@ function getRoundInfo(J, L){
   numTurns = isNum(numTurns) && numTurns>0 ? numTurns : NaN;
   rounds   = isNum(rounds)   && rounds>0   ? rounds   : NaN;
   return { numTurns, rounds };
+}
+
+/* ============================ bad-turn detection ============================ */
+// A "bad turn" is one whose direct-side measurement failed or was estimated, so
+// its per-turn charts/tables would otherwise plot fabricated data as if real.
+// Two sources are combined so this works with JSON, LOG, or both:
+//   1. JSON authoritative list: latency_ms.excluded_cached_artifact_turns — the
+//      turns the harness itself excluded from its latency/quality aggregates.
+//      (NOTE: context_window.cached_or_missing_usage_turns is deliberately NOT
+//      used — it lists every turn whose prompt-token count came from the proxy's
+//      optimized-header estimate, which is normal for almost all proxy turns and
+//      is not a failure signal.)
+//   2. LOG heuristics (future-proof, needs no JSON): a direct call that returned
+//      in a few ms with zero chars (empty/failed response), a direct token count
+//      whose source was "estimated_missing_usage" (backend returned no usage),
+//      or an uncomputable quality row (sem/jaccard/rouge all n/a). These are the
+//      fingerprints of a direct-side turn that failed or returned no usable text.
+// Returns a Set of global turn indices flagged as bad, plus a per-turn reason map.
+function detectBadTurns(J, L){
+  const bad = new Set();
+  const reasons = {};              // turn -> reason string
+  const flag=(t,why)=>{ if(!isNum(t)) return; bad.add(t); reasons[t]=reasons[t]?reasons[t]+'; '+why:why; };
+
+  // 1) JSON authoritative exclusions
+  if(J){
+    const lat=J.latency||{};
+    (lat.excluded_cached_artifact_turns||[]).forEach(t=>flag(t,'excluded (cached/failed artifact)'));
+  }
+
+  // 2) LOG heuristics
+  if(L){
+    // direct-side backend token count recorded as an estimate (no real usage)
+    for(const [k,d] of Object.entries(L.directTurns||{})){
+      if(d && d.source==='estimated_missing_usage') flag(+k,'direct usage estimated');
+    }
+    for(const t of (L.turnList||[])){
+      // empty/failed direct response: returned almost instantly with no content
+      if(isNum(t.direct_ms) && t.direct_ms<=15 && isNum(t.direct_chars) && t.direct_chars===0)
+        flag(t.turn,'empty direct response');
+      // quality uncomputable (no direct baseline to compare against)
+      if(!isNum(t.sem) && !isNum(t.jaccard) && !isNum(t.rouge))
+        flag(t.turn,'quality n/a (no baseline)');
+    }
+  }
+  return {bad, reasons};
 }
 
 /* ============================ coupling verification ============================ */
@@ -332,12 +394,14 @@ function renderChart(canvas, cfg, hover){
     for(const v of ds.data){ if(isNum(v)){ axes[ax].min=Math.min(axes[ax].min,v); axes[ax].max=Math.max(axes[ax].max,v);} }
   }
   if(!isFinite(axes.y.min)){ axes.y.min=0; axes.y.max=1; }
-  if(cfg.yMin!=null) axes.y.min=cfg.yMin; if(cfg.yMax!=null) axes.yMax=cfg.yMax;
+  if(cfg.yMin!=null) axes.y.min=cfg.yMin; if(cfg.yMax!=null) axes.y.max=cfg.yMax;
   if(cfg.dual && !isFinite(axes.y1.min)){ axes.y1.min=0; axes.y1.max=1; }
   // pad
   const pad=(mx,mn)=> (mx-mn)*0.08 || 1;
   axes.y.min=Math.min(axes.y.min, cfg.yMin!=null?cfg.yMin:axes.y.min-pad(axes.y.max-axes.y.min));
-  axes.y.max=axes.y.max+pad(axes.y.max-axes.y.min);
+  // Respect an explicit yMax (e.g. quality scores capped at 1.0): don't add the
+  // 8% headroom padding that would push the axis top above the requested cap.
+  if(cfg.yMax==null) axes.y.max=axes.y.max+pad(axes.y.max-axes.y.min);
   if(cfg.dual){ axes.y1.min=Math.min(axes.y1.min,0); axes.y1.max=axes.y1.max+pad(axes.y1.max-axes.y1.min); }
   // bar charts encode magnitude: anchor the value axis at zero for honest comparison
   if(cfg.datasets.some(ds=>ds.type==='bar')){
@@ -372,7 +436,26 @@ function renderChart(canvas, cfg, hover){
   for(let i=0;i<n;i+=step){ ctx.fillText(labels[i], xLabelAt(i), padT+plotH+6); }
   if(n>0) ctx.fillText(labels[n-1], xLabelAt(n-1), padT+plotH+6);
 
-  // datasets (grouped bars + lines)
+  // flagged (bad) turns: shade the column so failed/estimated data points are
+  // visibly marked instead of being read as real measurements. `cfg.flagged` is
+  // a Set of x-indices (into `labels`).
+  const flagged = cfg.flagged instanceof Set ? cfg.flagged : null;
+  if(flagged && flagged.size){
+    const colW = plotW/n;
+    for(const i of flagged){
+      if(i<0||i>=n) continue;
+      const cx = (hasBars?xBarCenter(i):xAt(i));
+      const bx = cx - colW/2;
+      ctx.fillStyle='rgba(248,81,73,0.12)';          // red wash
+      ctx.fillRect(bx, padT, colW, plotH);
+      ctx.strokeStyle='rgba(248,81,73,0.45)'; ctx.lineWidth=1; ctx.setLineDash([2,2]);
+      ctx.beginPath(); ctx.moveTo(cx,padT); ctx.lineTo(cx,padT+plotH); ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+
+  // datasets (grouped bars + lines). Flagged (bad) turns are skipped entirely so
+  // estimated/failed values are never drawn as if they were real measurements.
+  const isFlagged = i => flagged ? flagged.has(i) : false;
   const groupW = Math.max(2, plotW/n*0.72);
   const bw = barSets.length>1 ? Math.max(1.5, groupW/barSets.length) : groupW;
   for(let di=0; di<cfg.datasets.length; di++){
@@ -382,15 +465,21 @@ function renderChart(canvas, cfg, hover){
     if(ds.type==='bar'){
       const bi=barSets.indexOf(ds);
       const off=(bi-barSets.length/2)*bw;
-      for(let i=0;i<n;i++){ const v=ds.data[i]; if(!isNum(v))continue;
+      for(let i=0;i<n;i++){ const v=ds.data[i]; if(!isNum(v)||isFlagged(i))continue;
         const x=xBarCenter(i)+off, y=yAt(v,ax); const bh=padT+plotH-y;
         ctx.fillStyle = ds.colorFn ? ds.colorFn(v) : color; ctx.globalAlpha=0.85;
         ctx.fillRect(x,y,bw,bh); ctx.globalAlpha=1;
       }
     } else {
+      // Rounds are independent conversations, so the line must NOT connect the
+      // last turn of one round to the first turn of the next. Break the path at
+      // each round boundary (every `roundSize` points) in addition to NaN/flagged.
+      const rSize = (isNum(cfg.roundSize) && cfg.roundSize>1) ? cfg.roundSize : 0;
       ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
       let started=false;
-      for(let i=0;i<n;i++){ const v=ds.data[i]; if(!isNum(v)){started=false;continue;}
+      for(let i=0;i<n;i++){
+        if(rSize && i>0 && i%rSize===0) started=false;   // new round -> new segment
+        const v=ds.data[i]; if(!isNum(v)||isFlagged(i)){started=false;continue;}
         const x=xAt(i), y=yAt(v,ax);
         if(!started){ctx.moveTo(x,y);started=true;} else ctx.lineTo(x,y);
       }
@@ -398,8 +487,18 @@ function renderChart(canvas, cfg, hover){
       if(ds.fill){ ctx.lineTo(xAt(n-1),padT+plotH); ctx.lineTo(xAt(0),padT+plotH); ctx.closePath();
         ctx.fillStyle=color; ctx.globalAlpha=0.10; ctx.fill(); ctx.globalAlpha=1; }
       // points
-      for(let i=0;i<n;i++){ const v=ds.data[i]; if(!isNum(v))continue;
+      for(let i=0;i<n;i++){ const v=ds.data[i]; if(!isNum(v)||isFlagged(i))continue;
         ctx.fillStyle=color; ctx.beginPath(); ctx.arc(xAt(i),yAt(v,ax),2.2,0,7); ctx.fill(); }
+    }
+  }
+  // mark each flagged turn with a small hollow "×" at the plot baseline so the
+  // gap reads as "measurement excluded", not "value is zero / missing point".
+  if(flagged && flagged.size){
+    ctx.strokeStyle='rgba(248,81,73,0.9)'; ctx.lineWidth=1.4;
+    for(const i of flagged){ if(i<0||i>=n) continue;
+      const cx=(hasBars?xBarCenter(i):xAt(i)), cy=padT+plotH-7, r=3.2;
+      ctx.beginPath(); ctx.moveTo(cx-r,cy-r); ctx.lineTo(cx+r,cy+r);
+      ctx.moveTo(cx+r,cy-r); ctx.lineTo(cx-r,cy+r); ctx.stroke();
     }
   }
   // round separators (turns are grouped into rounds of cfg.roundSize)
@@ -521,11 +620,14 @@ function attachHover(canvas){
     renderChart(canvas,g.cfg,idx);
     // build tooltip
     let html=`<div class="tt-title">${g.labels[idx]}</div>`;
+    const isBad = g.cfg.flagged instanceof Set && g.cfg.flagged.has(idx);
+    if(isBad) html+=`<div class="tt-row" style="color:#f85149"><b>&#9888; excluded turn — direct-side failed/estimated</b></div>`;
     for(const ds of g.cfg.datasets){
       const v=ds.data[idx];
       const col=ds.color||PALETTE[ds.label.toLowerCase().replace(/[^a-z]/g,'')]||'#58a6ff';
       const f=ds.axis==='y1'?(g.cfg.yFmt1||g.cfg.yFmt):g.cfg.yFmt;
-      html+=`<div class="tt-row"><span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${col};margin-right:5px"></i>${ds.label}</span><b>${f?f(v):fmt(v)}</b></div>`;
+      const shown = isBad ? '—' : (f?f(v):fmt(v));
+      html+=`<div class="tt-row"><span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${col};margin-right:5px"></i>${ds.label}</span><b>${shown}</b></div>`;
     }
     tip.innerHTML=html; tip.style.display='block';
     tip.style.left=Math.min(e.clientX+14, window.innerWidth-tip.offsetWidth-10)+'px';
@@ -593,11 +695,12 @@ function render(){
 
   const ri=getRoundInfo(p.json,p.log);
   if(p.json) renderJSONView(root,p.json,p.log,ri);
-  if(p.log) renderLogView(root,p.log,ri);
+  if(p.log) renderLogView(root,p.log,ri,p.json);
 }
 
 function renderJSONView(root,J,L,ri){
   const c=J.config, tok=J.tokens, lat=J.latency, ttft=J.ttft, q=J.quality, sem=J.semantic, sec=J.secondary, ctxw=J.context, cache=J.cache, ev=J.eviction, pr=J.perRound;
+  const faith=q.prompt_faithfulness||null, evict=q.evicted_content_recall||null;
 
   // ---- summary cards ----
   const cards=el('div','cards');
@@ -606,13 +709,26 @@ function renderJSONView(root,J,L,ri){
     d.appendChild(Object.assign(el('div','value '+(cls||'')),{textContent:value}));
     if(delta) d.appendChild(Object.assign(el('div','delta'),{textContent:delta}));
     return d; };
-  cards.appendChild(card('Token savings', fmtPct(tok.token_savings_pct), tok.token_savings_pct>0?'good':'bad',
+  cards.appendChild(card('Token savings (vs direct)', fmtPct(tok.token_savings_pct), tok.token_savings_pct>0?'good':'bad',
     `${fmt(tok.total_direct_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok`));
+  cards.appendChild(card('Token savings (vs proxy raw input)', fmtPct(tok.token_savings_vs_raw_pct), tok.token_savings_vs_raw_pct>0?'good':'bad',
+    `${fmt(tok.total_raw_input_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok`));
   const latD = lat.delta_proxy_minus_direct_ms;
-  cards.appendChild(card('Mean latency (proxy)', fmtSec(lat.proxy&&lat.proxy.mean), latD&&latD.mean>0?'bad':'good',
-    `direct ${fmtSec(lat.direct&&lat.direct.mean)} · Δ ${latD?fmtSec(latD.mean):'—'}`));
+  // Focus this card on the latency OVERHEAD the proxy adds (proxy − direct),
+  // not the absolute proxy latency (which is dominated by backend generation
+  // time and is not what the proxy controls). Positive Δ = proxy slower (bad).
+  const latDMean = latD && isNum(latD.mean) ? latD.mean : NaN;
+  const dPct = (lat.direct && isNum(lat.direct.mean) && lat.direct.mean>0 && isNum(latDMean))
+    ? (latDMean/lat.direct.mean*100) : NaN;
+  cards.appendChild(card('Latency overhead (proxy − direct)',
+    (isNum(latDMean)?(latDMean>=0?'+':'')+fmtSec(latDMean):'—'),
+    isNum(latDMean)?(latDMean>0?'bad':'good'):'',
+    `proxy ${fmtSec(lat.proxy&&lat.proxy.mean)} vs direct ${fmtSec(lat.direct&&lat.direct.mean)}${isNum(dPct)?` · ${(dPct>=0?'+':'')+dPct.toFixed(1)}%`:''}`));
+  cards.appendChild(card('Context faithfulness', faith&&faith.mean!=null?fmt2(faith.mean):'—',
+    faith&&faith.mean!=null?(faith.mean>=0.7?'good':faith.mean>=0.5?'warn':'bad'):'',
+    `min ${faith&&faith.min!=null?fmt2(faith.min):'—'} · evicted recall ${evict&&evict.mean!=null?fmt2(evict.mean):'—'}`));
   cards.appendChild(card('Mean semantic sim', fmt2(sem.mean), sem.mean>=0.7?'good':sem.mean>=0.5?'warn':'bad',
-    `min ${fmt2(sem.min)} · median ${fmt2(sem.median)}`));
+    `informational only · min ${fmt2(sem.min)} · median ${fmt2(sem.median)}`));
   const cacheRate = cache.per_round_proxy_metrics && cache.per_round_proxy_metrics[0] ? cache.per_round_proxy_metrics[0].cache_hit_rate : NaN;
   cards.appendChild(card('Prefix cache hit rate', fmtPct(cacheRate*100), cacheRate>=0.9?'good':cacheRate>0?'warn':'bad',
     `${fmt(cache.total_prefix_cache_hit_tokens)} hit tok`));
@@ -649,15 +765,23 @@ function renderJSONView(root,J,L,ri){
   }
 
   // Quality metrics — radar (multivariate 0–1 comparison)
-  if(q.rouge_l_f1||q.token_jaccard||q.edit_similarity||sem.mean!=null){
-    const labels=['ROUGE-L F1','Token Jaccard','Edit similarity','Code blocks','Syntax valid','Semantic sim'];
-    const mk=(o)=>o&&o.mean!=null?o.mean:NaN;
-    grid.appendChild(panel('Quality metrics (mean, 0–1)','score',
+  // Headline = the optimizer's ACTUAL job (context retention) + the one
+  // hard correctness check (code syntax). Response-vs-response overlap
+  // scores (ROUGE/Jaccard/edit) are now secondary (see quality detail).
+  if(faith||evict||q.code_syntax_validity||q.code_block_ratio||sem.mean!=null){
+    const labels=['Context faith','Evicted recall','Syntax valid','Code blocks','Semantic sim'];
+    // Radar axes are 0..1, so clamp each mean to >=0 for DISPLAY ONLY. Semantic
+    // sim is a cosine in [-1,1] and can be legitimately negative (proxy/direct
+    // responses diverge in embedding space) - we clamp at the radar boundary, we
+    // do NOT abs() it, because that would falsify the aggregate. Tables and the
+    // per-turn chart keep the true signed value.
+    const mk=(o)=>o&&o.mean!=null?Math.max(0,o.mean):NaN;
+    grid.appendChild(panel('Optimizer quality (mean, 0–1)','score',
       {type:'radar', labels,
         datasets:[
-          {label:'Quality (proxy vs direct)',color:PALETTE.sem,data:[mk(q.rouge_l_f1),mk(q.token_jaccard),mk(q.edit_similarity),mk(q.code_block_ratio),mk(q.code_syntax_validity),mk(sem)]}
+          {label:'Optimizer quality',color:PALETTE.sem,data:[mk(faith),mk(evict),mk(q.code_syntax_validity),mk(q.code_block_ratio),mk(sem)]}
         ], yFmt:fmt2, yMin:0, yMax:1},
-      'Mean quality scores across measured turns (1.0 = identical to direct). Axes: ROUGE-L F1 = n-gram overlap with the direct response; Token Jaccard = token-set overlap; Edit similarity = Levenshtein-based; Code blocks = fraction of code blocks preserved; Syntax valid = fraction of code blocks that still parse; Semantic sim = embedding cosine similarity with the direct response.'));
+      'Mean scores across measured turns. Context faith = fraction of original prompt tokens surviving compaction (1.0 = nothing lost); Evicted recall = fraction of early-turn content carried forward; Syntax valid = generated code still parses; Code blocks = fraction of code blocks preserved; Semantic sim = embedding cosine vs direct (informational only, weak on code). Negative semantic-sim values are clamped to 0 on this 0-1 radar but shown signed elsewhere.'));
   }
 
   // Per-round token savings + semantic
@@ -669,7 +793,8 @@ function renderJSONView(root,J,L,ri){
         lineBarCfg(labels,[
           {label:'Token savings %',color:PALETTE.proxy,type:'bar',data:rounds.map(r=>pr[r].token_savings_pct)},
           {label:'Semantic sim',color:PALETTE.sem,data:rounds.map(r=>pr[r].semantic_similarity&&pr[r].semantic_similarity.mean)}
-        ], v=>isNum(v)?(v<=1.5?v.toFixed(2):v.toFixed(1)+'%'):'—', 0, null), 'Bars = token savings %, line = mean semantic similarity per round.'));
+        ], v=>isNum(v)?(v<=1.5?v.toFixed(2):v.toFixed(1)+'%'):'—', 0, null),
+        'Each round is an INDEPENDENT replay of the same fixture (a fresh 10-turn conversation), not a continuation. So per-round swings in semantic sim are mostly model phrasing variance, NOT an optimizer regression — read token savings % (the real signal) across rounds instead. Semantic sim is cosine in [-1,1]; negatives are valid.'));
     }
   }
 
@@ -677,11 +802,20 @@ function renderJSONView(root,J,L,ri){
   if(cache.per_round_proxy_metrics && cache.per_round_proxy_metrics.length){
     const m=cache.per_round_proxy_metrics;
     const labels=m.map(r=>'R'+(r.round+1));
-    grid.appendChild(panel('Cache reuse per round (proxy)','',
+    // Both series are percentages but of DIFFERENT denominators:
+    //  - Cache hit rate  = hits/requests           (fraction of requests, 0..1)
+    //  - Reuse ratio     = cached_tok/prompt_tok   (fraction of tokens,   0..1)
+    // Plot BOTH as % on a shared 0..100 axis. Previously the reuse ratio was
+    // plotted raw (0.16..0.65) against hit-rate bars scaled to ~100, so it was
+    // squashed onto the baseline and looked like a flat 0 even when it wasn't.
+    grid.appendChild(panel('Cache reuse per round (proxy)','%',
       lineBarCfg(labels,[
-        {label:'Cache hit rate',color:PALETTE.cache,type:'bar',data:m.map(r=>r.cache_hit_rate*100)},
-        {label:'Reuse ratio',color:PALETTE.sem,data:m.map(r=>r.prefix_cache_reuse_ratio)}
-      ], v=>isNum(v)?(v<=1.5?v.toFixed(2):v.toFixed(1)+'%'):'—', 0, null), 'Prefix-cache hit rate (%) and reuse ratio per round.'));
+        {label:'Cache hit rate',color:PALETTE.cache,type:'bar',data:m.map(r=>isNum(r.cache_hit_rate)?r.cache_hit_rate*100:NaN)},
+        // High-contrast magenta line so the reuse-ratio series stays legible on
+        // top of the cyan cache-hit bars (green-on-cyan was hard to see).
+        {label:'Reuse ratio (tokens)',color:'#ff7bd5',data:m.map(r=>isNum(r.prefix_cache_reuse_ratio)?r.prefix_cache_reuse_ratio*100:NaN)}
+      ], v=>isNum(v)?v.toFixed(0)+'%':'—', 0, null),
+      'Cache hit rate = % of requests with a prefix-cache hit. Reuse ratio = % of prompt tokens served from cache. Both shown as %.'));
   }
 
   // Eviction / compaction — per-turn TOKEN SAVINGS (proxy vs direct prompt tokens).
@@ -690,17 +824,29 @@ function renderJSONView(root,J,L,ri){
   if(ev && ev.total_chars_before_optimization){
     const exceed = ev.turns_raw_exceeds_optimized_target != null ? ev.turns_raw_exceeds_optimized_target : 0;
     const evict = ev.eviction_triggered_at_turns ? ev.eviction_triggered_at_turns.length : 0;
-    const desc = `Budget ${fmt(ev.char_budget)} chars/turn · ${exceed} turns exceeded target · ${evict} evictions triggered · ${fmt(ev.total_chars_before_optimization)} raw chars total. Savings % = (direct − proxy prompt tokens) ÷ direct × 100 per turn.`;
-    const pt = (L && L.turnList) ? L.turnList.filter(t=>isNum(t.direct_tok)&&isNum(t.proxy_tok)&&t.direct_tok>0) : [];
+    const desc = `Budget ${fmt(ev.char_budget)} chars/turn · ${exceed} turns exceeded target · ${evict} evictions triggered · ${fmt(ev.total_chars_before_optimization)} raw chars total. Savings % = (proxy RAW input − optimized output) ÷ raw input × 100 per turn — isolates the optimizer's own compaction from direct-path tokenization.`;
+    // Prefer the proxy's raw input tokens (what the proxy received) as the
+    // baseline. Fall back to direct_tok only when raw_input_tok is unavailable
+    // (older logs / JSON without the field).
+    const ptAll = (L && L.turnList) ? L.turnList : [];
+    const pt = ptAll.filter(t=>isNum(t.proxy_tok)&&t.proxy_tok>0&&(isNum(t.raw_input_tok)?t.raw_input_tok>0:isNum(t.direct_tok)&&t.direct_tok>0));
     if(pt.length){
-      const cfg={labels:pt.map(t=>'T'+t.turn), roundSize:isNum(ri.numTurns)?ri.numTurns:null,
+      // Flag failed/estimated turns so their savings % (computed against an
+      // estimated direct baseline) is not read as a real measurement.
+      const {bad}=detectBadTurns(J,L);
+      const ptFlagged=new Set(); pt.forEach((t,i)=>{ if(bad.has(t.turn)) ptFlagged.add(i); });
+      const cfg={labels:pt.map(t=>'T'+t.turn), roundSize:isNum(ri.numTurns)?ri.numTurns:null, flagged:ptFlagged,
         datasets:[
-          {label:'Token savings %',color:PALETTE.proxy,data:pt.map(t=>(t.direct_tok-t.proxy_tok)/t.direct_tok*100)}
+          {label:'Token savings % (vs raw input)',color:PALETTE.proxy,data:pt.map(t=>{
+            const base = isNum(t.raw_input_tok)&&t.raw_input_tok>0 ? t.raw_input_tok : t.direct_tok;
+            return (base - t.proxy_tok)/base*100;
+          })}
         ], yFmt:v=>isNum(v)?v.toFixed(1)+'%':'—', yMin:0};
-      grid.appendChild(panel('Token savings per turn (proxy vs direct)','%',
-        cfg, desc));
+      grid.appendChild(panel('Token savings per turn (proxy raw input → optimized)','%',
+        cfg, desc+' Red ✕ = savings vs an estimated (failed) baseline; omitted.'));
     } else {
-      const sp = isNum(J.tokens.token_savings_pct) ? J.tokens.token_savings_pct : NaN;
+      const sp = isNum(J.tokens.token_savings_vs_raw_pct) ? J.tokens.token_savings_vs_raw_pct
+               : (isNum(J.tokens.token_savings_pct) ? J.tokens.token_savings_pct : NaN);
       grid.appendChild(panel('Token savings (aggregate)','%',
         {labels:['Savings %'],
           datasets:[
@@ -709,16 +855,20 @@ function renderJSONView(root,J,L,ri){
     }
   }
 
-  // Secondary quality metrics — radar (meaningful 0–1 structural/lexical metrics)
-  if(sec.trigram_overlap||sec.markdown_structure_similarity||sec.rouge_l_precision||sec.rouge_l_recall||sec.response_stability||sec.code_structure_consistency){
-    const labels=['Trigram overlap','Markdown struct','ROUGE-L prec','ROUGE-L rec','Resp. stability','Code struct'];
+  // Secondary / informational quality metrics — radar (0–1).
+  // These are response-vs-response overlap scores. They conflate optimizer
+  // quality with the model's phrasing variance and have near-zero
+  // discriminative power for a context optimizer, so they are informational
+  // only (see the optimizer-quality radar above for the real signals).
+  if(sec.trigram_overlap||sec.markdown_structure_similarity||sec.rouge_l_precision||sec.rouge_l_recall||sec.response_stability||sec.code_structure_consistency||q.rouge_l_f1||q.token_jaccard||q.edit_similarity){
+    const labels=['ROUGE-L F1','Token Jaccard','Edit sim','Trigram overlap','Markdown struct','Code struct'];
     const mk=(o)=>o&&o.mean!=null?o.mean:NaN;
-    grid.appendChild(panel('Secondary quality metrics (mean, 0–1)','score',
+    grid.appendChild(panel('Secondary quality metrics (mean, 0–1, informational)','score',
       {type:'radar', labels,
         datasets:[
-          {label:'Secondary quality (proxy vs direct)',color:PALETTE.rouge,data:[mk(sec.trigram_overlap),mk(sec.markdown_structure_similarity),mk(sec.rouge_l_precision),mk(sec.rouge_l_recall),mk(sec.response_stability),mk(sec.code_structure_consistency)]}
+          {label:'Secondary quality (proxy vs direct)',color:PALETTE.rouge,data:[mk(q.rouge_l_f1),mk(q.token_jaccard),mk(q.edit_similarity),mk(sec.trigram_overlap),mk(sec.markdown_structure_similarity),mk(sec.code_structure_consistency)]}
         ], yFmt:fmt2, yMin:0, yMax:1},
-      'Mean secondary quality scores across measured turns (1.0 = identical to direct). Axes: Trigram overlap = 3-gram token overlap; Markdown struct = heading/list/code-block structure similarity; ROUGE-L prec/rec = longest-common-subsequence precision/recall vs the direct response; Resp. stability = consistency of response shape; Code struct = code-block structural consistency.'));
+      'Informational only — response-vs-response overlap. Low absolute values are expected (LLM phrasing variance), NOT optimizer failure. Axes: ROUGE-L F1 / Token Jaccard / Edit sim = overlap with the direct response; Trigram overlap = 3-gram token overlap; Markdown struct = structure similarity; Code struct = code-block structural consistency.'));
   }
 
   root.appendChild(grid);
@@ -741,20 +891,32 @@ function renderJSONView(root,J,L,ri){
   }
 
   // quality detail table
-  root.appendChild(sectionTitle('Quality detail (JSON aggregates)'));
+  root.appendChild(sectionTitle('Optimizer quality (headline — context retention + correctness)'));
   const qrows=[];
   const addQ=(name,o)=>{ if(o&&o.mean!=null) qrows.push({Metric:name,'Mean':fmt2(o.mean),'Median':fmt2(o.median),'Min':fmt2(o.min),'Max':fmt2(o.max)}); };
-  addQ('ROUGE-L F1',q.rouge_l_f1); addQ('Token Jaccard',q.token_jaccard); addQ('Edit similarity',q.edit_similarity);
-  addQ('Code block ratio',q.code_block_ratio); addQ('Code syntax validity',q.code_syntax_validity);
-  addQ('Semantic sim',sem);
-  addQ('Length ratio',q.length_ratio); addQ('Trigram overlap',J.secondary.trigram_overlap);
-  addQ('Markdown struct',J.secondary.markdown_structure_similarity); addQ('Vocab richness Δ',J.secondary.vocabulary_richness_delta);
-  addQ('ROUGE precision',J.secondary.rouge_l_precision); addQ('ROUGE recall',J.secondary.rouge_l_recall);
-  addQ('Response stability',J.secondary.response_stability); addQ('Code struct consist.',J.secondary.code_structure_consistency);
+  addQ('Prompt faithfulness',q.prompt_faithfulness); addQ('Evicted-content recall',q.evicted_content_recall);
+  addQ('Code syntax validity',q.code_syntax_validity); addQ('Code block ratio',q.code_block_ratio);
   if(qrows.length) root.appendChild(dataTable(qrows));
+
+  root.appendChild(sectionTitle('Response-overlap quality (secondary — informational only)'));
+  const srows=[];
+  const addS=(name,o)=>{ if(o&&o.mean!=null) srows.push({Metric:name,'Mean':fmt2(o.mean),'Median':fmt2(o.median),'Min':fmt2(o.min),'Max':fmt2(o.max)}); };
+  addS('ROUGE-L F1',q.rouge_l_f1); addS('Token Jaccard',q.token_jaccard); addS('Edit similarity',q.edit_similarity);
+  addS('Semantic sim',sem);
+  addS('Length ratio',q.length_ratio); addS('Trigram overlap',J.secondary.trigram_overlap);
+  addS('Markdown struct',J.secondary.markdown_structure_similarity); addS('Vocab richness Δ',J.secondary.vocabulary_richness_delta);
+  addS('ROUGE precision',J.secondary.rouge_l_precision); addS('ROUGE recall',J.secondary.rouge_l_recall);
+  addS('Response stability',J.secondary.response_stability); addS('Code struct consist.',J.secondary.code_structure_consistency);
+  if(srows.length) root.appendChild(dataTable(srows));
+  const verb = q.model_verbosity_delta_turns||0;
+  if(verb>0){
+    const note=el('div','coupling warn');
+    note.innerHTML=`<b>&#9888; ${verb} turn(s) verbose inflation (length_ratio >2.0):</b> this is MODEL verbosity under a different prompt, NOT optimizer-caused. Reported for context only.`;
+    root.appendChild(note);
+  }
 }
 
-function renderLogView(root,L,ri){
+function renderLogView(root,L,ri,J){
   const rs = (ri && isNum(ri.numTurns) && ri.numTurns>1) ? ri.numTurns : null;
   const roundTag = (isNum(ri.numTurns)&&isNum(ri.rounds)) ? ` — ${ri.numTurns} turns × ${ri.rounds} rounds` : '';
   root.appendChild(sectionTitle('Per-turn trace (from log)'+roundTag));
@@ -768,44 +930,89 @@ function renderLogView(root,L,ri){
   const tl=L.turnList;
   if(!tl.length){ root.appendChild(Object.assign(el('div','meta'),{textContent:'No "Turn NN:" lines parsed from log.'})); return; }
 
+  // Detect failed/estimated turns so their per-turn points are visibly flagged
+  // (red column + × marker) rather than plotted as real data. `flaggedIdx` maps
+  // to the shared `tl` label domain; charts on a different domain (prefix hits)
+  // build their own index set from the same global turn numbers.
+  const {bad, reasons}=detectBadTurns(J,L);
+  const flaggedIdx=new Set(); tl.forEach((t,i)=>{ if(bad.has(t.turn)) flaggedIdx.add(i); });
+  if(bad.size){
+    const list=[...bad].sort((a,b)=>a-b).map(t=>'T'+t).join(', ');
+    const note=el('div','coupling warn');
+    note.innerHTML=`<b>&#9888; ${bad.size} flagged turn(s):</b> ${list}. `+
+      `These had a failed or estimated direct-side result (empty response / missing usage), `+
+      `so their per-turn points are marked <span style="color:#f85149">red ✕</span> and omitted from the line/bar series `+
+      `(they are also excluded from the JSON aggregates).`;
+    root.appendChild(note);
+  }
+
   // charts from log
   const grid=el('div','grid');
   const labels=tl.map(t=>'T'+t.turn);
 
   // latency per turn
   grid.appendChild(panel('Latency per turn (direct vs proxy)','ms',
-    lineBarCfg(labels,[
+    withFlags(lineBarCfg(labels,[
       {label:'Direct',color:PALETTE.direct,data:tl.map(t=>t.direct_ms)},
       {label:'Proxy',color:PALETTE.proxy,data:tl.map(t=>t.proxy_ms)}
-    ], fmtSec, null, null, rs), 'Wall-clock per turn. Note the direct=4ms artifacts (missing usage) in the last turns of each round.'));
+    ], fmtSec, null, null, rs), flaggedIdx), 'Wall-clock per turn. Red ✕ columns = turns whose direct call failed/was estimated (excluded).'));
 
   // delta latency per turn (signed bars)
   grid.appendChild(panel('Latency delta per turn (proxy − direct)','ms',
-    {labels, roundSize:rs, datasets:[{label:'Δ latency',color:'#888',data:tl.map(t=>t.delta_ms),
+    {labels, roundSize:rs, flagged:flaggedIdx, datasets:[{label:'Δ latency',color:'#888',data:tl.map(t=>t.delta_ms),
       colorFn:v=>v>=0?PALETTE.neg:PALETTE.pos, type:'bar'}], yFmt:fmtSec},
-    'Red = proxy slower, green = proxy faster. Huge variance turn-to-turn.'));
+    'Red = proxy slower, green = proxy faster. Red ✕ columns = flagged turns (direct-side failure/estimate).'));
 
   // token usage per turn (direct vs proxy prompt)
   grid.appendChild(panel('Prompt tokens per turn (direct vs proxy)','tok',
-    lineBarCfg(labels,[
+    withFlags(lineBarCfg(labels,[
       {label:'Direct',color:PALETTE.direct,data:tl.map(t=>t.direct_tok)},
       {label:'Proxy',color:PALETTE.proxy,data:tl.map(t=>t.proxy_tok)}
-    ], fmt, null, null, rs), 'Proxy keeps each turn\'s prompt tokens far smaller than direct.'));
+    ], fmt, null, null, rs), flaggedIdx), 'Proxy keeps each turn\'s prompt tokens far smaller than direct. Red ✕ = direct tokens were estimated (failed turn) and omitted.'));
 
-  // quality per turn
-  grid.appendChild(panel('Quality per turn (sem / jaccard / rouge)','score',
-    lineBarCfg(labels,[
-      {label:'Semantic',color:PALETTE.sem,data:tl.map(t=>t.sem)},
+  // quality per turn — split into two panels because the metrics live on
+  // DIFFERENT scales and mean different things:
+  //   • Jaccard / ROUGE are token-overlap ratios in [0,1] (always ≥ 0).
+  //   • Semantic sim is a cosine similarity in [-1,1]; NEGATIVE values are
+  //     valid (the proxy and direct responses point in opposite directions in
+  //     embedding space) and must NOT be clamped to 0 — clamping made them
+  //     render as a flat broken line at the axis, which looked like a bug.
+  grid.appendChild(panel('Response overlap per turn (jaccard / rouge, 0–1)','score',
+    withFlags(lineBarCfg(labels,[
       {label:'Jaccard',color:PALETTE.jaccard,data:tl.map(t=>t.jaccard)},
       {label:'ROUGE',color:PALETTE.rouge,data:tl.map(t=>t.rouge)}
-    ], fmt2, 0, 1, rs), 'Per-turn similarity to the direct response. Gaps = where compaction changed output.'));
+    ], fmt2, 0, 1, rs), flaggedIdx), 'Per-turn token overlap with the direct response (informational — conflates optimizer quality with model phrasing variance). Red ✕ = no direct baseline (quality uncomputable).'));
+
+  const semData = tl.map(t=>t.sem);
+  if(semData.some(v=>isNum(v))){
+    grid.appendChild(panel('Semantic similarity per turn (cosine, −1..1)','score',
+      withFlags(lineBarCfg(labels,[
+        {label:'Semantic',color:PALETTE.sem,data:semData}
+      ], fmt2, -1, 1, rs), flaggedIdx),
+      'Cosine similarity of proxy vs direct response embeddings. Range is −1..1: NEGATIVE values are real (responses diverge in embedding space), not an error. Informational only — weak on code-heavy agentic traffic. Red ✕ = no direct baseline.'));
+  }
+
+  // Context faithfulness per turn — the optimizer's ACTUAL job.
+  // faith = fraction of original prompt tokens surviving compaction;
+  // evict = fraction of early-turn (evicted) content carried forward.
+  const faithData = tl.map(t=>t.faith), evictData = tl.map(t=>t.evict);
+  if(faithData.some(v=>isNum(v)) || evictData.some(v=>isNum(v))){
+    grid.appendChild(panel('Context faithfulness per turn (optimizer job)','score',
+      withFlags(lineBarCfg(labels,[
+        {label:'Prompt faithfulness',color:PALETTE.proxy,data:faithData},
+        {label:'Evicted-content recall',color:'#ff7bd5',data:evictData}
+      ], fmt2, 0, 1, rs), flaggedIdx),
+      'PRIMARY optimizer signal: how much of the original input context survived compaction (1.0 = nothing lost). Low/declining = the optimizer dropped context the agent needed. Red ✕ = flagged turn.'));
+  }
 
   // cache prefix hits per turn (from proxyTurns)
   const phKeys=Object.keys(L.proxyTurns).map(Number).sort((a,b)=>a-b).filter(k=>isNum(L.proxyTurns[k].prefixHits));
   if(phKeys.length){
+    // phKeys is its own index domain (proxy turns only); flag by global turn number
+    const phFlagged=new Set(); phKeys.forEach((k,i)=>{ if(bad.has(k)) phFlagged.add(i); });
     grid.appendChild(panel('Prefix-cache hits per turn (proxy)','tok',
-      lineBarCfg(phKeys.map(k=>'T'+k),[{label:'Prefix hits',color:PALETTE.cache,data:phKeys.map(k=>L.proxyTurns[k].prefixHits)}], fmt, null, null, rs),
-      'Tokens reused from the KV prefix cache each proxy turn.'));
+      withFlags(lineBarCfg(phKeys.map(k=>'T'+k),[{label:'Prefix hits',color:PALETTE.cache,data:phKeys.map(k=>L.proxyTurns[k].prefixHits)}], fmt, null, null, rs), phFlagged),
+      'Tokens reused from the KV prefix cache each proxy turn. Red ✕ = turn flagged (direct-side failure/estimate).'));
   }
   root.appendChild(grid);
 
@@ -813,15 +1020,19 @@ function renderLogView(root,L,ri){
   root.appendChild(sectionTitle('Per-turn table'));
   const rows=tl.map(t=>({
     'Turn':t.turn, 'Round':t.round,
+    'Flag': bad.has(t.turn) ? (reasons[t.turn]||'flagged') : '',
     'Direct ms':t.direct_ms, 'Proxy ms':t.proxy_ms,
     'Δ ms':t.delta_ms,
     'Direct tok':t.direct_tok, 'Proxy tok':t.proxy_tok, 'Δ tok':t.delta_tok,
     'Raw chars':t.proxy_raw_chars, 'Cache':isNum(t.cache_hit)?t.cache_hit:'n/a',
-    'Sem':t.sem, 'Jacc':t.jaccard, 'Rouge':t.rouge
+    'Sem':t.sem, 'Jacc':t.jaccard, 'Rouge':t.rouge,
+    'Faith':t.faith, 'Evict':t.evict,
+    '_bad': bad.has(t.turn)
   }));
   const cols=[
     {k:'Turn',f:v=>fmt(v)},
     {k:'Round',f:v=>isNum(v)?'R'+fmt(v):'—'},
+    {k:'Flag',f:v=>v?{html:`<span class="neg" title="${escapeHtml(v)}">&#9888; excluded</span>`}:''},
     {k:'Direct ms',f:v=>fmtMs(v)},
     {k:'Proxy ms',f:v=>fmtMs(v)},
     {k:'Δ ms',f:v=>cls(v,fmtMs(v),v<0)},
@@ -834,13 +1045,16 @@ function renderLogView(root,L,ri){
     {k:'Jacc',f:v=>isNum(v)?fmt2(v):'n/a'},
     {k:'Rouge',f:v=>isNum(v)?fmt2(v):'n/a'}
   ];
-  root.appendChild(dataTable(rows,cols));
+  root.appendChild(dataTable(rows,cols,row=>row._bad?'badrow':''));
 }
 
 /* ============================ chart/table helpers ============================ */
 function lineBarCfg(labels, datasets, yFmt, yMin, yMax, roundSize){
   return {labels, datasets, yFmt, yMin, yMax, roundSize};
 }
+// Attach a Set of flagged (bad) x-indices to a chart cfg so renderChart marks
+// those turns (red column + ✕) and omits them from the drawn series.
+function withFlags(cfg, flagged){ if(flagged instanceof Set && flagged.size) cfg.flagged=flagged; return cfg; }
 function cls(v,text,neg){ return {html:`<span class="${neg?'neg':'pos'}">${text}</span>`}; }
 
 function panel(title,hint,cfg,desc){
@@ -869,7 +1083,7 @@ function kvTable(title, pairs){
   wrap.appendChild(tb); return wrap;
 }
 
-function dataTable(rows, cols){
+function dataTable(rows, cols, rowClassFn){
   const wrap=el('div','tablewrap'); const tb=el('table');
   if(!rows.length){ wrap.appendChild(Object.assign(el('div'),{textContent:'—'})); return wrap; }
   const keys = cols? cols.map(c=>c.k) : Object.keys(rows[0]);
@@ -877,26 +1091,25 @@ function dataTable(rows, cols){
   for(const k of keys){ const th=el('th'); th.textContent=k; th.dataset.k=k; thead.appendChild(th); }
   tb.appendChild(thead);
   const tbody=el('tbody');
-  for(const row of rows){
+  const buildRow=(row)=>{
     const tr=el('tr');
+    const rc=rowClassFn?rowClassFn(row):''; if(rc) tr.className=rc;
     for(const k of keys){
       const td=el('td');
       if(cols){ const c=cols.find(c=>c.k===k); const out=c.f(row[k]); td.innerHTML = out&&out.html!=null?out.html:escapeHtml(out==null?'':String(out)); }
       else { const v=row[k]; td.innerHTML = (v&&v.html!=null)?v.html:escapeHtml(v==null?'':String(v)); }
       tr.appendChild(td);
     }
-    tbody.appendChild(tr);
-  }
+    return tr;
+  };
+  for(const row of rows){ tbody.appendChild(buildRow(row)); }
   tb.appendChild(tbody); wrap.appendChild(tb);
   // sortable
   thead.querySelectorAll('th').forEach(th=>{
     th.onclick=()=>{ const k=th.dataset.k; const asc=!th._asc; th._asc=asc;
       rows.sort((a,b)=>{ let x=a[k],y=b[k];
         if(isNum(x)&&isNum(y)) return asc?x-y:y-x; return asc?String(x).localeCompare(String(y)):String(y).localeCompare(String(x)); });
-      tbody.innerHTML=''; for(const row of rows){ const tr=el('tr'); for(const k of keys){ const td=el('td');
-        if(cols){const c=cols.find(c=>c.k===k); const out=c.f(row[k]); td.innerHTML=out&&out.html!=null?out.html:escapeHtml(out==null?'':String(out));}
-        else {const v=row[k]; td.innerHTML=(v&&v.html!=null)?v.html:escapeHtml(v==null?'':String(v));}
-        tr.appendChild(td);} tbody.appendChild(tr); }
+      tbody.innerHTML=''; for(const row of rows){ tbody.appendChild(buildRow(row)); }
     };
   });
   return wrap;

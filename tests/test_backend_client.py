@@ -105,6 +105,41 @@ class TestLemonadeClient:
             "metadata": {"purpose": "test"},
         }
 
+    async def test_chat_completions_create_routes_id_slot_into_extra_body(self) -> None:
+        """id_slot is a llama.cpp extension: it must go in extra_body, not as a
+        top-level kwarg the OpenAI SDK would reject."""
+        client = LemonadeClient(base_url="http://localhost:13305/api/v1")
+        fake = _FakeClient()
+        client._client = fake  # type: ignore[assignment]
+
+        await client.chat_completions_create(
+            messages=[{"role": "user", "content": "hello"}],
+            model="test-model",
+            id_slot=3,
+        )
+
+        assert "id_slot" not in fake.chat.completions.kwargs
+        assert fake.chat.completions.kwargs["extra_body"] == {"id_slot": 3}
+
+    async def test_chat_completions_create_merges_id_slot_with_extra_body(self) -> None:
+        """id_slot merges into an existing extra_body without clobbering it."""
+        client = LemonadeClient(base_url="http://localhost:13305/api/v1")
+        fake = _FakeClient()
+        client._client = fake  # type: ignore[assignment]
+
+        await client.chat_completions_create(
+            messages=[{"role": "user", "content": "hello"}],
+            model="test-model",
+            id_slot=1,
+            extra_body={"metadata": {"purpose": "test"}},
+        )
+
+        assert "id_slot" not in fake.chat.completions.kwargs
+        assert fake.chat.completions.kwargs["extra_body"] == {
+            "metadata": {"purpose": "test"},
+            "id_slot": 1,
+        }
+
     async def test_chat_completions_create_strips_proxy_internal_extra_body(self) -> None:
         """Proxy-internal MTP/expert fields must not reach Lemonade."""
         client = LemonadeClient(base_url="http://localhost:13305/api/v1")

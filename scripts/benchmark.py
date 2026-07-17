@@ -1703,7 +1703,7 @@ def _apply_profile_overrides(args: argparse.Namespace) -> None:
 
 def _build_request_body(
     messages: list[dict],
-    max_tokens: int = 1024,
+    max_tokens: int = 8192,
     tools: list[dict] | None = None,
     temperature: float = 0.0,
     session_id: str | None = None,
@@ -1867,6 +1867,23 @@ def _message_text(content: Any) -> str:
     return json.dumps(content)
 
 
+def _serialize_messages_text(messages: list[dict]) -> str:
+    """Render a message list as plain text (role + content), newline-joined.
+
+    Mirrors the proxy's X-MOEPT-Optimized-Prompt-Text serialization so the
+    benchmark can compare the FULL pre-optimization prompt against the
+    optimized prompt the proxy actually sent (prompt-faithfulness).
+    """
+    parts: list[str] = []
+    for msg in messages:
+        role = str(msg.get("role", "unknown"))
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            content = _message_text(content)
+        parts.append(f"[{role}]\n{content}")
+    return "\n".join(parts)
+
+
 def _estimate_prompt_tokens(messages: list[dict]) -> int:
     """Estimate prompt tokens when the backend omits usage.prompt_tokens."""
     try:
@@ -1967,28 +1984,28 @@ def _calculate_timeout(turns: int, rounds: int) -> float:
     return min(300.0, base_timeout * context_growth_factor)
 
 
-def _direct_request(messages: list[dict], max_tokens: int = 1024, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0) -> tuple[dict, float, dict[str, str]]:
+def _direct_request(messages: list[dict], max_tokens: int = 8192, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0) -> tuple[dict, float, dict[str, str]]:
     url = f"{LEMONADE_URL}/chat/completions"
     body = _build_request_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature)
     return _request(url, body, timeout)
 
 
 def _proxy_request(
-    messages: list[dict], session_id: str | None = None, max_tokens: int = 1024, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0
+    messages: list[dict], session_id: str | None = None, max_tokens: int = 8192, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0
 ) -> tuple[dict, float, dict[str, str]]:
     url = f"http://127.0.0.1:{MOEPT_PORT}/v1/chat/completions"
     body = _build_request_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature, session_id=session_id)
     return _request(url, body, timeout)
 
 
-def _direct_stream_request(messages: list[dict], max_tokens: int = 1024, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0):
+def _direct_stream_request(messages: list[dict], max_tokens: int = 8192, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0):
     url = f"{LEMONADE_URL}/chat/completions"
     body = _build_request_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature)
     return _stream_request(url, body, timeout)
 
 
 def _proxy_stream_request(
-    messages: list[dict], session_id: str | None = None, max_tokens: int = 1024, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0,
+    messages: list[dict], session_id: str | None = None, max_tokens: int = 8192, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0,
 ):
     url = f"http://127.0.0.1:{MOEPT_PORT}/v1/chat/completions"
     body = _build_request_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature, session_id=session_id)
@@ -2164,50 +2181,300 @@ def _code_syntax_validity(content: str) -> float:
     return round(valid / len(blocks), 6)
 
 
+# Tree-sitter based code-block comparison (language-agnostic).
+#
+# We use tree-sitter to *parse* each fenced code block with the grammar that
+# matches its fence language tag (python, js, bash, json, go, rust, …). The
+# grammar is loaded by name from tree-sitter-language-pack — no hardcoded
+# per-language rules. From the parse tree we build a structural fingerprint
+# that is invariant to whitespace/formatting but still distinguishes a renamed
+# symbol or a dropped statement. For languages tree-sitter cannot parse (or
+# parse errors / unknown fence tags) we fall back to a whitespace-normalized
+# exact-text signature so the metric never crashes and still handles prose.
+_TS_PARSER = None  # lazily set to a tree_sitter.Parser, or False if unavailable
+_TS_MOD = None      # the single imported tree_sitter module instance
+_TS_LP = None       # the single imported tree_sitter_language_pack module instance
+_TS_LANG_CACHE: dict[str, object] = {}
+
+# Curated fence-tag aliases -> tree-sitter language-pack names. These are
+# overlaid on top of the grammars shipped by tree-sitter-language-pack so common
+# shorthand tags (py, js, sh, tsx, …) resolve correctly. The base set of valid
+# grammar ids is derived dynamically from the pack (see _build_fence_lang_map),
+# so this list only needs to cover *aliases*, not every language.
+_FENCE_LANG_ALIASES = {
+    "py": "python", "py3": "python", "python": "python",
+    "js": "javascript", "jsx": "javascript", "node": "javascript", "javascript": "javascript",
+    "ts": "typescript", "tsx": "tsx", "typescript": "typescript",
+    "sh": "bash", "shell": "bash", "zsh": "zsh", "bash": "bash",
+    "yml": "yaml", "yaml": "yaml",
+    "golang": "go", "go": "go",
+    "cs": "csharp", "c#": "csharp", "csharp": "csharp",
+    "kt": "kotlin", "kotlin": "kotlin",
+    "rs": "rust", "rust": "rust",
+    "rb": "ruby", "rake": "ruby", "ruby": "ruby",
+    "pl": "perl", "pm": "perl",
+    "hs": "haskell", "lisp": "commonlisp", "el": "elisp",
+    "erl": "erlang", "ex": "elixir", "exs": "elixir",
+    "ml": "ocaml", "sc": "scala", "scala": "scala",
+    "md": "markdown", "docker": "dockerfile", "tf": "terraform",
+    "sol": "solidity", "gql": "graphql", "graphql": "graphql",
+    "c++": "cpp", "cc": "cpp", "cxx": "cpp", "hpp": "cpp", "hxx": "cpp", "cpp": "cpp",
+    "h": "c", "c": "c",
+    "objc": "objc", "objectivec": "objc",
+    "clj": "clojure", "jl": "julia", "nim": "nim", "dart": "dart", "swift": "swift",
+    "groovy": "groovy", "r": "r", "lua": "lua", "sql": "sql", "zig": "zig",
+    "vue": "vue", "svelte": "svelte", "proto": "proto",
+    "make": "make", "cmake": "cmake", "toml": "toml", "ini": "ini",
+    "json5": "json5", "jsonc": "json", "json": "json",
+    "xml": "xml", "htm": "html", "html": "html", "css": "css",
+    "sass": "scss", "less": "less",
+    "php3": "php", "php4": "php", "php5": "php", "php7": "php", "php8": "php", "php": "php",
+    "asm": "asm", "nasm": "nasm", "x86asm": "x86asm",
+    "bat": "batch", "ps1": "powershell",
+}
+
+# Static fallback subset, used only if tree-sitter-language-pack is unavailable.
+# Mirrors the proxy's fallback in src/moeptimizer/code_chunking.py.
+_FENCE_LANG_FALLBACK = {
+    "python": "python", "javascript": "javascript", "typescript": "typescript",
+    "go": "go", "rust": "rust", "cpp": "cpp", "c": "c", "java": "java",
+    "csharp": "csharp", "php": "php", "ruby": "ruby", "html": "html",
+    "css": "css", "json": "json",
+}
+
+
+def _build_fence_lang_map() -> dict[str, str]:
+    """Build the fence-tag -> grammar-id map, dynamically, like the proxy.
+
+    The base is every grammar shipped by tree-sitter-language-pack (so the map
+    can never reference a non-existent grammar), then curated aliases are
+    layered on top. Falls back to a static subset if the pack is unavailable.
+    This keeps the benchmark's language coverage in lock-step with the proxy
+    (src/moeptimizer/code_chunking.py:_build_lang_map) — no hardcoded drift.
+    """
+    try:
+        from tree_sitter_language_pack import manifest_languages
+
+        base = {lang: lang for lang in manifest_languages()}
+    except Exception:
+        base = dict(_FENCE_LANG_FALLBACK)
+    # Keep only aliases whose target grammar actually exists in the pack.
+    base.update({k: v for k, v in _FENCE_LANG_ALIASES.items() if v in base})
+    return base
+
+
+_FENCE_LANG_MAP = _build_fence_lang_map()
+
+
+def _ts_runtime():
+    """Lazily import tree-sitter + language pack ONCE, reusing the same module
+    instances.
+
+    Returns ``(tree_sitter_module, language_pack_module, Parser)`` or ``None`` if
+    tree-sitter is unavailable. Importing both modules a single time (rather than
+    re-importing inside each call) is essential: a ``Parser`` and a ``Language``
+    must come from the *same* ``tree_sitter`` C-extension instance, otherwise
+    assigning ``parser.language = lang`` raises and the comparison silently
+    falls back to text matching.
+    """
+    global _TS_PARSER, _TS_MOD, _TS_LP
+    if _TS_PARSER is False:
+        return None  # already known unavailable
+    if _TS_PARSER is not None:
+        return (_TS_MOD, _TS_LP, _TS_PARSER)
+    try:
+        import tree_sitter as _ts  # type: ignore
+        import tree_sitter_language_pack as _lp  # type: ignore
+        _TS_MOD = _ts
+        _TS_LP = _lp
+        _TS_PARSER = _ts.Parser()
+        return (_ts, _lp, _TS_PARSER)
+    except Exception:
+        _TS_PARSER = False
+        return None
+
+
+def _ts_get_language(fence_tag: str):
+    """Resolve a tree-sitter Language for a fence tag, or None if unsupported."""
+    tag = (fence_tag or "").strip().lower()
+    name = _FENCE_LANG_MAP.get(tag)
+    if not name or name in _TS_LANG_CACHE and _TS_LANG_CACHE[name] is False:
+        return None
+    if name in _TS_LANG_CACHE:
+        return _TS_LANG_CACHE[name]
+    rt = _ts_runtime()
+    if rt is None:
+        _TS_LANG_CACHE[name] = False
+        return None
+    _ts, _lp, _parser = rt
+    try:
+        lang = _lp.get_language(name)
+        _TS_LANG_CACHE[name] = lang
+        return lang
+    except Exception:
+        _TS_LANG_CACHE[name] = False
+        return None
+
+
+def _code_block_fingerprint(block: str, fence_tag: str) -> str:
+    """Structural fingerprint of a code block, language-agnostic.
+
+    Walks the tree-sitter parse tree (grammar resolved by the fence tag, no
+    hardcoded rules) and emits ``node_type`` tokens for the structure. Identifier
+    handling is deliberately split:
+
+    * **Local variable / reference / parameter names are anonymized** to ``_``
+      — the model legitimately picks different local names across rounds, which
+      is model phrasing variance, not optimizer damage, so it must not penalize
+      the metric.
+    * **Definition names** (function / class / method names exposed via the
+      grammar's ``name`` field) are kept, so a *dropped* definition (e.g. direct
+      emits ``def a`` and ``def b`` but the proxy drops ``def b``) is still
+      detected instead of over-credited.
+
+    Keywords, punctuation, operators, strings and numbers emit their node type
+    only. The fingerprint is therefore invariant to whitespace/formatting and to
+    local-variable renaming, while still catching dropped or structurally
+    changed code.
+
+    Falls back to a whitespace-normalized exact-text signature when tree-sitter
+    cannot parse the block (unknown language, parse error, or no grammar).
+    """
+    lang = _ts_get_language(fence_tag)
+    if lang is not None:
+        rt = _ts_runtime()
+        if rt is not None:
+            _ts, _lp, _parser = rt
+            try:
+                _parser.language = lang
+                tree = _parser.parse(block.encode("utf-8"))
+                parts: list[str] = []
+
+                def _walk(node):
+                    # Skip comment nodes — they don't affect structure.
+                    if node.type in ("comment",) or node.type.startswith("comment"):
+                        return
+                    if node.child_count == 0:
+                        # Leaf node. Anonymize identifier names to "_" EXCEPT for
+                        # declaration names (function/class/type names exposed via
+                        # the grammar's ``name`` field). Rationale:
+                        #   * Local variable / reference renames across rounds are
+                        #     model phrasing variance, NOT optimizer damage — they
+                        #     must NOT penalize the metric (name-invariant).
+                        #   * Declaration names are stable per task; keeping them
+                        #     lets us detect a *dropped* function/class (e.g. direct
+                        #     emits ``def a`` and ``def b`` but proxy drops ``def b``)
+                        #     instead of over-crediting it.
+                        # Keywords, punctuation, operators, strings, numbers emit
+                        # their node type only (literal text is irrelevant to
+                        # structural preservation).
+                        if node.type in ("identifier", "type_identifier", "property_identifier",
+                                         "field_identifier", "shorthand_property_identifier"):
+                            parent = node.parent
+                            # tree-sitter nodes are not identity-stable across
+                            # child_by_field_name() calls, so compare byte spans
+                            # rather than using ``is``.
+                            name_node = parent.child_by_field_name("name") if parent is not None else None
+                            # Keep ONLY the names of definitions (functions,
+                            # classes, methods) — these are stable per task, so a
+                            # dropped definition is real loss we must detect.
+                            # Local variable / parameter declarations (e.g.
+                            # ``const x``, function params) are anonymized: the
+                            # model freely renames locals across rounds, which is
+                            # phrasing variance, not optimizer damage.
+                            is_def_name = (
+                                name_node is not None
+                                and name_node.start_byte == node.start_byte
+                                and name_node.end_byte == node.end_byte
+                                and parent is not None
+                                and (
+                                    "definition" in parent.type
+                                    or parent.type in (
+                                        "function_declaration", "class_declaration",
+                                        "method_definition", "generator_function_declaration",
+                                        "generator_function_definition",
+                                    )
+                                )
+                            )
+                            if is_def_name:
+                                text = block[node.start_byte:node.end_byte]
+                                parts.append(f"{node.type}:{text}")
+                            else:
+                                parts.append(f"{node.type}:_")
+                        else:
+                            parts.append(node.type)
+                    else:
+                        parts.append(node.type)
+                        for ch in node.children:
+                            _walk(ch)
+
+                _walk(tree.root_node)
+                fp = " ".join(parts)
+                if fp:
+                    return fp
+            except Exception:
+                pass
+    # Fallback: whitespace-normalized exact text. Coarser than the tree-sitter
+    # fingerprint (it is rename-sensitive and formatting-normalized only), used
+    # only when tree-sitter is unavailable or the fence tag is unknown.
+    norm = re.sub(r"\s+", " ", block.strip())
+    return norm
+
+
+def _code_block_preserved(dblock: str, dtag: str, proxy_blocks: list[tuple[str, str]]) -> bool:
+    """Decide whether a direct code block is preserved in the proxy response.
+
+    Compares the structural, name-invariant :func:`_code_block_fingerprint` of
+    the direct block (parsed with its own fence language) against each proxy
+    block's fingerprint. Language-agnostic: the grammar is resolved by the fence
+    tag via tree-sitter, with no hardcoded rules. Invariant to reformatting and
+    to identifier renaming / literal changes (model phrasing variance, not
+    optimizer damage); still catches dropped or structurally changed code.
+
+    Falls back to an exact-substring check for trivially short blocks.
+    """
+    sig = _code_block_fingerprint(dblock, dtag)
+    if not sig:
+        return True  # empty / whitespace-only block: nothing to lose
+    if any(_code_block_fingerprint(pb, ptag) == sig for pb, ptag in proxy_blocks):
+        return True
+    # Exact substring as a last resort for very short blocks.
+    clean = re.sub(r"\s+", " ", dblock.strip()).strip()
+    if len(clean) < 3:
+        return True
+    proxy_text = re.sub(r"\s+", " ", "".join(b for b, _ in proxy_blocks)).strip()
+    return clean in proxy_text
+
+
 def _code_block_preservation(direct_content: str, proxy_content: str) -> dict[str, float]:
     """Measure how many code blocks from the direct response are preserved in the proxy response.
 
     Returns dict with:
-        block_ratio: fraction of direct's code blocks whose content appears (≥50%) in proxy
+        block_ratio: fraction of direct's code blocks preserved in proxy
         has_code_direct: whether direct had any code blocks
         has_code_proxy: whether proxy had any code blocks
+
+    Preservation is decided by :func:`_code_block_preserved`, which uses a
+    tree-sitter structural fingerprint (language resolved from the fence tag,
+    no hardcoded grammar) so it works for Python, JS, bash, JSON, etc. and is
+    invariant to reformatting and to identifier renaming / literal changes
+    (model phrasing variance, not optimizer damage) while still catching
+    dropped or structurally changed code.
     """
     import re
 
-    # Extract fenced code blocks (```lang ... ```)
-    code_block_re = re.compile(r"```(?:\w*)\n(.*?)```", re.DOTALL)
-    direct_blocks = code_block_re.findall(direct_content)
-    proxy_blocks = code_block_re.findall(proxy_content)
+    # Extract fenced code blocks WITH their language tag: ```lang ... ```
+    fence_re = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
+    direct_blocks = [(m.group(2), m.group(1).strip()) for m in fence_re.finditer(direct_content)]
+    proxy_blocks = [(m.group(2), m.group(1).strip()) for m in fence_re.finditer(proxy_content)]
 
     if not direct_blocks:
         return {"block_ratio": 1.0, "has_code_direct": False, "has_code_proxy": bool(proxy_blocks)}
 
     preserved = 0
-    for dblock in direct_blocks:
-        # Check if at least half of the block content appears anywhere in proxy
-        clean = re.sub(r"\s+", " ", dblock.strip()).strip()
-        if len(clean) < 3:
+    for dblock, dtag in direct_blocks:
+        if _code_block_preserved(dblock, dtag, proxy_blocks):
             preserved += 1
-            continue
-        # For short blocks require exact match; for longer blocks use character overlap
-        proxy_text = re.sub(r"\s+", " ", "".join(proxy_blocks)).strip()
-        if clean in proxy_text:
-            preserved += 1
-        elif len(clean) > 20:
-            # Fuzzy: check if the majority of unique words appear
-            direct_words = set(clean.split())
-            proxy_words = set(proxy_text.split())
-            overlap = len(direct_words & proxy_words) / max(len(direct_words), 1)
-            if overlap >= 0.3:  # Lowered threshold for more lenient matching
-                preserved += 1
-        else:
-            # For short blocks, check if key code elements are present
-            # (handles cases where code is reformatted but semantically same)
-            key_elements = ["def ", "class ", "import ", "return ", "if ", "for ", "while "]
-            direct_has_code = any(kw in clean for kw in key_elements)
-            proxy_has_code = any(kw in proxy_text for kw in key_elements)
-            if direct_has_code and proxy_has_code:
-                preserved += 1
 
     # If the proxy produced no extractable fenced blocks, fall back to a
     # content heuristic instead of assuming full preservation.
@@ -2223,17 +2490,11 @@ def _code_block_preservation(direct_content: str, proxy_content: str) -> dict[st
                 "has_code_direct": True,
                 "has_code_proxy": False,
             }
-        # Code-like content but no fences: score by word overlap per block.
+        # Code-like content but no fences: score by structural fingerprint.
         preserved = 0
-        for dblock in direct_blocks:
-            clean = re.sub(r"\s+", " ", dblock.strip()).strip()
-            if len(clean) < 3:
-                preserved += 1
-                continue
-            direct_words = set(clean.split())
-            proxy_words = set(proxy_content.split())
-            overlap = len(direct_words & proxy_words) / max(len(direct_words), 1)
-            if overlap >= 0.5:
+        for dblock, dtag in direct_blocks:
+            sig = _code_block_fingerprint(dblock, dtag)
+            if not sig or _code_block_fingerprint(proxy_content, dtag) == sig:
                 preserved += 1
 
     return {
@@ -2318,7 +2579,64 @@ def _vocabulary_richness_delta(text_a: str, text_b: str) -> float:
     return round(abs(ttr_a - ttr_b), 6)
 
 
-def _compute_quality_metrics(direct_content: str, proxy_content: str) -> dict[str, float]:
+def _prompt_faithfulness(full_prompt: str, optimized_prompt: str) -> float | None:
+    """Measure how much of the ORIGINAL context survived compaction.
+
+    This is the DIRECT measure of the optimizer's one job (it compacts ONLY
+    the input context). Unlike the response-vs-response overlap scores, it does
+    not conflate optimizer quality with the model's phrasing variance.
+
+    Returns token-set Jaccard between the full pre-optimization prompt and the
+    optimized prompt the proxy actually sent. 1.0 = nothing lost; lower =
+    more of the original context was dropped. None when either side is empty
+    (e.g. turn 1, where there is nothing to compact yet).
+    """
+    if not full_prompt or not optimized_prompt:
+        return None
+    full_tokens = set(full_prompt.lower().split())
+    opt_tokens = set(optimized_prompt.lower().split())
+    if not full_tokens or not opt_tokens:
+        return None
+    intersection = len(full_tokens & opt_tokens)
+    union = len(full_tokens | opt_tokens)
+    return round(intersection / max(union, 1), 6)
+
+
+def _evicted_content_recall(full_prompt: str, optimized_prompt: str) -> float | None:
+    """Recall of content that lived ONLY in the evicted (early) part of the prompt.
+
+    When the optimizer evicts early turns, the question is whether the
+    SURVIVING optimized prompt still carries the key entities (file paths,
+    function/identifier names, error strings) that originated in those evicted
+    turns. We approximate "evicted content" as the tokens present in the full
+    prompt but ABSENT from the most recent ~40% of it (i.e. the tail the
+    optimizer always keeps), then measure what fraction of those tokens the
+    optimized prompt retained.
+
+    Returns a 0..1 recall score, or None when the prompt is too short to
+    split meaningfully (nothing was evicted yet).
+    """
+    if not full_prompt or not optimized_prompt:
+        return None
+    full_tokens = full_prompt.lower().split()
+    if len(full_tokens) < 40:
+        return None
+    # Tail = last 40% of the full prompt (the part the optimizer keeps verbatim).
+    split = int(len(full_tokens) * 0.6)
+    evicted_tokens = set(full_tokens[:split])
+    if not evicted_tokens:
+        return None
+    opt_tokens = set(optimized_prompt.lower().split())
+    retained = len(evicted_tokens & opt_tokens)
+    return round(retained / max(len(evicted_tokens), 1), 6)
+
+
+def _compute_quality_metrics(
+    direct_content: str,
+    proxy_content: str,
+    full_prompt: str = "",
+    optimized_prompt: str = "",
+) -> dict[str, float]:
     """Compute quality comparison metrics between two responses."""
     metrics = {}
 
@@ -2378,6 +2696,14 @@ def _compute_quality_metrics(direct_content: str, proxy_content: str) -> dict[st
     # counts, reasoning markers, and code keywords) — not MTP-specific.
     metrics["response_stability"] = _assess_response_stability(direct_content, proxy_content)
     metrics["code_structure_consistency"] = _assess_code_structure_consistency(direct_content, proxy_content)
+
+    # ── Context faithfulness (the optimizer's ACTUAL job) ──────────
+    # These measure how much of the ORIGINAL input context survived
+    # compaction, NOT how similarly the model phrased its answer. They are
+    # the primary quality signal for a context optimizer; the response-vs-
+    # response overlap scores above are only informational for this use case.
+    metrics["prompt_faithfulness"] = _prompt_faithfulness(full_prompt, optimized_prompt)
+    metrics["evicted_content_recall"] = _evicted_content_recall(full_prompt, optimized_prompt)
 
     return metrics
 
@@ -2473,6 +2799,9 @@ class TurnMetrics:
     error: str | None = None
     content_preview: str = ""  # First 200 chars for dump
     chars_before_optimization: int = 0  # Total chars in messages before proxy optimization
+    raw_input_tokens: int = 0  # Token count of the proxy's RAW input (messages before optimization). The true baseline for measuring compaction: savings = (raw_input_tokens - optimized_prompt_tokens) / raw_input_tokens.
+    optimized_prompt_text: str = ""  # Plain-text optimized prompt the proxy sent to the backend (X-MOEPT-Optimized-Prompt-Text), for faithfulness measurement
+    full_prompt_text: str = ""  # Plain-text FULL prompt BEFORE optimization (the optimizer's input), for faithfulness measurement
     prefix_cache_hit_tokens: int = 0  # Proxy's authoritative prefix-cache hit count (X-Prefix-Cache-Hit-Tokens)
     proxy_process_ms: float | None = None  # Proxy's own optimization/forwarding overhead (X-Proxy-Process-Ms), if emitted
     ttft_ms: float | None = None  # Time to first token (streaming / --measure-ttft path only)
@@ -2541,14 +2870,25 @@ class BenchmarkReport:
 
         direct_tokens = [t.direct.prompt_tokens for t in self.turns]
         proxy_tokens = [t.proxy.prompt_tokens for t in self.turns]
+        raw_input_tokens = [t.proxy.raw_input_tokens for t in self.turns]
         cached = [t.proxy.cached_tokens for t in self.turns]
 
         total_direct_prompt = sum(direct_tokens)
         total_proxy_prompt = sum(proxy_tokens)
+        total_raw_input = sum(raw_input_tokens)
         total_cached = sum(cached)
         tokens_saved_pct = (
             round((total_direct_prompt - total_proxy_prompt) / max(total_direct_prompt, 1) * 100, 2)
             if total_direct_prompt > 0
+            else 0.0
+        )
+        # Savings measured against the proxy's RAW input (what it received), not
+        # the direct path. This isolates the optimizer's own compaction from
+        # differences in how the direct vs proxy paths are tokenized, and avoids
+        # masking real compaction with role-tag overhead on short turns.
+        tokens_saved_vs_raw_pct = (
+            round((total_raw_input - total_proxy_prompt) / max(total_raw_input, 1) * 100, 2)
+            if total_raw_input > 0
             else 0.0
         )
 
@@ -2565,20 +2905,30 @@ class BenchmarkReport:
         total_proxy_completion = sum(proxy_completion)
 
         # ── Quality metrics aggregation ───────────────────────────────
-        # HEADLINE = the non-redundant, robust signals we gate/report on.
-        # SECONDARY = correlated/redundant overlap signals, kept for deep
-        #   inspection but excluded from the headline summary.
-        # semantic_similarity is demoted to its own informational key: the
-        #   embed-gemma-300m-FLM embedder is weak on code, so it must not sit
-        #   in the headline quality block (review §11.1 fix #5).
+        # HEADLINE = the signals that actually validate a CONTEXT OPTIMIZER in
+        #   agentic coding. The optimizer compacts ONLY the input context, so the
+        #   primary question is "did the compressed prompt retain what the agent
+        #   needed?" — answered by prompt_faithfulness / evicted_content_recall
+        #   (how much of the original context survived) and code_syntax_validity
+        #   (the one hard correctness check on emitted code).
+        # SECONDARY = response-vs-response overlap scores. These measure how
+        #   similarly the MODEL phrased its answer, which conflates optimizer
+        #   quality with LLM phrasing variance and has near-zero discriminative
+        #   power here (review: rouge/jaccard/edit are informational only, like
+        #   semantic_similarity already is).
+        # length_ratio is NOT a degradation signal: the proxy cannot control
+        #   response verbosity, so its verbosity_count is mis-attributed and is
+        #   reported only as an informational "model verbosity delta".
         headline_quality_metrics = [
-            "rouge_l_f1", "token_jaccard", "code_block_ratio", "edit_similarity",
-            "length_ratio", "code_syntax_validity",
+            "prompt_faithfulness", "evicted_content_recall",
+            "code_syntax_validity", "code_block_ratio",
         ]
         secondary_quality_metrics = [
+            "rouge_l_f1", "token_jaccard", "edit_similarity",
             "trigram_overlap", "markdown_structure_similarity", "vocabulary_richness_delta",
             "rouge_l_precision", "rouge_l_recall", "response_stability",
             "code_structure_consistency", "has_code_direct", "has_code_proxy",
+            "length_ratio",
         ]
 
         def _aggregate_quality(metric_names: list[str]) -> dict[str, Any]:
@@ -2629,6 +2979,11 @@ class BenchmarkReport:
         quality_skipped_count = sum(1 for t in self.turns if not t.quality_computed)
 
         # ── Response length analysis ────────────────────────────────────
+        # length_ratio = proxy_response_len / direct_response_len. The proxy
+        # compacts ONLY the input context and CANNOT control response verbosity,
+        # so a high ratio is a property of the MODEL under a different prompt,
+        # not an optimizer defect. We therefore report it as an informational
+        # "model verbosity delta" and do NOT count it as optimizer degradation.
         length_ratios = [t.quality.get("length_ratio") for t in self.turns if t.quality and t.quality.get("length_ratio") is not None]
         truncation_count = sum(1 for r in length_ratios if r < 0.5) if length_ratios else 0
         verbosity_count = sum(1 for r in length_ratios if r > 2.0) if length_ratios else 0
@@ -2770,10 +3125,13 @@ class BenchmarkReport:
             "tokens": {
                 "total_direct_prompt": total_direct_prompt,
                 "total_proxy_prompt": total_proxy_prompt,
+                "total_raw_input_prompt": total_raw_input,
                 "total_cached_tokens": total_cached,
                 "token_savings_pct": tokens_saved_pct,
+                "token_savings_vs_raw_pct": tokens_saved_vs_raw_pct,
                 "per_turn_direct": _stats(direct_tokens),
                 "per_turn_proxy": _stats(proxy_tokens),
+                "per_turn_raw_input": _stats(raw_input_tokens),
                 "per_turn_cached": _stats(cached),
             },
             "cost_usd": {
@@ -2814,7 +3172,9 @@ class BenchmarkReport:
                 "low_semantic_similarity_turns": low_semantic_count,
                 "low_token_jaccard_turns": low_jaccard_count,
                 "truncation_count": truncation_count,
-                "verbosity_count": verbosity_count,
+                # verbosity_count is informational only (model verbosity delta,
+                # NOT optimizer-caused) — see length-ratio note above.
+                "model_verbosity_delta_turns": verbosity_count,
                 "code_block_loss_turns": code_loss_count,
                 "code_syntax_invalid_turns": invalid_code_turns if invalid_code_turns else None,
                 "rouge_precision_recall_gap_mean": rouge_gap_mean,
@@ -2865,8 +3225,12 @@ def _per_round_summary(
         ]
         d_tok = sum(t.direct.prompt_tokens for t in rturns)
         p_tok = sum(t.proxy.prompt_tokens for t in rturns)
+        raw_tok = sum(t.proxy.raw_input_tokens for t in rturns)
         savings = (
             round((d_tok - p_tok) / max(d_tok, 1) * 100, 2) if d_tok > 0 else 0.0
+        )
+        savings_vs_raw = (
+            round((raw_tok - p_tok) / max(raw_tok, 1) * 100, 2) if raw_tok > 0 else 0.0
         )
         rounds_out[str(rnd)] = {
             "turns": len(rturns),
@@ -2876,6 +3240,7 @@ def _per_round_summary(
                 "max": round(max(sims), 4) if sims else None,
             },
             "token_savings_pct": savings,
+            "token_savings_vs_raw_pct": savings_vs_raw,
         }
 
     # Pooled per-round mean/min of semantic similarity, used by the gate so a
@@ -2968,12 +3333,20 @@ def _collect_direct_conversation(
 
     for local_turn in range(num_turns):
         turn_index = turn_offset + local_turn + 1
+        # Select scenario content by the WITHIN-ROUND position (local_turn), not
+        # the global turn_index, so every round replays the SAME num_turns-long
+        # slice of exchanges/tasks. Indexing by the global turn_index made rounds
+        # replay different slices whenever len(turn_exchanges) did not divide
+        # evenly into rounds*num_turns (e.g. 30 exchanges over 5×10=50 turns made
+        # R1/R4 use the small exchanges 0-9 while R2/R3/R5 used the large 10-29),
+        # which broke round-to-round comparability. turn_index is still used for
+        # labels/metrics below.
         if turn_exchanges:
-            exchange = turn_exchanges[(turn_index - 1) % len(turn_exchanges)]
+            exchange = turn_exchanges[local_turn % len(turn_exchanges)]
             messages.extend(exchange)
         else:
             user_content = (
-                user_tasks[(turn_index - 1) % len(user_tasks)]
+                user_tasks[local_turn % len(user_tasks)]
                 if user_tasks
                 else fallback_user_task.format(turn_index=turn_index)
             )
@@ -2981,7 +3354,7 @@ def _collect_direct_conversation(
 
         direct_context = _context_size_summary(messages)
         _human_print(
-            f"  Direct turn {turn_index:02d}/{num_turns:02d}: "
+            f"  Direct turn {local_turn + 1:02d}/{num_turns:02d}: "
             f"backend-facing ~{direct_context['estimated_tokens']:,} tok "
             f"(raw {direct_context['messages']} msgs/{direct_context['chars']:,} chars, no proxy)"
         )
@@ -3088,20 +3461,27 @@ def _collect_proxy_conversation(
 
     for local_turn in range(num_turns):
         turn_index = turn_offset + local_turn + 1
+        # Select scenario content by the WITHIN-ROUND position (local_turn) so
+        # every round replays the SAME slice; see _collect_direct_conversation
+        # for the rationale (global-index selection broke round comparability).
         if turn_exchanges:
-            exchange = turn_exchanges[(turn_index - 1) % len(turn_exchanges)]
+            exchange = turn_exchanges[local_turn % len(turn_exchanges)]
             messages.extend(exchange)
         else:
             user_content = (
-                user_tasks[(turn_index - 1) % len(user_tasks)]
+                user_tasks[local_turn % len(user_tasks)]
                 if user_tasks
                 else fallback_user_task.format(turn_index=turn_index)
             )
             messages.append({"role": "user", "content": user_content})
 
         proxy_context = _context_size_summary(messages)
+        # Capture the FULL (pre-optimization) prompt text so we can later
+        # measure how much of the original context survived compaction
+        # (prompt-faithfulness). This is the direct input to the optimizer.
+        _full_prompt_text = _serialize_messages_text(messages)
         _human_print(
-            f"  Proxy turn {turn_index:02d}/{num_turns:02d}: "
+            f"  Proxy turn {local_turn + 1:02d}/{num_turns:02d}: "
             f"raw {proxy_context['messages']} msgs/{proxy_context['chars']:,} chars/"
             f"~{proxy_context['estimated_tokens']:,} tok (pre-optimization)"
         )
@@ -3153,6 +3533,18 @@ def _collect_proxy_conversation(
                 or p_headers.get("x-optimized-prompt-tokens")
                 or 0
             )
+            # The proxy can expose the exact optimized prompt TEXT it sent to the
+            # backend (X-MOEPT-Optimized-Prompt-Text). This is the direct
+            # measure of the optimizer's one job (it compacts ONLY the input
+            # context), so we capture it to compute prompt-faithfulness.
+            _p_optimized_text = (
+                p_headers.get("X-MOEPT-Optimized-Prompt-Text")
+                or p_headers.get("x-moept-optimized-prompt-text")
+                or ""
+            )
+            # Header value has newlines escaped as literal "\n"; restore them.
+            if _p_optimized_text:
+                _p_optimized_text = _p_optimized_text.replace("\\n", "\n")
             _p_prompt, _p_prompt_source, _p_cached_response = _resolve_prompt_tokens(
                 _p_prompt_raw,
                 messages,
@@ -3177,6 +3569,9 @@ def _collect_proxy_conversation(
                 prompt_tokens=_p_prompt,
                 raw_prompt_tokens=_p_prompt_raw,
                 optimized_prompt_tokens=_p_optimized_prompt_tokens,
+                optimized_prompt_text=_p_optimized_text,
+                full_prompt_text=_full_prompt_text,
+                raw_input_tokens=_estimate_prompt_tokens(messages) if messages else 0,
                 prompt_tokens_source=_p_prompt_source,
                 cached_response=_p_cached_response,
                 completion_tokens=int(p_usage.get("completion_tokens", 0) or 0),
@@ -3215,6 +3610,12 @@ def _collect_proxy_conversation(
                 opt_error = e.response.headers.get("X-Optimization-Error")
                 if opt_error:
                     metrics.error = f"{metrics.error} | optimization: {opt_error}"
+            # Surface the failure immediately so a broken proxy turn is never
+            # silent in the log (it would otherwise just lack the backend-facing
+            # line and look like a missing metric).
+            _human_print(
+                f"    ⚠ proxy turn {turn_index:02d} FAILED: {metrics.error}"
+            )
             p_content = ""
             p_msg = {}
 
@@ -3246,7 +3647,7 @@ def _build_turn_comparisons(
     ):
         quality: dict[str, float | None] = {}
         if d_content and p_content:
-            quality.update(_compute_quality_metrics(d_content, p_content))
+            quality.update(_compute_quality_metrics(d_content, p_content, proxy.full_prompt_text, proxy.optimized_prompt_text))
 
         comparison = TurnComparison(
             turn_index=direct.turn_index,
@@ -3473,6 +3874,39 @@ def run_benchmark(
         # leak into the next benchmark round.
         session_id = f"benchmark-{int(time.time())}-{round_num}-{uuid.uuid4().hex[:8]}"
 
+        # Per-round KV-cache bust. The backend's prefix cache is GLOBAL (keyed by
+        # token prefix, not by session), so a later round's "fresh" turn-1 prompt
+        # can reuse a stale cached prefix left by an EARLIER round's proxy run.
+        # That contamination makes later rounds' responses diverge in SHAPE from
+        # earlier ones (and from the direct run), even though the conversation is
+        # identical — breaking round-to-round comparability.
+        #
+        # The marker MUST be PREPENDED (not appended): the backend caches by the
+        # LEADING token sequence, so a unique token at the very start makes the
+        # entire prefix distinct and prevents any cross-round cache hit. Appending
+        # it at the end leaves the shared leading prefix (system prompt + tools +
+        # proxy scaffolding, ~764 tokens) identical across rounds, so the cache
+        # still hits on that prefix — which is exactly the 764 we kept seeing.
+        #
+        # The PROXY and DIRECT paths each get their OWN unique marker. This
+        # isolates the two paths: the direct conversation must NOT reuse the
+        # proxy's cached prefix (the proxy runs first in each round, so without
+        # separate markers the direct turn-1 would inherit the proxy's end-of-
+        # round cache and report a spurious cache hit). Separate markers mean
+        # each path builds its own natural prefix cache from a cold start, so the
+        # proxy-vs-direct comparison is fair AND cross-ROUND leakage is prevented.
+        #
+        # CRITICAL: the markers must diverge at the VERY FIRST token. The backend
+        # caches by the leading token sequence, so two markers that share a long
+        # common prefix (e.g. "<!-- benchmark round N proxy" vs "...direct")
+        # still collide on the backend's prefix-cache key and leak cache between
+        # paths. Prefixing with a distinct single character ('P' vs 'D') makes
+        # the first token unique, so neither path can reuse the other's cache.
+        proxy_marker = f"P{{benchmark round {round_num} proxy session {session_id}}}\n"
+        direct_marker = f"D{{benchmark round {round_num} direct session {session_id}}}\n"
+        proxy_system_prompt = proxy_marker + system_prompt
+        direct_system_prompt = direct_marker + system_prompt
+
         # Run the PROXY conversation first against a cold backend so its
         # prefix-cache hits (turns 2..N) reflect the proxy's own stable
         # prefix rather than a warm cache left by a prior direct run. The
@@ -3487,6 +3921,7 @@ def run_benchmark(
 
         _human_print(f"  Round {round_num + 1}/{rounds}: proxy conversation")
         proxy_messages: list[dict] = [dict(msg) for msg in base_messages]
+        proxy_messages[0] = {"role": "system", "content": proxy_system_prompt}
         proxy_metrics, proxy_contents = _collect_proxy_conversation(
             proxy_messages,
             session_id,
@@ -3509,6 +3944,7 @@ def run_benchmark(
 
         _human_print(f"  Round {round_num + 1}/{rounds}: direct conversation")
         direct_messages: list[dict] = [dict(msg) for msg in base_messages]
+        direct_messages[0] = {"role": "system", "content": direct_system_prompt}
         direct_metrics, direct_contents = _collect_direct_conversation(
             direct_messages,
             num_turns,
@@ -3544,18 +3980,23 @@ def run_benchmark(
             q_sem = comparison.quality.get("semantic_similarity") if comparison.quality else None
             q_jaccard = comparison.quality.get("token_jaccard") if comparison.quality else None
             q_rouge = comparison.quality.get("rouge_l_f1") if comparison.quality else None
+            q_faith = comparison.quality.get("prompt_faithfulness") if comparison.quality else None
+            q_evict = comparison.quality.get("evicted_content_recall") if comparison.quality else None
             direct_error = f" direct_error={comparison.direct.error[:80]!r}" if comparison.direct.error else ""
             proxy_error = f" proxy_error={comparison.proxy.error[:80]!r}" if comparison.proxy.error else ""
             quality_parts = [
                 f"quality_sem={q_sem:.3f}" if q_sem is not None else "quality_sem=n/a",
                 f"jaccard={q_jaccard:.3f}" if q_jaccard is not None else "jaccard=n/a",
                 f"rouge={q_rouge:.3f}" if q_rouge is not None else "rouge=n/a",
+                f"faith={q_faith:.3f}" if q_faith is not None else "faith=n/a",
+                f"evict={q_evict:.3f}" if q_evict is not None else "evict=n/a",
             ]
             _human_print(
                 f"  Turn {comparison.turn_index:02d}: "
                 f"direct={comparison.direct.latency_ms:.0f}ms/{comparison.direct.prompt_tokens:,}tok/{comparison.direct.response_chars:,}chars"
                 f" proxy={comparison.proxy.latency_ms:.0f}ms/{comparison.proxy.prompt_tokens:,}tok/"
                 f"{comparison.proxy.chars_before_optimization:,}chars_raw/{comparison.proxy.response_chars:,}chars"
+                f" raw_input={comparison.proxy.raw_input_tokens:,}tok"
                 f" delta={comparison.latency_delta_ms:+.0f}ms/{comparison.token_delta:+,}tok"
                 f" cache={comparison.proxy.cached_tokens:,}/{comparison.proxy.cache_hit_rate if comparison.proxy.cache_hit_rate is not None else 'n/a'} "
                 f"{' '.join(quality_parts)}"
@@ -3821,30 +4262,37 @@ def print_report(report: BenchmarkReport) -> None:
     if qual_rows:
         print(_fmt_table(q_headers, qual_rows))
 
-    # ── Degradation flags ─────────────────────────────────────────────
+    # ── Degradation flags ──────────────────────────────────────────
     low_semantic = qual.get("low_semantic_similarity_turns", 0)
     low_jaccard = qual.get("low_token_jaccard_turns", 0)
     truncation_count = qual.get("truncation_count", 0)
-    verbosity_count = qual.get("verbosity_count", 0)
+    verbosity_count = qual.get("model_verbosity_delta_turns", 0)
     code_loss = qual.get("code_block_loss_turns", 0)
     rouge_gap = qual.get("rouge_precision_recall_gap_mean", 0.0)
     quality_skipped = qual.get("quality_skipped_turns", 0)
+    faith = qual.get("prompt_faithfulness")
+    evict_recall = qual.get("evicted_content_recall")
 
     degradation_notes: list[str] = []
     if quality_skipped > 0:
         degradation_notes.append(
             f"{quality_skipped} turn(s) excluded from quality (one side errored/empty) — means may be optimistic"
         )
-    if low_semantic > 0:
-        degradation_notes.append(f"{low_semantic} turn(s) low semantic similarity (<0.75)")
-    if low_jaccard > 0:
-        degradation_notes.append(f"{low_jaccard} turn(s) low token overlap (<0.40)")
-    if truncation_count > 0:
-        degradation_notes.append(f"{truncation_count} turn(s) severely truncated (length_ratio <0.5)")
-    if verbosity_count > 0:
-        degradation_notes.append(f"{verbosity_count} turn(s) verbose inflation (length_ratio >2.0)")
+    # prompt_faithfulness / evicted_content_recall are the PRIMARY optimizer
+    # signals: low values mean the compaction dropped needed context.
+    if faith is not None and faith < 0.5:
+        degradation_notes.append(f"LOW context faithfulness ({faith:.3f}) — optimizer dropped >50% of original prompt tokens")
+    if evict_recall is not None and evict_recall < 0.3:
+        degradation_notes.append(f"LOW evicted-content recall ({evict_recall:.3f}) — early-turn context not carried forward")
     if code_loss > 0:
         degradation_notes.append(f"{code_loss} turn(s) with lost code blocks")
+    if truncation_count > 0:
+        degradation_notes.append(f"{truncation_count} turn(s) severely truncated (length_ratio <0.5)")
+    # verbosity_count is INFORMATIONAL only: the proxy cannot control response
+    # length, so a verbose proxy response is model behavior, not optimizer
+    # degradation. Reported as a note, not a degradation flag.
+    if verbosity_count > 0:
+        degradation_notes.append(f"{verbosity_count} turn(s) verbose inflation (length_ratio >2.0) — MODEL verbosity, not optimizer-caused")
     if rouge_gap and abs(rouge_gap) > 0.05:
         direction = "proxy loses recall" if rouge_gap < 0 else "proxy adds content"
         degradation_notes.append(f"ROUGE gap {rouge_gap:+.4f} → proxy {direction}")
@@ -4276,7 +4724,7 @@ def main() -> None:
     parser.add_argument("--max-wall-seconds", type=float, default=None, dest="max_wall_seconds", help="Abort remaining rounds (or scenarios, with --scenario all) once this wall-clock budget is exceeded.")
     parser.add_argument("--baseline", type=str, default=None, help="Path to a prior JSON report (from --json) to diff against. Prints per-metric deltas and fails the regression gate if token-savings or quality regress beyond --baseline-tolerance.")
     parser.add_argument("--baseline-tolerance", type=float, default=0.05, dest="baseline_tolerance", help="Absolute tolerance for baseline diffs (e.g. 0.05 = quality mean may drop by 0.05 before the gate fails).")
-    parser.add_argument("--max-tokens", type=int, default=1024, help="Max tokens per response (realistic for agentic coding; 256 understates proxy savings)")
+    parser.add_argument("--max-tokens", type=int, default=8192, help="Max tokens per response. Default 8192: an agentic coding turn may rewrite a whole source file inside a single tool-call argument (the largest fixture, loader.py, is ~21KB ~= 6.2K tokens; JSON-string escaping + a short reasoning preamble push the worst case to ~7.6-8.3K). A smaller value (e.g. 1024) truncates those tool-call arguments mid-string, so llama.cpp fails to parse the unterminated JSON and returns HTTP 500.")
     parser.add_argument("--port", type=int, default=MOEPT_PORT, help="Proxy server port")
     parser.add_argument(
         "--json", action="store_true", dest="json_output",
@@ -4424,13 +4872,17 @@ def main() -> None:
                 if t.quality:
                     q = t.quality
                     parts = []
-                    for key in ["semantic_similarity", "token_jaccard", "rouge_l_f1", "edit_similarity", "code_block_ratio", "length_ratio", "response_stability", "code_structure_consistency"]:
+                    for key in ["prompt_faithfulness", "evicted_content_recall", "semantic_similarity", "token_jaccard", "rouge_l_f1", "edit_similarity", "code_block_ratio", "length_ratio", "response_stability", "code_structure_consistency"]:
                         val = q.get(key)
                         if val is not None:
                             parts.append(f"{key}={val:.4f}")
                     print(f"    Quality: {', '.join(parts)}")
 
                 # Show degradation markers
+                if t.quality and isinstance(t.quality.get("prompt_faithfulness"), float) and t.quality["prompt_faithfulness"] < 0.5:
+                    print(f"    ⚠️  LOW CONTEXT FAITHFULNESS ({t.quality['prompt_faithfulness']:.3f}) — optimizer dropped >50% of original prompt")
+                if t.quality and isinstance(t.quality.get("evicted_content_recall"), float) and t.quality["evicted_content_recall"] < 0.3:
+                    print(f"    ⚠️  LOW EVICTED-CONTENT RECALL ({t.quality['evicted_content_recall']:.3f}) — early-turn context not carried forward")
                 if t.quality and isinstance(t.quality.get("semantic_similarity"), float) and t.quality["semantic_similarity"] < 0.75:
                     print(f"    ⚠️  LOW SEMANTIC SIMILARITY ({t.quality['semantic_similarity']:.3f})")
                 if t.quality and isinstance(t.quality.get("length_ratio"), float):
@@ -4438,7 +4890,7 @@ def main() -> None:
                     if lr < 0.5:
                         print(f"    ⚠️  SEVERE TRUNCATION (length_ratio={lr:.3f})")
                     elif lr > 2.0:
-                        print(f"    ⚠️  VERBOSE INFLATION (length_ratio={lr:.3f})")
+                        print(f"    ⚠️  VERBOSE INFLATION (length_ratio={lr:.3f}) — MODEL verbosity, not optimizer-caused")
                 if t.quality and isinstance(t.quality.get("code_block_ratio"), float) and t.quality["code_block_ratio"] < 1.0:
                     print(f"    ⚠️  CODE BLOCK LOSS ({t.quality['code_block_ratio']:.2f})")
                     # Show full content for debugging
@@ -4454,17 +4906,27 @@ def main() -> None:
 def _select_quality_gate(summary: dict[str, Any]) -> tuple[float, str]:
     """Pick the best available quality metric for the regression gate.
 
-    Prefers robust *lexical* signals (ROUGE-L F1, token Jaccard, code-block
-    preservation, edit similarity) over embedding cosine similarity. Embeddings
-    are weak on code — two equivalent code blocks with renamed variables score
-    low cosine similarity while two verbose-but-wrong answers score high — so
-    ``semantic_similarity`` is treated as informational and only used as a
-    fallback when no lexical signal is available. Returns ``(value, metric_name)``.
+    Prefers the PRIMARY optimizer signal — ``prompt_faithfulness`` (how much
+    of the original context survived compaction) and ``evicted_content_recall``
+    — because the proxy compacts ONLY the input context, so context retention
+    is the question that actually validates it. Falls back to robust *lexical*
+    signals (code-block preservation, ROUGE-L F1, token Jaccard, edit
+    similarity) over embedding cosine similarity. Embeddings are weak on code —
+    two equivalent code blocks with renamed variables score low cosine while two
+    verbose-but-wrong answers score high — so ``semantic_similarity`` is
+    treated as informational and only used as a last resort.
+    Returns ``(value, metric_name)``.
     """
     qual = summary.get("quality", {})
 
-    # Lexical battery first (most robust for code).
-    for metric in ("rouge_l_f1", "token_jaccard", "code_block_ratio", "edit_similarity"):
+    # Primary optimizer signal: context retention (1.0 = nothing lost).
+    for metric in ("prompt_faithfulness", "evicted_content_recall"):
+        val = (qual.get(metric) or {}).get("mean")
+        if val is not None and val > 0:
+            return val, metric
+
+    # Lexical battery next (most robust for code).
+    for metric in ("code_block_ratio", "rouge_l_f1", "token_jaccard", "edit_similarity"):
         val = (qual.get(metric) or {}).get("mean")
         if val is not None and val > 0:
             return val, metric
@@ -4486,12 +4948,13 @@ def _select_quality_gate(summary: dict[str, Any]) -> tuple[float, str]:
 def _select_aggregated_gate(agg: dict[str, Any]) -> tuple[float, str]:
     """Pick the best available aggregated quality metric for the regression gate.
 
-    Mirrors :func:`_select_quality_gate`: prefers lexical signals
-    (``rouge_l_f1``, ``token_jaccard``, ``code_block_ratio``, ``edit_similarity``)
-    over embedding cosine similarity, which is weak on code, so
-    ``semantic_similarity`` is only a fallback.
+    Mirrors :func:`_select_quality_gate`: prefers the PRIMARY optimizer
+    signal (``prompt_faithfulness``, ``evicted_content_recall`` — context
+    retention) over lexical signals (``code_block_ratio``, ``rouge_l_f1``,
+    ``token_jaccard``, ``edit_similarity``) over embedding cosine similarity,
+    which is weak on code, so ``semantic_similarity`` is only a fallback.
     """
-    for metric in ("rouge_l_f1", "token_jaccard", "code_block_ratio", "edit_similarity"):
+    for metric in ("prompt_faithfulness", "evicted_content_recall", "code_block_ratio", "rouge_l_f1", "token_jaccard", "edit_similarity"):
         val = (agg.get(metric) or {}).get("mean")
         if val is not None and val > 0:
             return val, metric
@@ -4562,6 +5025,8 @@ def _print_baseline_diff(current: dict[str, Any], baseline: dict[str, Any]) -> N
         ("token_jaccard", "quality", "token_jaccard", "{:.4f}", 1.0),
         ("code_block_ratio", "quality", "code_block_ratio", "{:.4f}", 1.0),
         ("edit_similarity", "quality", "edit_similarity", "{:.4f}", 1.0),
+        ("prompt_faithfulness", "quality", "prompt_faithfulness", "{:.4f}", 1.0),
+        ("evicted_content_recall", "quality", "evicted_content_recall", "{:.4f}", 1.0),
         ("semantic_similarity", "semantic_similarity", "mean", "{:.4f}", 1.0),
         ("proxy_latency_mean_ms", "latency_ms", "proxy", "mean", "{:.1f}ms", 1.0),
         ("ttft_proxy_mean_ms", "ttft_ms", "proxy", "mean", "{:.1f}ms", 1.0),
@@ -4613,8 +5078,10 @@ def _check_baseline_gate(
                 f"{key} regressed {drop:.2f}pp (baseline {base:.2f} -> {cur:.2f}, tol {tol*100:.2f}pp)"
             )
 
-    # Headline quality metrics (lower is a regression).
-    for qm in ("rouge_l_f1", "token_jaccard", "code_block_ratio", "edit_similarity"):
+    # Headline quality metrics (lower is a regression). prompt_faithfulness
+    # and evicted_content_recall are the PRIMARY optimizer signals (context
+    # retention); the lexical battery is secondary for this use case.
+    for qm in ("prompt_faithfulness", "evicted_content_recall", "code_block_ratio", "rouge_l_f1", "token_jaccard", "edit_similarity"):
         cur = _baseline_get(current, "quality", qm) or 0.0
         base = _baseline_get(baseline, "quality", qm) or 0.0
         drop = base - cur

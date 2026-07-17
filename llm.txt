@@ -1,0 +1,149 @@
+# MOE-ptimizer — LLM project map
+
+A concise, structured map of the MOE-ptimizer repository for LLMs and coding agents.
+Read this first when asked to navigate, modify, or extend the codebase.
+
+## One-paragraph summary
+
+MOE-ptimizer is a transparent OpenAI-compatible API proxy that optimizes context for
+MoE + MTP models in multi-turn agentic tasks. It sits between an OpenAI-SDK client and
+a backend (Lemonade server), compacting the **input** context sent to the backend while
+keeping byte-stable prefixes so the backend's native prefix cache is reused. It does
+NOT generate responses and does NOT tune response verbosity — it only transforms the
+request context on the way in and passes the response straight through.
+
+## Key facts
+
+- **Language / runtime**: Python 3.11+ (also 3.12). FastAPI + uvicorn,
+  pydantic-settings, tree-sitter, LanceDB, tiktoken, numpy.
+- **Version**: `0.7.4` (source of truth: `pyproject.toml`). Note
+  `src/moeptimizer/__init__.__version__` may lag behind.
+- **Package**: `src/moeptimizer/`. Entry point `python -m moeptimizer` (console script
+  `moeptimizer`). Config validator: `moeptimizer-config-check` / `--check-config`.
+- **Ports**: proxy `:8080` (start via `bash scripts/run.sh`); backend `:13305`
+  (`MOEPT_SERVER__URL`, default `http://localhost:13305/api/v1`).
+- **Config**: environment variables with `MOEPT_` prefix and `__` nesting, e.g.
+  `MOEPT_AGENTIC__QUALITY_PROFILE` (one of `quality` / `balanced` / `aggressive`),
+  `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS`, `MOEPT_V050__CACHE_STABLE_MODE`. Copy
+  `.env.example` to `.env`.
+- **Endpoints**: `POST /v1/chat/completions`, `POST /v1/embeddings`, `GET /v1/models`,
+  `GET /v1/health`, `POST /v1/agent/state`, `POST /v1/agent/state/reset`,
+  `GET /v1/agent/sessions`, `DELETE /v1/agent/session/{id}`, `POST /v1/cache/clear`,
+  `GET /v1/metrics`, `POST /v1/metrics/reset`.
+- **Core modules**: `app.py` (FastAPI + streaming), `optimizer.py` (main pipeline),
+  `config.py` (settings), `session_manager.py`, `compactor.py`, `context_compressor.py`,
+  `code_chunking.py`, `state_rag.py`, `hierarchical_summarizer.py`, `backend_client.py`,
+  `backend_capabilities.py`.
+- **Tests**: `pytest tests/` (`asyncio_mode = "auto"`), one `test_<module>.py` per
+  module. Integration tests: `test_e2e.py`, `test_optimizer.py`. Fixtures in
+  `tests/conftest.py`.
+- **Lint / types**: `ruff check src/ tests/`; `mypy --strict src/moeptimizer/`.
+  Full suite: `bash scripts/dev.sh`.
+- **Benchmark**: `python scripts/benchmark.py` compares direct vs proxy (agentic
+  OpenCode-harness by default). Scenarios: `debug`, `refactor`, `feature`, `default`,
+  `*_long` variants, `opencode`/`fixtures`. Flags: `--turns`, `--rounds` (default 3),
+  `--profile`, `--min-similarity` (regression gate, exit 2), `--json`, `--no-agentic`,
+  `--no-measure-ttft`. Report UI: `scripts/benchmark_dashboard.html`.
+
+## Repository layout
+
+```
+moeptimizer/
+├── src/moeptimizer/        # source package (one module per pipeline stage)
+│   ├── app.py              # FastAPI app + streaming
+│   ├── optimizer.py        # main AgentContextOptimizer pipeline
+│   ├── config.py           # AppConfig (pydantic-settings)
+│   ├── config_check.py     # --check-config CLI
+│   ├── backend_client.py   # backend HTTP communication
+│   ├── backend_capabilities.py  # live, device-aware capability probing
+│   ├── session_manager.py  # per-session isolation
+│   ├── compactor.py        # scratchpad compaction
+│   ├── context_compressor.py / context_canonicalizer.py / selective_truncator.py
+│   ├── code_chunking.py / code_block_optimizer.py / cache_aware_chunker.py
+│   ├── state_store.py / state_rag.py / symbol_index.py
+│   ├── hierarchical_summarizer.py / summarize_old_turns.py
+│   ├── static_prefix_kv.py / cache_registry.py / hit_prediction_model.py
+│   ├── mtp_speculative.py / mtp_state.py / kv_slot_tracker.py
+│   └── __init__.py         # public re-exports
+├── tests/                  # pytest suite (test_<module>.py per module)
+├── scripts/
+│   ├── run.sh              # start proxy on :8080
+│   ├── dev.sh              # install + pytest + ruff + mypy
+│   ├── benchmark.py        # direct-vs-proxy benchmark
+│   ├── benchmark_dashboard.html  # report UI
+│   ├── benchmark_all.sh
+│   └── fixtures/           # real project replayed by opencode/fixtures scenario
+├── CHANGELOG.md            # version-by-version feature history
+├── README.md               # concise overview + configuration reference
+├── AGENTS.md               # guidance for AI coding agents
+├── CONTRIBUTING.md         # how to contribute
+├── llm.txt                 # this file
+└── pyproject.toml          # build + tool config (ruff, mypy, pytest)
+```
+
+## Pipeline stages (src/moeptimizer/optimizer.py)
+
+`AgentContextOptimizer` orchestrates one module per stage. The main stages:
+
+- **Session management** — `session_manager.py` (per-session isolation + stable
+  anonymous session resolver).
+- **Scratchpad compaction** — `compactor.py` (front-loading eviction for MTP
+  protection).
+- **Thinking preservation** — `thinking_preserver.py` (protects recent `<think>`
+  blocks, archives stale reasoning).
+- **State-based RAG** — `state_rag.py` + `state_store.py` (graph-indexed retrieval:
+  Goal → Subtask → Tool → Outcome) + `symbol_index.py` (fuzzy symbol lookup).
+- **Loop detection** — `loop_detector.py` (repeated tool calls / actions / thinking).
+- **Progress tracking** — `progress_tracker.py` + `goal_decomposer.py`.
+- **Code chunking** — `code_chunking.py` (tree-sitter-aware splitting + language
+  detection) + `code_block_optimizer.py` (chunk dedup) + `cache_aware_chunker.py`.
+- **Context compression** — `context_compressor.py`, `context_canonicalizer.py`,
+  `selective_truncator.py`, `context_aligner.py`, `context_template_matcher.py`,
+  `dependency_orderer.py` (newest-user-turn only).
+- **Hierarchical summarization** — `hierarchical_summarizer.py` (cache-stable
+  rolling-summary compaction) + `summarize_old_turns.py`.
+- **Prefix reuse & prediction** — `static_prefix_kv.py`, `cache_registry.py`,
+  `hit_prediction_model.py` (XGBoost early-exit), `chunk_fingerprint.py`,
+  `delta_encoder.py`, `kv_slot_tracker.py`.
+- **Backend communication** — `backend_client.py`, `backend_capabilities.py`
+  (live, device-aware auto-detection of slot pinning, native MTP, tokenizer).
+- **Async offload** — `async_io_stage.py` (offloads tree-sitter + embedding ranking
+  to a thread pool; primary TTFT cost).
+
+## Hard constraints (do not violate)
+
+- Proxy scope = input compaction only; never compress response verbosity.
+- Keep cached prefixes byte-stable; never mutate the middle of cached context.
+- Benchmark invariant: never interleave direct and proxified requests within a round.
+- Only the new benchmark format is supported (no legacy logs).
+- Internal cache hints (attention sinks, pattern markers) are stripped before model input.
+- Capability auto-detection drives slot pinning / MTP passthrough / tokenizer; the
+  explicit force-on flags are overrides, not defaults.
+
+## Common commands
+
+```bash
+bash scripts/run.sh                 # start proxy on :8080
+bash scripts/dev.sh                 # install + pytest + ruff + mypy
+pytest tests/ -v                    # tests only
+ruff check src/ tests/              # lint
+mypy src/moeptimizer/               # type-check
+python -m moeptimizer --check-config  # validate resolved config
+python scripts/benchmark.py --scenario opencode --turns 30 --json > report.json 2> run.log
+```
+
+## Where to look for common tasks
+
+- **Add a config flag**: `src/moeptimizer/config.py` (`AppConfig`) → `.env.example` →
+  `README.md` config table.
+- **Add a pipeline stage**: new module → wire into `optimizer.py` → re-export from
+  `__init__.py` → add `tests/test_<module>.py`.
+- **Change an endpoint**: `src/moeptimizer/app.py` (`create_app`).
+- **Change backend communication**: `src/moeptimizer/backend_client.py` /
+  `backend_capabilities.py`.
+- **Change benchmark**: `scripts/benchmark.py` (keep no-legacy / no-interleave
+  invariants) and `scripts/benchmark_dashboard.html`.
+
+## License
+
+MIT.

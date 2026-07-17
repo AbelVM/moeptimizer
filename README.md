@@ -86,6 +86,7 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_SERVER__EMBED_URL` | `http://localhost:13305/api/v1` | Base URL of the OpenAI-compatible embedding server; set separately when embeddings are hosted elsewhere |
 | `MOEPT_SERVER__LLM_MODEL` | `Qwen3.6-35B-A3B-MTP-GGUF` | LLM model identifier for chat completions |
 | `MOEPT_SERVER__EMBED_MODEL` | `embed-gemma-300m-FLM` | Embedding model identifier |
+| `MOEPT_SERVER__TOKENIZER` | `auto` | Tokenizer for budget/counting. `auto` tries a local Qwen HF tokenizer, else falls back to tiktoken `cl100k_base` (GPT-4 BPE, approximate for Qwen). Set to a HuggingFace repo id or a local `tokenizer.json` path for exact Qwen counts. Runtime calibration from the backend's real `prompt_tokens` corrects the residual ratio each turn regardless. |
 | `MOEPT_SERVER__TIMEOUT` | `300.0` | Request timeout in seconds for long context conversations |
 
 ### Agentic Loop Tuning
@@ -100,6 +101,7 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO` | `0.75` | Ratio of max tokens where compaction/compression starts |
 | `MOEPT_AGENTIC__THINKING_PROTECT_RECENT` | `2` | Keep full thinking for last N steps |
 | `MOEPT_AGENTIC__SESSION_TIMEOUT` | `3600` | Session inactivity timeout in seconds |
+| `MOEPT_AGENTIC__MAX_SESSIONS` | `256` | Max concurrently tracked sessions; LRU eviction over the cap (`0` disables) |
 | `MOEPT_AGENTIC__USE_TOKEN_BUDGET` | `true` | Use token-based budget enforcement |
 | `MOEPT_AGENTIC__FAST_PATH_ENABLED` | `true` | Bypass expensive transformations for contexts already under budget |
 | `MOEPT_AGENTIC__RAG_ENABLED` | `true` | Enable state-based RAG injection for long/over-budget sessions |
@@ -136,11 +138,17 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 
 ### v0.5.x Optimizations
 
+> **Auto-detection (default):** with `MOEPT_V050__CAPABILITY_AUTODETECT=true`, the proxy probes the *live* backend's own metadata on a TTL — the active device and per-model `backend_url` from `/health`, native `/slots`, native `/tokenize`, and the model's checkpoint/labels — and enables slot pinning, native MTP passthrough, and the exact tokenizer only when the **currently active device** actually supports them. This is NPU↔GPU hot-swap aware: a session is never pinned to an `id_slot` on a device that has no slots. The manual `SLOT_PINNING_ENABLED` / `NATIVE_MTP_PASSTHROUGH` flags below are **force-on overrides**; leave them `false` to let auto-detection decide. All probes are best-effort and never block startup or requests.
+
 | Variable | Default | Description |
 |---|---|---|
 | `MOEPT_V050__STATIC_PREFIX_KV_ENABLED` | `true` | Enable static prefix memo — stores the prompt *text* (NOT real KV tensors; a client proxy cannot read backend KV). It only short-circuits the pipeline when the incoming prefix is byte-identical and already under budget; the backend's own prefix cache does the real KV reuse. |
 | `MOEPT_V050__STATIC_PREFIX_KV_MAX_ENTRIES` | `64` | Max entries in static prefix KV-cache |
 | `MOEPT_V050__TOKEN_AWARE_TRUNCATION_ENABLED` | `true` | Enable token-aware truncation with tiktoken |
+| `MOEPT_V050__CAPABILITY_AUTODETECT` | `true` | Live, device-aware capability detection. Probes the backend's own metadata on a TTL and drives slot pinning, MTP passthrough, and tokenizer selection from what the **active device** (NPU vs GPU) actually supports. Best-effort; failures never block startup or requests. |
+| `MOEPT_V050__CAPABILITY_PROBE_TTL_SECONDS` | `30.0` | How long a capability snapshot is trusted before a live re-check. Re-checks are cheap (cached between TTLs) and let device hot-swaps be picked up without restarting the proxy. |
+| `MOEPT_V050__REMOTE_TOKENIZE_ENABLED` | `true` | When the active backend exposes an exact native `/tokenize` (llama.cpp), prefer it for authoritative whole-prompt token counts (fingerprint-cached, never on the per-fragment hot path). Falls back to the local/tiktoken counter + backend `prompt_tokens` calibration otherwise (e.g. NPU device). Only takes effect with `CAPABILITY_AUTODETECT` on. |
+| `MOEPT_V050__SLOT_PINNING_ENABLED` | `false` | **Force-on override** for slot pinning: pin each session to a stable llama.cpp `id_slot` so the backend reuses the whole conversation prefix across turns instead of re-prefilling. With `CAPABILITY_AUTODETECT` on, this is enabled automatically on devices that expose `/slots` (e.g. GPU/llama.cpp) and skipped when the active device has none (e.g. NPU); set this `true` to force it unconditionally. `id_slot` is sent via `extra_body`, so non-llama.cpp backends ignore it. |
 | `MOEPT_V050__CACHE_STABLE_MODE` | `true` | Freeze a stable prefix block (system + first user + early turns) verbatim and never front-evict from it, so the backend reuses the KV cache across turns. Disable for backends without prefix caching to maximize token savings. |
 | `MOEPT_V050__FROZEN_PREFIX_TURNS` | `2` | Number of early complete user-assistant turns (after the first user message) to freeze verbatim as part of the stable prefix when cache-stable mode is enabled. |
 | `MOEPT_V050__CHUNK_FINGERPRINT_ENABLED` | `true` | Enable chunk fingerprinting and reuse |
@@ -153,8 +161,8 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_V050__DELTA_ENCODING_ENABLED` | `true` | Enable delta-encoding of code snapshots |
 | `MOEPT_V050__DELTA_ENCODING_MAX_SNAPSHOTS` | `100` | Max code snapshots to keep |
 | `MOEPT_V050__ENABLE_EXPERIMENTAL_BACKEND_HINTS` | `false` | Send optional llama.cpp/MTP cache-control hints |
-| `MOEPT_V050__NATIVE_MTP_PASSTHROUGH` | `false` | Forward MTP/speculative `extra_body` keys to the backend instead of stripping them, so a backend that supports native MTP speculative decoding (e.g. llama.cpp `--speculative`) uses the model's own 2–3× decode-speed feature. Disabled by default because most backends reject unknown fields. |
-| `MOEPT_V050__NATIVE_MTP_AUTODETECT` | `true` | At startup, probe the backend for native MTP speculative decoding support and automatically enable `native_mtp_passthrough` when detected. Best-effort and bounded by a timeout, so startup is never blocked. |
+| `MOEPT_V050__NATIVE_MTP_PASSTHROUGH` | `false` | **Force-on override** for MTP passthrough: forward MTP/speculative `extra_body` keys to the backend instead of stripping them, so a backend with native MTP speculative decoding (e.g. llama.cpp `--speculative` / Qwen3-MTP heads) uses the model's own 2–3× decode-speed feature. With `CAPABILITY_AUTODETECT` on, this is enabled automatically from backend metadata (a `mtp` label, a speculative slot, or `--spec-type ...mtp` launch args). |
+| `MOEPT_V050__NATIVE_MTP_AUTODETECT` | `true` | Last-resort chat-probe for native MTP when metadata is inconclusive. Best-effort and bounded by a timeout, so startup is never blocked. |
 | `MOEPT_V050__ASYNC_IO_ENABLED` | `true` | Enable async I/O for heavy pipeline stages. Offloads tree-sitter compression and embedding ranking to a thread pool (primary TTFT cost). |
 | `MOEPT_V050__ASYNC_IO_MAX_THREAD_WORKERS` | `4` | Max thread workers for CPU-bound stages |
 | `MOEPT_V050__ASYNC_IO_MAX_CONCURRENCY` | `16` | Max concurrent async tasks |
@@ -194,7 +202,7 @@ Conversation continuity is OpenAI-compatible by default. Clients can set the sta
 | `GET` | `/v1/agent/sessions` | List active sessions |
 | `DELETE` | `/v1/agent/session/{id}` | Delete a session |
 | `POST` | `/v1/cache/clear` | Clear caches |
-| `GET` | `/v1/metrics` | Proxy metrics: per-turn `cached_tokens`, `prompt_tokens`, `saved_tokens`, `latency_ms`, and aggregate token savings / latency (review03.md §10) |
+| `GET` | `/v1/metrics` | Proxy metrics: per-turn `cached_tokens`, `prompt_tokens`, `saved_tokens`, `latency_ms`, aggregate token savings / latency, a `backend_errors` count (turns the backend failed to serve, e.g. a truncated tool call), plus a per-session breakdown under `sessions{}` (review03.md §10) |
 | `POST` | `/v1/metrics/reset` | Reset the process-wide metrics counters |
 
 ## Observability & Operations (review03.md §10)
@@ -204,13 +212,19 @@ Conversation continuity is OpenAI-compatible by default. Clients can set the sta
 The proxy exposes a process-wide metrics aggregate (lock-protected) fed from
 both the streaming and non-streaming completion paths. Each turn records
 `cached_tokens`, `prompt_tokens`, `saved_tokens`, and `latency_ms` against the
-backend.
+backend. A per-session breakdown (bounded by an internal LRU) is also returned
+under `sessions{}` so you can see cache-hit rate and prefix-cache reuse per
+conversation, not just in aggregate.
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/metrics | jq
 # -> { "requests": 30, "cache_hits": ..., "cache_misses": ..., "cache_hit_rate": ...,
 #      "total_cached_tokens": ..., "total_prompt_tokens": ..., "prefix_cache_reuse_ratio": ...,
-#      "total_saved_tokens": ..., "total_latency_ms": ..., "avg_latency_ms": ... }
+#      "total_saved_tokens": ..., "total_latency_ms": ..., "avg_latency_ms": ...,
+#      "backend_errors": ...,
+#      "sessions": { "<session_id>": { "requests": ..., "cache_hit_rate": ...,
+#                    "total_cached_tokens": ..., "prefix_cache_reuse_ratio": ...,
+#                    "total_saved_tokens": ..., "avg_latency_ms": ..., "backend_errors": ... }, ... } }
 
 curl -s -X POST http://127.0.0.1:8080/v1/metrics/reset   # reset counters
 ```
