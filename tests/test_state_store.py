@@ -1,11 +1,10 @@
 """Tests for state store."""
 
-import pytest
 
+from moeptimizer.models import AgentStep
 from moeptimizer.state_store import (
     AgentStateStore,
 )
-from moeptimizer.models import AgentStep
 
 
 class TestAgentStateStore:

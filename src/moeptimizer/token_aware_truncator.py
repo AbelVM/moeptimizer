@@ -132,7 +132,7 @@ class TokenAwareTruncator:
             Calibrated total token count
         """
         raw = sum(self.count_message_tokens(m) for m in messages)
-        return int(round(raw * self._token_calibration))
+        return round(raw * self._token_calibration)
 
     def trim_messages_to_budget(
         self,
@@ -327,7 +327,7 @@ class TokenAwareTruncator:
 
         result = [dict(msg) for msg in messages[:frozen_end]]
         for msg in dynamic_middle:
-            if self.count_messages_tokens(result + [msg] + protected_tail) <= max_tokens:
+            if self.count_messages_tokens([*result, msg, *protected_tail]) <= max_tokens:
                 result.append(dict(msg))
             else:
                 break

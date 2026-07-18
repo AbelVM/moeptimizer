@@ -1,6 +1,5 @@
 """Tests for cache module."""
 
-import pytest
 
 from moeptimizer.cache import (
     align_to_block_boundary,

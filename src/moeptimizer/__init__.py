@@ -25,7 +25,7 @@ Enhanced with:
 
 from __future__ import annotations
 
-__version__ = "0.7.6"
+__version__ = "0.7.7"
 
 from moeptimizer.async_io_stage import AsyncIOStage, get_async_io_stage
 from moeptimizer.attention_sink import AttentionSinkManager, apply_attention_sinks
@@ -67,11 +67,6 @@ from moeptimizer.context_template_matcher import (
 from moeptimizer.delta_encoder import CodeDeltaEncoder, get_delta_encoder
 from moeptimizer.dependency_orderer import DependencyOrderer, get_dependency_orderer
 from moeptimizer.embedding import EmbeddingService
-from moeptimizer.expert_cache import (
-    ExpertRoutingCache,
-    get_expert_cache,
-    hash_for_expert_routing,
-)
 from moeptimizer.goal_decomposer import GoalDecomposer
 from moeptimizer.goal_relevance_scorer import GoalRelevanceScorer
 from moeptimizer.hierarchical_index import get_hierarchical_index
@@ -81,7 +76,6 @@ from moeptimizer.incremental_updater import IncrementalUpdater, get_incremental_
 from moeptimizer.kv_slot_tracker import get_kv_slot_tracker
 from moeptimizer.loop_detector import LoopDetector
 from moeptimizer.models import AgentStep, LoopWarning
-from moeptimizer.mtp_speculative import MTPSpeculativeDecoder, build_mtp_speculative_body
 from moeptimizer.mtp_state import MTPStateManager, get_mtp_state_manager
 from moeptimizer.optimizer import AgentContextOptimizer
 from moeptimizer.output_shaper import OutputShaper
@@ -125,7 +119,6 @@ __all__ = [
     "ContextTemplateMatcher",
     "DependencyOrderer",
     "EmbeddingService",
-    "ExpertRoutingCache",
     "GoalDecomposer",
     "GoalRelevanceScorer",
     "HierarchicalSummarizer",
@@ -133,7 +126,6 @@ __all__ = [
     "IncrementalUpdater",
     "LoopDetector",
     "LoopWarning",
-    "MTPSpeculativeDecoder",
     "MTPStateManager",
     "OutputShaper",
     "PatternInjector",
@@ -152,7 +144,6 @@ __all__ = [
     "ToolOutputFilter",
     "align_to_block_boundary",
     "apply_attention_sinks",
-    "build_mtp_speculative_body",
     "cache_get",
     "cache_key",
     "cache_put",
@@ -178,7 +169,6 @@ __all__ = [
     "get_context_template_matcher",
     "get_delta_encoder",
     "get_dependency_orderer",
-    "get_expert_cache",
     "get_hierarchical_index",
     "get_hierarchical_summarizer",
     "get_hit_prediction_model",
@@ -192,6 +182,5 @@ __all__ = [
     "get_template_manager",
     "get_tool_streamer",
     "has_code_blocks",
-    "hash_for_expert_routing",
     "optimize_code_in_text",
 ]

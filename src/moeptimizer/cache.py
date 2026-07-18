@@ -74,10 +74,10 @@ def canonicalize_code_for_cache(text: str) -> str:
 
     # Sort imports alphabetically
     import_lines = sorted(
-        [l for l in import_lines if l.strip().startswith("import ")],
+        [line for line in import_lines if line.strip().startswith("import ")],
         key=lambda x: x.strip(),
     ) + sorted(
-        [l for l in import_lines if l.strip().startswith("from ")],
+        [line for line in import_lines if line.strip().startswith("from ")],
         key=lambda x: x.strip(),
     )
 
@@ -159,4 +159,4 @@ def hash_ast_node(node_text: str, node_type: str) -> str:
 
     Uses 32 hex chars (128 bits) to minimize collision risk.
     """
-    return hashlib.md5(f"{node_type}:{node_text}".encode("utf8")).hexdigest()[:32]
+    return hashlib.md5(f"{node_type}:{node_text}".encode()).hexdigest()[:32]

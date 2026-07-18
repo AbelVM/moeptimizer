@@ -90,7 +90,7 @@ class ThinkingPreserver:
         result = []
         in_code_block = False
 
-        for i, line in enumerate(lines):
+        for line in lines:
             if line.strip().startswith("```") and not in_code_block:
                 in_code_block = True
                 result.append(line)

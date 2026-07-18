@@ -20,11 +20,6 @@ from typing import Any
 import openai
 from openai import AsyncOpenAI
 
-from moeptimizer.mtp_speculative import (
-    MTPSpeculativeDecoder,
-    build_mtp_speculative_body,
-)
-
 logger = logging.getLogger(__name__)
 
 _CUSTOM_SESSION_FIELDS = {"_session_id", "_session_state"}
@@ -66,103 +61,6 @@ def _strip_custom_session_fields(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-class SpeculativeDecoder:
-    """
-    Speculative decoding with MTP-aware draft model.
-
-    Uses MTP head outputs as draft tokens for tree-based verification.
-    Improves throughput by 2-3x when draft model is available.
-    """
-
-    def __init__(
-        self,
-        target_client: LemonadeClient,
-        draft_client: LemonadeClient | None = None,
-        mtp_lookahead: int = 4,
-        confidence_threshold: float = 0.7,
-    ) -> None:
-        self._target = target_client
-        self._draft = draft_client
-        lookahead_heads = [head for head in (2, 3, 4) if head <= max(1, mtp_lookahead)]
-        if not lookahead_heads:
-            lookahead_heads = [1]
-        self._mtp_decoder = MTPSpeculativeDecoder(
-            mtp_heads=len(lookahead_heads),
-            mtp_lookahead=lookahead_heads,
-            confidence_threshold=confidence_threshold,
-        )
-        self._stats: dict[str, int] = {"accepted": 0, "rejected": 0, "total": 0}
-        self._temp_stats: dict[str, float] = {"high_conf": 0.0, "low_conf": 0.0}
-
-    def get_temperature_for_mtp_confidence(
-        self,
-        mtp_confidence: float,
-    ) -> float:
-        """Get optimal temperature based on MTP confidence.
-
-        High confidence → lower temperature (more deterministic)
-        Low confidence → higher temperature (more exploration)
-
-        For precise coding tasks, target ~0.6 for best results.
-        """
-        if mtp_confidence > 0.8:
-            return 0.5   # Very confident, precise coding
-        elif mtp_confidence > 0.5:
-            return 0.6   # Moderately confident, recommended for coding
-        else:
-            return 0.7   # Low confidence, allow exploration
-
-    async def generate(
-        self,
-        messages: list[dict[str, Any]],
-        model: str,
-        **kwargs: Any,
-    ) -> Any:
-        """Generate with speculative decoding if draft model available."""
-        # Use MTP-aware speculative decoding
-        return await self._mtp_speculative_generate(
-            messages=messages,
-            model=model,
-            **kwargs,
-        )
-
-    async def _mtp_speculative_generate(
-        self,
-        messages: list[dict[str, Any]],
-        model: str,
-        **kwargs: Any,
-    ) -> Any:
-        """MTP-aware speculative generation using native MTP heads."""
-        # Build MTP-aware speculative body
-        mtp_body = build_mtp_speculative_body(
-            mtp_heads=self._mtp_decoder._mtp_heads,
-            mtp_lookahead=max(self._mtp_decoder._mtp_lookahead),
-            confidence_threshold=self._mtp_decoder._confidence_threshold,
-        )
-
-        # Merge with existing extra_body
-        params: dict[str, Any] = {
-            key: value
-            for key, value in kwargs.items()
-            if value is not None and key not in _CUSTOM_SESSION_FIELDS
-        }
-        params["model"] = model
-        params["messages"] = messages
-        existing_body = params.get("extra_body", {})
-        params["extra_body"] = {**existing_body, **mtp_body}
-
-        return await self._target._send_chat_completions_request(
-            params=params,
-            validated_messages=messages,
-            model=model,
-            stream=bool(params.get("stream", False)),
-        )
-
-    def get_stats(self) -> dict[str, int]:
-        """Get speculative decoding statistics."""
-        return dict(self._stats)
-
-
 class LemonadeClient:
     """Async client for the Lemonade NPU server using OpenAI SDK."""
 
@@ -188,22 +86,7 @@ class LemonadeClient:
             max_retries=2,
             timeout=timeout,
         )
-        self._speculative_decoder: SpeculativeDecoder | None = None
         self._native_mtp_passthrough = native_mtp_passthrough
-
-    def enable_speculative_decoding(
-        self,
-        draft_client: LemonadeClient | None = None,
-        mtp_lookahead: int = 4,
-        confidence_threshold: float = 0.7,
-    ) -> None:
-        """Enable speculative decoding with optional draft model."""
-        self._speculative_decoder = SpeculativeDecoder(
-            target_client=self,
-            draft_client=draft_client,
-            mtp_lookahead=mtp_lookahead,
-            confidence_threshold=confidence_threshold,
-        )
 
     def enable_native_mtp_passthrough(self) -> None:
         """Forward MTP/speculative extra_body keys to the backend.
@@ -243,7 +126,7 @@ class LemonadeClient:
                 if not getattr(models, "data", None):
                     return False
                 model = models.data[0].id
-            except Exception as exc:  # noqa: BLE001 - best-effort
+            except Exception as exc:
                 logger.debug("MTP probe: model list unavailable (%s)", exc)
                 return False
 
@@ -273,7 +156,7 @@ class LemonadeClient:
                 "MTP probe rejected by backend (status=%s)", exc.status_code
             )
             return False
-        except Exception as exc:  # noqa: BLE001 - best-effort
+        except Exception as exc:
             logger.debug("MTP probe failed (assuming unsupported): %s", exc)
             return False
 
@@ -350,16 +233,6 @@ class LemonadeClient:
                 validated_messages[-1].get("role") if validated_messages else "none",
             )
 
-        if self._speculative_decoder is not None and not stream:
-            spec_params = dict(params)
-            spec_params.pop("model", None)
-            spec_params.pop("messages", None)
-            return await self._speculative_decoder.generate(
-                messages=validated_messages,
-                model=model,
-                **spec_params,
-            )
-
         return await self._send_chat_completions_request(
             params=params,
             validated_messages=validated_messages,
@@ -433,8 +306,3 @@ class LemonadeClient:
     def client(self) -> AsyncOpenAI:
         """Return the underlying OpenAI client."""
         return self._client
-
-    @property
-    def speculative_decoder(self) -> SpeculativeDecoder | None:
-        """Return speculative decoder if enabled."""
-        return self._speculative_decoder

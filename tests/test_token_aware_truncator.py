@@ -1,6 +1,5 @@
 """Tests for token_aware_truncator module."""
 
-import pytest
 
 from moeptimizer.token_aware_truncator import TokenAwareTruncator
 

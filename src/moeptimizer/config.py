@@ -69,6 +69,14 @@ class AgenticConfig(BaseModel):
                     "Lower values improve token savings by evicting older complete turns from the top; "
                     "the optimizer never mutates middle-history content.",
     )
+    code_ledger_max_sigs: int = Field(
+        default=40,
+        description="Max code-signature lines carried forward into the evicted-turn code ledger. "
+                    "When front-eviction drops a code-bearing turn, its function/class signatures are "
+                    "accumulated into a compact '[Evicted-turn code index]' message appended to the "
+                    "protected tail, so the model keeps awareness of code that lived in dropped turns "
+                    "(fixes has_code_proxy=0 / code_block_loss). Capped to bound the ledger's own size.",
+    )
     archive_threshold: int = Field(
         default=3,
         description="Steps before this index are archived/compressed",
@@ -149,6 +157,31 @@ class AgenticConfig(BaseModel):
         default=4000,
         description="Tool/assistant outputs longer than this (chars) are boundary-compressed.",
     )
+    user_paste_compression_enabled: bool = Field(
+        default=True,
+        description=(
+            "Boundary-compress large user code pastes (file dumps pasted into a user "
+            "turn) with the same cheap, lossless-ish transforms as tool output. Applied "
+            "before the paste enters the stable prefix, so the compressed form is frozen "
+            "into the prefix and the backend's prefix cache stays valid. Disabled only if "
+            "you need verbatim user-pasted content in the cached prefix."
+        ),
+    )
+    user_paste_compression_max_chars: int = Field(
+        default=4000,
+        description="User code pastes longer than this (chars) are boundary-compressed.",
+    )
+    config_hot_reload_enabled: bool = Field(
+        default=True,
+        description=(
+            "Allow live config reload without a process restart (review §11.5 / C9). "
+            "A SIGUSR2 signal (or POST /v1/config/reload) re-reads AppConfig from the "
+            "environment and applies the selected quality profile. New sessions pick up "
+            "the new config; existing sessions keep their optimizer so in-flight requests "
+            "never race a mid-turn config change. Disable only if your deployment manages "
+            "config via restarts."
+        ),
+    )
     live_zone_compression_enabled: bool = Field(
         default=True,
         description=(
@@ -215,6 +248,28 @@ class AgenticConfig(BaseModel):
             "in response headers."
         ),
     )
+    optimizer_max_workers: int = Field(
+        default=2,
+        description=(
+            "Max worker threads for the dedicated optimizer executor (review §9). The "
+            "CPU-bound optimizer runs on its own bounded ThreadPoolExecutor so it does not "
+            "compete with async-IO / embedding workers for the default event-loop pool "
+            "threads under concurrent agentic sessions. Keep small: the optimizer is the "
+            "TTFT-critical path and runs one task per in-flight request."
+        ),
+    )
+    incremental_optimization_enabled: bool = Field(
+        default=False,
+        description=(
+            "Incremental optimization (review §4). When enabled, turns whose leading "
+            "stable prefix is byte-identical to the previous turn reuse the previously "
+            "computed optimized prefix and only re-run the pipeline on the new live zone, "
+            "cutting TTFT on long agentic conversations. OFF by default: it must be "
+            "benchmarked for quality_sem / cache-reuse regression before enabling in "
+            "production. The full-path output is byte-identical to the incremental path "
+            "when the flag is on, so enabling it is a pure latency optimization."
+        ),
+    )
 
 
 class CodeChunkingConfig(BaseModel):
@@ -222,7 +277,15 @@ class CodeChunkingConfig(BaseModel):
 
     chunk_max_chars: int = Field(default=1500)
     top_k_chunks: int = Field(default=5)
-    min_chunk_score: float = Field(default=0.05)
+    min_chunk_score: float = Field(
+        default=0.2,
+        description=(
+            "Minimum cosine-similarity score for a code chunk to be retained during "
+            "semantic retrieval. The previous 0.05 default let nearly every chunk "
+            "survive, defeating the ranking (review §5). 0.2 drops low-relevance chunks "
+            "while keeping genuinely related code; lower it only if RAG recall suffers."
+        ),
+    )
     embedding_dim: int = Field(default=384)
 
 

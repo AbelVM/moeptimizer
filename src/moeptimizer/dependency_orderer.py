@@ -133,11 +133,6 @@ class DependencyOrderer:
         sorted_blocks = sorted(blocks, key=lambda b: (len(b["imports"]), b["imports"]))
 
         # Reconstruct: replace original code blocks with sorted ones
-        code_pattern = re.compile(
-            r"```([\w]*)\n.*?```",
-            re.DOTALL,
-        )
-
         def replace_block(match: re.Match, idx: int = 0) -> str:
             if idx < len(sorted_blocks):
                 block = sorted_blocks[idx]

@@ -1,6 +1,5 @@
 """Tests for goal decomposer."""
 
-import pytest
 
 from moeptimizer.goal_decomposer import (
     GoalDecomposer,

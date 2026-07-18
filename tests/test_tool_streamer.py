@@ -1,6 +1,5 @@
 """Tests for tool output streaming."""
 
-import pytest
 
 from moeptimizer.tool_streamer import (
     ToolOutputStreamer,

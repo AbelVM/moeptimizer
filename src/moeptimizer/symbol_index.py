@@ -303,4 +303,4 @@ class SymbolIndex:
         start = max(0, line - 10)
         end = min(len(lines), line + 10)
 
-        return f"\n".join(lines[start:end])
+        return "\n".join(lines[start:end])

@@ -39,9 +39,7 @@ class IncrementalUpdater:
         key = self._get_context_key(messages)
 
         # If this is a known context, we can potentially append
-        if key in self._context_versions:
-            # Only append if there's actual new content
-            if new_content:
+        if key in self._context_versions and new_content:
                 result = [dict(m) for m in messages]
                 result[-1] = {
                     **result[-1],
@@ -98,9 +96,6 @@ class IncrementalUpdater:
 
         Uses proper prefix detection: old context must be a prefix of new context.
         """
-        old_key = self._get_context_key(old_messages)
-        new_key = self._get_context_key(new_messages)
-
         # Check if old context is a prefix of new context
         # by comparing the actual content, not the hash
         old_content = "".join(m.get("content", "") for m in old_messages)

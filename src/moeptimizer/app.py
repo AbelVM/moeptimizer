@@ -6,16 +6,18 @@ import asyncio
 import hashlib
 import json
 import logging
+import signal
 import threading
 import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from openai import APIError, APIStatusError, AsyncOpenAI
 
 from moeptimizer.backend_client import LemonadeClient
@@ -26,6 +28,12 @@ from moeptimizer.output_shaper import OutputShaper
 from moeptimizer.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
+
+# Dedicated bounded executor for the CPU-bound optimizer (review §9). Running the
+# optimizer on the default ThreadPoolExecutor shares threads with async-IO / embedding
+# workers, so under concurrent agentic sessions the optimizer queues and raises TTFT.
+# A separate executor isolates optimizer work and bounds its concurrency.
+_OPTIMIZER_EXECUTOR: ThreadPoolExecutor | None = None
 
 
 class _ProxyMetrics:
@@ -199,6 +207,105 @@ class _ProxyMetrics:
 # Single process-wide metrics instance.
 PROXY_METRICS = _ProxyMetrics()
 
+# Self-contained live dashboard HTML (review §11 / P4c). No framework, no external
+# assets — it polls /v1/metrics and renders the proxy's effectiveness with plain
+# SVG (FT Visual Vocabulary: magic-stat headline, bar chart for per-session savings,
+# line for cache-reuse ratio). Kept as a module constant so the route is a one-liner.
+_METRICS_DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MOEptimizer — Proxy Effectiveness</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --ink:#e6edf3; --muted:#8b949e;
+          --accent:#3fb950; --accent2:#58a6ff; --warn:#d29922; --line:#30363d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex;
+           align-items:baseline; gap:12px; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:12px; }
+  main { padding:24px; display:grid; gap:20px;
+         grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:18px 20px; }
+  .stat .v { font-size:30px; font-weight:700; }
+  .stat .k { color:var(--muted); font-size:12px; text-transform:uppercase;
+             letter-spacing:.04em; margin-top:4px; }
+  .stat.good .v { color:var(--accent); }
+  .stat.info .v { color:var(--accent2); }
+  .stat.warn .v { color:var(--warn); }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px;
+           padding:18px 20px; grid-column:1/-1; }
+  .panel h2 { font-size:14px; margin:0 0 12px; color:var(--muted);
+              text-transform:uppercase; letter-spacing:.04em; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:right; padding:6px 10px; border-bottom:1px solid var(--line); }
+  th:first-child, td:first-child { text-align:left; font-family:ui-monospace,Menlo,monospace; }
+  .bar { height:8px; border-radius:4px; background:var(--accent2); }
+  .barwrap { background:var(--line); border-radius:4px; min-width:80px; }
+  .empty { color:var(--muted); font-style:italic; }
+  footer { padding:12px 24px; color:var(--muted); font-size:12px; border-top:1px solid var(--line); }
+</style>
+</head>
+<body>
+<header>
+  <h1>MOEptimizer</h1>
+  <span class="sub">Proxy effectiveness &middot; live prefix-cache reuse &amp; token savings</span>
+</header>
+<main id="stats">
+  <div class="stat good"><div class="v" id="s-reuse">—</div><div class="k">Prefix cache reuse</div></div>
+  <div class="stat info"><div class="v" id="s-saved">—</div><div class="k">Tokens saved (total)</div></div>
+  <div class="stat"><div class="v" id="s-hitrate">—</div><div class="k">Cache hit rate</div></div>
+  <div class="stat warn"><div class="v" id="s-ttft">—</div><div class="k">Avg TTFT (ms)</div></div>
+  <div class="stat"><div class="v" id="s-err">—</div><div class="k">Backend errors</div></div>
+  <div class="panel">
+    <h2>Per-session token savings</h2>
+    <div id="sess"><p class="empty">No sessions recorded yet.</p></div>
+  </div>
+</main>
+<footer>Auto-refresh every 3s &middot; source: <code>GET /v1/metrics</code></footer>
+<script>
+const fmt = n => (n==null? "—" : n.toLocaleString());
+const pct = n => (n==null? "—" : (n*100).toFixed(1) + "%");
+async function refresh() {
+  let d;
+  try { const r = await fetch("/v1/metrics"); d = await r.json(); }
+  catch (e) { return; }
+  document.getElementById("s-reuse").textContent = pct(d.prefix_cache_reuse_ratio);
+  document.getElementById("s-saved").textContent = fmt(d.total_saved_tokens);
+  document.getElementById("s-hitrate").textContent = pct(d.cache_hit_rate);
+  document.getElementById("s-ttft").textContent = fmt(d.avg_latency_ms);
+  document.getElementById("s-err").textContent = fmt(d.backend_errors);
+  const sess = d.sessions || {};
+  const ids = Object.keys(sess);
+  const box = document.getElementById("sess");
+  if (!ids.length) { box.innerHTML = '<p class="empty">No sessions recorded yet.</p>'; return; }
+  const maxSaved = Math.max(1, ...ids.map(id => sess[id].total_saved_tokens || 0));
+  let rows = '<table><thead><tr><th>session</th><th>reqs</th><th>reuse</th>'
+           + '<th>saved</th><th>avg TTFT</th><th></th></tr></thead><tbody>';
+  for (const id of ids.slice(0, 64)) {
+    const s = sess[id];
+    const w = Math.round(100 * (s.total_saved_tokens || 0) / maxSaved);
+    rows += '<tr><td>' + id.slice(0,12) + '</td>'
+          + '<td>' + fmt(s.requests) + '</td>'
+          + '<td>' + pct(s.prefix_cache_reuse_ratio) + '</td>'
+          + '<td>' + fmt(s.total_saved_tokens) + '</td>'
+          + '<td>' + fmt(s.avg_latency_ms) + '</td>'
+          + '<td><div class="barwrap"><div class="bar" style="width:' + w + '%"></div></div></td></tr>';
+  }
+  rows += '</tbody></table>';
+  box.innerHTML = rows;
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
+"""
+
 
 def _explain_header_value(messages: list[dict[str, Any]]) -> str:
     """Serialize the optimized prompt for the explain-mode response header.
@@ -258,6 +365,44 @@ def _header_safe(value: str) -> str:
         return value
     folded = "".join(_HEADER_UNICODE_FOLD.get(ch, ch) for ch in value)
     return "".join(ch if ord(ch) <= 255 else "" for ch in folded)
+
+
+def _dry_run_response(
+    optimizer: AgentContextOptimizer,
+    original_messages: list[dict[str, Any]],
+    optimized_messages: list[dict[str, Any]],
+    optimization_error: str | None,
+) -> JSONResponse:
+    """Build the response for ``X-MOEPT-Dry-Run`` requests (review §11 / P4a).
+
+    Returns the optimized prompt the proxy would send to the backend, a token
+    savings diff, and an estimated cache-hit signal — WITHOUT calling the backend.
+    Purely observational; never mutates session state or metrics.
+    """
+    original_tokens = optimizer.token_counter.count_messages(original_messages)
+    optimized_tokens = optimizer.token_counter.count_messages(optimized_messages)
+    saved = max(0, original_tokens - optimized_tokens)
+    # Estimated cache hit: the proxy's static-prefix KV cache key for the optimized
+    # prompt. A stable (reused) key across turns is the local proxy signal that the
+    # backend prefix cache will be reused. We report the key's presence, not a
+    # backend-authorized count (which only the backend can give after a real call).
+    cache_key = ""
+    with suppress(Exception):
+        cache_key = optimizer.get_cache_key(optimized_messages)
+    payload: dict[str, Any] = {
+        "object": "moept.dry_run",
+        "optimized_messages": optimized_messages,
+        "tokens": {
+            "original": original_tokens,
+            "optimized": optimized_tokens,
+            "saved": saved,
+            "saved_pct": round(100.0 * saved / original_tokens, 1) if original_tokens else 0.0,
+        },
+        "est_cache_hit": bool(cache_key),
+        "cache_key_prefix": cache_key[:16] if cache_key else "",
+        "optimization_error": optimization_error,
+    }
+    return JSONResponse(content=payload)
 
 
 def _validate_messages(messages: list[dict[str, Any]]) -> None:
@@ -711,6 +856,9 @@ def _make_streaming_generator(
                     proxy_estimated = optimizer.token_counter.count_messages(proxy_estimated_msgs)
                     if proxy_estimated > 0:
                         optimizer.set_token_calibration(backend_prompt_tokens / proxy_estimated)
+                    # B0.6: also calibrate the remote-path per-message overhead so
+                    # budget enforcement uses the backend's true token count.
+                    optimizer.calibrate_remote_overhead(backend_prompt_tokens, proxy_estimated_msgs)
                 except Exception:
                     logger.debug("Streaming token calibration failed", exc_info=True)
 
@@ -720,6 +868,13 @@ def _make_streaming_generator(
             # visible to tooling) so the streaming path also surfaces reuse (review §8.2).
             if cached_tokens is not None:
                 yield f": X-Prefix-Cache-Hit-Tokens: {cached_tokens}\n\n"
+
+            # C8 (review §11.4): when front-eviction dropped complete turns this
+            # turn, tell the client via an SSE comment so it knows history was
+            # compacted. Valid SSE, ignored by clients but visible to tooling.
+            evicted = getattr(optimizer, "last_evicted_turns", 0) or 0
+            if evicted > 0:
+                yield f": X-MOEPT-Context-Budget: evicted {evicted} turn(s)\n\n"
 
         yield "data: [DONE]\n\n"
 
@@ -839,12 +994,18 @@ async def _do_non_streaming(
                         optimizer.set_token_calibration(
                             backend_prompt_tokens / proxy_estimated
                         )
+                    # B0.6: also calibrate the remote-path per-message overhead.
+                    optimizer.calibrate_remote_overhead(backend_prompt_tokens, proxy_estimated_msgs)
             except Exception:
                 logger.debug("Token calibration failed", exc_info=True)
 
         response_headers = dict(response_headers or {})
         if isinstance(cache_hit_tokens, int):
             response_headers["X-Prefix-Cache-Hit-Tokens"] = str(cache_hit_tokens)
+        # C8 (review §11.4): surface eviction count on the non-streaming path too.
+        evicted = getattr(optimizer, "last_evicted_turns", 0) or 0
+        if evicted > 0:
+            response_headers["X-MOEPT-Context-Budget"] = f"evicted {evicted} turn(s)"
 
         return JSONResponse(
             content={
@@ -956,6 +1117,38 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     # part of the standard OpenAI chat-completions contract.
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        global _OPTIMIZER_EXECUTOR
+        # §9: dedicated bounded executor for the CPU-bound optimizer so it does
+        # not compete with async-IO / embedding workers for default-pool threads.
+        _OPTIMIZER_EXECUTOR = ThreadPoolExecutor(
+            max_workers=max(1, cfg.agentic.optimizer_max_workers),
+            thread_name_prefix="moept-optim",
+        )
+
+        # C9 (review §11.5): config hot-reload via SIGUSR2. The handler re-reads
+        # AppConfig and swaps it into the SessionManager under its lock; existing
+        # sessions keep their optimizer so in-flight requests never race a mid-turn
+        # config change. Only registered when hot-reload is enabled and the platform
+        # supports signals (not on Windows).
+        _sigusr2_handler = None
+        if cfg.agentic.config_hot_reload_enabled and hasattr(signal, "SIGUSR2"):
+
+            def _handle_sigusr2(signum: int, frame: object) -> None:
+                try:
+                    session_manager.reload_config()
+                    logger.info("Config hot-reloaded via SIGUSR2")
+                except Exception as exc:  # Never crash the process from a signal
+                    logger.warning("SIGUSR2 config reload failed: %s", exc)
+
+            try:
+                signal.signal(signal.SIGUSR2, _handle_sigusr2)
+                _sigusr2_handler = _handle_sigusr2
+            except (ValueError, OSError) as exc:
+                # Signal handling is unavailable in this runtime (e.g. non-main
+                # thread / unsupported platform). The /v1/config/reload endpoint
+                # still works, so hot-reload is not fully lost.
+                logger.debug("SIGUSR2 handler not registered: %s", exc)
+
         await embedding_service.initialize()
         # Live capability detection (review: NPU<->GPU aware). A single probe
         # reads the backend's own metadata (active device, /slots, native MTP,
@@ -1025,6 +1218,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         yield
         await embedding_service.close()
         await embed_client.close()
+        # C9: deregister the SIGUSR2 handler so a later process reusing this PID
+        # does not inherit a dangling callback.
+        if _sigusr2_handler is not None and hasattr(signal, "SIGUSR2"):
+            with suppress(ValueError, OSError):
+                signal.signal(signal.SIGUSR2, signal.SIG_DFL)
+        # §9: shut down the dedicated optimizer executor after the server stops
+        # accepting requests (in-flight requests have already completed by now).
+        if _OPTIMIZER_EXECUTOR is not None:
+            _OPTIMIZER_EXECUTOR.shutdown(wait=True)
+            _OPTIMIZER_EXECUTOR = None
 
     app = FastAPI(
         title="Lemonade MoE Agentic Optimizer",
@@ -1125,9 +1328,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             # Run the (CPU-bound, synchronous) optimizer in a worker thread so the
             # asyncio event loop stays free for concurrent sessions. Previously the
             # optimizer ran inline on the event loop, so one long session blocked
-            # all others (review §2/§4/§5).
+            # all others (review §2/§4/§5). Use the dedicated optimizer executor
+            # (review §9) so it does not compete with async-IO / embedding workers
+            # for the default-pool threads.
             optimized_messages = await asyncio.get_running_loop().run_in_executor(
-                None, optimizer.optimize_messages, messages
+                _OPTIMIZER_EXECUTOR, optimizer.optimize_messages, messages
             )
         except Exception as e:
             logger.exception("Context optimization failed, falling back to recent-turn context")
@@ -1135,6 +1340,20 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             # X-Optimization-Error response header, which must be latin-1-encodable.
             optimization_error = _header_safe(f"{type(e).__name__}: {e}")
             optimized_messages = _fallback_optimized_messages(messages, cfg.agentic.keep_full_steps)
+
+        # Dry-run mode (review §11 / P4a): when the X-MOEPT-Dry-Run header is set,
+        # return the optimized prompt the proxy WOULD send to the backend plus a
+        # token-savings diff and an estimated cache-hit signal — WITHOUT calling the
+        # backend. This lets operators inspect what the proxy does to a request
+        # (and how much it saves) without spending a single backend token. It is
+        # purely observational and never mutates session state or metrics.
+        dry_run = str(request.headers.get("X-MOEPT-Dry-Run", "")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ) or bool(body.get("_dry_run"))
+        if dry_run:
+            return _dry_run_response(optimizer, messages, optimized_messages, optimization_error)
 
         # Refresh live backend capabilities on their TTL (cheap: a no-op when the
         # cached snapshot is fresh). This is what lets slot pinning / MTP / remote
@@ -1258,6 +1477,15 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         if optimization_error:
             response_headers["X-Optimization-Error"] = optimization_error
 
+        # Degradation vector (review §11 / P4b): surface any pipeline stages that
+        # swallowed a failure this turn and fell back to a safe default. Operators
+        # can use this to spot quality risk (e.g. RAG or code-block optimization
+        # silently disabled) without scraping logs. Omitted entirely when the turn
+        # ran clean so the header is only present on degraded responses.
+        degradation = optimizer.last_degradation
+        if degradation:
+            response_headers["X-MOEPT-Optimization-Degraded"] = _header_safe("; ".join(degradation))
+
         body["model"] = cfg.server.llm_model
         body["messages"] = optimized_messages
         body.setdefault("temperature", 0.1)
@@ -1339,6 +1567,19 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         """Reset the process-wide proxy metrics counters."""
         PROXY_METRICS.reset()
         return {"object": "proxy.metrics", "status": "reset"}
+
+    @app.get("/v1/metrics/ui")
+    async def proxy_metrics_ui():
+        """Live cache-reuse + token-savings dashboard (review §11 / P4c).
+
+        A tiny self-contained HTML page (no framework, no external assets) that
+        polls ``/v1/metrics`` and renders the proxy's effectiveness: aggregate
+        prefix-cache reuse, token savings, average TTFT, and a per-session
+        breakdown. Chart types follow the FT Visual Vocabulary (big-number
+        "magic stat" for the headline, bar chart for per-session savings, line
+        for cache-reuse ratio over the session list).
+        """
+        return HTMLResponse(content=_METRICS_DASHBOARD_HTML, status_code=200)
 
     @app.post("/v1/embeddings")
     async def create_embeddings(request: Request):
@@ -1516,6 +1757,36 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         return {
             "status": "ok",
             "embed_cache_size": 0,
+        }
+
+    @app.post("/v1/config/reload")
+    async def reload_config():
+        """Hot-reload configuration from the environment without a restart (C9).
+
+        Re-reads ``AppConfig`` (env / ``.env``) and applies the selected quality
+        profile. New sessions pick up the new config immediately; existing sessions
+        keep their optimizer so in-flight requests never race a mid-turn config
+        change. Equivalent to sending ``SIGUSR2`` to the process. Useful for
+        environments where signals are unavailable (containers, CI).
+        """
+        if not cfg.agentic.config_hot_reload_enabled:
+            return JSONResponse(
+                status_code=403,
+                content={"status": "disabled", "detail": "config_hot_reload_enabled is false"},
+            )
+        try:
+            new_config = session_manager.reload_config()
+        except Exception as e:
+            logger.warning("Config hot-reload failed: %s", e)
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "detail": f"{type(e).__name__}: {e}"},
+            )
+        return {
+            "status": "ok",
+            "quality_profile": new_config.agentic.quality_profile,
+            "max_optimized_tokens": new_config.agentic.max_optimized_tokens,
+            "rag_enabled": new_config.agentic.rag_enabled,
         }
 
     return app

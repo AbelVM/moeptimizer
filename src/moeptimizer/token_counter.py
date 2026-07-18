@@ -156,6 +156,14 @@ class TokenCounter:
                 self._use_remote = True
                 logger.debug("TokenCounter using remote /tokenize (backend tokenizer)")
 
+        # Per-message overhead correction for the remote path (review B0.6).
+        # The remote join format ``[role] content`` is NOT ChatML, so the fixed
+        # ``+5 * len(messages)`` overhead is systematically wrong. The app layer
+        # feeds the measured ``prompt_tokens - remote_joined_count`` as a single
+        # additive delta once the backend reports authoritative usage. Defaults
+        # to 0 (no correction) so behavior is unchanged until calibrated.
+        self._calibration_delta: int = 0
+
         # 1) Explicit HF tokenizer id/path (or "auto" -> try common Qwen ids).
         #    "auto" is restricted to LOCAL files only so it never triggers a
         #    surprise network download on a local/offline box; an explicitly
@@ -232,6 +240,18 @@ class TokenCounter:
     def backend_name(self) -> str:
         """Human-readable name of the active tokenizer backend."""
         return self._backend_name
+
+    def set_token_calibration_delta(self, delta: int) -> None:
+        """Set the remote-path per-message overhead correction (review B0.6).
+
+        ``delta`` should be ``prompt_tokens - remote_joined_count`` measured from
+        the backend's authoritative ``usage.prompt_tokens``. A single additive
+        correction is applied to the remote count instead of the hardcoded
+        ``+5 * len(messages)``, which is systematically wrong because the remote
+        join format is not ChatML. Negative deltas are clamped to 0 (never
+        under-count below the joined content).
+        """
+        self._calibration_delta = max(0, int(delta))
 
     def count(self, text: str, lang: str = "generic") -> int:
         """Estimate token count for the given text."""
@@ -342,7 +362,10 @@ class TokenCounter:
             combined = "\n".join(parts)
             remote = self._remote_count(combined)
             if remote is not None:
-                total = remote + 5 * len(messages)
+                # B0.6: the remote join is not ChatML, so the per-message overhead
+                # is not a fixed +5. Apply the calibrated delta (measured from the
+                # backend's authoritative prompt_tokens) instead of guessing.
+                total = remote + self._calibration_delta
                 self._cache[fp] = total
                 self._cache_order.append(fp)
                 if len(self._cache_order) > self._max_cache:
@@ -367,6 +390,32 @@ class TokenCounter:
             old = self._cache_order.pop(0)
             self._cache.pop(old, None)
         return total
+
+    def count_messages_remote_raw(self, messages: list[dict[str, Any]]) -> int:
+        """Return the raw remote joined-token count WITHOUT the overhead delta.
+
+        Used by ``calibrate_remote_overhead`` to measure the per-message overhead
+        correction (review B0.6): ``delta = backend_prompt_tokens - raw``. Returns
+        0 when the remote path is unavailable so callers skip calibration.
+        """
+        if not messages or not self._use_remote:
+            return 0
+        parts: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                parts.append(f"[{role}] {content}")
+            elif isinstance(content, list):
+                texts = [
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                parts.append(f"[{role}] " + " ".join(texts))
+        combined = "\n".join(parts)
+        remote = self._remote_count(combined)
+        return remote if remote is not None else 0
 
     @staticmethod
     def _fingerprint(messages: list[dict[str, Any]]) -> str:

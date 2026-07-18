@@ -1,6 +1,5 @@
 """Tests for chunk_fingerprint module."""
 
-import pytest
 
 from moeptimizer.chunk_fingerprint import ChunkFingerprintCache, get_chunk_fingerprint_cache
 

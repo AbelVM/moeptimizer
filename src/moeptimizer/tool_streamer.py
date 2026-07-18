@@ -7,7 +7,6 @@ while maintaining prediction quality.
 from __future__ import annotations
 
 import re
-from typing import Any
 
 
 class ToolOutputStreamer:
@@ -41,10 +40,7 @@ class ToolOutputStreamer:
             return True
 
         # Check character count
-        if len(content) > 4000:
-            return True
-
-        return False
+        return len(content) > 4000
 
     def stream_output(
         self,
@@ -86,7 +82,7 @@ class ToolOutputStreamer:
                 # Keep overlap
                 overlap_start = max(0, len(current_chunk) - 10)
                 current_chunk = current_chunk[overlap_start:]
-                current_size = sum(len(l) for l in current_chunk)
+                current_size = sum(len(chunk_line) for chunk_line in current_chunk)
             current_chunk.append(line)
             current_size += len(line)
 

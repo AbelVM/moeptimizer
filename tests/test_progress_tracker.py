@@ -1,11 +1,10 @@
 """Tests for progress tracker."""
 
-import pytest
 
+from moeptimizer.models import AgentStep
 from moeptimizer.progress_tracker import (
     ProgressTracker,
 )
-from moeptimizer.models import AgentStep
 
 
 class TestProgressTracker:

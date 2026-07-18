@@ -1,6 +1,5 @@
 """Tests for context aligner."""
 
-import pytest
 
 from moeptimizer.context_aligner import (
     ContextAligner,

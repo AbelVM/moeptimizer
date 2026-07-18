@@ -430,3 +430,45 @@ suite after changes: **396 passed, 2 skipped**.
   per-session metrics. `AgentContextOptimizer.get_debug_info()` aggregates the
   data. 2 endpoint tests added. Full suite after changes: **404 passed, 2
   skipped**.
+
+### v0.7.7 — Config hot-reload + benchmark regression gate (2026-07-18)
+
+Closes the last two operability items from the architecture review (`REVIEW.md`
+C9, C10). Full test suite after changes: **417 passed, 2 skipped**.
+
+- **Config hot-reload (C9, review §11.5).** `SessionManager.reload_config()`
+  re-reads `get_config()` and applies the selected quality profile under lock.
+  Existing sessions keep their optimizer (no mid-turn race); new sessions pick
+  up the new config. `app.py` registers a `SIGUSR2` handler in the lifespan
+  (deregistered on shutdown) and exposes `POST /v1/config/reload`; both are
+  guarded by the new `config_hot_reload_enabled` flag (default `true`). 4 tests
+  added (`TestConfigHotReload`).
+- **Benchmark regression gate (C10, review §11.6).** New `scripts/benchmark_gate.py`
+  normalizes both single-scenario and aggregated `--json` reports and exits
+  non-zero when `token_savings_pct` (percentage points) or headline quality
+  (`prompt_faithfulness` / `evicted_content_recall` / lexical battery) drops
+  beyond `--tolerance` (default `0.05`). Ready to wire into CI when a backend is
+  available in the runner. The GitHub Actions workflow itself is deferred.
+
+  #### Benchmark validation — code-ledger carry-forward (fix1)
+
+  A/B pair `benchmark_opencode_30_1_0.7.7.json` (baseline) vs
+  `benchmark_opencode_30_1_0.7.7_fix1.json` (after the code-ledger carry-forward
+  fix), **same backend, same scenario (30 turns × 1 round)**. The direct replay
+  path is identical across both runs (`total_raw_input_prompt` 544,246;
+  `total_cached_tokens` 28,008; `cache_hit_rate` 0.9667), so all deltas below are
+  attributable to the optimizer change, not run-to-run backend variance.
+
+  - **Code preservation.** `code_block_loss_turns` 13 → 3; `code_block_ratio`
+    mean 0.567 → 0.900; `code_structure_consistency` mean 0.633 → 0.967.
+  - **Semantic fidelity.** `semantic_similarity` mean 0.313 → 0.478, median
+    0.046 → 0.733; `response_stability` mean 0.783 → 0.950; `truncation_count`
+    17 → 11; `low_semantic_similarity_turns` 20 → 15.
+  - **No regressions.** `token_savings_vs_raw_pct` 92.55% (unchanged);
+    `cache_hit_rate` 0.9667 (unchanged); `code_syntax_validity` 1.0.
+  - **TTFT measurement fixed.** Proxy TTFT now captured (mean 7,315 ms vs direct
+    13,379 ms); previously `{}` due to the streaming-clock bug.
+  - **Open item.** `has_code_proxy` remains 0.0 — the ledger carries code
+    *signatures*, not full bodies, so the proxy does not reproduce code blocks.
+    Extending the ledger to carry short code bodies is the next step if proxy
+    code reproduction is required.

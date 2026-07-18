@@ -3,8 +3,6 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
-
 from moeptimizer.backend_capabilities import (
     BackendCapabilities,
     BackendCapabilityProbe,
@@ -51,7 +49,7 @@ class _FakeAsyncClient:
         self.calls.append(url)
         return self._next()
 
-    async def post(self, url: str, json: dict | None = None) -> _Resp:  # noqa: A002
+    async def post(self, url: str, json: dict | None = None) -> _Resp:
         self.calls.append(url)
         return self._next()
 
@@ -248,7 +246,7 @@ async def test_probe_handles_connection_error() -> None:
         async def get(self, url: str) -> _Resp:
             raise RuntimeError("connection refused")
 
-        async def post(self, url: str, json: dict | None = None) -> _Resp:  # noqa: A002
+        async def post(self, url: str, json: dict | None = None) -> _Resp:
             raise RuntimeError("connection refused")
 
     probe = BackendCapabilityProbe(

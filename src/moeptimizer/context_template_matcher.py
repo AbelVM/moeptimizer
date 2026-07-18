@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any
+from typing import Any, ClassVar
 
 
 class ContextTemplateMatcher:
@@ -19,7 +19,7 @@ class ContextTemplateMatcher:
     - Minimize deviation from cached patterns
     """
 
-    TEMPLATES = {
+    TEMPLATES: ClassVar[dict[str, Any]] = {
         "code_review": {
             "pattern": r"(review|analyze|check).*code",
             "static": "You are a code reviewer. Analyze the following code:",

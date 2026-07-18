@@ -1,6 +1,5 @@
 """Tests for loop detector."""
 
-import pytest
 
 from moeptimizer.loop_detector import (
     LoopDetector,

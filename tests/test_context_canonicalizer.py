@@ -1,6 +1,5 @@
 """Tests for context canonicalizer."""
 
-import pytest
 
 from moeptimizer.context_canonicalizer import (
     ContextCanonicalizer,

@@ -1,12 +1,11 @@
 """Tests for code chunking."""
 
-import pytest
 
 from moeptimizer.code_chunking import (
+    LANG_MAP,
     chunk_code_with_treesitter,
     deduplicate_chunks,
     detect_language_and_id,
-    LANG_MAP,
 )
 
 

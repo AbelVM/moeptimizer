@@ -1,6 +1,5 @@
 """Tests for MTP state management."""
 
-import pytest
 
 from moeptimizer.mtp_state import (
     MTPStateManager,

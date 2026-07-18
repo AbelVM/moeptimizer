@@ -1,6 +1,5 @@
 """Tests for selective truncator."""
 
-import pytest
 
 from moeptimizer.selective_truncator import (
     SelectiveTruncator,

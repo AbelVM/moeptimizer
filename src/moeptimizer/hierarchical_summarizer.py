@@ -37,7 +37,7 @@ class HierarchicalSummarizer:
     # Retaining these in the rolling summary is what stops the 2.17x verbosity
     # regression: when the proxy drops them, the model re-derives them verbosely.
     _CONSTRAINT_HINTS = (
-        "don't", "do not", "doesn't", "does not", "don’t", "don’t",
+        "don't", "do not", "doesn't", "does not", "dont", "dont",
         "must not", "mustn't", "should not", "shouldn't",
         "cannot", "can't", "can not", "won't", "will not",
         "avoid", "never", "no longer", "not allowed", "prohibited",

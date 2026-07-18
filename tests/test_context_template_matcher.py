@@ -1,6 +1,5 @@
 """Tests for context template matcher."""
 
-import pytest
 
 from moeptimizer.context_template_matcher import (
     ContextTemplateMatcher,

@@ -1,6 +1,5 @@
 """Tests for incremental context updates."""
 
-import pytest
 
 from moeptimizer.incremental_updater import (
     IncrementalUpdater,

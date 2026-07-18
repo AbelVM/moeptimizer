@@ -1,6 +1,5 @@
 """Tests for symbol index."""
 
-import pytest
 
 from moeptimizer.symbol_index import (
     SymbolIndex,

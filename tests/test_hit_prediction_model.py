@@ -1,6 +1,5 @@
 """Tests for hit_prediction_model module."""
 
-import pytest
 
 from moeptimizer.hit_prediction_model import HitPredictionModel, get_hit_prediction_model
 

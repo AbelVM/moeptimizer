@@ -1,6 +1,5 @@
 """Tests for hierarchical repository indexing."""
 
-import pytest
 
 from moeptimizer.hierarchical_index import (
     HierarchicalIndex,

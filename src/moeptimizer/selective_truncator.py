@@ -103,7 +103,7 @@ class SelectiveTruncator:
             return messages
 
         result = []
-        for i, msg in enumerate(messages[:-keep_last]):
+        for msg in messages[:-keep_last]:
 # Summarize old messages
             content = msg.get("content", "")
             if len(content) > 200:

@@ -37,6 +37,26 @@ class SessionManager:
     def _make_optimizer(self) -> AgentContextOptimizer:
         return AgentContextOptimizer(self._config, self._capability_probe)
 
+    def reload_config(self) -> AppConfig:
+        """Hot-reload configuration from the environment without a process restart.
+
+        Re-reads ``AppConfig`` (which re-reads env / ``.env``) and applies the
+        selected quality profile, then swaps ``self._config`` under the lock. Only
+        **new** sessions pick up the new config; existing sessions keep their
+        optimizer (and thus their config) so in-flight requests never race against a
+        mid-turn config change (review §11.5 / C9). Returns the freshly loaded config.
+        """
+        from moeptimizer.config import apply_quality_profile, get_config
+
+        new_config = get_config()
+        apply_quality_profile(new_config)
+        with self._lock:
+            self._config = new_config
+            agentic = self._config.agentic
+            self._session_timeout = agentic.session_timeout
+            self._max_sessions = agentic.max_sessions
+        return new_config
+
     def get_or_create(self, session_id: str | None = None) -> AgentContextOptimizer:
         """Get an existing optimizer for the session, or create a new one."""
         if session_id is None:

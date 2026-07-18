@@ -39,10 +39,7 @@ class ContextAligner:
         for i, msg in enumerate(messages):
             if msg.get("role") == "system":
                 static_end = i + 1
-            elif msg.get("role") == "user" and static_end > 0:
-                static_end = i + 1
-                break
-            elif msg.get("role") == "user" and static_end == 0:
+            elif (msg.get("role") == "user" and static_end > 0) or (msg.get("role") == "user" and static_end == 0):
                 static_end = i + 1
                 break
         return static_end

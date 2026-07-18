@@ -1,6 +1,5 @@
 """Tests for dependency orderer."""
 
-import pytest
 
 from moeptimizer.dependency_orderer import (
     DependencyOrderer,

@@ -6,7 +6,7 @@ Adds consistent section markers and delimiters.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, ClassVar
 
 
 class PatternInjector:
@@ -18,7 +18,7 @@ class PatternInjector:
     - Maintains code structure patterns
     """
 
-    SECTION_MARKERS = {
+    SECTION_MARKERS: ClassVar[dict[str, str]] = {
         "static": "<!-- STATIC_LAYER -->",
         "context": "<!-- CONTEXT_LAYER -->",
         "dynamic": "<!-- DYNAMIC_LAYER -->",

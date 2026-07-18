@@ -1,6 +1,5 @@
 """Tests for prompt template versioning."""
 
-import pytest
 
 from moeptimizer.prompt_templates import (
     PromptTemplateManager,

@@ -1,6 +1,5 @@
 """Tests for pattern injector."""
 
-import pytest
 
 from moeptimizer.pattern_injector import (
     PatternInjector,

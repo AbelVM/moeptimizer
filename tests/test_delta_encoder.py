@@ -1,6 +1,5 @@
 """Tests for delta_encoder module."""
 
-import pytest
 
 from moeptimizer.delta_encoder import CodeDeltaEncoder, get_delta_encoder
 

@@ -1812,9 +1812,17 @@ def _stream_request(
         # chunk with `content: ""` (e.g. the proxy's initial SSE chunk), which
         # would otherwise be mis-counted as the first generated token and make
         # TTFT collapse to ~0ms. Only non-empty content starts the TTFT clock.
+        # For reasoning-heavy models (Qwen3.6-MTP) the first emitted token is
+        # often a `reasoning_content` delta, so we also start the clock on the
+        # first non-empty reasoning delta — otherwise proxy TTFT is never
+        # recorded (the model emits only reasoning before any final `content`,
+        # leaving ttft_ms=None and the dashboard showing an empty proxy series).
+        if ttft_ms is None and (
+            delta.get("content")
+            or (delta.get("reasoning_content") is not None and delta.get("reasoning_content") != "")
+        ):
+            ttft_ms = (time.monotonic() - t0) * 1000
         if delta.get("content"):
-            if ttft_ms is None:
-                ttft_ms = (time.monotonic() - t0) * 1000
             content_parts.append(delta["content"])
         if delta.get("reasoning_content") is not None:
             reasoning_parts.append(delta["reasoning_content"])
@@ -3997,6 +4005,7 @@ def run_benchmark(
                 f" proxy={comparison.proxy.latency_ms:.0f}ms/{comparison.proxy.prompt_tokens:,}tok/"
                 f"{comparison.proxy.chars_before_optimization:,}chars_raw/{comparison.proxy.response_chars:,}chars"
                 f" raw_input={comparison.proxy.raw_input_tokens:,}tok"
+                f" ttft(d/p)={_fmt_ttft(comparison.direct.ttft_ms)}/{_fmt_ttft(comparison.proxy.ttft_ms)}"
                 f" delta={comparison.latency_delta_ms:+.0f}ms/{comparison.token_delta:+,}tok"
                 f" cache={comparison.proxy.cached_tokens:,}/{comparison.proxy.cache_hit_rate if comparison.proxy.cache_hit_rate is not None else 'n/a'} "
                 f"{' '.join(quality_parts)}"
@@ -4009,6 +4018,13 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
+
+
+def _fmt_ttft(value: float | None) -> str:
+    """Format a TTFT value (ms) for the per-turn log, or 'n/a' when missing."""
+    if value is None:
+        return "n/a"
+    return f"{value:.0f}ms"
 
 
 def _fmt_table(headers: list[str], rows: list[list[str]]) -> str:

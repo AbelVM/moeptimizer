@@ -1,6 +1,5 @@
 """Tests for state RAG module."""
 
-import pytest
 
 from moeptimizer.state_rag import (
     StateBasedRAG,

@@ -38,10 +38,7 @@ class SummarizeOldTurns:
         for i, msg in enumerate(messages):
             if msg.get("role") == "system":
                 system_end = i + 1
-            elif msg.get("role") == "user" and system_end > 0:
-                system_end = i + 1
-                break
-            elif msg.get("role") == "user" and system_end == 0:
+            elif (msg.get("role") == "user" and system_end > 0) or (msg.get("role") == "user" and system_end == 0):
                 system_end = i + 1
                 break
 
@@ -59,7 +56,7 @@ class SummarizeOldTurns:
             # Create summary
             summary = self._create_summary(to_summarize)
 
-            return system_anchor + [summary] + keep_recent
+            return [*system_anchor, summary, *keep_recent]
 
         return messages
 

@@ -15,7 +15,6 @@ from moeptimizer.code_chunking import (
     detect_language_and_id,
 )
 
-
 # Pre-compiled regex for fallback (kept for performance)
 _CODE_BLOCK_PATTERN = re.compile(r"(```[\w]*\n.*?```)", re.DOTALL)
 
@@ -73,7 +72,7 @@ def optimize_code_in_text(
     block_chunks: list[list[str]] = []
     block_langs: list[str] = []  # Track language per block
 
-    for lang, code, start, end in blocks:
+    for lang, code, _, _ in blocks:
         block_langs.append(lang)
         # Detect language if not specified
         lang_id = detect_language_and_id(code) if not lang else LANG_MAP.get(lang, lang)
@@ -97,7 +96,7 @@ def optimize_code_in_text(
 
     # If any block has fewer chunks after dedup, we'd lose code
     # Return original text to preserve all code blocks
-    for i, (original, deduped) in enumerate(zip(block_chunks, deduped_block_chunks)):
+    for original, deduped in zip(block_chunks, deduped_block_chunks, strict=True):
         if len(deduped) < len(original):
             return text
 

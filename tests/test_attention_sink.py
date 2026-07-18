@@ -1,6 +1,5 @@
 """Tests for attention sink management."""
 
-import pytest
 
 from moeptimizer.attention_sink import AttentionSinkManager, apply_attention_sinks
 

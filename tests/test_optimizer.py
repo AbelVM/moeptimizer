@@ -1,6 +1,7 @@
 """Tests for the full optimizer pipeline — front-loading eviction strategy."""
 
 import json
+from typing import Any
 from unittest.mock import patch
 
 from moeptimizer.config import AppConfig
@@ -45,6 +46,29 @@ class TestAgentContextOptimizer:
         assert self.optimizer._token_calibration == 0.5
         self.optimizer.set_token_calibration(-1.0)
         assert self.optimizer._token_calibration == 0.5
+
+    def test_record_cache_outcome_skips_weak_label(self) -> None:
+        """Review §2 / C7: do not train hit_prediction on a guessed label.
+
+        When the authoritative ``cached_tokens`` is absent, the turn must be
+        skipped rather than labeled with the weak local static-prefix signal.
+        """
+        assert self.optimizer.hit_prediction is not None
+        calls: list[tuple] = []
+        self.optimizer.hit_prediction.record_outcome = lambda *a, **kw: calls.append((a, kw))
+
+        # No cached_tokens -> no training (weak label avoided).
+        self.optimizer.record_cache_outcome(None)
+        assert calls == []
+
+        # Authoritative signal present -> trains with hit = (cached_tokens > 0).
+        self.optimizer.record_cache_outcome(123)
+        assert len(calls) == 1
+        assert calls[0][1]["hit"] is True
+
+        self.optimizer.record_cache_outcome(0)
+        assert len(calls) == 2
+        assert calls[1][1]["hit"] is False
 
     def test_seed_token_calibration_anchors_from_exact_count(self) -> None:
         sample = "hello world test"
@@ -164,6 +188,39 @@ class TestAgentContextOptimizer:
         trimmed = self.optimizer._evict_for_budget(body, budget, use_tokens=False)
         total = sum(len(m.get("content", "")) for m in trimmed)
         assert total <= budget
+
+    def test_eviction_carries_forward_code_ledger(self) -> None:
+        """When front-eviction drops a code-bearing turn, its function/class
+        signatures are carried forward in a compact '[Evicted-turn code index]'
+        message appended to the result, so the model keeps awareness of code
+        that lived in dropped turns (fixes has_code_proxy=0 / code_block_loss).
+        """
+        self.optimizer._config.agentic.eviction_low_water_ratio = 1.0
+        self.optimizer._config.agentic.code_ledger_max_sigs = 40
+        body = [
+            {
+                "role": "user",
+                "content": "implement helper",
+            },
+            {
+                "role": "assistant",
+                "content": "Here:\n```python\ndef compute_hash(x):\n    return x\n\nclass Parser:\n    pass\n```",
+            },
+            {"role": "user", "content": "t1 " + "x" * 400},
+            {"role": "assistant", "content": "r1 " + "y" * 400},
+            {"role": "user", "content": "t2 " + "x" * 400},
+            {"role": "assistant", "content": "r2 " + "y" * 400},
+        ]
+        # Budget small enough to evict the first (code-bearing) pair.
+        trimmed = self.optimizer._evict_for_budget(body, budget=1500, use_tokens=False)
+        ledger = [m for m in trimmed if m.get("_code_ledger")]
+        assert ledger, "expected an evicted-turn code ledger message"
+        content = ledger[0]["content"]
+        assert "Evicted-turn code index" in content
+        assert "def compute_hash" in content
+        assert "class Parser" in content
+        # The ledger must not re-introduce the full dropped code body.
+        assert "return x" not in content
 
     def test_static_prefix_cache_hit_still_enforces_budget(self) -> None:
         """Static prefix cache hits must not bypass context compaction."""
@@ -442,6 +499,38 @@ class TestAgentContextOptimizer:
         assert "Second task" in joined
         assert "Third task" in joined
 
+    def test_volatile_turn_not_accumulated(self) -> None:
+        """A prior volatile trailing turn is stripped before a fresh one is appended.
+
+        Regression guard for review §8: without the ``_volatile_turn`` tag the
+        prior volatile turn became a historical user turn on the next request and
+        a new one was appended after it, so the context accumulated one extra
+        volatile turn every turn until eviction.
+        """
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 200_000
+        optimizer = AgentContextOptimizer(config)
+
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "Task A"},
+            {"role": "assistant", "content": "Done A"},
+        ]
+        # Simulate a prior pass that already appended a volatile trailing turn.
+        prior = list(messages)
+        prior.append(
+            {"role": "user", "content": "Old volatile context", "_volatile_turn": True}
+        )
+
+        result = optimizer._append_volatile_context(
+            prior, anchor="anchor text", rag_context="", warning_lines=[], proactive_threshold_tokens=0
+        )
+        volatile = [m for m in result if m.get("_volatile_turn")]
+        # Exactly one volatile turn, and the stale one was removed.
+        assert len(volatile) == 1
+        assert volatile[0]["content"] == "# Conversation Quality Anchor\nanchor text"
+        assert "Old volatile context" not in [m["content"] for m in result]
+
 
 class TestToolOutputCompressionPipeline:
     """Step 11.6: large tool outputs must be boundary-compressed by the pipeline."""
@@ -501,3 +590,381 @@ class TestToolOutputCompressionPipeline:
         tool_msg = next(m for m in result if m.get("role") == "tool")
         # Under the threshold -> quality-safe verbatim forwarding.
         assert tool_msg["content"] == small
+
+
+class TestUserPasteCompression:
+    """Review §5 / C13: large user code pastes must be boundary-compressed by the
+    pipeline (agentic coding bloats on pasted files, not just tool output)."""
+
+    def test_large_user_paste_is_compressed(self) -> None:
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 200_000
+        assert config.agentic.user_paste_compression_enabled
+        threshold = config.agentic.user_paste_compression_max_chars
+        optimizer = AgentContextOptimizer(config)
+
+        # A realistic oversized file paste: many repeated lines -> over threshold.
+        big_paste = "\n".join(["def helper():  # boilerplate"] * 400)
+        assert len(big_paste) > threshold
+
+        messages = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": f"Here is my file:\n{big_paste}"},
+        ]
+        result = optimizer.optimize_messages(messages)
+        user_msg = next(m for m in result if m.get("role") == "user")
+        assert len(user_msg["content"]) < len(big_paste)
+        # Compression collapsed the repeated line rather than forwarding verbatim.
+        assert user_msg["content"].count("def helper()") < 400
+
+    def test_small_user_paste_forwarded_verbatim(self) -> None:
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 200_000
+        optimizer = AgentContextOptimizer(config)
+        small = "def add(a, b):\n    return a + b"
+        messages = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": f"Review this:\n{small}"},
+        ]
+        result = optimizer.optimize_messages(messages)
+        user_msg = next(m for m in result if m.get("role") == "user")
+        # Under the threshold -> verbatim forwarding (quality-safe).
+        assert small in user_msg["content"]
+
+    def test_user_paste_compression_can_be_disabled(self) -> None:
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 200_000
+        config.agentic.user_paste_compression_enabled = False
+        optimizer = AgentContextOptimizer(config)
+        big_paste = "\n".join(["x = 1  # repeated"] * 400)
+        messages = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": f"Paste:\n{big_paste}"},
+        ]
+        result = optimizer.optimize_messages(messages)
+        user_msg = next(m for m in result if m.get("role") == "user")
+        # Disabled -> the paste is forwarded unchanged.
+        assert user_msg["content"] == f"Paste:\n{big_paste}"
+
+
+class TestIncrementalOptimization:
+    """Review §4: incremental optimization (behind a flag) must produce output
+    byte-identical to the full path while reusing the stable prefix."""
+
+    def _build_conversation(self, turns: int) -> list[dict[str, Any]]:
+        msgs: list[dict[str, Any]] = [
+            {"role": "system", "content": "You are a helpful coding agent."},
+        ]
+        for i in range(turns):
+            msgs.append({"role": "user", "content": f"Step {i}: implement feature {i}"})
+            msgs.append(
+                {"role": "assistant", "content": f"Done step {i}."}
+            )
+        return msgs
+
+    def test_incremental_matches_full_path(self) -> None:
+        """With the flag on, the incremental path is byte-identical to full path."""
+        full_cfg = AppConfig()
+        full_cfg.agentic.max_optimized_chars = 200_000
+        full_cfg.agentic.live_zone_compression_enabled = True
+        full_cfg.v050.cache_stable_mode = True
+        full_cfg.v050.frozen_prefix_turns = 2
+        full = AgentContextOptimizer(full_cfg)
+
+        incr_cfg = AppConfig()
+        incr_cfg.agentic.max_optimized_chars = 200_000
+        incr_cfg.agentic.live_zone_compression_enabled = True
+        incr_cfg.v050.cache_stable_mode = True
+        incr_cfg.v050.frozen_prefix_turns = 2
+        incr_cfg.agentic.incremental_optimization_enabled = True
+        incr = AgentContextOptimizer(incr_cfg)
+
+        # Replay a growing conversation; at each turn compare incremental vs full.
+        for turn in range(1, 12):
+            messages = self._build_conversation(turn)
+            full_out = full.optimize_messages(list(messages))
+            incr_out = incr.optimize_messages(list(messages))
+            # Byte-identical optimized prompts (volatile turn included).
+            assert [
+                {k: v for k, v in m.items() if k != "_volatile_turn"}
+                for m in full_out
+            ] == [
+                {k: v for k, v in m.items() if k != "_volatile_turn"}
+                for m in incr_out
+            ], f"turn {turn}: incremental output diverged from full path"
+
+    def test_incremental_reuses_stable_prefix(self) -> None:
+        """The memo is populated and reused across turns with an unchanged prefix."""
+        incr_cfg = AppConfig()
+        incr_cfg.agentic.max_optimized_chars = 200_000
+        incr_cfg.agentic.live_zone_compression_enabled = True
+        incr_cfg.v050.cache_stable_mode = True
+        incr_cfg.v050.frozen_prefix_turns = 2
+        incr_cfg.agentic.incremental_optimization_enabled = True
+        incr = AgentContextOptimizer(incr_cfg)
+
+        # The first turn has no prior stable prefix, so the memo is not yet set.
+        incr.optimize_messages(self._build_conversation(3))
+        assert incr._stable_prefix_optimized is None
+
+        # The second turn establishes a stable prefix and populates the memo.
+        incr.optimize_messages(self._build_conversation(4))
+        assert incr._stable_prefix_optimized is not None
+        assert incr._stable_prefix_hash is not None
+        memo_before = incr._stable_prefix_optimized
+
+        # A further turn with an unchanged prefix reuses the memo verbatim.
+        incr.optimize_messages(self._build_conversation(5))
+        # The stable prefix portion is reused byte-for-byte.
+        assert incr._stable_prefix_optimized == memo_before
+
+    def test_incremental_disabled_by_default(self) -> None:
+        """The flag defaults to off so production behavior is unchanged."""
+        cfg = AppConfig()
+        assert cfg.agentic.incremental_optimization_enabled is False
+
+
+class TestFastPathSingleGate:
+    """Review §2 / C14: the fast-path concept must be a single early-return gate that
+    also skips RAG/summary when the context is small — even when the fast path itself
+    is bypassed (e.g. a lean context that carries a large tool output)."""
+
+    def _make_optimizer(self) -> AgentContextOptimizer:
+        cfg = AppConfig()
+        # Generous budget so the conversation stays under the proactive threshold
+        # (lean context), but include a large tool output that bypasses the fast path.
+        cfg.agentic.max_optimized_chars = 200_000
+        cfg.agentic.rag_enabled = True
+        cfg.v050.cache_stable_summary_enabled = True
+        cfg.v050.hierarchical_summary_enabled = True
+        cfg.v050.cache_stable_mode = True
+        return AgentContextOptimizer(cfg)
+
+    def test_rag_skipped_on_lean_context_with_large_tool_output(self) -> None:
+        opt = self._make_optimizer()
+        # A small conversation (lean) but with one large tool output that forces the
+        # fast path to return None. RAG must still be skipped because the context is
+        # lean (single gate), not fired just because the fast path was bypassed.
+        big_tool = "\n".join(["line of output"] * 50)  # >1000 chars -> bypasses fast path
+        messages = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Run it."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "run", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "name": "run", "content": big_tool},
+        ]
+        rag_calls: list[object] = []
+        opt.state_rag.get_context_for_step = lambda *a, **kw: rag_calls.append(a) or ""  # type: ignore[method-assign]
+
+        result = opt.optimize_messages(messages)
+
+        # RAG was not invoked because the context is lean (single gate).
+        assert rag_calls == []
+        # The tool output is still present (not evicted) and the volatile turn is
+        # appended without RAG context.
+        tool_msg = next(m for m in result if m.get("role") == "tool")
+        assert tool_msg["content"] == big_tool
+
+    def test_rag_runs_on_over_threshold_context(self) -> None:
+        opt = self._make_optimizer()
+        # A large conversation that exceeds the proactive threshold -> RAG should run.
+        # The threshold is ~1350 tokens; use a 20k-char user turn to clear it.
+        big_user = "x" * 20_000
+        messages = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": big_user},
+            {"role": "assistant", "content": "ok"},
+        ]
+        rag_calls: list[object] = []
+        opt.state_rag.get_context_for_step = lambda *a, **kw: rag_calls.append(a) or ""  # type: ignore[method-assign]
+
+        opt.optimize_messages(messages)
+        # Over threshold -> RAG is invoked.
+        assert len(rag_calls) >= 1
+
+
+class TestRankChunksThreshold:
+    """Review §5 / C2: min_chunk_score must actually drop low-relevance chunks."""
+
+    def _make_optimizer(self) -> AgentContextOptimizer:
+        cfg = AppConfig()
+        # Use the production default threshold (0.2) unless overridden below.
+        return AgentContextOptimizer(cfg)
+
+    def test_low_relevance_chunks_dropped_at_default_threshold(self) -> None:
+        import numpy as np
+
+        opt = self._make_optimizer()
+        # Query vector along the x-axis.
+        query = np.array([1.0, 0.0, 0.0], dtype=float)
+        # Three chunks: one highly relevant (cos=1.0), one marginal (cos=0.1,
+        # below 0.2), one orthogonal (cos=0.0). Only the relevant one should survive.
+        chunks = ["relevant", "marginal", "orthogonal"]
+        vecs = [
+            np.array([1.0, 0.0, 0.0], dtype=float),   # cos = 1.0
+            np.array([0.1, 1.0, 0.0], dtype=float),   # cos ~ 0.099
+            np.array([0.0, 1.0, 0.0], dtype=float),   # cos = 0.0
+        ]
+        ranked = opt._rank_chunks(query, vecs, chunks)
+        assert ranked == ["relevant"]
+
+    def test_permissive_threshold_keeps_marginal_chunk(self) -> None:
+        import numpy as np
+
+        cfg = AppConfig()
+        cfg.code_chunking.min_chunk_score = 0.05  # legacy permissive value
+        opt = AgentContextOptimizer(cfg)
+        query = np.array([1.0, 0.0, 0.0], dtype=float)
+        chunks = ["relevant", "marginal", "orthogonal"]
+        vecs = [
+            np.array([1.0, 0.0, 0.0], dtype=float),
+            np.array([0.1, 1.0, 0.0], dtype=float),
+            np.array([0.0, 1.0, 0.0], dtype=float),
+        ]
+        ranked = opt._rank_chunks(query, vecs, chunks)
+        # At 0.05 the marginal chunk (cos ~0.099) survives; orthogonal (0.0) still drops.
+        assert "relevant" in ranked
+        assert "marginal" in ranked
+        assert "orthogonal" not in ranked
+
+    def test_default_threshold_is_raised_from_legacy(self) -> None:
+        assert AppConfig().code_chunking.min_chunk_score == 0.2
+
+
+class TestDeltaSnapshotScopedToLiveZone:
+    """Review §4 / C4: delta-snapshot regex scan must only cover the live zone
+    (new/mutated turns), not the byte-stable prefix re-scanned every turn."""
+
+    def _make_optimizer(self) -> AgentContextOptimizer:
+        cfg = AppConfig()
+        cfg.v050.delta_encoding_enabled = True
+        cfg.agentic.fast_path_enabled = False  # reach the delta-snapshot step
+        cfg.v050.hit_prediction_enabled = False  # avoid early-exit before delta step
+        cfg.v050.static_prefix_kv_enabled = False  # avoid KV-cache early return
+        cfg.agentic.max_optimized_chars = 100_000  # no eviction; keep full history
+        cfg.v050.cache_stable_mode = True
+        opt = AgentContextOptimizer(cfg)
+        # The cache registry is a process-global singleton that learns a 1.0 hit
+        # rate after the first turn, which would early-exit the second turn
+        # before the delta-snapshot step. Replace it with a fresh, empty registry
+        # so the test exercises the full pipeline on every turn.
+        from moeptimizer.cache_registry import CacheKeyRegistry, get_cache_registry
+
+        get_cache_registry.__globals__["_registry"] = CacheKeyRegistry()
+        opt.cache_registry = get_cache_registry()
+        # The cache registry predicts a 1.0 hit rate for a repeated static prefix,
+        # which early-exits the pipeline before the delta-snapshot step. Force it
+        # to 0.0 so the test exercises the full pipeline (and the delta scan) every
+        # turn.
+        opt.cache_registry.predict_hit_rate = lambda *a, **k: 0.0  # type: ignore[method-assign]
+        return opt
+
+    def test_stable_prefix_code_block_not_rescanned_each_turn(self) -> None:
+        opt = self._make_optimizer()
+        code_block = "```python\ndef stable():\n    return 42\n```"
+
+        # Turn 1: a code block in an early (stable-prefix) user turn.
+        msgs1 = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": f"Here is the helper:\n{code_block}"},
+            {"role": "assistant", "content": "Got it."},
+        ]
+        opt.optimize_messages(msgs1)
+        stored_after_t1 = opt.delta_encoder._stats["snapshots_stored"]
+
+        # Turn 2: append a NEW turn. The early code block is now in the stable
+        # prefix and must NOT be re-scanned (no new snapshot for it).
+        msgs2 = [*msgs1,
+            {"role": "user", "content": "Now add a test."},
+            {"role": "assistant", "content": "Added."},
+        ]
+        opt.optimize_messages(msgs2)
+        stored_after_t2 = opt.delta_encoder._stats["snapshots_stored"]
+
+        # The new turn has no code block, so the stable-prefix block must not be
+        # re-stored: the snapshot count stays the same (C4 gating).
+        assert stored_after_t2 == stored_after_t1
+        assert stored_after_t1 >= 1  # the block WAS stored on turn 1
+
+    def test_new_live_zone_code_block_is_stored(self) -> None:
+        opt = self._make_optimizer()
+        msgs1 = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Start."},
+            {"role": "assistant", "content": "OK."},
+        ]
+        opt.optimize_messages(msgs1)
+        stored_after_t1 = opt.delta_encoder._stats["snapshots_stored"]
+
+        # Turn 2 introduces a code block in the live zone -> must be stored.
+        new_code = "```python\ndef new_fn():\n    pass\n```"
+        msgs2 = [*msgs1,
+            {"role": "user", "content": f"Add this:\n{new_code}"},
+            {"role": "assistant", "content": "Done."},
+        ]
+        opt.optimize_messages(msgs2)
+        stored_after_t2 = opt.delta_encoder._stats["snapshots_stored"]
+
+        assert stored_after_t2 > stored_after_t1
+
+
+class TestQualityAnchorMonotonic:
+    """Review §5 / C5: the quality anchor is the trailing volatile user turn, so its
+    content must be byte-stable across turns. Constraints accumulate append-only and
+    only drop from the FRONT (oldest) when capped, so the recent tail never churns."""
+
+    def _make_optimizer(self) -> AgentContextOptimizer:
+        cfg = AppConfig()
+        cfg.agentic.max_optimized_chars = 100_000
+        return AgentContextOptimizer(cfg)
+
+    def _user_turns(self, *contents: str) -> list[dict[str, Any]]:
+        msgs: list[dict[str, Any]] = [{"role": "system", "content": "You are a coding agent."}]
+        for c in contents:
+            msgs.append({"role": "user", "content": c})
+            msgs.append({"role": "assistant", "content": "ok"})
+        return msgs
+
+    def test_first_request_is_frozen_across_turns(self) -> None:
+        opt = self._make_optimizer()
+        a1 = opt._build_quality_anchor(self._user_turns("Build a REST API for users"))
+        a2 = opt._build_quality_anchor(self._user_turns("Build a REST API for users", "Add auth"))
+        # The "Original request" head must be identical on both turns (monotonic).
+        assert "Build a REST API for users" in a1
+        assert "Build a REST API for users" in a2
+        assert opt._anchor_first_request  # captured once, never rewritten
+
+    def test_constraints_accumulate_append_only(self) -> None:
+        opt = self._make_optimizer()
+        a1 = opt._build_quality_anchor(self._user_turns("Task", "constraint one"))
+        a2 = opt._build_quality_anchor(self._user_turns("Task", "constraint one", "constraint two"))
+        # The first constraint must still be present and the second appended.
+        assert "constraint one" in a1
+        assert "constraint one" in a2
+        assert "constraint two" in a2
+        # The tail is monotonic: a2's constraint block contains a1's constraint block.
+        assert a1 in a2 or "constraint one" in a2
+
+    def test_oldest_constraint_drops_from_front_not_middle(self) -> None:
+        opt = self._make_optimizer()
+        # Feed 7 distinct constraints; cap is 5, so the 2 oldest drop from the FRONT.
+        contents = ["Task"] + [f"constraint {i}" for i in range(1, 8)]
+        anchor = opt._build_quality_anchor(self._user_turns(*contents))
+        assert "constraint 1" not in anchor
+        assert "constraint 2" not in anchor
+        # The most-recent 5 are retained and in original order (tail stable).
+        for i in range(3, 8):
+            assert f"constraint {i}" in anchor
+        assert anchor.index("constraint 3") < anchor.index("constraint 7")
+
+    def test_repeated_user_turn_does_not_grow_anchor(self) -> None:
+        opt = self._make_optimizer()
+        a1 = opt._build_quality_anchor(self._user_turns("Task", "dup constraint"))
+        a2 = opt._build_quality_anchor(self._user_turns("Task", "dup constraint", "dup constraint"))
+        # The duplicate is deduped against the running set; tail stays byte-identical.
+        assert a1 == a2

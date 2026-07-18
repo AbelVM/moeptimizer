@@ -14,7 +14,8 @@ import hashlib
 import logging
 import pickle
 from collections import OrderedDict
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ class MTPStateManager:
         self,
         messages: list[dict[str, Any]],
         overlap_tokens: int = 128,
-        encode: "Callable[[str], list[int]] | None" = None,
+        encode: Callable[[str], list[int]] | None = None,
     ) -> str:
         """Generate a state key from the trailing context (review §6 bug #6).
 

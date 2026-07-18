@@ -1,6 +1,5 @@
 """Tests for cache-aware chunking."""
 
-import pytest
 
 from moeptimizer.cache_aware_chunker import (
     CacheAwareChunker,

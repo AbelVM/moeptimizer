@@ -134,7 +134,12 @@ class EmbeddingService:
         return self._breaker.stats()
 
     def _sync_get_embedding(self, text: str) -> NDArray[np.float32]:
-        """Synchronous embedding helper safe from sync or async contexts."""
+        """Synchronous embedding helper safe from sync or async contexts.
+
+        Reuses a single long-lived event loop per worker thread (via
+        ``_get_sync_loop``) instead of spawning a fresh ``new_event_loop()``
+        per call, which leaked loops under concurrent turns (review §8/§10).
+        """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -143,7 +148,7 @@ class EmbeddingService:
         if loop.is_running():
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 return pool.submit(
-                    lambda: asyncio.new_event_loop().run_until_complete(self.get_embedding(text))
+                    lambda: _get_sync_loop().run_until_complete(self.get_embedding(text))
                 ).result()
         return loop.run_until_complete(self.get_embedding(text))
 
@@ -152,6 +157,12 @@ class EmbeddingService:
         with concurrent.futures.ThreadPoolExecutor() as pool:
             futures = [pool.submit(self._sync_get_embedding, t) for t in texts]
             return [f.result() for f in futures]
+
+    # Single stable table for all agent turns. Sharding by turn-id prefix
+    # (the old `agent_turns_{turn_id[:4]}` scheme) made `search_similar` read
+    # from a table that was never written, so RAG silently returned [] (review
+    # §9). One table keeps index and search consistent.
+    _TABLE_NAME = "agent_turns"
 
     async def index_turn(
         self,
@@ -173,13 +184,12 @@ class EmbeddingService:
             row.update(metadata)
 
         try:
-            table_name = f"agent_turns_{turn_id[:4]}"
             try:
-                table = self._lancedb_db.open_table(table_name)
+                table = self._lancedb_db.open_table(self._TABLE_NAME)
                 table.add([row])
             except Exception:
                 table = self._lancedb_db.create_table(
-                    table_name,
+                    self._TABLE_NAME,
                     [row],
                     mode="overwrite",
                 )
@@ -197,7 +207,7 @@ class EmbeddingService:
 
         try:
             query_embedding = await self.get_embedding(query)
-            table = self._lancedb_db.open_table("agent_turns")
+            table = self._lancedb_db.open_table(self._TABLE_NAME)
             results = (
                 table.search(query_embedding.tolist())
                 .limit(limit)

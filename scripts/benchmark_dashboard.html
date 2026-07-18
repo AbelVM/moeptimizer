@@ -148,7 +148,7 @@ function parseJSON(text){
 }
 
 /* ============================ LOG parser ============================ */
-const RE_TURN = /^  Turn (\d+):\s*direct=([\d.]+)ms\/([\d,]+)tok\/([\d,]+)chars\s*proxy=([\d.]+)ms\/([\d,]+)tok\/([\d,]+)chars_raw\/([\d,]+)chars\s*raw_input=([\d,]+)tok\s*delta=([+-]?[\d.]+)ms\/([+-]?[\d,]+)tok\s*cache=([\d,.]+|n\/a)\/([\d,.]+|n\/a)\s*quality_sem=([+-]?[\d.]+|n\/a)\s*jaccard=([+-]?[\d.]+|n\/a)\s*rouge=([+-]?[\d.]+|n\/a)\s*faith=([+-]?[\d.]+|n\/a)\s*evict=([+-]?[\d.]+|n\/a)/;
+  const RE_TURN = /^  Turn (\d+):\s*direct=([\d.]+)ms\/([\d,]+)tok\/([\d,]+)chars\s*proxy=([\d.]+)ms\/([\d,]+)tok\/([\d,]+)chars_raw\/([\d,]+)chars\s*raw_input=([\d,]+)tok\s*(?:ttft\(d\/p\)=([\d.]+|n\/a)ms\/([\d.]+|n\/a)ms\s*)?delta=([+-]?[\d.]+)ms\/([+-]?[\d,]+)tok\s*cache=([\d,.]+|n\/a)\/([\d,.]+|n\/a)\s*quality_sem=([+-]?[\d.]+|n\/a)\s*jaccard=([+-]?[\d.]+|n\/a)\s*rouge=([+-]?[\d.]+|n\/a)\s*faith=([+-]?[\d.]+|n\/a)\s*evict=([+-]?[\d.]+|n\/a)/;
 const RE_PTURN = /^  Proxy turn (\d+)\/(\d+): raw (\d+) msgs\/([\d,]+) chars\/~?([\d,]+) tok \(pre-optimization\)/;
 const RE_PBACK = /^    → backend-facing: ([\d,]+) tok \(source=([\w_]+), cached=([\d,]+), prefix_hits=([\d,]+), raw=([\d,]+) chars\)/;
 const RE_DTURN = /^  Direct turn (\d+)\/(\d+): backend-facing ~?([\d,]+) tok \(raw (\d+) msgs\/([\d,]+) chars, no proxy\)/;
@@ -183,10 +183,11 @@ function parseLog(text){
         direct_ms:num(m[2]), direct_tok:num(m[3]), direct_chars:num(m[4]),
         proxy_ms:num(m[5]), proxy_tok:num(m[6]), proxy_raw_chars:num(m[7]), proxy_chars:num(m[8]),
         raw_input_tok:num(m[9]),
-        delta_ms:num(m[10]), delta_tok:num(m[11]),
-        cache_hit:(m[12]==='n/a'?NaN:num(m[12])), cache_miss:(m[13]==='n/a'?NaN:num(m[13])),
-        sem:num(m[14]), jaccard:num(m[15]), rouge:num(m[16]),
-        faith:num(m[17]), evict:num(m[18])
+        ttft_direct_ms:(m[10]==='n/a'?NaN:num(m[10])), ttft_proxy_ms:(m[11]==='n/a'?NaN:num(m[11])),
+        delta_ms:num(m[12]), delta_tok:num(m[13]),
+        cache_hit:(m[14]==='n/a'?NaN:num(m[14])), cache_miss:(m[15]==='n/a'?NaN:num(m[15])),
+        sem:num(m[16]), jaccard:num(m[17]), rouge:num(m[18]),
+        faith:num(m[19]), evict:num(m[20])
       };
     } else if((m=RE_PTURN.exec(line))){
       // New benchmark: numerator is the WITHIN-ROUND position (1..perRound).
@@ -723,9 +724,9 @@ function renderJSONView(root,J,L,ri){
   //    direct conversation (with proxy vs without). Higher because the direct
   //    path sends the entire context every turn (no eviction/compaction).
   cards.appendChild(card('Token savings (intrinsic, vs raw input)', fmtPct(tok.token_savings_vs_raw_pct), tok.token_savings_vs_raw_pct>0?'good':'bad',
-    `${fmt(tok.total_raw_input_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok · proxy's own compaction`));
+    `HEADLINE · ${fmt(tok.total_raw_input_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok · proxy's own compaction (honest metric)`));
   cards.appendChild(card('Token savings (real-world, vs direct)', fmtPct(tok.token_savings_pct), tok.token_savings_pct>0?'good':'bad',
-    `${fmt(tok.total_direct_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok · with vs without proxy`));
+    `${fmt(tok.total_direct_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok · inflated: direct sends full context every turn`));
   const latD = lat.delta_proxy_minus_direct_ms;
   // Focus this card on the latency OVERHEAD the proxy adds (proxy − direct),
   // not the absolute proxy latency (which is dominated by backend generation
@@ -737,6 +738,17 @@ function renderJSONView(root,J,L,ri){
     (isNum(latDMean)?(latDMean>=0?'+':'')+fmtSec(latDMean):'—'),
     isNum(latDMean)?(latDMean>0?'bad':'good'):'',
     `proxy ${fmtSec(lat.proxy&&lat.proxy.mean)} vs direct ${fmtSec(lat.direct&&lat.direct.mean)}${isNum(dPct)?` · ${(dPct>=0?'+':'')+dPct.toFixed(1)}%`:''}`));
+  // TTFT (time-to-first-token) — only present when the run used --measure-ttft.
+  // Both direct and proxy are shown; empty series (no streaming run) is '—'.
+  const ttftD = ttft.direct && isNum(ttft.direct.mean) ? ttft.direct.mean : NaN;
+  const ttftP = ttft.proxy && isNum(ttft.proxy.mean) ? ttft.proxy.mean : NaN;
+  const ttftHasData = isNum(ttftD) || isNum(ttftP);
+  cards.appendChild(card('Time-to-first-token (TTFT)',
+    ttftHasData ? `${isNum(ttftP)?fmtSec(ttftP):'—'} / ${isNum(ttftD)?fmtSec(ttftD):'—'}` : '—',
+    ttftHasData ? '' : 'info',
+    ttftHasData
+      ? `proxy ${isNum(ttftP)?fmtSec(ttftP):'n/a'} vs direct ${isNum(ttftD)?fmtSec(ttftD):'n/a'} (streaming run)`
+      : 'no TTFT captured (run with --measure-ttft)'));
   // PRIMARY quality signal: context retention (the optimizer's actual job).
   // Promoted to the top of the quality cards — these are what a context
   // optimizer is measured on, not response-vs-response similarity.

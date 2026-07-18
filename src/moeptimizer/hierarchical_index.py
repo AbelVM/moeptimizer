@@ -7,10 +7,7 @@ retrieval and better cache locality.
 from __future__ import annotations
 
 import re
-from collections import defaultdict
 from typing import Any
-
-from moeptimizer.code_chunking import LANG_MAP, _get_cached_parser
 
 
 class HierarchyNode:

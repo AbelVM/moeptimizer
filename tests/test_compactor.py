@@ -1,6 +1,5 @@
 """Tests for scratchpad compactor."""
 
-import pytest
 
 from moeptimizer.compactor import (
     ScratchpadCompactor,
