@@ -30,6 +30,7 @@ import logging
 import re
 import threading
 import time
+from contextlib import suppress
 from typing import Any
 
 import numpy as np
@@ -63,6 +64,7 @@ from moeptimizer.dependency_orderer import get_dependency_orderer
 from moeptimizer.embedding import EmbeddingService
 from moeptimizer.expert_cache import get_expert_cache
 from moeptimizer.goal_decomposer import GoalDecomposer
+from moeptimizer.goal_relevance_scorer import GoalRelevanceScorer
 from moeptimizer.hierarchical_index import get_hierarchical_index
 from moeptimizer.hierarchical_summarizer import get_hierarchical_summarizer
 from moeptimizer.hit_prediction_model import get_hit_prediction_model
@@ -83,6 +85,7 @@ from moeptimizer.thinking_preserver import ThinkingPreserver
 from moeptimizer.token_aware_truncator import TokenAwareTruncator
 from moeptimizer.token_counter import TokenCounter
 from moeptimizer.tool_output_compressor import ToolOutputCompressor, compress_tool_messages
+from moeptimizer.tool_output_filter import ToolOutputFilter, filter_tool_messages
 from moeptimizer.tool_streamer import get_tool_streamer
 
 logger = logging.getLogger(__name__)
@@ -108,42 +111,78 @@ _OPENAI_MESSAGE_KEYS = {
 class AgentContextOptimizer:
     """Main orchestrator for agentic context optimization."""
 
-    def __init__(self, config: AppConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig | None = None,
+        capability_probe: Any = None,
+    ) -> None:
         self._config = config or AppConfig()
         self._lock = threading.RLock()
         self.store = AgentStateStore()
         self.context_aligner = get_context_aligner()
+
+        # v0.5.0 components (must be initialized before ScratchpadCompactor
+        # because the compactor may reference self.hierarchical_summarizer).
+        v050 = self._config.v050
+        self._cache_stable_summary = v050.cache_stable_summary_enabled or v050.hierarchical_summary_enabled
+        self.hierarchical_summarizer = (
+            get_hierarchical_summarizer(max_full_turns=v050.hierarchical_summary_max_full_turns)
+            if self._cache_stable_summary
+            else None
+        )
+        self.static_prefix_kv = get_static_prefix_kv_cache() if v050.static_prefix_kv_enabled else None
+        self.token_aware_truncator = (
+            TokenAwareTruncator(
+                cache_stable_mode=v050.cache_stable_mode,
+                frozen_prefix_turns=v050.frozen_prefix_turns,
+                context_aligner=self.context_aligner,
+                token_calibration=1.0,
+            )
+            if v050.token_aware_truncation_enabled
+            else None
+        )
+        self.chunk_fingerprint = get_chunk_fingerprint_cache(max_entries=v050.chunk_fingerprint_max_entries) if v050.chunk_fingerprint_enabled else None
+        self.hit_prediction = get_hit_prediction_model(retrain_threshold=v050.hit_prediction_retrain_threshold) if v050.hit_prediction_enabled else None
+        self.delta_encoder = get_delta_encoder() if v050.delta_encoding_enabled else None
+        self.async_io = get_async_io_stage(max_thread_workers=v050.async_io_max_thread_workers, max_async_concurrency=v050.async_io_max_concurrency) if v050.async_io_enabled else None
+
         self.compactor = ScratchpadCompactor(
             keep_full=self._config.agentic.keep_full_steps,
             cache_stable_mode=self._config.v050.cache_stable_mode,
             frozen_prefix_turns=self._config.v050.frozen_prefix_turns,
             context_aligner=self.context_aligner,
+            hierarchical_summarizer=self.hierarchical_summarizer,
         )
         self.thinking_preserver = ThinkingPreserver()
         self.state_rag = StateBasedRAG(self.store)
         self.loop_detector = LoopDetector(threshold=3)
         self.progress_tracker = ProgressTracker()
-        self.token_counter = TokenCounter(tokenizer=self._config.server.tokenizer)
+        self.token_counter = TokenCounter(
+            tokenizer=self._config.server.tokenizer,
+            capability_probe=capability_probe,
+        )
         self.goal_decomposer = GoalDecomposer()
+        self.goal_relevance_scorer = GoalRelevanceScorer(self._config.agentic)
         self.embedding_service = EmbeddingService()
-        self.expert_cache = get_expert_cache()
+        self.expert_cache = get_expert_cache()  # NON-FUNCTIONAL placeholder: fabricated expert masks, no real MoE routing (review03.md §2.1)
         self.symbol_index = SymbolIndex()
         self.cache_registry = get_cache_registry()
         self.cache_registry.load_from_disk()
         self.context_canonicalizer = get_context_canonicalizer()
         self.context_compressor = get_context_compressor()
         self.context_template_matcher = get_context_template_matcher()
-        self.dependency_orderer = get_dependency_orderer()
+        self.dependency_orderer = get_dependency_orderer()  # no-op: instantiated but never called in the pipeline; import ordering not applied
         self.incremental_updater = get_incremental_updater()
         self.pattern_injector = get_pattern_injector()
-        self.selective_truncator = get_selective_truncator()
+        self.selective_truncator = get_selective_truncator()  # limited: only remove_duplicates is called (deduplicate code blocks in newest user message)
         self.cache_aware_chunker = get_cache_aware_chunker(block_size=get_block_size())
         self.hierarchical_index = get_hierarchical_index()
-        self.mtp_state_manager = get_mtp_state_manager()
+        self.mtp_state_manager = get_mtp_state_manager()  # NON-FUNCTIONAL placeholder: cannot capture real MTP state (review03.md §2.1/§10)
         self.tool_streamer = get_tool_streamer()
         self.tool_output_compressor = ToolOutputCompressor(
             max_chars=self._config.agentic.tool_output_compression_max_chars
         )
+        self.tool_output_filter = ToolOutputFilter()
         self._task_type: str = "default"
         self._last_mtp_state_key: str | None = None
         self._last_backend_extra_body: dict[str, Any] = {}
@@ -165,36 +204,18 @@ class AgentContextOptimizer:
         # Set once the calibration ratio has been anchored to the backend's exact
         # tokenizer (native /tokenize) so the seed is not re-fetched every turn.
         self._calibration_seeded: bool = False
-
-        # v0.5.0 components
-        v050 = self._config.v050
-        self.static_prefix_kv = get_static_prefix_kv_cache() if v050.static_prefix_kv_enabled else None
-        self.token_aware_truncator = (
-            TokenAwareTruncator(
-                cache_stable_mode=v050.cache_stable_mode,
-                frozen_prefix_turns=v050.frozen_prefix_turns,
-                context_aligner=self.context_aligner,
-                token_calibration=self._token_calibration,
-            )
-            if v050.token_aware_truncation_enabled
-            else None
-        )
-        self.chunk_fingerprint = get_chunk_fingerprint_cache(max_entries=v050.chunk_fingerprint_max_entries) if v050.chunk_fingerprint_enabled else None
-        self.hit_prediction = get_hit_prediction_model(retrain_threshold=v050.hit_prediction_retrain_threshold) if v050.hit_prediction_enabled else None
-        # The cache-stable rolling-summary path is the SAFE summarization mode
-        # (review §1/§3/§5, #7): older dynamic turns are folded into an
-        # append-only block placed right after the frozen prefix and protected
-        # from front-eviction, so the backend's prefix cache stays valid. It is
-        # enabled by the dedicated `cache_stable_summary_enabled` flag, or by the
-        # legacy `hierarchical_summary_enabled` alias.
-        self._cache_stable_summary = v050.cache_stable_summary_enabled or v050.hierarchical_summary_enabled
-        self.hierarchical_summarizer = (
-            get_hierarchical_summarizer(max_full_turns=v050.hierarchical_summary_max_full_turns)
-            if self._cache_stable_summary
-            else None
-        )
-        self.delta_encoder = get_delta_encoder() if v050.delta_encoding_enabled else None
-        self.async_io = get_async_io_stage(max_thread_workers=v050.async_io_max_thread_workers, max_async_concurrency=v050.async_io_max_concurrency) if v050.async_io_enabled else None
+        # Live-zone compression state (P3). Tracks the boundary between the
+        # stable prefix (already optimized, must stay byte-identical for cache
+        # reuse) and the live zone (new messages that can be optimized). When
+        # the stable prefix is unchanged across turns, only the live zone is
+        # re-processed by expensive stages (tree-sitter, RAG, tool compression).
+        self._last_stable_prefix: list[dict[str, Any]] = []
+        self._live_zone_start: int = 0
+        # Content-hash cache for tool-output filtering/compression (P3). Avoids
+        # re-running regex filters and boundary compression on identical tool
+        # outputs that appear across turns.
+        self._tool_output_cache: dict[str, dict[str, Any]] = {}
+        self._tool_output_cache_max: int = 1024
 
     def _budget_tokens(self) -> int:
         """Return the configured token budget without letting defaults override chars."""
@@ -225,7 +246,7 @@ class AgentContextOptimizer:
     def calibrated_token_count(self, messages: list[dict[str, Any]]) -> int:
         """Return the token count scaled by the learned backend ratio (#6)."""
         raw = self.token_counter.count_messages(messages)
-        return int(round(raw * self._token_calibration))
+        return round(raw * self._token_calibration)
 
     def seed_token_calibration(self, sample_text: str, exact_tokens: int) -> None:
         """Seed the calibration ratio from an EXACT reference count (#6).
@@ -243,6 +264,72 @@ class AgentContextOptimizer:
         if local > 0:
             self.set_token_calibration(exact_tokens / local)
             self._calibration_seeded = True
+
+    def _compute_live_zone_start(self, messages: list[dict[str, Any]]) -> int:
+        """Return the index where the live zone begins.
+
+        The stable prefix is the leading block of messages that is byte-identical
+        to the previous turn's optimized prefix. When it matches, everything after
+        it is the live zone and can be re-optimized without breaking cache reuse.
+        When it does not match (e.g. context reset, first turn), the entire list
+        is treated as live.
+        """
+        if not self._last_stable_prefix:
+            return 0
+
+        # Compare role+content of the current prefix against the stored one.
+        def _norm(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [{"role": m.get("role"), "content": m.get("content")} for m in msgs]
+
+        current_prefix = _norm(messages[: len(self._last_stable_prefix)])
+        if current_prefix == _norm(self._last_stable_prefix):
+            return self._live_zone_start
+
+        # Prefix changed (new session, reset, or different history). Treat all
+        # as live and reset the stored prefix.
+        self._last_stable_prefix = []
+        self._live_zone_start = 0
+        return 0
+
+    def _update_stable_prefix(self, optimized: list[dict[str, Any]]) -> None:
+        """Record the stable prefix boundary after a successful optimization."""
+        frozen_end = self.context_aligner.frozen_prefix_end(
+            optimized, self._config.v050.frozen_prefix_turns
+        )
+        self._live_zone_start = frozen_end
+        self._last_stable_prefix = [
+            {k: v for k, v in m.items() if k in ("role", "content")}
+            for m in optimized[:frozen_end]
+        ]
+
+    @staticmethod
+    def _content_hash(messages: list[dict[str, Any]]) -> str:
+        """Return a stable hash for a message list based on role+content."""
+        h = hashlib.sha256()
+        for m in messages:
+            role = str(m.get("role", ""))
+            content = str(m.get("content") or "")
+            h.update(role.encode("utf-8", errors="replace"))
+            h.update(b"\x00")
+            h.update(content.encode("utf-8", errors="replace"))
+            h.update(b"\x00")
+        return h.hexdigest()[:16]
+
+    @staticmethod
+    def _split_live_zone(
+        messages: list[dict[str, Any]], live_zone_start: int
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split messages into (stable_prefix, live_zone)."""
+        start = max(0, live_zone_start)
+        return messages[:start], messages[start:]
+
+    @staticmethod
+    def _merge_live_zone(
+        stable_prefix: list[dict[str, Any]],
+        live_zone: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Recombine stable prefix and optimized live zone."""
+        return [dict(m) for m in stable_prefix] + [dict(m) for m in live_zone]
 
     def _register_context(self, messages: list[dict[str, Any]]) -> None:
         """Register the optimized context and persist only periodically.
@@ -319,6 +406,15 @@ class AgentContextOptimizer:
         """
         start_time = time.time()
 
+        # Live-zone compression (P3): compute the boundary between the stable
+        # prefix (byte-identical to the previous turn) and the live zone (new
+        # messages that can be re-optimized). When the stable prefix is unchanged,
+        # expensive stages below only touch the live zone, keeping the prefix
+        # byte-stable for backend prefix-cache reuse.
+        live_zone_start = 0
+        if self._config.agentic.live_zone_compression_enabled:
+            live_zone_start = self._compute_live_zone_start(messages)
+
         # Step 1: Populate the state store from messages
         self._ingest_messages(messages)
 
@@ -333,6 +429,21 @@ class AgentContextOptimizer:
                     subtasks = self.goal_decomposer.decompose(goal_text)
                     self.progress_tracker.set_subtasks(subtasks)
                     break
+
+        # Step 2.5: Task-aware goal-relevance pruning (P3, review §10).
+        # Evict low-relevance steps from the evictable body (oldest archived
+        # steps) before heavy optimization. The recent/protected tail and the
+        # frozen prefix are never mutated, so backend prefix-cache reuse holds.
+        try:
+            threshold = self._config.agentic.goal_relevance_threshold
+            if threshold > 0 and len(self.store.steps) > self._config.agentic.keep_full_steps:
+                self.store.prune_by_relevance(
+                    threshold=threshold,
+                    goal=self.store.get_goal(),
+                    keep_recent=self._config.agentic.keep_full_steps,
+                )
+        except Exception as e:
+            logger.warning("Goal-relevance pruning failed: %s", e)
 
         # Step 3: Run loop detection on each step
         loop_warnings: list[LoopWarning] = []
@@ -357,6 +468,7 @@ class AgentContextOptimizer:
 
         fast_path = self._maybe_fast_path(optimized, total_tokens, proactive_threshold_tokens)
         if fast_path is not None:
+            self._update_stable_prefix(fast_path)
             return fast_path
 
         # Step 5.0: Check static prefix KV-cache for early exit.
@@ -370,6 +482,7 @@ class AgentContextOptimizer:
                     logger.info("[AgentOptimizer] Static prefix KV-cache hit, skipping optimization")
                     optimized = self._strip_internal_flags(optimized)
                     self._register_context(optimized)
+                    self._update_stable_prefix(optimized)
                     return optimized
                 logger.info(
                     "[AgentOptimizer] Static prefix KV-cache hit, but context is over budget "
@@ -388,6 +501,7 @@ class AgentContextOptimizer:
                 )
                 optimized = self._strip_internal_flags(optimized)
                 self._register_context(optimized)
+                self._update_stable_prefix(optimized)
                 return optimized
             logger.info(
                 "[AgentOptimizer] High cache hit rate (%.2f), but context is over budget "
@@ -409,6 +523,7 @@ class AgentContextOptimizer:
             )
             optimized = self._strip_internal_flags(optimized)
             self._register_context(optimized)
+            self._update_stable_prefix(optimized)
             return optimized
 
         # Static layer end is recomputed after compaction/RAG because those stages
@@ -468,22 +583,10 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Context compression failed: %s", e)
 
-        # Step 5.9: Warm expert cache only when the backend will receive the
-        # hints. Otherwise the warmed cache is discarded and the work is wasted.
-        if (
-            self._config.v050.enable_experimental_backend_hints
-            and total_chars > 1000
-            and total_tokens > proactive_threshold_tokens
-        ):
-            try:
-                static_content = self._get_static_layer_content(optimized)
-                if static_content and self._config.v050.enable_experimental_backend_hints:
-                    # Only warm the (placeholder) expert cache when the backend
-                    # actually receives hints; otherwise it is discarded and the
-                    # work is pure overhead (review03.md §2.1/§6 #4).
-                    self.expert_cache.warm_cache_for_static_layer(static_content)
-            except Exception as e:
-                logger.warning("Expert cache warming failed: %s", e)
+        # Step 5.9: Expert cache warming is skipped — expert_cache is a
+        # NON-FUNCTIONAL placeholder (review03.md §2.1). The backend decides
+        # MoE expert routing internally; client-side heuristics provide no
+        # real cache locality.
 
         # Step 5.10: Prefetch dependencies only when the context is over budget.
         # This keeps RAG/cache enrichment quality-focused instead of always-on.
@@ -560,11 +663,8 @@ class AgentContextOptimizer:
         # Removing messages from the middle of history changes the serialized
         # prompt prefix even when the remaining text is semantically similar.
 
-        # Step 7.7: Apply dependency ordering for cache locality
-        try:
-            optimized = self.dependency_orderer.order_by_dependencies(optimized)
-        except Exception as e:
-            logger.warning("Dependency ordering failed: %s", e)
+        # Step 7.7: Dependency ordering is skipped — dependency_orderer is a
+        # no-op (returns messages unchanged). Retained as inert scaffolding.
 
         # Step 7.8: Apply incremental update for cache preservation
         try:
@@ -657,10 +757,18 @@ class AgentContextOptimizer:
             try:
                 current_tokens = self.token_counter.count_messages(optimized)
                 if current_tokens > proactive_threshold_tokens:
-                    for msg in optimized:
-                        content = msg.get("content") or ""
-                        if isinstance(content, str) and self._has_code_blocks(content):
-                            msg["content"] = self._optimize_code_block_content(content)
+                    if live_zone_start > 0 and live_zone_start < len(optimized):
+                        stable_prefix, live_zone = self._split_live_zone(optimized, live_zone_start)
+                        for msg in live_zone:
+                            content = msg.get("content") or ""
+                            if isinstance(content, str) and self._has_code_blocks(content):
+                                msg["content"] = self._optimize_code_block_content(content)
+                        optimized = self._merge_live_zone(stable_prefix, live_zone)
+                    else:
+                        for msg in optimized:
+                            content = msg.get("content") or ""
+                            if isinstance(content, str) and self._has_code_blocks(content):
+                                msg["content"] = self._optimize_code_block_content(content)
                 else:
                     logger.debug(
                         "[AgentOptimizer] Code block optimization skipped: tokens=%d <= threshold=%d",
@@ -699,6 +807,21 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Proactive trimming failed: %s", e)
 
+        # Step 11.5: Filter large tool/assistant outputs (rtk/snip pattern, review §3/§5.1).
+        # Applied before compression so the filter's concise markers enter the
+        # stable prefix instead of the verbose original. Idempotent on already-
+        # filtered content.
+        if self._config.agentic.tool_output_compression_enabled:
+            try:
+                if live_zone_start > 0 and live_zone_start < len(optimized):
+                    stable_prefix, live_zone = self._split_live_zone(optimized, live_zone_start)
+                    live_zone = filter_tool_messages(live_zone, self.tool_output_filter)
+                    optimized = self._merge_live_zone(stable_prefix, live_zone)
+                else:
+                    optimized = filter_tool_messages(optimized, self.tool_output_filter)
+            except Exception as e:
+                logger.warning("Tool output filtering failed: %s", e)
+
         # Step 11.6: Boundary-compress large tool/assistant outputs (headroom/
         # snip-style, review §3/§5.1). Applied once when a tool message first
         # appears, so the compressed form is frozen into the stable leading
@@ -706,7 +829,12 @@ class AgentContextOptimizer:
         # already-compressed (small) outputs, so re-running is safe.
         if self._config.agentic.tool_output_compression_enabled:
             try:
-                optimized = self._compress_tool_outputs(optimized)
+                if live_zone_start > 0 and live_zone_start < len(optimized):
+                    stable_prefix, live_zone = self._split_live_zone(optimized, live_zone_start)
+                    live_zone = self._compress_tool_outputs(live_zone)
+                    optimized = self._merge_live_zone(stable_prefix, live_zone)
+                else:
+                    optimized = self._compress_tool_outputs(optimized)
             except Exception as e:
                 logger.warning("Tool output compression failed: %s", e)
 
@@ -717,18 +845,9 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Token recount failed: %s", e)
 
-        # Step 11.7: Save MTP state before trimming for context switching.
-        # This is only meaningful when the backend receives MTP hints, so skip
-        # the bookkeeping otherwise (the result is never sent to the model).
-        if self._config.v050.enable_experimental_backend_hints:
-            try:
-                state_key = self.mtp_state_manager.get_state_key(
-                    optimized, encode=getattr(self.token_counter, "_encode", None)
-                )
-                # Store the state key in the optimizer for potential restoration
-                self._last_mtp_state_key = state_key
-            except Exception as e:
-                logger.warning("MTP state key generation failed: %s", e)
+        # Step 11.7: MTP state bookkeeping is skipped — mtp_state is a
+        # NON-FUNCTIONAL placeholder (review03.md §2.1/§10). MTP hidden states
+        # cannot be captured/restored by an OpenAI client proxy.
 
         # Step 11.8: Apply sliding window for long contexts
         # This is the preferred method for context management with MTP state preservation
@@ -898,6 +1017,15 @@ class AgentContextOptimizer:
         # the app layer's cache-outcome and token-calibration signals match what
         # was actually sent to the backend (#6, review §1/§9).
         self._last_optimized = optimized
+
+        # Live-zone compression (P3): update the stable prefix boundary so the
+        # next turn can skip re-optimizing unchanged content.
+        if self._config.agentic.live_zone_compression_enabled:
+            try:
+                self._update_stable_prefix(optimized)
+            except Exception as e:
+                logger.debug("Live-zone prefix update failed: %s", e)
+
         return optimized
 
     def _strip_internal_flags(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1455,10 +1583,7 @@ class AgentContextOptimizer:
         """
         if self.hit_prediction is None:
             return
-        if cached_tokens is not None:
-            hit = cached_tokens > 0
-        else:
-            hit = self._last_static_prefix_hit
+        hit = cached_tokens > 0 if cached_tokens is not None else self._last_static_prefix_hit
         try:
             self.hit_prediction.record_outcome(self._last_optimized, hit=hit)
         except Exception as e:  # pragma: no cover - defensive
@@ -1488,18 +1613,9 @@ class AgentContextOptimizer:
     ) -> None:
         """Prefetch dependencies for files in context.
 
-        Warms the expert cache for related code to avoid cold starts.
+        Skipped — expert_cache is a NON-FUNCTIONAL placeholder (review03.md §2.1).
         """
-        # Extract file references from context
-        file_refs = self._extract_file_references(messages)
-
-        for file_path in file_refs:
-            # Get dependency context
-            dep_context = self.state_rag.get_dependency_context(file_path)
-            if dep_context and self._config.v050.enable_experimental_backend_hints:
-                # Warm expert cache for dependency patterns. Only when the
-                # backend receives hints; otherwise the warmed cache is discarded.
-                self.expert_cache.warm_cache_for_static_layer(dep_context)
+        # No-op: expert cache warming is inert scaffolding.
 
     def _extract_file_references(
         self,
@@ -1731,8 +1847,30 @@ class AgentContextOptimizer:
         Cheap, lossless-ish transforms (truncate, collapse repeated lines/frames,
         strip ANSI) applied before the output enters the stable prefix. Idempotent
         on small/already-compressed content, so it is safe to run every turn.
+
+        Uses a content-hash cache to avoid re-compressing identical tool outputs
+        that appear across turns (P3 live-zone compression).
         """
-        return compress_tool_messages(messages, self.tool_output_compressor)
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") == "tool":
+                content = msg.get("content") or ""
+                if isinstance(content, str):
+                    cache_key = self._content_hash([msg])
+                    if cache_key in self._tool_output_cache:
+                        result.append(self._tool_output_cache[cache_key])
+                        continue
+                    compressed = compress_tool_messages([msg], self.tool_output_compressor)
+                    compressed_msg = compressed[0] if compressed else msg
+                    self._tool_output_cache[cache_key] = compressed_msg
+                    if len(self._tool_output_cache) > self._tool_output_cache_max:
+                        self._tool_output_cache.pop(next(iter(self._tool_output_cache)))
+                    result.append(compressed_msg)
+                else:
+                    result.append(msg)
+            else:
+                result.append(msg)
+        return result
 
     def get_optimal_temperature(
         self,
@@ -1784,6 +1922,40 @@ class AgentContextOptimizer:
             ),
             "mtp_state_key": self._last_mtp_state_key,
         })
+
+    def get_debug_info(self) -> dict[str, Any]:
+        """Return per-session debug snapshot for the operator dashboard (P4).
+
+        Aggregates the live-zone boundary (stable prefix vs. live zone), the
+        real prefix-cache outcome, token savings, and the embedding circuit
+        breaker state. All fields are read-only and cheap; this is purely
+        observational and never affects the optimization path.
+        """
+        goal = self.store.get_goal()
+        cache_stats = {}
+        with suppress(Exception):
+            cache_stats = self.cache_registry.get_cache_stats()
+        breaker_stats: dict[str, Any] = {}
+        with suppress(Exception):
+            breaker_stats = self.embedding_service.breaker_stats()
+        return {
+            "session_id": getattr(self, "_session_id", None),
+            "live_zone": {
+                "live_zone_start": self._live_zone_start,
+                "stable_prefix_len": len(self._last_stable_prefix),
+                "live_zone_compression_enabled": self._config.agentic.live_zone_compression_enabled,
+            },
+            "cache": {
+                "last_static_prefix_hit": self._last_static_prefix_hit,
+                "last_optimized_token_count": self._last_optimized_token_count,
+                "last_original_token_count": self._last_original_token_count,
+                "last_saved_token_count": self.last_saved_token_count,
+                "registry": cache_stats,
+            },
+            "embedding_breaker": breaker_stats,
+            "goal": goal.original_prompt if goal is not None else None,
+            "step_count": len(self.store.steps),
+        }
 
     def load_session_state(self, state_json: str) -> None:
         """Load state from a previous session."""

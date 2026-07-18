@@ -149,6 +149,17 @@ class AgenticConfig(BaseModel):
         default=4000,
         description="Tool/assistant outputs longer than this (chars) are boundary-compressed.",
     )
+    live_zone_compression_enabled: bool = Field(
+        default=True,
+        description=(
+            "Skip re-optimizing unchanged content in the stable prefix. When enabled, "
+            "the optimizer tracks a content hash of the frozen prefix and only applies "
+            "expensive transformations (tree-sitter code optimization, tool-output "
+            "filtering/compression) to new or changed messages. This keeps the prefix "
+            "byte-identical across turns, guarantees prefix-cache reuse, and reduces "
+            "per-turn CPU by avoiding redundant parsing of unchanged code blocks."
+        ),
+    )
     eviction_low_water_ratio: float = Field(
         default=0.8,
         description=(
@@ -173,6 +184,14 @@ class AgenticConfig(BaseModel):
         default=200,
         description="Maximum steps retained in AgentStateStore per session. Oldest archived steps are "
                     "pruned beyond this cap to bound memory growth over long agentic sessions.",
+    )
+    goal_relevance_threshold: float = Field(
+        default=2.0,
+        description=(
+            "Minimum relevance score for a step to survive task-aware pruning. "
+            "Steps scored below this threshold are evicted from the evictable body "
+            "after goal decomposition (review §10). Set to 0.0 to disable."
+        ),
     )
     quality_profile: str = Field(
         default="balanced",

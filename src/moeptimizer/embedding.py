@@ -12,6 +12,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from moeptimizer.cache import cache_get, cache_key, cache_put
+from moeptimizer.circuit_breaker import CircuitBreaker
 from moeptimizer.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,14 @@ class EmbeddingService:
         self._embed_cache: OrderedDict[str, NDArray[np.float32]] = OrderedDict()
         self._http_client: Any | None = None
         self._lancedb_db: Any = None
+        # Circuit breaker: an embedding-server outage must not block the
+        # optimization pipeline. After repeated failures we fast-fail with a
+        # zero vector for a cooldown window instead of hammering the server.
+        self._breaker = CircuitBreaker(
+            failure_threshold=5,
+            cooldown_seconds=30.0,
+            name="embedding",
+        )
 
     async def initialize(self) -> None:
         """Initialize HTTP client and LanceDB connection."""
@@ -80,47 +89,49 @@ class EmbeddingService:
             self._lancedb_db.close()
 
     async def get_embedding(self, text: str) -> NDArray[np.float32]:
-        """Get an embedding for the given text, using cache when possible."""
+        """Get an embedding for the given text, using cache when possible.
+
+        The external embedding call is protected by a circuit breaker so a
+        server outage fast-fails to a zero vector instead of blocking the
+        optimization pipeline (review §10).
+        """
         cache_key_str = cache_key(text)
         cached = cache_get(self._embed_cache, cache_key_str)
         if cached is not None:
             return cached
 
-        assert self._http_client is not None, "HTTP client not initialized"
-        try:
-            result = await self._http_client.post(
-                "/embeddings",
-                json={"input": text, "model": self._config.server.embed_model},
-            )
-            if result.status_code != 200:
-                embedding = np.zeros(self._config.code_chunking.embedding_dim, dtype=np.float32)
-            else:
-                data = result.json()
-                embedding_data = data["data"]["embedding"]
-                embedding = np.array(
-                    embedding_data[: self._config.code_chunking.embedding_dim],
-                    dtype=np.float32,
-                )
+        zero_vec = np.zeros(self._config.code_chunking.embedding_dim, dtype=np.float32)
 
-            cache_put(
-                self._embed_cache,
-                cache_key_str,
-                embedding,
-                self._config.cache.embed_cache_max,
-            )
-            return embedding
-        except Exception:
-            zero_vec = np.zeros(
-                self._config.code_chunking.embedding_dim,
+        def _fetch() -> NDArray[np.float32]:
+            assert self._http_client is not None, "HTTP client not initialized"
+            result = asyncio.run_coroutine_threadsafe(
+                self._http_client.post(
+                    "/embeddings",
+                    json={"input": text, "model": self._config.server.embed_model},
+                ),
+                _get_sync_loop(),
+            ).result()
+            if result.status_code != 200:
+                return zero_vec
+            data = result.json()
+            embedding_data = data["data"]["embedding"]
+            return np.array(
+                embedding_data[: self._config.code_chunking.embedding_dim],
                 dtype=np.float32,
             )
-            cache_put(
-                self._embed_cache,
-                cache_key_str,
-                zero_vec,
-                self._config.cache.embed_cache_max,
-            )
-            return zero_vec
+
+        embedding = self._breaker.call(_fetch, fallback=zero_vec)
+        cache_put(
+            self._embed_cache,
+            cache_key_str,
+            embedding,
+            self._config.cache.embed_cache_max,
+        )
+        return embedding
+
+    def breaker_stats(self) -> dict[str, object]:
+        """Return circuit-breaker state for diagnostics/dashboards."""
+        return self._breaker.stats()
 
     def _sync_get_embedding(self, text: str) -> NDArray[np.float32]:
         """Synchronous embedding helper safe from sync or async contexts."""

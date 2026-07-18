@@ -1,6 +1,8 @@
 """Tests for TokenCounter."""
 
 
+from unittest.mock import MagicMock
+
 from moeptimizer.token_counter import TokenCounter
 
 
@@ -86,3 +88,52 @@ class TestTokenCounter:
             [{"role": "user", "content": "alpha " + "word " * 20}]
         )
         assert b > a
+
+    def test_remote_count_uses_backend_when_enabled(self) -> None:
+        """When capability_probe reports remote_tokenize, _remote_count returns the backend count."""
+        probe = MagicMock()
+        probe.cached.return_value = MagicMock(remote_tokenize=True)
+        probe.tokenize_count_sync.return_value = 42
+        counter = TokenCounter(capability_probe=probe)
+        assert counter._remote_count("hello world") == 42
+        probe.tokenize_count_sync.assert_called_once_with("hello world")
+
+    def test_remote_count_cache_hit_skips_probe(self) -> None:
+        """Repeated _remote_count calls for the same text hit the bounded remote cache."""
+        probe = MagicMock()
+        probe.cached.return_value = MagicMock(remote_tokenize=True)
+        probe.tokenize_count_sync.return_value = 42
+        counter = TokenCounter(capability_probe=probe)
+        assert counter._remote_count("hello world") == 42
+        assert counter._remote_count("hello world") == 42
+        probe.tokenize_count_sync.assert_called_once()
+
+    def test_remote_count_disabled_when_probe_reports_no_remote(self) -> None:
+        """If the probe reports remote_tokenize=False, remote counting is disabled."""
+        probe = MagicMock()
+        probe.cached.return_value = MagicMock(remote_tokenize=False)
+        counter = TokenCounter(capability_probe=probe)
+        assert counter._remote_count("hello") is None
+        assert counter._use_remote is False
+
+    def test_remote_count_disabled_after_failure(self) -> None:
+        """If the backend /tokenize call fails, remote is disabled for the instance."""
+        probe = MagicMock()
+        probe.cached.return_value = MagicMock(remote_tokenize=True)
+        probe.tokenize_count_sync.return_value = None
+        counter = TokenCounter(capability_probe=probe)
+        assert counter._remote_count("hello") is None
+        assert counter._use_remote is False
+
+    def test_count_messages_uses_remote_path(self) -> None:
+        """count_messages uses the remote path when enabled and falls back to local overhead."""
+        probe = MagicMock()
+        probe.cached.return_value = MagicMock(remote_tokenize=True)
+        probe.tokenize_count_sync.return_value = 10
+        counter = TokenCounter(capability_probe=probe)
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello"},
+        ]
+        # remote=10 + 2 messages * 5 overhead = 20
+        assert counter.count_messages(messages) == 20

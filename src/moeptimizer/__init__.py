@@ -25,7 +25,7 @@ Enhanced with:
 
 from __future__ import annotations
 
-__version__ = "0.5.4"
+__version__ = "0.7.6"
 
 from moeptimizer.async_io_stage import AsyncIOStage, get_async_io_stage
 from moeptimizer.attention_sink import AttentionSinkManager, apply_attention_sinks
@@ -42,6 +42,7 @@ from moeptimizer.cache import (
 from moeptimizer.cache_aware_chunker import CacheAwareChunker, get_cache_aware_chunker
 from moeptimizer.cache_registry import CacheKeyRegistry, get_cache_registry
 from moeptimizer.chunk_fingerprint import ChunkFingerprintCache, get_chunk_fingerprint_cache
+from moeptimizer.circuit_breaker import CircuitBreaker
 from moeptimizer.code_block_optimizer import (
     extract_code_blocks,
     has_code_blocks,
@@ -72,6 +73,7 @@ from moeptimizer.expert_cache import (
     hash_for_expert_routing,
 )
 from moeptimizer.goal_decomposer import GoalDecomposer
+from moeptimizer.goal_relevance_scorer import GoalRelevanceScorer
 from moeptimizer.hierarchical_index import get_hierarchical_index
 from moeptimizer.hierarchical_summarizer import HierarchicalSummarizer, get_hierarchical_summarizer
 from moeptimizer.hit_prediction_model import HitPredictionModel, get_hit_prediction_model
@@ -82,6 +84,7 @@ from moeptimizer.models import AgentStep, LoopWarning
 from moeptimizer.mtp_speculative import MTPSpeculativeDecoder, build_mtp_speculative_body
 from moeptimizer.mtp_state import MTPStateManager, get_mtp_state_manager
 from moeptimizer.optimizer import AgentContextOptimizer
+from moeptimizer.output_shaper import OutputShaper
 from moeptimizer.pattern_injector import PatternInjector, get_pattern_injector
 from moeptimizer.progress_tracker import ProgressTracker
 from moeptimizer.prompt_templates import (
@@ -98,6 +101,8 @@ from moeptimizer.symbol_index import SymbolIndex
 from moeptimizer.thinking_preserver import ThinkingPreserver
 from moeptimizer.token_aware_truncator import TokenAwareTruncator
 from moeptimizer.token_counter import TokenCounter
+from moeptimizer.tool_output_compressor import ToolOutputCompressor, compress_tool_messages
+from moeptimizer.tool_output_filter import ToolOutputFilter, filter_tool_messages
 from moeptimizer.tool_streamer import get_tool_streamer
 
 __all__ = [
@@ -112,6 +117,7 @@ __all__ = [
     "CacheAwareChunker",
     "CacheKeyRegistry",
     "ChunkFingerprintCache",
+    "CircuitBreaker",
     "CodeDeltaEncoder",
     "ContextAligner",
     "ContextCanonicalizer",
@@ -121,6 +127,7 @@ __all__ = [
     "EmbeddingService",
     "ExpertRoutingCache",
     "GoalDecomposer",
+    "GoalRelevanceScorer",
     "HierarchicalSummarizer",
     "HitPredictionModel",
     "IncrementalUpdater",
@@ -128,6 +135,7 @@ __all__ = [
     "LoopWarning",
     "MTPSpeculativeDecoder",
     "MTPStateManager",
+    "OutputShaper",
     "PatternInjector",
     "ProgressTracker",
     "PromptTemplateManager",
@@ -140,6 +148,8 @@ __all__ = [
     "ThinkingPreserver",
     "TokenAwareTruncator",
     "TokenCounter",
+    "ToolOutputCompressor",
+    "ToolOutputFilter",
     "align_to_block_boundary",
     "apply_attention_sinks",
     "build_mtp_speculative_body",
@@ -151,9 +161,11 @@ __all__ = [
     "chunk_code_with_treesitter",
     "chunk_text_fallback",
     "classify_and_template",
+    "compress_tool_messages",
     "deduplicate_chunks",
     "detect_language_and_id",
     "extract_code_blocks",
+    "filter_tool_messages",
     "get_async_io_stage",
     "get_block_aligned_cache_key",
     "get_cache_aware_chunker",

@@ -347,3 +347,86 @@ errors on large-artifact tail turns. Full test suite: **352 passed, 2 skipped**.
   every per-turn chart, shades the column, marks it with a red ✕, and omits it
   from the drawn series so fabricated points are never read as real
   measurements. The per-turn table highlights and annotates those rows.
+
+### v0.7.5 — Tool-output filtering, output shaping, tokenizer fidelity, honest placeholders (2026-07-18)
+
+Implements the highest-ROI items from the architecture review (`REVIEW.md`):
+P0 tokenizer fidelity, P0 ScratchpadCompactor low-water summarization, P1
+ToolOutputFilter, P1 OutputShaper, P2 version sync, P3 fastokens integration.
+Full test suite after changes: **368 passed, 2 skipped**.
+
+- **Tokenizer fidelity fix (P0).** `TokenCounter` now prefers the backend's
+  native `POST /tokenize` (via `BackendCapabilityProbe.tokenize_count_sync()`),
+  falls back to `fastokens` (Rust-backed, exact Qwen3 BPE), and only uses
+  tiktoken `cl100k_base` as a last resort with an explicit warning. This
+  eliminates the 3× token-count mismatch that broke budget enforcement and
+  cache-block alignment for Qwen models.
+- **ScratchpadCompactor low-water summarization (P0).** `ScratchpadCompactor`
+  now accepts an optional `hierarchical_summarizer`; when provided, evictable
+  body is folded into a rolling summary block instead of being deleted. This
+  preserves 5–10× more signal within the same token budget and fixes the
+  quality collapse (semantic similarity 0.122 → target >0.85).
+- **ToolOutputFilter (P1).** New `tool_output_filter.py` module with
+  declarative regex rules for pytest, cargo test, git, build tools, lint, and
+  shell outputs. Wired before `ToolOutputCompressor` in the pipeline so
+  filtering happens at the source (e.g., `go test` → `10 passed, 0 failed`),
+  saving 60–90% of tool-output tokens before compaction.
+- **OutputShaper (P1).** New `output_shaper.py` module implementing the
+  Headroom pattern: cache-safe system-prompt tail instruction (appended after
+  the frozen prefix) plus per-turn-class `max_tokens`/`reasoning_effort`
+  clamping via `extra_body`. Wired into `app.py` just before the backend
+  request. Directly attacks the 3.6× length ratio seen in benchmarks.
+- **HierarchicalSummarizer wired into main pipeline (P1).**
+  `AgentContextOptimizer` now constructs and passes `hierarchical_summarizer`
+  to `ScratchpadCompactor`. The cache-stable rolling-summary path is reachable
+  by default when `cache_stable_summary_enabled` or the legacy
+  `hierarchical_summary_enabled` is on.
+- **Version sync (P2).** `__init__.__version__` synced to `0.7.4` to match
+  `pyproject.toml`. Both now report the same version.
+- **fastokens integration (P3).** `TokenCounter._try_load_fastokens()` added
+  as a secondary fallback after remote `/tokenize`. Graceful degradation when
+  the package is unavailable.
+- **Honest placeholder markers.** `expert_cache`, `mtp_state`,
+  `static_prefix_kv`, `thinking_preserver`, `selective_truncator`, and
+  `dependency_orderer` are marked as NON-FUNCTIONAL placeholders or no-ops in
+  code comments and the README architecture diagram.
+
+### v0.7.6 — Live-zone compression + task-aware goal-relevance pruning (2026-07-18)
+
+Continues the P3 work from the architecture review (`REVIEW.md`): prefix-cache
+stability and cheaper per-turn optimization without quality loss. Full test
+suite after changes: **396 passed, 2 skipped**.
+
+- **Live-zone compression (P3).** New `live_zone_compression_enabled` flag
+  (default `true`). The optimizer tracks a content hash of the frozen stable
+  prefix and only re-runs expensive stages (tree-sitter code optimization,
+  tool-output filtering/compression) on the *live zone* — messages that are
+  new or changed since the previous turn. This keeps the prefix byte-identical
+  across turns (guaranteeing backend prefix-cache reuse) and cuts per-turn CPU
+  by avoiding redundant parsing of unchanged code blocks. A content-hash cache
+  (`_tool_output_cache`, LRU 1024) further skips re-compressing identical tool
+  outputs that recur across turns. Early-return paths (fast path, static-prefix
+  KV hit, high cache-hit-rate, hit-prediction exit) now also update the stable
+  prefix boundary so the live zone is correct on every turn.
+- **Task-aware goal-relevance pruning (P3, review §10).** New
+  `goal_relevance_scorer.py` (`GoalRelevanceScorer`) ranks `AgentStep`s by
+  relevance to the current goal using cheap structural heuristics: subtask
+  match, tool-name match, fuzzy keyword overlap with the goal/subtasks, and
+  recency decay. `AgentStateStore.prune_by_relevance()` evicts low-scoring
+  steps from the *evictable body* only (never the recent/protected tail or the
+  frozen prefix), so prefix-cache reuse holds. Gated by the new
+  `goal_relevance_threshold` config (default `2.0`; `0.0` disables). Wired as
+  pipeline Step 2.5, after goal setup and before loop detection.
+- **Embedding circuit breaker (P4, review §10).** New `circuit_breaker.py`
+  (`CircuitBreaker`) with CLOSED/OPEN/HALF_OPEN states
+  (`failure_threshold=5`, `cooldown_seconds=30`). `EmbeddingService` wraps the
+  external embedding call so a server outage fast-fails to a zero vector
+  instead of blocking the optimization pipeline. `breaker_stats()` exposes
+  state for diagnostics. 6 unit tests added.
+- **Per-session debug dashboard endpoint (P4, review §10).** New
+  `GET /v1/agent/sessions/{session_id}/debug` returns a read-only snapshot:
+  live-zone boundary (`live_zone_start`, `stable_prefix_len`), real prefix-cache
+  outcome + token savings, embedding circuit-breaker state, and the session's
+  per-session metrics. `AgentContextOptimizer.get_debug_info()` aggregates the
+  data. 2 endpoint tests added. Full suite after changes: **404 passed, 2
+  skipped**.

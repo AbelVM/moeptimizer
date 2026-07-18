@@ -15,44 +15,47 @@ The full version-by-version feature history (v0.1.0 → v0.5.4, plus the review0
 
 ```
 Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
-                                │
-                                ├── SessionManager (per-session isolation)
-                                │   └── Stable Anonymous Session Resolver
-                                ├── AgentContextOptimizer (cache-stability policy)
-                                │   ├── Immutable Static Layer Guard
-                                │   ├── Reasoning Content Preserver
-                                │   ├── Stable Turn Structure Normalizer
-                                │   └── Top-Only Eviction Policy
-                                ├── AgentStateStore (KV graph)
-                                ├── ScratchpadCompactor
-                                ├── ThinkingPreserver
-                                ├── StateBasedRAG
-                                │   └── SymbolIndex (fuzzy symbol lookup)
-                                ├── LoopDetector
-                                ├── ProgressTracker
-                                ├── PromptTemplateManager (task classification)
-                                │   └── ContextTemplateMatcher (template matching)
-                                ├── AttentionSinkManager (internal cache hint only; no model-visible markers)
-                                ├── ExpertRoutingCache (MoE routing cache)
-                                ├── CacheKeyRegistry (hit prediction)
-                                │   └── HitPredictionModel (XGBoost early-exit)
-                                ├── KVSlotTracker (explicit cache control)
-                                ├── StaticPrefixKVCache (internal cache-key reuse only)
-                                ├── ContextAligner (internal alignment; no prompt padding)
-                                ├── ContextCanonicalizer (newest-user-turn only)
-                                 ├── SelectiveTruncator (newest-user-turn only)
+                                 │
+                                 ├── SessionManager (per-session isolation)
+                                 │   └── Stable Anonymous Session Resolver
+                                 ├── AgentContextOptimizer (cache-stability policy)
+                                 │   ├── Immutable Static Layer Guard
+                                 │   ├── Reasoning Content Preserver
+                                 │   ├── Stable Turn Structure Normalizer
+                                 │   ├── Top-Only Eviction Policy
+                                 │   ├── ToolOutputFilter (declarative regex filter for tool outputs)
+                                 │   ├── ToolOutputCompressor (boundary-compress large tool outputs)
+                                 │   └── OutputShaper (cache-safe terse instruction + turn-class max_tokens/reasoning_effort clamping)
+                                 ├── AgentStateStore (KV graph)
+                                 ├── ScratchpadCompactor
+                                 │   └── HierarchicalSummarizer (cache-stable rolling-summary compaction)
+                                 ├── ThinkingPreserver (no-op; preserves <think> blocks verbatim)
+                                 ├── StateBasedRAG
+                                 │   └── SymbolIndex (fuzzy symbol lookup)
+                                 ├── LoopDetector
+                                 ├── ProgressTracker
+                                 ├── PromptTemplateManager (task classification)
+                                 │   └── ContextTemplateMatcher (template matching)
+                                 ├── AttentionSinkManager (internal cache hint only; no model-visible markers)
+                                 ├── ExpertRoutingCache (placeholder; fabricated expert masks)
+                                 ├── CacheKeyRegistry (hit prediction)
+                                 │   └── HitPredictionModel (XGBoost early-exit)
+                                 ├── KVSlotTracker (explicit cache control)
+                                 ├── StaticPrefixKVCache (text memo; not real KV tensors)
+                                 ├── ContextAligner (internal alignment; no prompt padding)
+                                 ├── ContextCanonicalizer (newest-user-turn only)
+                                 ├── SelectiveTruncator (no-op; returns unchanged)
                                  ├── PatternInjector (section markers; stripped before model input)
-                                ├── DependencyOrderer (import ordering)
-                                ├── IncrementalUpdater (cache preservation)
-                                ├── CacheAwareChunker (aligned chunking)
-                                ├── ContextCompressor (newest-user-turn only)
-                                ├── CodeBlockOptimizer (tree-sitter code optimization)
-                                ├── ChunkFingerprintCache (SHA-256 chunk reuse)
-                                ├── DeltaEncoder (code delta compression)
-                                 ├── HierarchicalSummarizer (cache-stable rolling-summary compaction; enabled in the stable pipeline when cache_stable_summary_enabled or the legacy hierarchical_summary_enabled)
-                                ├── TokenAwareTruncator (whole-message top-only fallback)
-                                ├── AsyncIOStage (async heavy stage offloading)
-                                └── EmbeddingService (LanceDB + embeddings model)
+                                 ├── DependencyOrderer (no-op; import ordering not applied)
+                                 ├── IncrementalUpdater (cache preservation)
+                                 ├── CacheAwareChunker (aligned chunking)
+                                 ├── ContextCompressor (newest-user-turn only)
+                                 ├── CodeBlockOptimizer (tree-sitter code optimization)
+                                 ├── ChunkFingerprintCache (SHA-256 chunk reuse)
+                                 ├── DeltaEncoder (code delta compression)
+                                 ├── TokenAwareTruncator (whole-message top-only fallback)
+                                 ├── AsyncIOStage (async heavy stage offloading)
+                                 └── EmbeddingService (LanceDB + embeddings model)
 ```
 
 ## Installation
@@ -113,6 +116,8 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_AGENTIC__MTP_BOUNDARY_ALIGNMENT_ENABLED` | `false` | Pad final context to an MTP prediction boundary |
 | `MOEPT_AGENTIC__IMMUTABLE_PREFIX_ENABLED` | `true` | Freeze the system prompt verbatim across turns so the backend's automatic prefix cache can reuse it. The first user message is not frozen (it is deterministically compressed and stays stable on its own). |
 | `MOEPT_AGENTIC__MAX_STATE_STEPS` | `200` | Maximum steps retained in AgentStateStore per session; oldest archived steps are pruned beyond this cap |
+| `MOEPT_AGENTIC__GOAL_RELEVANCE_THRESHOLD` | `2.0` | Minimum relevance score for a step to survive task-aware pruning (review §10). Steps scored below this threshold are evicted from the evictable body after goal decomposition. Set to `0.0` to disable. |
+| `MOEPT_AGENTIC__LIVE_ZONE_COMPRESSION_ENABLED` | `true` | Live-zone compression (review §5.1/§7.1). Tracks a content hash of the frozen stable prefix and only re-runs expensive stages (tree-sitter code optimization, tool-output filter/compression) on the *live zone* — messages new or changed since the previous turn. Keeps the prefix byte-identical across turns (guaranteeing backend prefix-cache reuse) and cuts per-turn CPU by avoiding redundant parsing of unchanged code blocks. |
 | `MOEPT_AGENTIC__QUALITY_PROFILE` | `balanced` | Optimization preset trading token savings against response fidelity (review03.md §10). One of `quality` (no summarization/RAG/anchor/code-skeleton; only lossless boundary compression — maximizes similarity to the direct baseline), `balanced` (defaults), `aggressive` (lower token cap, more top-only eviction, earlier compaction). Applied on top of any explicit field overrides, so individual fields can still be tuned. |
 | `MOEPT_AGENTIC__EXPLAIN_MODE_ENABLED` | `false` | Dry-run / explain mode (review03.md §10). When enabled, the proxy attaches the optimized prompt it would send to the backend as the `X-MOEPT-Optimized-Messages` response header (base64 JSON) so operators can inspect exactly what the proxy changed. A single request can also opt in via the `X-MOEPT-Explain: true` request header, which works regardless of this flag. Off by default to avoid leaking full context in response headers. |
 
@@ -200,6 +205,7 @@ Conversation continuity is OpenAI-compatible by default. Clients can set the sta
 | `POST` | `/v1/agent/state` | Get agent session state |
 | `POST` | `/v1/agent/state/reset` | Reset agent session |
 | `GET` | `/v1/agent/sessions` | List active sessions |
+| `GET` | `/v1/agent/sessions/{id}/debug` | Per-session debug snapshot: live-zone boundary, real prefix-cache outcome + token savings, embedding circuit-breaker state, and per-session metrics (review §11.6) |
 | `DELETE` | `/v1/agent/session/{id}` | Delete a session |
 | `POST` | `/v1/cache/clear` | Clear caches |
 | `GET` | `/v1/metrics` | Proxy metrics: per-turn `cached_tokens`, `prompt_tokens`, `saved_tokens`, `latency_ms`, aggregate token savings / latency, a `backend_errors` count (turns the backend failed to serve, e.g. a truncated tool call), plus a per-session breakdown under `sessions{}` (review03.md §10) |

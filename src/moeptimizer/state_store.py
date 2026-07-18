@@ -69,6 +69,51 @@ class AgentStateStore:
         del self.steps[:excess]
         self._rebuild_indices()
 
+    def prune_by_relevance(
+        self,
+        threshold: float,
+        goal: GoalNode | None = None,
+        keep_recent: int = 3,
+    ) -> int:
+        """Evict low-relevance steps from the evictable body.
+
+        Operates on the *archived* (oldest) portion of the step list so the
+        recent/protected tail and the frozen prefix are never mutated. Returns
+        the number of steps removed.
+
+        Args:
+            threshold: Minimum relevance score; steps below this are dropped.
+            goal: Current goal node for scoring. Falls back to the stored goal.
+            keep_recent: Minimum number of recent steps to preserve regardless
+                of score (matches ``keep_full_steps`` semantics).
+        """
+        from moeptimizer.goal_relevance_scorer import GoalRelevanceScorer
+
+        if threshold <= 0 or len(self.steps) <= keep_recent:
+            return 0
+
+        scorer = GoalRelevanceScorer(self._config)
+        active_goal = goal or self.get_goal()
+        if active_goal is not None:
+            scorer.set_goal(active_goal)
+
+        # Only score the evictable body (everything except the recent tail).
+        evictable = self.steps[:-keep_recent] if len(self.steps) > keep_recent else []
+        protected_tail = self.steps[-keep_recent:] if len(self.steps) > keep_recent else []
+
+        if not evictable:
+            return 0
+
+        scored = scorer.score_steps(evictable, active_goal)
+        kept = [step for step, score in scored if score >= threshold]
+        removed = len(evictable) - len(kept)
+
+        if removed > 0:
+            self.steps = kept + protected_tail
+            self._rebuild_indices()
+
+        return removed
+
     def _rebuild_indices(self) -> None:
         """Recompute all derived indices after steps are pruned/shifted."""
         self._step_index.clear()

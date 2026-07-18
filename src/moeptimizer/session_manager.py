@@ -23,8 +23,10 @@ class SessionManager:
         self,
         session_timeout: int | None = None,
         config: AppConfig | None = None,
+        capability_probe: Any = None,
     ) -> None:
         self._config = config or get_config()
+        self._capability_probe = capability_probe
         agentic = self._config.agentic
         self._sessions: dict[str, AgentContextOptimizer] = {}
         self._session_timestamps: dict[str, float] = {}
@@ -33,7 +35,7 @@ class SessionManager:
         self._lock = threading.RLock()
 
     def _make_optimizer(self) -> AgentContextOptimizer:
-        return AgentContextOptimizer(self._config)
+        return AgentContextOptimizer(self._config, self._capability_probe)
 
     def get_or_create(self, session_id: str | None = None) -> AgentContextOptimizer:
         """Get an existing optimizer for the session, or create a new one."""

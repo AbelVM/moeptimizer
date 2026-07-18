@@ -37,6 +37,11 @@
   .card .value{font-size:26px;font-weight:650;margin-top:6px}
   .card .delta{font-size:12px;margin-top:3px;color:var(--muted)}
   .card .value.good{color:var(--good)} .card .value.bad{color:var(--bad)} .card .value.warn{color:var(--warn)}
+  .card .value.info{color:var(--muted)}
+  .callout{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--good);border-radius:8px;padding:12px 16px;margin-bottom:20px}
+  .callout-title{font-size:13px;font-weight:650;text-transform:uppercase;letter-spacing:.5px;color:var(--good);margin-bottom:6px}
+  .callout p{margin:4px 0;font-size:12.5px;color:var(--text);line-height:1.5}
+  .callout p:last-child{color:var(--muted)}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:18px}
   .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px 8px}
   .panel h2{font-size:14px;margin:0 0 4px;font-weight:600}
@@ -709,10 +714,18 @@ function renderJSONView(root,J,L,ri){
     d.appendChild(Object.assign(el('div','value '+(cls||'')),{textContent:value}));
     if(delta) d.appendChild(Object.assign(el('div','delta'),{textContent:delta}));
     return d; };
-  cards.appendChild(card('Token savings (vs direct)', fmtPct(tok.token_savings_pct), tok.token_savings_pct>0?'good':'bad',
-    `${fmt(tok.total_direct_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok`));
-  cards.appendChild(card('Token savings (vs proxy raw input)', fmtPct(tok.token_savings_vs_raw_pct), tok.token_savings_vs_raw_pct>0?'good':'bad',
-    `${fmt(tok.total_raw_input_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok`));
+  // Token savings — two complementary baselines, clearly labelled so they are
+  // not read as contradictory:
+  //  • vs proxy raw input = INTRINSIC compaction: what the proxy did to the
+  //    input it received (raw_input → optimized). Isolates the optimizer's own
+  //    work; unaffected by backend tokenization or the direct path.
+  //  • vs direct = REAL-WORLD savings: proxy output vs the full un-compacted
+  //    direct conversation (with proxy vs without). Higher because the direct
+  //    path sends the entire context every turn (no eviction/compaction).
+  cards.appendChild(card('Token savings (intrinsic, vs raw input)', fmtPct(tok.token_savings_vs_raw_pct), tok.token_savings_vs_raw_pct>0?'good':'bad',
+    `${fmt(tok.total_raw_input_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok · proxy's own compaction`));
+  cards.appendChild(card('Token savings (real-world, vs direct)', fmtPct(tok.token_savings_pct), tok.token_savings_pct>0?'good':'bad',
+    `${fmt(tok.total_direct_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok · with vs without proxy`));
   const latD = lat.delta_proxy_minus_direct_ms;
   // Focus this card on the latency OVERHEAD the proxy adds (proxy − direct),
   // not the absolute proxy latency (which is dominated by backend generation
@@ -724,10 +737,18 @@ function renderJSONView(root,J,L,ri){
     (isNum(latDMean)?(latDMean>=0?'+':'')+fmtSec(latDMean):'—'),
     isNum(latDMean)?(latDMean>0?'bad':'good'):'',
     `proxy ${fmtSec(lat.proxy&&lat.proxy.mean)} vs direct ${fmtSec(lat.direct&&lat.direct.mean)}${isNum(dPct)?` · ${(dPct>=0?'+':'')+dPct.toFixed(1)}%`:''}`));
+  // PRIMARY quality signal: context retention (the optimizer's actual job).
+  // Promoted to the top of the quality cards — these are what a context
+  // optimizer is measured on, not response-vs-response similarity.
   cards.appendChild(card('Context faithfulness', faith&&faith.mean!=null?fmt2(faith.mean):'—',
     faith&&faith.mean!=null?(faith.mean>=0.7?'good':faith.mean>=0.5?'warn':'bad'):'',
-    `min ${faith&&faith.min!=null?fmt2(faith.min):'—'} · evicted recall ${evict&&evict.mean!=null?fmt2(evict.mean):'—'}`));
-  cards.appendChild(card('Mean semantic sim', fmt2(sem.mean), sem.mean>=0.7?'good':sem.mean>=0.5?'warn':'bad',
+    `PRIMARY · min ${faith&&faith.min!=null?fmt2(faith.min):'—'} · fraction of original prompt kept`));
+  cards.appendChild(card('Evicted-content recall', evict&&evict.mean!=null?fmt2(evict.mean):'—',
+    evict&&evict.mean!=null?(evict.mean>=0.7?'good':evict.mean>=0.5?'warn':'bad'):'',
+    `PRIMARY · min ${evict&&evict.min!=null?fmt2(evict.min):'—'} · early-turn content carried fwd`));
+  // Semantic sim is INFORMATIONAL ONLY (weak on code, noisy at long outputs).
+  // Demoted below the primary context-retention cards and explicitly labelled.
+  cards.appendChild(card('Mean semantic sim', fmt2(sem.mean), 'info',
     `informational only · min ${fmt2(sem.min)} · median ${fmt2(sem.median)}`));
   const cacheRate = cache.per_round_proxy_metrics && cache.per_round_proxy_metrics[0] ? cache.per_round_proxy_metrics[0].cache_hit_rate : NaN;
   cards.appendChild(card('Prefix cache hit rate', fmtPct(cacheRate*100), cacheRate>=0.9?'good':cacheRate>0?'warn':'bad',
@@ -738,6 +759,18 @@ function renderJSONView(root,J,L,ri){
   cards.appendChild(card('Quality-skipped turns', fmt(qskip), qskip===0?'good':'warn',
     `low-sem ${q.low_semantic_similarity_turns||0} · trunc ${q.truncation_count||0}`));
   root.appendChild(cards);
+
+  // ---- primary-signal callout ----
+  // Make the metric hierarchy explicit: context faithfulness + evicted recall
+  // are the optimizer's real job (input compaction); response-vs-response
+  // similarity is informational only and expected to be low at long outputs.
+  const note=el('div','callout');
+  note.appendChild(Object.assign(el('div','callout-title'),{textContent:'How to read quality'}));
+  note.appendChild(Object.assign(el('p'),{textContent:
+    'PRIMARY signals (top cards + first table): Context faithfulness = fraction of the original prompt that survived compaction (1.0 = nothing lost); Evicted-content recall = fraction of early-turn content still carried forward. These measure the proxy\'s one job — compacting the INPUT context — and are the metrics to watch for regressions.'}));
+  note.appendChild(Object.assign(el('p'),{textContent:
+    'INFORMATIONAL only: Semantic similarity, ROUGE/Jaccard/edit overlap, and response stability compare the proxy\'s answer to the direct (un-compressed) answer. They conflate optimizer quality with the model\'s phrasing variance and are weak on code, so low absolute values are EXPECTED (not a defect) — especially at long outputs (max_tokens ≥ 8192), where the two prompts produce genuinely different long answers.'}));
+  root.appendChild(note);
 
   // ---- charts grid ----
   const grid=el('div','grid');
@@ -765,23 +798,22 @@ function renderJSONView(root,J,L,ri){
   }
 
   // Quality metrics — radar (multivariate 0–1 comparison)
-  // Headline = the optimizer's ACTUAL job (context retention) + the one
-  // hard correctness check (code syntax). Response-vs-response overlap
-  // scores (ROUGE/Jaccard/edit) are now secondary (see quality detail).
-  if(faith||evict||q.code_syntax_validity||q.code_block_ratio||sem.mean!=null){
-    const labels=['Context faith','Evicted recall','Syntax valid','Code blocks','Semantic sim'];
-    // Radar axes are 0..1, so clamp each mean to >=0 for DISPLAY ONLY. Semantic
-    // sim is a cosine in [-1,1] and can be legitimately negative (proxy/direct
-    // responses diverge in embedding space) - we clamp at the radar boundary, we
-    // do NOT abs() it, because that would falsify the aggregate. Tables and the
-    // per-turn chart keep the true signed value.
+  // Headline = the optimizer's ACTUAL job (context retention) + the hard
+  // correctness/structure checks (code syntax, code blocks, code structure).
+  // Response-vs-response overlap scores (ROUGE/Jaccard/edit) and Semantic sim
+  // are now secondary (see the secondary radar + quality detail below).
+  if(faith||evict||q.code_syntax_validity||q.code_block_ratio||sec.code_structure_consistency){
+    const labels=['Context faith','Evicted recall','Syntax valid','Code blocks','Code struct'];
+    // Radar axes are 0..1. Code struct is a 0..1 consistency score, so no
+    // clamping needed. (Semantic sim was moved to the secondary radar because
+    // it is a cosine in [-1,1] and the noisiest of the metrics.)
     const mk=(o)=>o&&o.mean!=null?Math.max(0,o.mean):NaN;
     grid.appendChild(panel('Optimizer quality (mean, 0–1)','score',
       {type:'radar', labels,
         datasets:[
-          {label:'Optimizer quality',color:PALETTE.sem,data:[mk(faith),mk(evict),mk(q.code_syntax_validity),mk(q.code_block_ratio),mk(sem)]}
+          {label:'Optimizer quality',color:PALETTE.sem,data:[mk(faith),mk(evict),mk(q.code_syntax_validity),mk(q.code_block_ratio),mk(sec.code_structure_consistency)]}
         ], yFmt:fmt2, yMin:0, yMax:1},
-      'Mean scores across measured turns. Context faith = fraction of original prompt tokens surviving compaction (1.0 = nothing lost); Evicted recall = fraction of early-turn content carried forward; Syntax valid = generated code still parses; Code blocks = fraction of code blocks preserved; Semantic sim = embedding cosine vs direct (informational only, weak on code). Negative semantic-sim values are clamped to 0 on this 0-1 radar but shown signed elsewhere.'));
+      'Mean scores across measured turns. The FIRST TWO axes (Context faith, Evicted recall) are the PRIMARY signal — they measure the proxy\'s one job (compacting the INPUT context) and are the metrics to watch for regressions. Syntax valid / Code blocks / Code struct are structural-preservation checks (does the proxy\'s optimized prompt still produce code that parses and matches the direct response\'s structure?). All axes are 0..1.'));
   }
 
   // Per-round token savings + semantic
@@ -837,13 +869,17 @@ function renderJSONView(root,J,L,ri){
       const ptFlagged=new Set(); pt.forEach((t,i)=>{ if(bad.has(t.turn)) ptFlagged.add(i); });
       const cfg={labels:pt.map(t=>'T'+t.turn), roundSize:isNum(ri.numTurns)?ri.numTurns:null, flagged:ptFlagged,
         datasets:[
-          {label:'Token savings % (vs raw input)',color:PALETTE.proxy,data:pt.map(t=>{
+          {label:'Savings % (vs proxy raw input)',color:PALETTE.proxy,data:pt.map(t=>{
             const base = isNum(t.raw_input_tok)&&t.raw_input_tok>0 ? t.raw_input_tok : t.direct_tok;
+            return (base - t.proxy_tok)/base*100;
+          })},
+          {label:'Savings % (vs direct)',color:PALETTE.direct,data:pt.map(t=>{
+            const base = isNum(t.direct_tok)&&t.direct_tok>0 ? t.direct_tok : t.raw_input_tok;
             return (base - t.proxy_tok)/base*100;
           })}
         ], yFmt:v=>isNum(v)?v.toFixed(1)+'%':'—', yMin:0};
       grid.appendChild(panel('Token savings per turn (proxy raw input → optimized)','%',
-        cfg, desc+' Red ✕ = savings vs an estimated (failed) baseline; omitted.'));
+        cfg, desc+' Two baselines shown: <b>vs proxy raw input</b> isolates the optimizer\'s own compaction (the honest metric); <b>vs direct</b> is inflated because the direct path sends the full un-compacted context every turn. Red ✕ = savings vs an estimated (failed) baseline; omitted.'));
     } else {
       const sp = isNum(J.tokens.token_savings_vs_raw_pct) ? J.tokens.token_savings_vs_raw_pct
                : (isNum(J.tokens.token_savings_pct) ? J.tokens.token_savings_pct : NaN);
@@ -860,15 +896,15 @@ function renderJSONView(root,J,L,ri){
   // quality with the model's phrasing variance and have near-zero
   // discriminative power for a context optimizer, so they are informational
   // only (see the optimizer-quality radar above for the real signals).
-  if(sec.trigram_overlap||sec.markdown_structure_similarity||sec.rouge_l_precision||sec.rouge_l_recall||sec.response_stability||sec.code_structure_consistency||q.rouge_l_f1||q.token_jaccard||q.edit_similarity){
-    const labels=['ROUGE-L F1','Token Jaccard','Edit sim','Trigram overlap','Markdown struct','Code struct'];
+  if(sec.trigram_overlap||sec.markdown_structure_similarity||sec.rouge_l_precision||sec.rouge_l_recall||sec.response_stability||q.rouge_l_f1||q.token_jaccard||q.edit_similarity||sem.mean!=null){
+    const labels=['ROUGE-L F1','Token Jaccard','Edit sim','Trigram overlap','Markdown struct','Semantic sim'];
     const mk=(o)=>o&&o.mean!=null?o.mean:NaN;
     grid.appendChild(panel('Secondary quality metrics (mean, 0–1, informational)','score',
       {type:'radar', labels,
         datasets:[
-          {label:'Secondary quality (proxy vs direct)',color:PALETTE.rouge,data:[mk(q.rouge_l_f1),mk(q.token_jaccard),mk(q.edit_similarity),mk(sec.trigram_overlap),mk(sec.markdown_structure_similarity),mk(sec.code_structure_consistency)]}
+          {label:'Secondary quality (proxy vs direct)',color:PALETTE.rouge,data:[mk(q.rouge_l_f1),mk(q.token_jaccard),mk(q.edit_similarity),mk(sec.trigram_overlap),mk(sec.markdown_structure_similarity),mk(sem)]}
         ], yFmt:fmt2, yMin:0, yMax:1},
-      'Informational only — response-vs-response overlap. Low absolute values are expected (LLM phrasing variance), NOT optimizer failure. Axes: ROUGE-L F1 / Token Jaccard / Edit sim = overlap with the direct response; Trigram overlap = 3-gram token overlap; Markdown struct = structure similarity; Code struct = code-block structural consistency.'));
+      'Informational only — response-vs-response overlap. Low absolute values are expected (LLM phrasing variance), NOT optimizer failure. Axes: ROUGE-L F1 / Token Jaccard / Edit sim = overlap with the direct response; Trigram overlap = 3-gram token overlap; Markdown struct = structure similarity; Semantic sim = embedding cosine vs direct (weak on code, expected low at long outputs, can be negative — clamped to 0 here, shown signed in the table/per-turn chart).'));
   }
 
   root.appendChild(grid);

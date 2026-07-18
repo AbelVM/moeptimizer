@@ -22,6 +22,7 @@ from moeptimizer.backend_client import LemonadeClient
 from moeptimizer.config import AppConfig, get_config
 from moeptimizer.embedding import EmbeddingService
 from moeptimizer.optimizer import AgentContextOptimizer
+from moeptimizer.output_shaper import OutputShaper
 from moeptimizer.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ class _ProxyMetrics:
         self.backend_errors = 0
         # Per-session breakdown, bounded LRU so it can never grow without limit
         # even under a flood of distinct session ids (review §11.1).
-        self._per_session: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._per_session: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._max_sessions_tracked = 512
 
     def record_backend_error(self, session_id: str | None = None) -> None:
@@ -917,14 +918,6 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     from moeptimizer.config import apply_quality_profile
 
     apply_quality_profile(cfg)
-    session_manager = SessionManager(config=cfg)
-    embedding_service = EmbeddingService()
-    backend_client = LemonadeClient(
-        base_url=cfg.server.url,
-        api_key="lemonade",
-        timeout=cfg.server.timeout,
-        native_mtp_passthrough=cfg.v050.native_mtp_passthrough,
-    )
     # Live, device-aware capability probe (NPU<->GPU aware). Detects slot
     # pinning, native MTP, exact remote tokenization, and the tokenizer id from
     # the backend's own metadata, refreshed on a TTL so capabilities follow the
@@ -936,6 +929,20 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         base_url=cfg.server.url,
         model=cfg.server.llm_model,
         ttl_seconds=cfg.v050.capability_probe_ttl_seconds,
+    )
+    session_manager = SessionManager(
+        config=cfg,
+        capability_probe=capability_probe,
+    )
+    embedding_service = EmbeddingService()
+    backend_client = LemonadeClient(
+        base_url=cfg.server.url,
+        api_key="lemonade",
+        timeout=cfg.server.timeout,
+        native_mtp_passthrough=cfg.v050.native_mtp_passthrough,
+    )
+    output_shaper = OutputShaper(
+        enabled=cfg.agentic.tool_output_compression_enabled,
     )
     embed_client = AsyncOpenAI(
         base_url=cfg.server.embed_url,
@@ -960,7 +967,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             try:
                 caps = await capability_probe.get(force=True)
                 logger.info("Detected backend capabilities: %s", caps.summary())
-            except Exception as exc:  # noqa: BLE001 - best-effort
+            except Exception as exc:
                 logger.warning("Capability detection failed: %s", exc)
 
         # Resolve MTP passthrough. Metadata (labels=['...','mtp'] or an active
@@ -983,7 +990,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                             "Backend chat-probe confirms native MTP; enabling "
                             "MTP extra_body passthrough."
                         )
-                except Exception as exc:  # noqa: BLE001 - best-effort
+                except Exception as exc:
                     logger.warning("MTP support auto-detection failed: %s", exc)
 
         # Derive the tokenizer from the backend's model checkpoint when the
@@ -1034,6 +1041,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     app.state.backend_client = backend_client
     app.state.embed_client = embed_client
     app.state.capability_probe = capability_probe
+    app.state.output_shaper = output_shaper
 
     @app.post("/v1/chat/completions")
     async def chat_completions_proxy(request: Request):
@@ -1146,7 +1154,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         if (
             cfg.v050.capability_autodetect
             and cfg.v050.remote_tokenize_enabled
-            and not getattr(optimizer, "_calibration_seeded", True)
+            and not getattr(optimizer, "_calibration_seeded", False)
         ):
             caps = capability_probe.cached()
             if caps and caps.remote_tokenize:
@@ -1254,6 +1262,17 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         body["messages"] = optimized_messages
         body.setdefault("temperature", 0.1)
         body.setdefault("stream", True)
+
+        # Step: shape the backend request for output length (review §2.4 / P1).
+        # Applies cache-safe system-prompt tail instruction + per-turn-class
+        # max_tokens / reasoning_effort clamping. Does not touch the input path.
+        output_shaper = getattr(app.state, "output_shaper", None)
+        if output_shaper is not None:
+            try:
+                body = output_shaper.shape_request(body)
+            except Exception as e:
+                logger.debug("Output shaping failed: %s", e)
+
         is_streaming = body.get("stream", True)
 
         # Only include session state in header if it's reasonably sized
@@ -1464,6 +1483,25 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         """List all active agent sessions."""
         sessions = session_manager.list_sessions()
         return {"sessions": sessions, "count": len(sessions)}
+
+    @app.get("/v1/agent/sessions/{session_id}/debug")
+    async def session_debug(session_id: str):
+        """Per-session debug dashboard (review §10, P4).
+
+        Exposes the live-zone boundary (stable prefix vs. live zone), the real
+        prefix-cache outcome, token savings, and the embedding circuit-breaker
+        state so operators can see why a session is (or is not) reusing its KV
+        cache and whether the embedding dependency is healthy. Read-only.
+        """
+        optimizer = session_manager.get_or_create(session_id)
+        try:
+            debug = optimizer.get_debug_info()
+        except Exception as e:  # Never let a debug read crash the request path
+            logger.debug("Failed to build session debug info: %s", e)
+            debug = {"error": f"{type(e).__name__}: {e}"}
+        debug["session_id"] = session_id
+        debug["metrics"] = PROXY_METRICS.snapshot().get("sessions", {}).get(session_id)
+        return {"object": "agent.session.debug", **debug}
 
     @app.delete("/v1/agent/session/{session_id}")
     async def delete_session(session_id: str):

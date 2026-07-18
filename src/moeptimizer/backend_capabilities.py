@@ -154,7 +154,7 @@ class BackendCapabilityProbe:
                 await self._probe_health(client, caps)
                 await self._probe_slots(client, caps)
                 await self._probe_tokenize(client, caps)
-        except Exception as exc:  # noqa: BLE001 - best-effort, never raise
+        except Exception as exc:
             logger.debug("Capability probe failed: %s", exc)
         logger.debug("Backend capabilities: %s", caps.summary())
         return caps
@@ -167,7 +167,7 @@ class BackendCapabilityProbe:
             r = await client.get(f"{self._base}/models")
             r.raise_for_status()
             data = r.json()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("Capability probe: /models unavailable (%s)", exc)
             return
         entry = self._select_model_entry(data.get("data", []))
@@ -214,7 +214,7 @@ class BackendCapabilityProbe:
             r = await client.get(f"{self._base}/health")
             r.raise_for_status()
             data = r.json()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("Capability probe: /health unavailable (%s)", exc)
             return
         for m in data.get("all_models_loaded", []):
@@ -257,7 +257,7 @@ class BackendCapabilityProbe:
         try:
             r = await client.get(f"{base}/slots")
             data = r.json()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("Capability probe: /slots unavailable (%s)", exc)
             return
         # NPU path returns {"error": {...}}; GPU/llama.cpp returns a list.
@@ -283,12 +283,27 @@ class BackendCapabilityProbe:
                 json={"model": self._model, "content": "probe"},
             )
             data = r.json()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("Capability probe: /tokenize unavailable (%s)", exc)
             return
         caps.remote_tokenize = isinstance(data, dict) and isinstance(
             data.get("tokens"), list
         )
+
+    def tokenize_count_sync(self, text: str) -> int | None:
+        """Sync wrapper around ``tokenize_count`` for use from sync code.
+
+        Tries ``asyncio.run()``; if we are already inside a running event loop
+        (e.g. called from async app code via a sync optimizer), falls back to
+        ``None`` so the caller uses local counting instead.
+        """
+        try:
+            import asyncio
+
+            return asyncio.run(self.tokenize_count(text))
+        except RuntimeError:
+            # Already in an async context — cannot start a new event loop.
+            return None
 
     async def tokenize_count(self, text: str) -> int | None:
         """Return the exact remote token count for ``text``, or None if unavailable.
@@ -312,6 +327,6 @@ class BackendCapabilityProbe:
             toks = data.get("tokens") if isinstance(data, dict) else None
             if isinstance(toks, list):
                 return len(toks)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("Remote tokenize failed: %s", exc)
         return None
