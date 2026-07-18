@@ -72,7 +72,10 @@ reuse or response quality and will not be caught by tests alone.
   conversation as its own full, contiguous, sorted session.
 - **Cache stability**: keep the system prompt and early turns byte-stable (frozen
   prefix) so the backend prefix cache is reused. Do not mutate the middle of cached
-  context; only append (incremental update) or front-evict.
+  context; only append (incremental update) or front-evict. The full DO/DON'T
+  reference for KV-cache stability when interfacing with a Qwen MoE-MTP model on
+  llama.cpp lives in `cache_preservation_guide.md` — consult it before changing any
+  prefix-reuse or context-mutation logic.
 - **No model-visible markers**: internal cache hints (attention sinks, pattern
   markers, reasoning preseed) are stripped before the model sees the prompt. The
   `ATTENTION_SINKS_ENABLED` / `REASONING_PRESEED_ENABLED` flags are WARN-level config

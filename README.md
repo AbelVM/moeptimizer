@@ -110,6 +110,8 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_AGENTIC__RAG_ENABLED` | `true` | Enable state-based RAG injection for long/over-budget sessions |
 | `MOEPT_AGENTIC__OPTIMIZE_CODE_BLOCKS` | `true` | Run tree-sitter code-block optimization (chunk dedup). Budget-gated: only fires when the context exceeds the proactive trim threshold, so lean contexts keep exact code and avoid proxy latency. |
 | `MOEPT_AGENTIC__CODE_SKELETON_ENABLED` | `true` | Compress large code blocks to skeletons under context pressure |
+| `MOEPT_AGENTIC__PROMPT_TEMPLATE_ENABLED` | `false` | Apply task-template specialization to rewrite the user prompt. OFF by default: for agentic coding the client's exact wording matters and template rewrites risk changing it (cache guide DONT #4). Gated behind the proactive threshold. |
+| `MOEPT_AGENTIC__DELTA_ENCODE_INJECT` | `false` | When a file is re-read after an edit, replace the full re-read file body with a compact unified diff against the prior snapshot (review §3.4). OFF by default: the model needs the full file to edit it, and a diff is only safe when the prior version is already in context. Injection is additionally gated so it only fires when the prior snapshot is already present. |
 | `MOEPT_AGENTIC__ATTENTION_SINKS_ENABLED` | `false` | Inject model-visible attention-sink markers |
 | `MOEPT_AGENTIC__STATIC_LAYER_ALIGNMENT_ENABLED` | `false` | Pad static layer to cache-block boundaries |
 | `MOEPT_AGENTIC__REASONING_PRESEED_ENABLED` | `false` | Inject reasoning scaffolding into user messages |
@@ -437,6 +439,26 @@ baseline falls below the threshold (regression gate).
   - **Syntax consistency**: Similarity of code-structure keywords preserved in code blocks. Higher is better; it indicates the proxy kept similar code constructs when code was present.
 - **MTP Stability**: Code block preservation, syntax consistency
 - **Eviction**: Two distinct signals. `raw_exceeds_optimized_target` (informational) counts turns whose raw input exceeded the proxy's post-optimization char budget (`MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS`) — expected for long scenarios, **not** a failure. The real eviction signal is `compaction_triggered`: turns where the proxy actually sent strictly fewer prompt tokens to the backend than the direct baseline (i.e. real compaction/optimization happened). The per-turn detail table flags eviction as `proxy.prompt_tokens < direct.prompt_tokens`.
+- **Long-horizon signals** (cross-turn, reported under `long_horizon` in the JSON
+  report and as dedicated dashboard cards). These measure how the proxy behaves
+  over a *whole* multi-turn conversation, not per-turn quality:
+  - **Context drift / fact recall**: a small set of anchor facts is prepended to
+    Turn 1's user message and a recall probe is appended as the final turn of
+    every scenario (no separate scenario, no flag). The final-turn response is
+    graded against the facts via embedding cosine similarity (threshold `0.35`);
+    `fact_recall` is the fraction of facts preserved. `None` when the embedding
+    model is unavailable. The anchor lands in user content, never the system
+    prompt, so the frozen prefix is untouched.
+  - **Self-contradiction rate**: `contradictions` counts turns whose assertions
+    flip a prior assertion's polarity (conservative negation-flip heuristic, a
+    lower bound — no extra backend calls). Lower is better.
+  - **Context-window wall**: `context_window_wall` is the first turn where
+    `code_block_ratio < 0.5` OR `semantic_similarity < 0.3` (the conversation
+    "falls off the cliff"). Reported per side as `{"proxy": int|None, "direct":
+    int|None}`; `null` means no wall was hit within the run.
+  - **Latency compounding**: the dashboard also plots a per-turn **TTFT growth**
+    curve (existing per-turn TTFT data, proxy vs direct) to show how
+    time-to-first-token compounds across turns under each path.
 
 ## Development
 

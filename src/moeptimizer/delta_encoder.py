@@ -33,6 +33,14 @@ class CodeDeltaEncoder:
         self._snapshots: OrderedDict[str, str] = OrderedDict()
         self._deltas: OrderedDict[str, str] = OrderedDict()
         self._max_snapshots = max_snapshots
+        # file_path -> most-recent snapshot key, so _find_previous_key can locate
+        # the prior version of a file (previously a no-op, so every snapshot
+        # stored full content and deltas were never produced).
+        self._file_keys: dict[str, str] = {}
+        # file_path -> content stored *before* the most recent store_snapshot for
+        # that path. Lets callers retrieve the delta of the latest version vs the
+        # immediately preceding one (used for re-read diff injection, P2.2).
+        self._prev_content: dict[str, str] = {}
         self._stats: dict[str, int] = {
             "snapshots_stored": 0,
             "deltas_stored": 0,
@@ -80,27 +88,60 @@ class CodeDeltaEncoder:
         self._snapshots[key] = content
         self._snapshots.move_to_end(key)
 
+        # Track file_path -> most-recent key so _find_previous_key can locate the
+        # prior version of the same file (previously a no-op, so deltas were
+        # never produced and every snapshot stored full content).
+        self._file_keys[file_path] = key
+        # Remember the content that preceded this store for the same path, so a
+        # later caller can retrieve the delta of this version vs the prior one.
+        self._prev_content[file_path] = prev_content
+
         # Evict oldest if over limit
         while len(self._snapshots) > self._max_snapshots:
             old_key, _ = self._snapshots.popitem(last=False)
             self._deltas.pop(old_key, None)
+            # Drop any file_path mapping that pointed at the evicted key.
+            for fp, k in list(self._file_keys.items()):
+                if k == old_key:
+                    self._file_keys.pop(fp, None)
+            self._prev_content.pop(file_path, None)
 
         self._stats["snapshots_stored"] += 1
         return key
 
     def _find_previous_key(self, file_path: str) -> str | None:
         """Find the most recent snapshot key for a file path."""
-        # Search from most recent to oldest
-        for _key in reversed(self._snapshots):
-            # Keys don't store file_path directly, so we check content
-            # In practice, we'd track file_path -> key mapping
-            pass
-        return None
+        return self._file_keys.get(file_path)
+
+    def get_previous_content(self, file_path: str) -> str | None:
+        """Return the content stored *before* the most recent store_snapshot for
+        ``file_path`` (None if this is the first version seen for that path)."""
+        prev = self._prev_content.get(file_path)
+        return prev if prev else None
+
+    def get_delta(self, key: str) -> str:
+        """Return the stored delta for ``key`` (empty string if none)."""
+        return self._deltas.get(key, "")
+
+    def get_delta_vs_previous(self, file_path: str, content: str) -> str:
+        """Return the diff of ``content`` against the previously stored version
+        of ``file_path`` (empty string if this is the first version or unchanged).
+
+        Used by the optimizer to inject a compact diff when a file is re-read
+        after an edit (P2.2). The caller is responsible for confirming the prior
+        version is already present in the model context before injecting.
+        """
+        prev = self._prev_content.get(file_path, "")
+        if not prev or prev == content:
+            return ""
+        return self._compute_delta(prev, content)
 
     def _compute_delta(self, old: str, new: str) -> str:
         """Compute a compact diff between old and new content.
 
-        Uses unified diff format, compressed to store only changed lines.
+        Uses unified diff format, compressed to store only the changed lines
+        (no unchanged context), so the delta is smaller than the full content
+        for any non-trivial edit.
         """
         old_lines = old.splitlines(keepends=True)
         new_lines = new.splitlines(keepends=True)
@@ -109,15 +150,16 @@ class CodeDeltaEncoder:
             old_lines,
             new_lines,
             lineterm="",
-            n=1,  # Context lines
+            n=0,  # No context lines — keep only added/removed lines.
         ))
 
-        # Filter to only include changed lines (not context)
-        changed_lines = []
-        for line in diff:
-            if line.startswith(("---", "+++", "@@")):
-                continue
-            changed_lines.append(line)
+        # Keep only added/removed lines; drop the ---/+++/@@ header lines and
+        # any unchanged context lines (space-prefixed).
+        changed_lines = [
+            line
+            for line in diff
+            if line and not line.startswith(("---", "+++", "@@", " "))
+        ]
 
         if not changed_lines:
             return ""

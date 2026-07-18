@@ -144,6 +144,7 @@ function parseJSON(text){
   out.perRound = get(['per_round'])||{};
   out.qualityTrend = get(['quality_trend'])||{};
   out.vocab = get(['vocab_richness'])||{};
+  out.longHorizon = get(['long_horizon'])||{};
   return out;
 }
 
@@ -770,6 +771,34 @@ function renderJSONView(root,J,L,ri){
   const qskip = q.quality_skipped_turns||0;
   cards.appendChild(card('Quality-skipped turns', fmt(qskip), qskip===0?'good':'warn',
     `low-sem ${q.low_semantic_similarity_turns||0} · trunc ${q.truncation_count||0}`));
+
+  // ---- long-horizon / cross-turn cards ----
+  // These answer "does the proxy still remember early context by Turn N?" — the
+  // core risk of a context compressor. fact_recall = recall of Turn-1 facts at
+  // the final probe turn; contradictions = self-contradictions within the
+  // session (lower bound, heuristic); wall = first turn quality collapses.
+  const lh = J.longHorizon || {};
+  const fr = lh.fact_recall_turn30 || lh.fact_recall || null;
+  const ct = lh.contradictions || null;
+  const wall = lh.context_window_wall || null;
+  const frP = fr && isNum(fr.proxy) ? fr.proxy : NaN;
+  const frD = fr && isNum(fr.direct) ? fr.direct : NaN;
+  cards.appendChild(card('Fact recall @ Turn N (drift)',
+    (isNum(frP)||isNum(frD)) ? `${isNum(frP)?fmtPct(frP*100):'—'} / ${isNum(frD)?fmtPct(frD*100):'—'}` : '—',
+    isNum(frP) ? (frP>=0.8?'good':frP>=0.6?'warn':'bad') : 'info',
+    `proxy / direct · recall of Turn-1 facts at final probe turn (lower proxy = context drift)`));
+  const ctP = ct && isNum(ct.proxy) ? ct.proxy : NaN;
+  const ctD = ct && isNum(ct.direct) ? ct.direct : NaN;
+  cards.appendChild(card('Self-contradictions (session)',
+    (isNum(ctP)||isNum(ctD)) ? `${isNum(ctP)?ctP:'—'} / ${isNum(ctD)?ctD:'—'}` : '—',
+    isNum(ctP) ? (ctP<=ctD?'good':'warn') : 'info',
+    `proxy / direct · heuristic lower bound (negation-flip only)`));
+  const wP = wall && isNum(wall.proxy) ? wall.proxy : NaN;
+  const wD = wall && isNum(wall.direct) ? wall.direct : NaN;
+  cards.appendChild(card('Context-window wall (turn)',
+    (isNum(wP)||isNum(wD)) ? `${isNum(wP)?wP:'—'} / ${isNum(wD)?wD:'—'}` : '—',
+    isNum(wP) ? 'warn' : 'good',
+    `proxy / direct · first turn code/semantic fidelity collapses (null = no wall)`));
   root.appendChild(cards);
 
   // ---- primary-signal callout ----
@@ -796,6 +825,23 @@ function renderJSONView(root,J,L,ri){
         {label:'Direct',color:PALETTE.direct,type:'bar',data:keys.map(k=>lat.direct[k])},
         {label:'Proxy',color:PALETTE.proxy,type:'bar',data:keys.map(k=>lat.proxy[k])}
       ], fmtSec), 'Grouped by percentile. Proxy is slower on average but with heavy tail variance.'));
+  }
+
+  // TTFT growth curve (latency compounding) — per-turn TTFT from the log.
+  // Shows whether the proxy's time-to-first-token grows faster than direct as
+  // the prompt history accumulates each turn (the "compounding" risk of a
+  // compressor). Empty series (non-streaming run) renders as '—'.
+  if(L && L.turns){
+    const idx=Object.keys(L.turns).map(Number).sort((a,b)=>a-b);
+    const pd=idx.map(i=>L.turns[i].ttft_direct_ms);
+    const pp=idx.map(i=>L.turns[i].ttft_proxy_ms);
+    if(pd.some(isNum)||pp.some(isNum)){
+      grid.appendChild(panel('TTFT growth per turn (proxy vs direct)','ms',
+        lineBarCfg(idx.map(String),[
+          {label:'Direct',color:PALETTE.direct,type:'line',data:pd},
+          {label:'Proxy',color:PALETTE.proxy,type:'line',data:pp}
+        ], fmtSec), 'Per-turn time-to-first-token. A steeper proxy slope = TTFT compounding (the proxy pays more each turn as history grows).'));
+    }
   }
 
   // Token usage per turn (from log) OR aggregate

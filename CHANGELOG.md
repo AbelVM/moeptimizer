@@ -468,7 +468,84 @@ C9, C10). Full test suite after changes: **417 passed, 2 skipped**.
     `cache_hit_rate` 0.9667 (unchanged); `code_syntax_validity` 1.0.
   - **TTFT measurement fixed.** Proxy TTFT now captured (mean 7,315 ms vs direct
     13,379 ms); previously `{}` due to the streaming-clock bug.
-  - **Open item.** `has_code_proxy` remains 0.0 — the ledger carries code
-    *signatures*, not full bodies, so the proxy does not reproduce code blocks.
-    Extending the ledger to carry short code bodies is the next step if proxy
-    code reproduction is required.
+   - **Open item.** `has_code_proxy` remains 0.0 — the ledger carries code
+     *signatures*, not full bodies, so the proxy does not reproduce code blocks.
+     Extending the ledger to carry short code bodies is the next step if proxy
+     code reproduction is required.
+
+### v0.7.8 — Long-horizon benchmark metrics (2026-07-18)
+
+Adds three cross-turn signals to `scripts/benchmark.py` plus dashboard cards, so
+a single run now reports how the proxy behaves over a *whole* multi-turn
+conversation, not just per-turn quality. Full test suite after changes:
+**430 passed, 2 skipped**.
+
+- **Context drift / fact recall.** A small set of anchor facts (`_DRIFT_FACTS`)
+  is prepended to Turn 1's user message and a recall probe (`_DRIFT_PROBE`) is
+  appended as the final turn of **every** scenario via `_inject_drift_probe()`
+  (handles both simple-tuple and OpenCode-style `list[dict]` scenarios, sized to
+  `num_turns`). No separate `drift` scenario and no flag — the probe is injected
+  unconditionally so drift is measured on the real benchmark conversation. The
+  final-turn response is graded against the facts via `_grade_fact_recall()`
+  (embedding cosine similarity, threshold `0.35`); `fact_recall` is the fraction
+  of facts preserved, `None` when the embedding model is unavailable. The anchor
+  lands in user content, never the system prompt, so the frozen prefix is
+  untouched (cache-stability hard constraint preserved).
+- **Self-contradiction rate.** `_count_contradictions()` scans each turn's
+  assertions for negation-flip contradictions vs prior turns (conservative
+  heuristic lower bound — no extra backend calls) and accumulates across rounds
+  into `report.contradictions`.
+- **Context-window wall.** `_context_window_wall()` derives the first turn where
+  `code_block_ratio < 0.5` OR `semantic_similarity < 0.3` (the conversation
+  "falls off the cliff"); reported per side as `{"proxy": int|None, "direct":
+  int|None}` under `report.context_window_wall` (`null` = no wall hit).
+- **Report + dashboard wiring.** `BenchmarkReport` gained `contradictions`,
+  `fact_recall`, and `context_window_wall` fields; `summary()` emits a new
+  `long_horizon` block. `benchmark_dashboard.html` adds three long-horizon cards
+  (fact recall/drift, self-contradictions, wall) showing proxy/direct, plus a
+  per-turn **TTFT growth** panel (latency compounding, from existing per-turn
+  TTFT data) — chosen per the FT Visual Vocabulary.
+- **Tests.** `tests/test_benchmark_long_horizon.py` (12 tests) covers injection
+  (tuple + opencode + long + empty), contradiction detection, wall detection, and
+  fact-recall grading (mocked embedding + unavailable-embedding path).
+
+### v0.7.9 — Quality-collapse re-tune + cache-stability wins (2026-07-18)
+
+Implements the P0 (stop the quality collapse) and P1 (cache-stability) items
+from `REVIEW.md`. Full test suite after changes: **430 passed, 2 skipped**.
+
+- **Re-tuned quality profiles (P0.1).** `QUALITY_PROFILES` budgets raised to a
+  sane fraction of the context window: `balanced` 8000 tok / 32000 chars / keep 4
+  (no skeletonization), `quality` 16000 / 64000 / keep 8, `aggressive` 4000 /
+  16000 / keep 2 (skeleton on). The old `balanced` behaved like `aggressive` and
+  was the root cause of `has_code_proxy = 0.0` / `semantic_similarity ≈ 0`.
+- **Live-zone-only code optimization (P0.2).** Step 10
+  (`_optimize_code_block_content`) now runs only on the live zone
+  (`optimized[live_start:]`), never re-skeletonizing the stable prefix — fixes
+  the docstring/scope mismatch and the prefix-stability break.
+- **State summary instead of keyword summary (P0.3).** `hierarchical_summarizer`
+  `_extract_constraints` now extracts task *state* (files touched, last errors,
+  plan, constraints, topic) instead of only "don't"/"must not" lines, so the
+  rolling summary retains the actual bug/code/decisions.
+- **Pure front-eviction compactor (P0.4).** Deleted the `ScratchpadCompactor`
+  summarization branch; it now does pure front-eviction and the single
+  cache-stable summary step folds evicted turns (no double-fold).
+- **Active-file tracking (P0.5).** The optimizer now tracks the most-recent
+  `read_file`/`edit`/`write` target per session and never skeletonizes or
+  evicts active-file content (`skip_predicate` in `ContextCompressor.compress`).
+- **Composite regression gate (P0.6).** `benchmark.py` gates on
+  `mean(code_block_ratio, rouge_l_f1, edit_similarity)` plus a hard
+  `semantic_similarity` floor (default `0.5 × --min-similarity`); added
+  `--min-semantic`. Raw embedding cosine is no longer the primary gate.
+- **Thinking-block reconstruction (P1.1, cache guide DO #2).** The optimizer
+  captures each assistant message's `reasoning_content` from the streaming
+  response (`capture_thinking`) and re-injects it on the next turn
+  (`_restore_thinking`) if the client stripped it — so the prefix the proxy
+  sends byte-matches the backend's cached prefix and avoids a forced re-prefill.
+- **Tools-schema pinning (P1.2, cache guide DO #5).** `pin_tools()` caches the
+  first-seen `tools` schema per session and re-emits it verbatim (stable
+  sorted-by-name order) every turn, ignoring client reordering that would shift
+  the backend's cached prefix. Wired into `app.py`.
+- **Tests.** Updated `tests/test_config.py` QualityProfile assertions to the
+  re-tuned budgets; enlarged the degradation-header test prompt so it still
+  reaches the canonicalization stage under the higher budget.

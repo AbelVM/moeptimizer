@@ -14,23 +14,29 @@ class TestCodeDeltaEncoder:
         assert self.encoder.reconstruct(key) == "def foo():\n    pass\n"
 
     def test_store_snapshot_delta(self) -> None:
-        code1 = "def foo():\n    x = 1\n    return x\n"
-        code2 = "def foo():\n    x = 2\n    y = 3\n    return x + y\n"
-        self.encoder.store_snapshot("test.py", code1)
-        key2 = self.encoder.store_snapshot("test.py", code2)
-        # Second snapshot should have a delta
+        # A large file with a small edit: the delta must be far smaller than the
+        # full content (the whole point of delta encoding).
+        base = "\n".join(f"line_{i} = {i}" for i in range(200)) + "\n"
+        edited = base.replace("line_100 = 100", "line_100 = 999")
+        self.encoder.store_snapshot("test.py", base)
+        key2 = self.encoder.store_snapshot("test.py", edited)
+        # A delta must have been produced (previously a no-op, so never stored).
+        assert self.encoder._stats["deltas_stored"] >= 1
         delta_size = self.encoder.get_delta_size(key2)
         full_size = self.encoder.get_full_size(key2)
-        # Delta should be smaller than full for non-trivial changes
-        assert delta_size <= full_size
+        # For a small edit to a large file the delta is a tiny fraction of full.
+        assert delta_size < full_size / 2
 
     def test_reconstruct_missing(self) -> None:
         result = self.encoder.reconstruct("nonexistent")
         assert result is None
 
     def test_get_compression_ratio(self) -> None:
-        self.encoder.store_snapshot("test.py", "def foo():\n    pass\n")
-        key = self.encoder.store_snapshot("test.py", "def foo():\n    return 1\n")
+        # Large file, single-line edit -> ratio well under 1.0.
+        base = "\n".join(f"line_{i} = {i}" for i in range(200)) + "\n"
+        edited = base.replace("line_50 = 50", "line_50 = 51")
+        self.encoder.store_snapshot("test.py", base)
+        key = self.encoder.store_snapshot("test.py", edited)
         ratio = self.encoder.get_compression_ratio(key)
         assert 0.0 <= ratio <= 1.0
 

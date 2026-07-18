@@ -64,7 +64,6 @@ from moeptimizer.delta_encoder import get_delta_encoder
 from moeptimizer.dependency_orderer import get_dependency_orderer
 from moeptimizer.embedding import EmbeddingService
 from moeptimizer.goal_decomposer import GoalDecomposer
-from moeptimizer.goal_relevance_scorer import GoalRelevanceScorer
 from moeptimizer.hierarchical_index import get_hierarchical_index
 from moeptimizer.hierarchical_summarizer import get_hierarchical_summarizer
 from moeptimizer.hit_prediction_model import get_hit_prediction_model
@@ -137,6 +136,7 @@ class AgentContextOptimizer:
                 frozen_prefix_turns=v050.frozen_prefix_turns,
                 context_aligner=self.context_aligner,
                 token_calibration=1.0,
+                keep_full_steps=self._config.agentic.keep_full_steps,
             )
             if v050.token_aware_truncation_enabled
             else None
@@ -162,7 +162,6 @@ class AgentContextOptimizer:
             capability_probe=capability_probe,
         )
         self.goal_decomposer = GoalDecomposer()
-        self.goal_relevance_scorer = GoalRelevanceScorer(self._config.agentic)
         self.embedding_service = EmbeddingService()
         self.symbol_index = SymbolIndex()
         self.cache_registry = get_cache_registry()
@@ -192,6 +191,14 @@ class AgentContextOptimizer:
         # is reused; the app layer may override it with the backend's actual
         # cached_tokens from usage.prompt_tokens_details.
         self._last_static_prefix_hit: bool = False
+        # Real backend prefix-cache reuse ratio (review P1.3). Rolling mean of
+        # the authoritative `cached_tokens > 0` signal reported by the app layer.
+        # When reuse collapses we assume our mutations shifted the prefix and
+        # *reduce* mutation (skip volatile append + gentler eviction) until reuse
+        # recovers — never the reverse, so this cannot make cache stability worse.
+        self._real_cache_hit_ratio: float = 1.0
+        self._real_cache_samples: int = 0
+        self._prefix_drift: bool = False
         self._last_optimized: list[dict[str, Any]] = []
         self._last_optimized_token_count: int | None = None
         self._last_original_token_count: int | None = None
@@ -247,6 +254,31 @@ class AgentContextOptimizer:
         # the most-recent tail byte-stable across turns.
         self._anchor_first_request: str = ""
         self._anchor_constraints: list[str] = []
+        # Active-file tracking (review P0.5): the most-recent file contents the
+        # agent read/edited are kept VERBATIM — never skeletonized or evicted —
+        # because they are the task-critical state the model must edit/extend.
+        # Maps a normalized file path -> exact content string. Bounded to the
+        # last few files so memory stays small.
+        self._active_files: dict[str, str] = {}
+        self._active_file_order: list[str] = []
+        # Thinking-block reconstruction store (review P1.1 / cache guide DO #2).
+        # The backend caches the KV for the prompt it received, which included
+        # the assistant's <think>/reasoning_content block. If the client strips
+        # reasoning_content on the next turn (common — many clients only persist
+        # `content`), the proxy would re-send an assistant message WITHOUT the
+        # thinking block, so the backend's cached prefix no longer matches and
+        # it must re-prefill. We capture the thinking we observed on the
+        # response stream and re-inject it into the matching assistant message
+        # before sending to the backend, keyed by a hash of the assistant
+        # `content` (the stable part the client always echoes). Bounded LRU.
+        self._thinking_store: dict[str, str] = {}
+        self._thinking_order: list[str] = []
+        # Tools-schema pinning (review P1.2 / cache guide DO #5). The backend
+        # caches the prompt prefix that includes the serialized `tools` array; if
+        # the client re-sends tools in a different order or with a different dict
+        # layout turn-to-turn, the prefix shifts and the cache is invalidated. We
+        # pin the first-seen schema and re-emit it verbatim every turn.
+        self._pinned_tools: list[dict[str, Any]] | None = None
 
     def _budget_tokens(self) -> int:
         """Return the configured token budget without letting defaults override chars."""
@@ -529,6 +561,14 @@ class AgentContextOptimizer:
         # Reset the per-turn eviction counter (review §11.4 / C8).
         self._last_evicted_turns = 0
 
+        # P1.1 (cache guide DO #2): re-inject any thinking block we
+        # previously observed for an assistant message whose client stripped it.
+        # This makes the message we send byte-match the backend's cached prefix
+        # and avoids a forced re-prefill. Must run before the pipeline so the
+        # restored thinking is part of the optimized prompt.
+        with suppress(Exception):
+            messages = self._restore_thinking(messages)
+
         # Live-zone compression (P3): compute the boundary between the stable
         # prefix (byte-identical to the previous turn) and the live zone (new
         # messages that can be re-optimized). When the stable prefix is unchanged,
@@ -593,22 +633,6 @@ class AgentContextOptimizer:
                     self.progress_tracker.set_subtasks(subtasks)
                     break
 
-        # Step 2.5: Task-aware goal-relevance pruning (P3, review §10).
-        # Evict low-relevance steps from the evictable body (oldest archived
-        # steps) before heavy optimization. The recent/protected tail and the
-        # frozen prefix are never mutated, so backend prefix-cache reuse holds.
-        try:
-            threshold = self._config.agentic.goal_relevance_threshold
-            if threshold > 0 and len(self.store.steps) > self._config.agentic.keep_full_steps:
-                self.store.prune_by_relevance(
-                    threshold=threshold,
-                    goal=self.store.get_goal(),
-                    keep_recent=self._config.agentic.keep_full_steps,
-                )
-        except Exception as e:
-            logger.warning("Goal-relevance pruning failed: %s", e)
-            self._record_degradation("goal_relevance_pruning", e)
-
         # Step 3: Run loop detection on each step
         loop_warnings: list[LoopWarning] = []
         for step in self.store.steps:
@@ -624,11 +648,17 @@ class AgentContextOptimizer:
         # Step 5: Apply thinking preservation (pass-through)
         optimized = self.thinking_preserver.process_messages(list(messages))
 
-        # Calculate token count early (needed for cache early-exit decisions).
+        # Calculate token count ONCE (P2.1). count_messages is memoized by a
+        # content fingerprint, but re-counting the same unchanged list at every
+        # gate still costs a full fingerprint pass. We keep a single local
+        # ``current_tokens`` and only recompute it right after a stage mutates
+        # ``optimized``. Every gate below reads this variable instead of calling
+        # count_messages again.
         max_tokens = self._budget_tokens()
         proactive_threshold_tokens = int(max_tokens * self._config.agentic.proactive_trim_ratio)
         compaction_threshold_tokens = int(max_tokens * self._config.agentic.compaction_trigger_ratio)
-        total_tokens = self.token_counter.count_messages(optimized)
+        current_tokens = self.token_counter.count_messages(optimized)
+        total_tokens = current_tokens
 
         # Single lean-context signal (review §2 / C14). The fast path is the
         # primary early-return gate, but it can be bypassed for lean contexts that
@@ -649,7 +679,7 @@ class AgentContextOptimizer:
             kv_data = self.static_prefix_kv.get(optimized)
             if kv_data is not None:
                 self._last_static_prefix_hit = True
-                if total_tokens <= proactive_threshold_tokens:
+                if current_tokens <= proactive_threshold_tokens:
                     logger.info("[AgentOptimizer] Static prefix KV-cache hit, skipping optimization")
                     optimized = self._strip_internal_flags(optimized)
                     self._register_context(optimized)
@@ -717,9 +747,9 @@ class AgentContextOptimizer:
         # Step 5.5: Apply context canonicalization only when context pressure
         # justifies normalization. Lean contexts preserve exact user/system text.
         try:
-            current_tokens = self.token_counter.count_messages(optimized)
             if current_tokens > proactive_threshold_tokens:
                 optimized = self.context_canonicalizer.canonicalize(optimized)
+                current_tokens = self.token_counter.count_messages(optimized)
             else:
                 logger.debug(
                     "[AgentOptimizer] Context canonicalization skipped: tokens=%d <= threshold=%d",
@@ -735,17 +765,22 @@ class AgentContextOptimizer:
         # preserving signatures, imports, comments, and structure. Small code
         # snippets remain exact because they often contain the task semantics.
         try:
-            current_tokens = self.token_counter.count_messages(optimized)
             if current_tokens > proactive_threshold_tokens and (
                 self._config.agentic.code_skeleton_enabled
                 or current_tokens > compaction_threshold_tokens
             ):
                 if self.async_io is not None:
                     optimized = self.async_io.run_sync_stage(
-                        self.context_compressor.compress, optimized, stage_name="compress"
+                        self.context_compressor.compress,
+                        optimized,
+                        skip_predicate=self._is_active_file_content,
+                        stage_name="compress",
                     )
                 else:
-                    optimized = self.context_compressor.compress(optimized)
+                    optimized = self.context_compressor.compress(
+                        optimized, skip_predicate=self._is_active_file_content
+                    )
+                current_tokens = self.token_counter.count_messages(optimized)
             else:
                 logger.debug(
                     "[AgentOptimizer] Context compression skipped: tokens=%d <= threshold=%d",
@@ -761,14 +796,20 @@ class AgentContextOptimizer:
         # because its heuristics provided no real cache locality and only burned CPU.
 
         # Step 6: Apply prompt template versioning only when context pressure
-        # justifies template specialization.
+        # justifies template specialization AND it is enabled. Default OFF for
+        # agentic scenarios (review §4.7): template rewrites can change the user's
+        # exact wording, which hurts coding tasks and risks cache-guide DONT #4.
         try:
-            current_tokens = self.token_counter.count_messages(optimized)
-            if current_tokens > proactive_threshold_tokens:
+            if (
+                self._config.agentic.prompt_template_enabled
+                and current_tokens > proactive_threshold_tokens
+            ):
                 optimized, self._task_type = classify_and_template(optimized)
+                current_tokens = self.token_counter.count_messages(optimized)
             else:
                 logger.debug(
-                    "[AgentOptimizer] Prompt template specialization skipped: tokens=%d <= threshold=%d",
+                    "[AgentOptimizer] Prompt template specialization skipped: enabled=%s tokens=%d threshold=%d",
+                    self._config.agentic.prompt_template_enabled,
                     current_tokens,
                     proactive_threshold_tokens,
                 )
@@ -777,12 +818,17 @@ class AgentContextOptimizer:
 
         # Step 6.5: Apply context template matching only for over-budget
         # contexts where a task template can preserve quality with fewer tokens.
-        if self.token_counter.count_messages(optimized) > proactive_threshold_tokens:
+        # Also gated by prompt_template_enabled (review §4.7).
+        if (
+            self._config.agentic.prompt_template_enabled
+            and current_tokens > proactive_threshold_tokens
+        ):
             try:
                 if not (optimized and optimized[0].get("role") == "system"):
                     template_name = self.context_template_matcher.match_template(optimized)
                     if template_name:
                         optimized = self.context_template_matcher.apply_template(optimized)
+                        current_tokens = self.token_counter.count_messages(optimized)
             except Exception as e:
                 logger.warning("Context template matching failed: %s", e)
 
@@ -790,9 +836,9 @@ class AgentContextOptimizer:
         # above the proactive threshold. This keeps compaction budget-driven
         # instead of letting it bypass proactive trim on short contexts.
         try:
-            current_tokens = self.token_counter.count_messages(optimized)
             if current_tokens > compaction_threshold_tokens:
                 optimized = self.compactor.compact_messages(optimized)
+                current_tokens = self.token_counter.count_messages(optimized)
             else:
                 logger.debug(
                     "[AgentOptimizer] Scratchpad compaction skipped: tokens=%d <= threshold=%d",
@@ -805,7 +851,7 @@ class AgentContextOptimizer:
 
         # Recalculate after compaction so later stages use the actual context size.
         try:
-            total_tokens = self.token_counter.count_messages(optimized)
+            total_tokens = current_tokens
             total_chars = sum(len(m.get("content") or "") for m in optimized)
         except Exception as e:
             logger.warning("Post-compaction recount failed: %s", e)
@@ -834,11 +880,12 @@ class AgentContextOptimizer:
         # Step 7.8: Apply incremental update for cache preservation
         try:
             optimized = self.incremental_updater.update_context(optimized, "")
+            current_tokens = self.token_counter.count_messages(optimized)
         except Exception as e:
             logger.warning("Incremental update failed: %s", e)
 
         try:
-            total_tokens = self.token_counter.count_messages(optimized)
+            total_tokens = current_tokens
             total_chars = sum(len(m.get("content") or "") for m in optimized)
         except Exception as e:
             logger.warning("Pre-RAG recount failed: %s", e)
@@ -855,7 +902,7 @@ class AgentContextOptimizer:
                 warning_message = self.loop_detector.get_warning_message(w)
                 warning_lines.append(warning_message.replace("[LOOP DETECTED: ", "Loop detected: "))
 
-            rag_tokens = self.token_counter.count_messages(optimized)
+            rag_tokens = current_tokens
             if (
                 self._config.agentic.rag_enabled
                 and not is_lean_context
@@ -880,7 +927,7 @@ class AgentContextOptimizer:
             self._record_degradation("rag_loop_warning", e)
 
         try:
-            total_tokens = self.token_counter.count_messages(optimized)
+            total_tokens = current_tokens
             total_chars = sum(len(m.get("content") or "") for m in optimized)
         except Exception as e:
             logger.warning("Post-RAG recount failed: %s", e)
@@ -898,7 +945,7 @@ class AgentContextOptimizer:
             and self._cache_stable_summary
             and self._config.v050.cache_stable_mode
             and not is_lean_context
-            and self.token_counter.count_messages(optimized) > proactive_threshold_tokens
+            and current_tokens > proactive_threshold_tokens
         ):
             try:
                 frozen_end = self.context_aligner.frozen_prefix_end(
@@ -907,6 +954,7 @@ class AgentContextOptimizer:
                 optimized = self.hierarchical_summarizer.summarize_turns_cache_stable(
                     optimized, frozen_end
                 )
+                current_tokens = self.token_counter.count_messages(optimized)
             except Exception as e:
                 logger.warning("Rolling summary compaction failed: %s", e)
 
@@ -924,22 +972,27 @@ class AgentContextOptimizer:
         # so we skip the tree-sitter parse/dedup on lean contexts (no latency
         # cost, no risk of altering exact code when there is room). The same
         # proactive threshold gates the skeleton compressor (step 5.7).
+        #
+        # CRITICAL (review P0.2): code-block optimization only ever touches the
+        # LIVE ZONE (messages at/after ``live_zone_start``). The stable prefix is
+        # frozen byte-for-byte for backend prefix-cache reuse; re-skeletonizing it
+        # every turn both destroys quality AND breaks the cache-stability
+        # guarantee. When ``live_zone_start == 0`` (first turn / reset) the whole
+        # list is the live zone, but on later turns we must never walk into the
+        # prefix.
         if self._config.agentic.optimize_code_blocks:
             try:
-                current_tokens = self.token_counter.count_messages(optimized)
                 if current_tokens > proactive_threshold_tokens:
-                    if live_zone_start > 0 and live_zone_start < len(optimized):
-                        stable_prefix, live_zone = self._split_live_zone(optimized, live_zone_start)
-                        for msg in live_zone:
-                            content = msg.get("content") or ""
-                            if isinstance(content, str) and self._has_code_blocks(content):
-                                msg["content"] = self._optimize_code_block_content(content)
-                        optimized = self._merge_live_zone(stable_prefix, live_zone)
-                    else:
-                        for msg in optimized:
-                            content = msg.get("content") or ""
-                            if isinstance(content, str) and self._has_code_blocks(content):
-                                msg["content"] = self._optimize_code_block_content(content)
+                    live_start = max(0, live_zone_start)
+                    for msg in optimized[live_start:]:
+                        content = msg.get("content") or ""
+                        if isinstance(content, str) and self._has_code_blocks(content):
+                            # P0.5: never skeletonize the active file body — it is
+                            # the task-critical state the model must edit/extend.
+                            if self._is_active_file_content(content):
+                                continue
+                            msg["content"] = self._optimize_code_block_content(content)
+                    current_tokens = self.token_counter.count_messages(optimized)
                 else:
                     logger.debug(
                         "[AgentOptimizer] Code block optimization skipped: tokens=%d <= threshold=%d",
@@ -951,21 +1004,21 @@ class AgentContextOptimizer:
                 self._record_degradation("code_block_optimization", e)
 
         try:
-            total_tokens = self.token_counter.count_messages(optimized)
+            total_tokens = current_tokens
         except Exception as e:
             logger.warning("Post-code recount failed: %s", e)
 
         # Step 10.5: Apply cache-aware chunking only for contexts that remain
         # over the compaction threshold after cheaper quality-preserving passes.
-        total_tokens = self.token_counter.count_messages(optimized)
-        if total_tokens > compaction_threshold_tokens:
+        if current_tokens > compaction_threshold_tokens:
             try:
                 optimized = self.cache_aware_chunker.chunk_context(optimized)
+                current_tokens = self.token_counter.count_messages(optimized)
             except Exception as e:
                 logger.warning("Cache-aware chunking failed: %s", e)
 
         try:
-            total_tokens = self.token_counter.count_messages(optimized)
+            total_tokens = current_tokens
         except Exception as e:
             logger.warning("Post-chunking recount failed: %s", e)
 
@@ -973,7 +1026,12 @@ class AgentContextOptimizer:
         # Keep this aligned with the configured proactive threshold so early gates
         # and final trimming use the same quality/leanness policy.
         proactive_threshold_tokens = int(max_tokens * self._config.agentic.proactive_trim_ratio)
-        if total_tokens > proactive_threshold_tokens:
+        # Drift-safe mode (review P1.3): when real prefix-cache reuse has
+        # collapsed, skip the aggressive proactive trim — it is the mutation most
+        # likely to have shifted the prefix. The hard budget cap (Step 12) still
+        # runs, so we never exceed the model window; we only stop *voluntarily*
+        # shrinking the context further until reuse recovers.
+        if total_tokens > proactive_threshold_tokens and not self._prefix_drift:
             try:
                 optimized = self._proactive_trim(optimized, proactive_threshold_tokens, use_tokens=True)
             except Exception as e:
@@ -1033,6 +1091,10 @@ class AgentContextOptimizer:
                 logger.warning("User paste compression failed: %s", e)
                 self._record_degradation("user_paste_compression", e)
 
+        # Step 11.7 mutations above may have changed the token count; refresh the
+        # local so the Step 11.8 gate below reads the post-filter size.
+        current_tokens = self.token_counter.count_messages(optimized)
+
         # Recalculate total_tokens after entropy trim (calibrated to the backend
         # tokenizer so the budget is enforced against true token counts, #6).
         try:
@@ -1046,7 +1108,9 @@ class AgentContextOptimizer:
 
         # Step 11.8: Apply sliding window for long contexts
         # This is the preferred method for context management with MTP state preservation
-        if total_tokens > int(max_tokens * 0.8):
+        # Skipped in drift-safe mode (review P1.3) for the same reason as Step 11:
+        # it is a prefix-shifting mutation we avoid while reuse is collapsed.
+        if total_tokens > int(max_tokens * 0.8) and not self._prefix_drift:
             try:
                 optimized = self._sliding_window_trim(optimized, use_tokens=True)
             except Exception as e:
@@ -1127,12 +1191,21 @@ class AgentContextOptimizer:
                 for msg in optimized[scan_from:]:
                     content = msg.get("content") or ""
                     if isinstance(content, str) and "```" in content:
-                        import re
                         for match in re.finditer(r"```(\w*)\n(.*?)```", content, re.DOTALL):
                             lang = match.group(1)
                             code = match.group(2)
-                            file_path = f"inline:{lang}:{hashlib.md5(code.encode()).hexdigest()[:8]}"
+                            # Stable per-language id so re-reads of the same file
+                            # map to one encoder entry and yield a real prior delta.
+                            file_path = f"inline:{lang}"
                             self.delta_encoder.store_snapshot(file_path, code)
+                # P2.2 (review §3.4): when a file is re-read after an edit, inject
+                # a compact unified diff instead of the full re-read file body. Only
+                # when enabled AND the prior snapshot is already present in the
+                # optimized context (so the model can apply the diff to a file it
+                # already has). This keeps edits correct and never changes what the
+                # model sees on first read.
+                if self._config.agentic.delta_encode_inject:
+                    self._inject_code_deltas(optimized, scan_from)
             except Exception as e:
                 logger.warning("Delta encoding snapshot storage failed: %s", e)
 
@@ -1209,9 +1282,14 @@ class AgentContextOptimizer:
         # expensive MoE re-prefill. This is the core KV-cache preservation change.
         try:
             anchor = self._build_quality_anchor(optimized)
-            optimized = self._append_volatile_context(
-                optimized, anchor, rag_context, warning_lines, proactive_threshold_tokens
-            )
+            # Drift-safe mode (review P1.3): when real prefix-cache reuse has
+            # collapsed we stop appending the volatile trailing turn, because
+            # even that append shifts the prefix the backend would otherwise
+            # reuse. Skipping it reduces mutation and lets reuse recover.
+            if not self._prefix_drift:
+                optimized = self._append_volatile_context(
+                    optimized, anchor, rag_context, warning_lines, proactive_threshold_tokens
+                )
         except Exception as e:
             logger.warning("Volatile context append failed: %s", e)
             self._record_degradation("volatile_context_append", e)
@@ -1402,6 +1480,11 @@ class AgentContextOptimizer:
         min_messages = max_full_turns + 3
         return len(messages) >= min_messages and self.token_counter.count_messages(messages) > proactive_threshold_tokens
 
+    # Tool names whose result content is a file body the agent is actively
+    # editing. Those contents are tracked verbatim and protected from
+    # skeletonization/eviction (review P0.5).
+    _FILE_TOOL_NAMES = frozenset({"read_file", "edit_file", "write_file", "open_file", "view_file"})
+
     def _ingest_messages(self, messages: list[dict[str, Any]]) -> None:
         """Convert message list into AgentStateStore steps."""
         for i, msg in enumerate(messages):
@@ -1424,6 +1507,14 @@ class AgentContextOptimizer:
                     step.tool_call_id = tool_calls[0].get("id", "") if tool_calls else ""
             elif role == "tool":
                 step.tool_call_id = msg.get("tool_call_id", "")
+                # Active-file tracking: capture the file path + body from a
+                # read/edit/write tool result so the optimizer can keep it
+                # verbatim later in the pipeline.
+                name = msg.get("name", "")
+                if name in self._FILE_TOOL_NAMES and isinstance(content, str) and content.strip():
+                    path = self._extract_file_path(msg, tool_calls=None, content=content)
+                    if path:
+                        self._track_active_file(path, content)
 
             fingerprint = self.store.step_fingerprint(step)
             if self.store.has_step_fingerprint(fingerprint):
@@ -1431,6 +1522,170 @@ class AgentContextOptimizer:
 
             self.store.add_step(step)
             self.progress_tracker.record_step(step)
+
+    @staticmethod
+    def _extract_file_path(msg: dict[str, Any], tool_calls: Any, content: str) -> str | None:
+        """Best-effort extraction of the file path a file-tool acted on."""
+        # Prefer the tool_call arguments on the matching assistant message; we
+        # only have the tool message here, so fall back to scanning the content
+        # for a path-like token and to the tool message's own metadata.
+        meta = msg.get("metadata", {}) or {}
+        for key in ("path", "file_path", "filename"):
+            val = meta.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        # Scan the first lines of the content for a path-like token.
+        for line in content.splitlines()[:5]:
+            m = re.search(r"(?:[/\\][\w.\-/\\]+){2,}\.\w{1,6}", line)
+            if m:
+                return m.group(0)
+        return None
+
+    def _track_active_file(self, path: str, content: str) -> None:
+        """Record an active file's verbatim content (bounded LRU)."""
+        norm = path.strip()
+        if norm in self._active_files:
+            self._active_file_order.remove(norm)
+        self._active_files[norm] = content
+        self._active_file_order.append(norm)
+        # Keep only the most recent few files.
+        while len(self._active_file_order) > 5:
+            old = self._active_file_order.pop(0)
+            self._active_files.pop(old, None)
+
+    def _is_active_file_content(self, content: str) -> bool:
+        """True if ``content`` is (a prefix of) a tracked active file body."""
+        if not self._active_files:
+            return False
+        for body in self._active_files.values():
+            if body and content and (content == body or content in body or body in content):
+                return True
+        return False
+
+    def _inject_code_deltas(
+        self, optimized: list[dict[str, Any]], scan_from: int
+    ) -> None:
+        """Replace re-read full file bodies with a diff against the prior snapshot.
+
+        P2.2 (review §3.4): when a file is re-read after an edit, the full new
+        file body is redundant if the model already has the prior version in
+        context. For each code block we ask the delta encoder for the diff vs the
+        previously stored version of the same block. The diff is only injected
+        when the prior content is already present somewhere in ``optimized``
+        (verified by substring), so the model can apply the diff to a file it
+        already sees — never on a first read, and never when the prior version is
+        absent (which would make the diff unapplicable).
+        """
+        if self.delta_encoder is None:
+            return
+        # Serialize the whole context once to test prior-content presence.
+        ctx_blob = "\n".join(
+            (m.get("content") or "") if isinstance(m.get("content"), str) else ""
+            for m in optimized
+        )
+        for msg in optimized[scan_from:]:
+            content = msg.get("content")
+            if not isinstance(content, str) or "```" not in content:
+                continue
+            new_parts: list[str] = []
+            last = 0
+            changed = False
+            for match in re.finditer(r"```(\w*)\n(.*?)```", content, re.DOTALL):
+                lang = match.group(1)
+                code = match.group(2)
+                # Stable per-language block id so re-reads of the same file map to
+                # the same encoder entry and produce a real prior-version delta.
+                file_path = f"inline:{lang}"
+                delta = self.delta_encoder.get_delta_vs_previous(file_path, code)
+                if delta:
+                    # The diff is only applicable if the PRIOR version is already
+                    # present in the context (so the model can apply the diff to a
+                    # file it already has). If the prior version is absent, keep the
+                    # full current code so the model can still see it.
+                    prev = self.delta_encoder.get_previous_content(file_path)
+                    if prev and prev in ctx_blob:
+                        new_parts.append(content[last : match.start()])
+                        new_parts.append(
+                            "```diff\n# file changed since last read; "
+                            "apply this diff to the version you already have:\n"
+                            f"{delta}\n```"
+                        )
+                        changed = True
+                        last = match.end()
+            if changed:
+                new_parts.append(content[last:])
+                msg["content"] = "".join(new_parts)
+
+    # --- Thinking-block reconstruction (review P1.1 / cache guide DO #2) ---
+
+    @staticmethod
+    def _thinking_key(content: str) -> str:
+        """Stable key for an assistant message: hash of its ``content``."""
+        return hashlib.md5((content or "").encode("utf-8", "replace")).hexdigest()[:16]
+
+    def pin_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        """Pin and re-emit the `tools` schema verbatim (review P1.2 / DO #5).
+
+        The backend's prefix cache includes the serialized `tools` array. If the
+        client re-sends tools in a different order or with a different dict layout
+        turn-to-turn, the cached prefix no longer matches and the backend must
+        re-prefill. We cache the first-seen schema and return it unchanged on
+        every subsequent turn, ignoring client reordering. Returns ``None`` when
+        no tools were ever seen (the caller should then leave `tools` untouched).
+        """
+        if tools:
+            # Normalize once: stable, sorted-by-name ordering so the serialized
+            # bytes are deterministic regardless of client input order.
+            normalized = sorted(
+                (dict(t) for t in tools if isinstance(t, dict)),
+                key=lambda t: str(t.get("function", {}).get("name", t.get("name", ""))),
+            )
+            if self._pinned_tools is None:
+                self._pinned_tools = normalized
+            return self._pinned_tools
+        return self._pinned_tools
+
+    def capture_thinking(self, content: str, reasoning: str | None) -> None:
+        """Store the thinking block observed for an assistant ``content``.
+
+        Called by the app layer after a streaming response completes, so the
+        proxy remembers the reasoning block the backend cached alongside this
+        assistant message. Bounded LRU.
+        """
+        if not content or not reasoning:
+            return
+        key = self._thinking_key(content)
+        if key in self._thinking_store:
+            self._thinking_order.remove(key)
+        self._thinking_store[key] = reasoning
+        self._thinking_order.append(key)
+        while len(self._thinking_order) > 32:
+            old = self._thinking_order.pop(0)
+            self._thinking_store.pop(old, None)
+
+    def _restore_thinking(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Re-inject stored thinking blocks into assistant messages (review P1.1).
+
+        If a client stripped ``reasoning_content`` from an assistant message we
+        previously saw WITH thinking, re-add it so the message we send to the
+        backend byte-matches what the backend cached — avoiding a forced re-prefill.
+        Only adds; never removes existing reasoning the client did echo.
+        """
+        if not self._thinking_store:
+            return messages
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
+                content = msg.get("content") or ""
+                key = self._thinking_key(content)
+                reasoning = self._thinking_store.get(key)
+                if reasoning:
+                    new_msg = dict(msg)
+                    new_msg["reasoning_content"] = reasoning
+                    out.append(new_msg)
+                    continue
+            out.append(msg)
+        return out
 
     def _has_code_blocks(self, text: str) -> bool:
         """Check if text contains fenced code blocks."""
@@ -1884,13 +2139,35 @@ class AgentContextOptimizer:
         the predictor (review §2). This replaces the previous constant
         ``hit=True`` label that trained the model on noise.
         """
-        if self.hit_prediction is None or cached_tokens is None:
+        if cached_tokens is None:
             return
         hit = cached_tokens > 0
-        try:
-            self.hit_prediction.record_outcome(self._last_optimized, hit=hit)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.debug("Hit prediction outcome recording failed: %s", e)
+        # Rolling real-reuse ratio (review P1.3). Exponential moving average so a
+        # single transient miss does not flip the drift flag, but a sustained
+        # collapse (prefix shifted) does.
+        self._real_cache_samples += 1
+        alpha = 0.3
+        self._real_cache_hit_ratio = (
+            self._real_cache_hit_ratio * (1 - alpha) + (1.0 if hit else 0.0) * alpha
+        )
+        # Declare drift only after we have a few real samples and reuse has
+        # genuinely collapsed. This is a *reduction* of mutation, so it is
+        # cache-safe: it never increases eviction or prefix mutation.
+        if self._real_cache_samples >= 3 and self._real_cache_hit_ratio < 0.34:
+            if not self._prefix_drift:
+                logger.info(
+                    "[AgentOptimizer] Prefix-cache reuse collapsed (ratio=%.2f); "
+                    "entering drift-safe mode (reduce mutation).",
+                    self._real_cache_hit_ratio,
+                )
+            self._prefix_drift = True
+        elif self._real_cache_hit_ratio > 0.6:
+            self._prefix_drift = False
+        if self.hit_prediction is not None:
+            try:
+                self.hit_prediction.record_outcome(self._last_optimized, hit=hit)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("Hit prediction outcome recording failed: %s", e)
 
     def _find_static_layer_end(self, messages: list[dict[str, Any]]) -> int:
         """Find the end index of the static layer (system + first user)."""

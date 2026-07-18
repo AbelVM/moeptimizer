@@ -33,11 +33,14 @@ class ContextCompressor:
     def compress(
         self,
         messages: list[dict[str, Any]],
+        skip_predicate: Any = None,
     ) -> list[dict[str, Any]]:
         """Compress only the newest user message.
 
         Historical user/system content is immutable once sent. Code skeleton
         compression is allowed only on the active user turn when explicitly used.
+        ``skip_predicate`` (optional callable str->bool) lets the caller protect
+        specific content (e.g. the active file body) from skeletonization (P0.5).
         """
         result = [dict(msg) for msg in messages]
         last_user_idx = -1
@@ -51,6 +54,8 @@ class ContextCompressor:
 
         content = result[last_user_idx].get("content", "")
         if isinstance(content, str):
+            if skip_predicate is not None and skip_predicate(content):
+                return result
             result[last_user_idx] = {
                 **result[last_user_idx],
                 "content": self._compress_content(content),

@@ -82,12 +82,17 @@ class AgenticConfig(BaseModel):
         description="Steps before this index are archived/compressed",
     )
     max_optimized_chars: int = Field(
-        default=12000,
-        description="Character fallback cap for optimized context (converted to ~3000 tokens)",
+        default=32000,
+        description="Character fallback cap for optimized context (converted to ~8000 tokens). "
+                    "Should be a meaningful fraction of the backend context window, not ~1% of it: "
+                    "evicting/skeletonizing below this starves the model of task context and collapses quality.",
     )
     max_optimized_tokens: int = Field(
-        default=3000,
-        description="Hard cap on optimized context window (tokens). Takes precedence over max_optimized_chars if set.",
+        default=8000,
+        description="Hard cap on optimized context window (tokens). Takes precedence over "
+                    "max_optimized_chars if set. Should be a sane fraction (a few %) of the backend "
+                    "context window so eviction only triggers when genuinely needed; a cap near 1% of "
+                    "the window forces aggressive lossy eviction on every long agentic turn.",
     )
     proactive_trim_ratio: float = Field(
         default=0.45,
@@ -133,9 +138,31 @@ class AgenticConfig(BaseModel):
         default=True,
         description="Compress large code blocks to AST/line skeletons when proactive context pressure starts.",
     )
+    prompt_template_enabled: bool = Field(
+        default=False,
+        description=(
+            "Apply task-template specialization (classify_and_template / context "
+            "template matching) to rewrite the user's prompt. OFF by default: for "
+            "agentic coding the client's exact wording matters and template rewrites "
+            "risk changing it (cache guide DONT #4). Only enable for non-agentic, "
+            "template-friendly scenarios. Still gated behind the proactive threshold."
+        ),
+    )
     attention_sinks_enabled: bool = Field(
         default=False,
         description="Inject model-visible attention-sink markers. Disabled by default to preserve exact prompts.",
+    )
+    delta_encode_inject: bool = Field(
+        default=False,
+        description=(
+            "When a file is re-read after an edit, replace the full re-read file "
+            "body in the tool result with a compact unified diff against the prior "
+            "snapshot (review §3.4). OFF by default: the model needs the full file "
+            "to edit it, and a diff is only safe when the prior version is already "
+            "present in the context. Injection is additionally gated so it only "
+            "fires when the prior snapshot content is already in the optimized "
+            "context, keeping edits correct."
+        ),
     )
     reasoning_preseed_enabled: bool = Field(
         default=False,
@@ -532,29 +559,31 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         "code_skeleton_enabled": False,
         "attention_sinks_enabled": False,
         "cache_stable_summary_enabled": False,
-        "keep_full_steps": 6,
-        "max_optimized_tokens": 6000,
-        "max_optimized_chars": 24000,
-        "proactive_trim_ratio": 0.7,
-        "compaction_trigger_ratio": 0.9,
+        "keep_full_steps": 8,
+        "max_optimized_tokens": 16000,
+        "max_optimized_chars": 64000,
+        "proactive_trim_ratio": 0.8,
+        "compaction_trigger_ratio": 0.95,
     },
     "balanced": {
-        # Current defaults; explicit here so the resolver is a single source.
+        # Default: keep task-critical context. Budget is a sane fraction of the
+        # backend window so eviction only triggers when needed; code is kept
+        # verbatim (no skeletonization) so the model can still edit/extend it.
         "hierarchical_summary_enabled": False,
         "rag_enabled": True,
         "reasoning_preseed_enabled": False,
-        "code_skeleton_enabled": True,
+        "code_skeleton_enabled": False,
         "attention_sinks_enabled": False,
         "cache_stable_summary_enabled": True,
-        "keep_full_steps": 3,
-        "max_optimized_tokens": 3000,
-        "max_optimized_chars": 12000,
-        "proactive_trim_ratio": 0.45,
-        "compaction_trigger_ratio": 0.75,
+        "keep_full_steps": 4,
+        "max_optimized_tokens": 8000,
+        "max_optimized_chars": 32000,
+        "proactive_trim_ratio": 0.6,
+        "compaction_trigger_ratio": 0.85,
     },
     "aggressive": {
         # Maximize token savings: lower cap, earlier compaction, more full steps
-        # evicted from the top.
+        # evicted from the top, and code skeletonization allowed under pressure.
         "hierarchical_summary_enabled": False,
         "rag_enabled": True,
         "reasoning_preseed_enabled": False,
@@ -562,10 +591,10 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         "attention_sinks_enabled": False,
         "cache_stable_summary_enabled": True,
         "keep_full_steps": 2,
-        "max_optimized_tokens": 2000,
-        "max_optimized_chars": 8000,
-        "proactive_trim_ratio": 0.35,
-        "compaction_trigger_ratio": 0.6,
+        "max_optimized_tokens": 4000,
+        "max_optimized_chars": 16000,
+        "proactive_trim_ratio": 0.45,
+        "compaction_trigger_ratio": 0.7,
     },
 }
 

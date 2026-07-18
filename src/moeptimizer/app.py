@@ -454,7 +454,13 @@ def _fallback_optimized_messages(messages: list[dict[str, Any]], keep_full_steps
         start_index = 0
 
     keep = max(1, keep_full_steps) * 2
-    fallback.extend(dict(msg) for msg in messages[max(start_index, len(messages) - keep):])
+    recent = messages[max(start_index, len(messages) - keep):]
+    # Strip internal proxy flags so they never leak to the backend (review §5.6).
+    cleaned: list[dict[str, Any]] = []
+    for msg in recent:
+        cleaned_msg = {k: v for k, v in msg.items() if not k.startswith("_")}
+        cleaned.append(cleaned_msg)
+    fallback.extend(cleaned)
     return fallback
 
 
@@ -701,6 +707,13 @@ def _make_streaming_generator(
             if id_slot is not None:
                 request_kwargs["id_slot"] = id_slot
 
+            # P1.1 (cache guide DO #2): accumulate the assistant's content +
+            # reasoning_content from the stream so we can remember the thinking
+            # block the backend cached alongside this assistant message. Re-injected
+            # on the next turn if the client stripped it (see optimizer.capture_thinking).
+            _acc_content: list[str] = []
+            _acc_reasoning: list[str] = []
+
             async for chunk in backend_client.chat_completions_stream(
                 messages=messages,
                 model=model_name,
@@ -720,8 +733,10 @@ def _make_streaming_generator(
                             delta["role"] = d.role
                         if hasattr(d, "content") and d.content is not None:
                             delta["content"] = d.content
+                            _acc_content.append(d.content)
                         if hasattr(d, "reasoning_content") and d.reasoning_content is not None:
                             delta["reasoning_content"] = d.reasoning_content
+                            _acc_reasoning.append(d.reasoning_content)
                     if hasattr(choice, "finish_reason") and choice.finish_reason:
                         finish_reason = choice.finish_reason
 
@@ -832,6 +847,19 @@ def _make_streaming_generator(
                     optimizer.record_cache_outcome(cached_tokens)
                 except Exception:
                     logger.debug("Failed to record streaming cache outcome", exc_info=True)
+
+            # P1.1 (cache guide DO #2): remember the thinking block we just
+            # observed for this assistant turn, so the next turn can re-inject it
+            # if the client stripped reasoning_content (keeps the backend's cached
+            # prefix byte-stable and avoids a forced re-prefill).
+            if optimizer is not None:
+                try:
+                    _assistant_content = "".join(_acc_content)
+                    _assistant_reasoning = "".join(_acc_reasoning)
+                    if _assistant_content:
+                        optimizer.capture_thinking(_assistant_content, _assistant_reasoning or None)
+                except Exception:
+                    logger.debug("Failed to capture thinking block", exc_info=True)
 
             # Aggregate process-wide metrics from the authoritative backend signal.
             PROXY_METRICS.record_turn(
@@ -1340,6 +1368,18 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             # X-Optimization-Error response header, which must be latin-1-encodable.
             optimization_error = _header_safe(f"{type(e).__name__}: {e}")
             optimized_messages = _fallback_optimized_messages(messages, cfg.agentic.keep_full_steps)
+
+        # P1.2 (cache guide DO #5): pin the `tools` schema per session so the
+        # backend's prefix cache (which includes the serialized tools array) is not
+        # invalidated by client-side reordering. Re-emit the first-seen schema
+        # verbatim on every turn. No-op when the client sent no tools.
+        if isinstance(body.get("tools"), list):
+            try:
+                pinned = optimizer.pin_tools(body["tools"])
+                if pinned is not None:
+                    body["tools"] = pinned
+            except Exception:
+                logger.debug("tools pinning failed; forwarding client tools as-is", exc_info=True)
 
         # Dry-run mode (review §11 / P4a): when the X-MOEPT-Dry-Run header is set,
         # return the optimized prompt the proxy WOULD send to the backend plus a

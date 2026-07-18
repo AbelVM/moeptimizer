@@ -50,9 +50,10 @@ class TestQualityProfile:
     def test_balanced_is_default(self) -> None:
         config = AppConfig()
         apply_quality_profile(config)
-        assert config.agentic.keep_full_steps == 3
-        assert config.agentic.max_optimized_tokens == 3000
-        assert config.agentic.code_skeleton_enabled is True
+        assert config.agentic.keep_full_steps == 4
+        assert config.agentic.max_optimized_tokens == 8000
+        # Re-tuned (review P0.1): balanced no longer skeletonizes all code.
+        assert config.agentic.code_skeleton_enabled is False
 
     def test_quality_profile_maximizes_fidelity(self) -> None:
         config = AppConfig()
@@ -62,23 +63,23 @@ class TestQualityProfile:
         assert config.agentic.rag_enabled is False
         assert config.agentic.code_skeleton_enabled is False
         assert config.agentic.reasoning_preseed_enabled is False
-        assert config.agentic.keep_full_steps == 6
-        assert config.agentic.max_optimized_tokens == 6000
+        assert config.agentic.keep_full_steps == 8
+        assert config.agentic.max_optimized_tokens == 16000
 
     def test_aggressive_profile_saves_more(self) -> None:
         config = AppConfig()
         config.agentic.quality_profile = "aggressive"
         apply_quality_profile(config)
         assert config.agentic.keep_full_steps == 2
-        assert config.agentic.max_optimized_tokens == 2000
-        assert config.agentic.proactive_trim_ratio == 0.35
+        assert config.agentic.max_optimized_tokens == 4000
+        assert config.agentic.proactive_trim_ratio == 0.45
 
     def test_unknown_profile_falls_back_to_balanced(self) -> None:
         config = AppConfig()
         config.agentic.quality_profile = "bogus"
         apply_quality_profile(config)
         assert config.agentic.quality_profile == "balanced"
-        assert config.agentic.max_optimized_tokens == 3000
+        assert config.agentic.max_optimized_tokens == 8000
 
 
 class TestConfigCheck:

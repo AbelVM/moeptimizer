@@ -50,9 +50,14 @@ class HierarchicalSummarizer:
         self,
         max_full_turns: int = 5,
         max_summary_turns: int = 15,
+        max_rolling_summary_chars: int = 4000,
     ) -> None:
         self._max_full_turns = max_full_turns
         self._max_summary_turns = max_summary_turns
+        # Cap the append-only rolling summary so a very long session does not
+        # grow it without bound (review §8.5). When exceeded, the OLDEST lines
+        # are dropped — the most-recent task state is what the model needs.
+        self._max_rolling_summary_chars = max(256, int(max_rolling_summary_chars))
         self._summaries: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._stats: dict[str, int] = {
             "turns_summarized": 0,
@@ -176,6 +181,15 @@ class HierarchicalSummarizer:
                     if self._rolling_summary_text
                     else new_text
                 )
+                # Cap growth: drop oldest lines when over budget (review §8.5).
+                if len(self._rolling_summary_text) > self._max_rolling_summary_chars:
+                    lines = self._rolling_summary_text.split("\n")
+                    while (
+                        lines
+                        and len("\n".join(lines)) > self._max_rolling_summary_chars
+                    ):
+                        lines.pop(0)
+                    self._rolling_summary_text = "\n".join(lines)
                 self._stats["turns_summarized"] += sum(len(t) for t in new_turns)
                 self._stats["turns_compressed"] += 1
             self._summarized_turn_count = end
@@ -222,51 +236,117 @@ class HierarchicalSummarizer:
             turns.append(current)
         return turns
 
+    # Patterns that identify a file path the agent is working on. Capturing
+    # these is what lets the rolling summary retain *which file* was edited when
+    # the full turn is evicted (review P0.3).
+    _FILE_PATH_RE = re.compile(
+        r"""(?:\b(?:file|path|module|read|write|edit|open|import|from)\b[^\n]{0,80}?|
+            (?:["'`])([./]?[\w./\-/]+\.\w{1,6})\1)""",
+        re.VERBOSE,
+    )
+    # A line that looks like a runtime/test error the model must keep in mind.
+    _ERROR_RE = re.compile(
+        r"""(?ix)
+        (?:error|exception|traceback|failed|failure|assert|raise[d]?||
+           \b\d{3}\b\s*(?:error|forbidden|not\s*found)||
+           module\s+not\s+found|no\s+such\s+file|syntax\s+error|type\s+error)
+        """,
+    )
+
     def _extract_constraints(
         self,
         turns: list[list[dict[str, Any]]],
     ) -> str:
-        """Extract constraint-retaining summary text from summarized turns.
+        """Extract a task-STATE summary from evicted turns (review P0.3).
 
-        Prefers explicit "don't"/"must not"/"avoid" style constraints and key
-        decisions; falls back to a short topic line so the block is never empty
-        and the model keeps the task's intent in context.
+        The old version only kept lines containing "don't"/"must not"/"avoid"
+        keywords, which dropped the actual bug, code, and decisions — causing the
+        quality collapse (proxy emitted no code, semantic_similarity ~0.25). The
+        new version retains the *state* the model needs to keep working:
+
+        - file paths touched (so the model knows what it was editing),
+        - the last error / failure message (so it knows what to fix),
+        - the current plan / goal (user requests + assistant "I will" statements),
+        - explicit constraints ("don't"/"must not"/"avoid") as before.
+
+        Falls back to a short topic line so the block is never empty.
         """
         constraints: list[str] = []
+        plans: list[str] = []
+        errors: list[str] = []
+        files: list[str] = []
         topics: list[str] = []
+        seen_files: set[str] = set()
+
         for turn in turns:
             for msg in turn:
                 content = msg.get("content", "")
                 if not isinstance(content, str) or not content:
                     continue
                 role = msg.get("role", "")
+                # File paths (from any role).
+                for m in self._FILE_PATH_RE.finditer(content):
+                    fp = m.group(1)
+                    if fp and fp not in seen_files and len(fp) < 120:
+                        seen_files.add(fp)
+                        files.append(fp)
+                # Errors (from tool/assistant output primarily).
+                if role in ("tool", "assistant"):
+                    for raw_line in content.splitlines():
+                        line = raw_line.strip()
+                        if 8 < len(line) < 240 and self._ERROR_RE.search(line):
+                            errors.append(line)
                 for raw_line in content.splitlines():
                     line = raw_line.strip()
-                    low = line.lower()
+                    low_line = line.lower()
                     if 12 < len(line) < 200 and any(
-                        hint in low for hint in self._CONSTRAINT_HINTS
+                        hint in low_line for hint in self._CONSTRAINT_HINTS
                     ):
                         constraints.append(line)
                 if role == "user":
-                    # Capture the first meaningful user request as a topic.
                     sentences = re.split(r"[.?!]", content)
                     for sent in sentences:
                         sent = sent.strip()
                         if 12 < len(sent) < 160:
                             topics.append(sent)
                             break
+                if role == "assistant":
+                    # Capture plan-like statements ("I will", "Next,", "Let's").
+                    for raw_line in content.splitlines():
+                        line = raw_line.strip()
+                        if 12 < len(line) < 200 and re.match(
+                            r"(?i)(i\s+will|next,|let's|now\s+we|the\s+plan|step\s*\d)", line
+                        ):
+                            plans.append(line)
 
         parts: list[str] = []
+        if files:
+            uniq_files = list(dict.fromkeys(files))[:10]
+            parts.append("Files touched: " + ", ".join(uniq_files))
+        if errors:
+            seen_e: set[str] = set()
+            uniq_e: list[str] = []
+            for e in errors:
+                if e not in seen_e:
+                    seen_e.add(e)
+                    uniq_e.append(e)
+            parts.append("Last errors: " + " | ".join(uniq_e[:3]))
+        if plans:
+            seen_p: set[str] = set()
+            uniq_p: list[str] = []
+            for p in plans:
+                if p not in seen_p:
+                    seen_p.add(p)
+                    uniq_p.append(p)
+            parts.append("Plan: " + " ".join(uniq_p[:3]))
         if constraints:
-            # De-duplicate while preserving order.
-            seen: set[str] = set()
-            uniq: list[str] = []
+            seen_c: set[str] = set()
+            uniq_c: list[str] = []
             for c in constraints:
-                if c not in seen:
-                    seen.add(c)
-                    uniq.append(c)
-            parts.append("Constraints retained:")
-            parts.extend(f"- {c}" for c in uniq[:8])
+                if c not in seen_c:
+                    seen_c.add(c)
+                    uniq_c.append(c)
+            parts.append("Constraints: " + "; ".join(uniq_c[:6]))
         if topics:
             parts.append("Topic: " + "; ".join(topics[:2]))
         return "\n".join(parts)

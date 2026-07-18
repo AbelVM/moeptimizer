@@ -650,9 +650,10 @@ class TestDegradationHeader:
             _failing_canonicalize,
         )
 
-        # A large enough prompt to exceed the proactive threshold and reach the
-        # canonicalization stage.
-        big = "Implement a feature. " * 400
+        # A large enough prompt to exceed the proactive threshold (balanced
+        # profile: max_optimized_tokens=8000, proactive_trim_ratio=0.6 -> ~4800
+        # tokens) and reach the canonicalization stage.
+        big = ("Implement a feature. " * 400) + ("x" * 40000)
         app = create_app(AppConfig())
         with TestClient(app) as client:
             resp = client.post(

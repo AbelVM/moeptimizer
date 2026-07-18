@@ -913,6 +913,61 @@ class TestDeltaSnapshotScopedToLiveZone:
         assert stored_after_t2 > stored_after_t1
 
 
+class TestCodeDeltaInjection:
+    """P2.2 (review §3.4): when a file is re-read after an edit, the optimizer
+    should replace the full re-read body with a compact diff against the prior
+    snapshot — but only when the prior version is already present in context."""
+
+    def _make_optimizer(self) -> AgentContextOptimizer:
+        cfg = AppConfig()
+        cfg.agentic.delta_encode_inject = True
+        return AgentContextOptimizer(cfg)
+
+    def test_reread_injects_diff_when_prior_in_context(self) -> None:
+        opt = self._make_optimizer()
+        v1 = "def add(a, b):\n    return a + b\n"
+        v2 = "def add(a, b):\n    return a + b + 0\n"
+        # Simulate the pipeline: v1 stored on a prior turn, v2 stored this turn
+        # (Step 14.8), so the encoder now has v1 as the prior version.
+        opt.delta_encoder.store_snapshot("inline:python", v1)
+        opt.delta_encoder.store_snapshot("inline:python", v2)
+        msgs = [
+            {"role": "user", "content": f"Here is the file:\n```python\n{v1}```"},
+            {"role": "user", "content": f"Re-read it:\n```python\n{v2}```"},
+        ]
+        opt._inject_code_deltas(msgs, 0)
+        reread = msgs[1]["content"]
+        assert "file changed since last read" in reread
+        # The full v2 body must be gone, replaced by the diff.
+        assert v2 not in reread
+        assert "-    return a + b" in reread
+        assert "+    return a + b + 0" in reread
+
+    def test_first_read_keeps_full_body(self) -> None:
+        opt = self._make_optimizer()
+        v1 = "def add(a, b):\n    return a + b\n"
+        msgs = [
+            {"role": "user", "content": f"Read the file:\n```python\n{v1}```"},
+        ]
+        opt._inject_code_deltas(msgs, 0)
+        # No prior version -> full body preserved, no diff marker.
+        assert "file changed since last read" not in msgs[0]["content"]
+        assert v1 in msgs[0]["content"]
+
+    def test_reread_without_prior_in_context_keeps_full(self) -> None:
+        opt = self._make_optimizer()
+        v1 = "def add(a, b):\n    return a + b\n"
+        v2 = "def add(a, b):\n    return a + b + 0\n"
+        opt.delta_encoder.store_snapshot("inline:python", v1)
+        # Prior version is NOT in the context blob -> keep full v2.
+        msgs = [
+            {"role": "user", "content": f"Re-read it:\n```python\n{v2}```"},
+        ]
+        opt._inject_code_deltas(msgs, 0)
+        assert "file changed since last read" not in msgs[0]["content"]
+        assert v2 in msgs[0]["content"]
+
+
 class TestQualityAnchorMonotonic:
     """Review §5 / C5: the quality anchor is the trailing volatile user turn, so its
     content must be byte-stable across turns. Constraints accumulate append-only and

@@ -1498,6 +1498,70 @@ def _build_opencode_scenario_tasks() -> list[list[dict]]:
 # `opencode` scenario keys, so build it once at import instead of twice.
 _OPENCODE_SCENARIO_TASKS = _build_opencode_scenario_tasks()
 
+# Facts planted in Turn 1 of every scenario (drift measurement). The probe turn
+# (last turn) asks the model to list them; fact recall measures how many
+# survived the proxy's compaction by Turn N. Kept short, distinct, checkable.
+_DRIFT_FACTS: list[str] = [
+    "The project codename is ATLAS.",
+    "We target Python 3.11.",
+    "The database is Postgres.",
+    "The max retry count is 3.",
+    "The owning team is platform-infra.",
+]
+
+_DRIFT_PLANT = (
+    "Context anchor — record these fixed project facts, we will refer back to "
+    "them later:\n" + "\n".join(f"- {f}" for f in _DRIFT_FACTS)
+)
+_DRIFT_PROBE = (
+    "Going back to the very first turn of this conversation: list the fixed facts "
+    "we established about the project (codename, language, database, max retries, "
+    "owning team). State each one explicitly."
+)
+
+
+def _inject_drift_probe(tasks: list, num_turns: int) -> list:
+    """Inject the drift measurement into an existing scenario's task list.
+
+    - Prepends the fact-planting anchor to the FIRST user turn (Turn 1), so the
+      proxy must carry those facts forward through compaction. The anchor goes in
+      Turn-1 *user* content (never the system prompt) to keep the cache-stable
+      frozen prefix untouched.
+    - Appends a recall probe as the FINAL turn, asking the model to list the
+      planted facts. The probe lands on the last turn regardless of how many
+      turns the runner cycles, because we size the returned list to ``num_turns``.
+
+    Accepts either simple ("role", "content") tuples or OpenCode-style
+    list[dict] exchanges and returns the same shape, extended to ``num_turns``.
+    """
+    if not tasks:
+        return tasks
+
+    # ── Prepend the anchor to the first user turn ────────────────────────
+    first = tasks[0]
+    if isinstance(first, tuple):
+        role, content = first
+        if role == "user":
+            tasks = [("user", f"{_DRIFT_PLANT}\n\n{content}", *first[2:]), *tasks[1:]]
+    elif isinstance(first, list):
+        # OpenCode-style exchange: find the first user message and extend it.
+        for msg in first:
+            if msg.get("role") == "user":
+                msg["content"] = f"{_DRIFT_PLANT}\n\n{msg['content']}"
+                break
+
+    # ── Append the recall probe as the final turn ───────────────────────
+    probe_exchange: list[dict] = [{"role": "user", "content": _DRIFT_PROBE}]
+    if len(tasks) >= num_turns:
+        # Already long enough: replace the last turn with the probe so it always
+        # lands on Turn N (the runner cycles by modulo, so the tail is what the
+        # final turn sees).
+        tasks = [*tasks[: num_turns - 1], probe_exchange]
+    else:
+        tasks = list(tasks) + [probe_exchange] * (num_turns - len(tasks) + 1)
+    return tasks[:num_turns]
+
+
 SCENARIOS = {
     "debug": {
         "description": "Debugging session with error analysis",
@@ -2639,6 +2703,132 @@ def _evicted_content_recall(full_prompt: str, optimized_prompt: str) -> float | 
     return round(retained / max(len(evicted_tokens), 1), 6)
 
 
+# ---------------------------------------------------------------------------
+# Long-horizon / cross-turn quality metrics (drift, contradiction, wall)
+# ---------------------------------------------------------------------------
+
+
+def _grade_fact_recall(probe_response: str, facts: list[str]) -> float | None:
+    """Grade how many planted facts the model still recalls at the probe turn.
+
+    Used by the ``drift`` scenario: Turn 1 plants N explicit, checkable facts;
+    the probe turn (last turn) asks the model to list them. Each fact is graded
+    by embedding similarity between the fact and the response (the response need
+    not quote the fact verbatim). Returns recall@probe in 0..1, or None when the
+    response is empty.
+
+    Embedding may be unavailable (proxy down); callers should treat None as
+    "not measured" rather than a zero score.
+    """
+    if not probe_response or not facts:
+        return None
+    try:
+        resp_emb = _embed_text(probe_response)
+    except Exception:
+        return None
+    recalled = 0
+    for fact in facts:
+        try:
+            fact_emb = _embed_text(fact)
+        except Exception:
+            continue
+        # Threshold chosen so a clearly-relevant mention (not just shared stop
+        # words) counts as recalled. Embeddings here are small (300d), so 0.35
+        # is a conservative, low-false-positive cutoff.
+        if _cosine_similarity(fact_emb, resp_emb) >= 0.35:
+            recalled += 1
+    return round(recalled / max(len(facts), 1), 4)
+
+
+_NEGATION_MARKERS = ("not ", "never ", "no longer", "isn't", "is not", "aren't",
+                     "are not", "don't", "do not", "doesn't", "does not", "won't",
+                     "will not", "can't", "cannot", "shouldn't", "should not",
+                     "instead of", "rather than", "contrary to")
+_ASSERT_RE = re.compile(
+    r"([A-Z][^.!?]*\b(?:is|are|was|were|must|should|will|always|never|means|equals|"
+    r"requires|uses|runs on|codename|owner)\b[^.!?]*[.!?])",
+    re.MULTILINE,
+)
+
+
+def _extract_assertions(text: str) -> list[str]:
+    """Pull simple declarative assertions (sentences) from a response."""
+    if not text:
+        return []
+    return [m.group(1).strip() for m in _ASSERT_RE.finditer(text)]
+
+
+def _assertions_contradict(a: str, b: str) -> bool:
+    """Heuristic: do two assertions contradict each other?
+
+    Flags a contradiction when the same subject token appears in both but one
+    carries a negation marker the other lacks. Deliberately conservative — it
+    only fires on explicit negation flips, not on subtle semantic disagreement
+    (which needs an LLM judge). Returns False on any parse failure.
+    """
+    try:
+        a_low = a.lower()
+        b_low = b.lower()
+        a_neg = any(m in a_low for m in _NEGATION_MARKERS)
+        b_neg = any(m in b_low for m in _NEGATION_MARKERS)
+        if a_neg == b_neg:
+            return False  # both negated or both affirmative -> not a flip
+        # Find a shared content word (len >= 4) as a proxy for "same subject".
+        a_words = {w for w in re.findall(r"[a-z]{4,}", a_low)}
+        b_words = {w for w in re.findall(r"[a-z]{4,}", b_low)}
+        shared = a_words & b_words
+        # Require a meaningful shared subject, not just stop words.
+        return len(shared) >= 2
+    except Exception:
+        return False
+
+
+def _count_contradictions(contents: list[str]) -> int:
+    """Count self-contradictions across a full conversation's responses.
+
+    Compares each turn's assertions against the union of prior turns' assertions
+    using a conservative negation-flip heuristic. This is a cheap, deterministic
+    signal of context drift / memory loss (the model contradicts what it said
+    earlier because the proxy dropped the earlier context). An LLM-judge path is
+    intentionally out of scope here to keep the benchmark free of extra backend
+    calls; the heuristic under-counts rather than over-counts, so it is a
+    lower bound on the true contradiction rate.
+    """
+    prior_assertions: list[str] = []
+    contradictions = 0
+    for content in contents:
+        cur = _extract_assertions(content)
+        for assertion in cur:
+            if any(_assertions_contradict(assertion, prev) for prev in prior_assertions):
+                contradictions += 1
+        prior_assertions.extend(cur)
+    return contradictions
+
+
+def _context_window_wall(turns: list["TurnComparison"]) -> dict[str, int | None]:
+    """Find the first turn where quality collapses due to budget exhaustion.
+
+    Derived purely from existing per-turn quality (no new requests). A "wall" is
+    the first turn where the proxy's code preservation breaks down
+    (code_block_ratio < 0.5) OR semantic fidelity collapses
+    (semantic_similarity < 0.3). Returns the first such turn index per side, or
+    None when no wall is reached within the run.
+    """
+    out: dict[str, int | None] = {"proxy": None, "direct": None}
+    for side in ("proxy", "direct"):
+        for t in turns:
+            q = t.quality
+            if not q:
+                continue
+            ratio = q.get("code_block_ratio")
+            sim = q.get("semantic_similarity")
+            hit = (ratio is not None and ratio < 0.5) or (sim is not None and sim < 0.3)
+            if hit:
+                out[side] = t.turn_index
+                break
+    return out
+
+
 def _compute_quality_metrics(
     direct_content: str,
     proxy_content: str,
@@ -2836,6 +3026,10 @@ class BenchmarkReport:
     config: dict = field(default_factory=dict)
     turns: list[TurnComparison] = field(default_factory=list)
     cache_reuse: list[dict] = field(default_factory=list)  # per-round proxy /v1/metrics snapshots
+    # Long-horizon cross-turn signals (computed post-hoc, not per-turn).
+    contradictions: dict[str, int] = field(default_factory=dict)  # {"proxy": int, "direct": int}
+    fact_recall: dict[str, float | None] = field(default_factory=dict)  # {"proxy": float|None, "direct": float|None}
+    context_window_wall: dict[str, int | None] = field(default_factory=dict)  # {"proxy": int|None, "direct": int|None}
 
     def summary(self) -> dict[str, Any]:
         """Return a flat summary dict for JSON output."""
@@ -3206,6 +3400,14 @@ class BenchmarkReport:
             },
             "cache_reuse": cache_reuse_trend,
             "per_round": _per_round_summary(self.turns, total_direct_prompt, total_proxy_prompt),
+            # Long-horizon / cross-turn signals. These answer "does the proxy
+            # still remember early context by the end of a 30-turn session?" —
+            # the core risk of a context compressor. See the metric spec.
+            "long_horizon": {
+                "contradictions": self.contradictions or None,
+                "fact_recall_turn30": self.fact_recall or None,
+                "context_window_wall": self.context_window_wall or None,
+            },
         }
 
 
@@ -3776,7 +3978,15 @@ def run_benchmark(
     #   - list[dict]                  -> a full OpenCode-style agentic turn exchange
     # The latter are collected into `turn_exchanges` and appended per turn.
     scenario_data = SCENARIOS.get(scenario, SCENARIOS["default"])
-    base_tasks = scenario_data["tasks"]
+    # The `drift` scenario builds its task list as a function of num_turns so the
+    # recall probe lands exactly on the final turn; other scenarios ship a static
+    # list. Support both shapes here.
+    _raw_tasks = scenario_data["tasks"]
+    base_tasks = _raw_tasks(num_turns) if callable(_raw_tasks) else _raw_tasks
+    # Inject the long-horizon drift probe (plant facts in Turn 1, recall probe
+    # on the final turn) into every scenario so drift is measured on the real
+    # benchmark conversation, not a synthetic one.
+    base_tasks = _inject_drift_probe(base_tasks, num_turns)
 
     system_prompt = SYSTEM_PROMPT
     base_messages: list[dict] = [{"role": "system", "content": system_prompt}]
@@ -3868,6 +4078,13 @@ def run_benchmark(
     _warm_up_backend(request_timeout)
 
     _wall_start = time.monotonic()
+    # Long-horizon signal accumulators (summed across rounds; rounds are
+    # isolated sessions, so contradictions/fact-recall are additive).
+    _contradiction_proxy = 0
+    _contradiction_direct = 0
+    _fact_recall_proxy: float | None = None
+    _fact_recall_direct: float | None = None
+    _drift_probe_turn = num_turns  # 1-based; the probe is the final turn
     for round_num in range(rounds):
         # Wall-clock guard: abort remaining rounds if we exceed the budget so a
         # long --scenario all run cannot hang indefinitely.
@@ -3967,6 +4184,18 @@ def run_benchmark(
             stream=measure_ttft,
         )
 
+        # ── Long-horizon cross-turn signals ──────────────────────────────
+        # Contradiction rate: how often the model contradicts its own earlier
+        # statements within this round's conversation. Summed across rounds.
+        _contradiction_proxy += _count_contradictions(proxy_contents)
+        _contradiction_direct += _count_contradictions(direct_contents)
+        # Fact recall (drift): grade the final turn's response against the
+        # planted facts. The probe is always the last turn, so the tail of
+        # contents is the probe answer for both proxy and direct.
+        if proxy_contents:
+            _fact_recall_proxy = _grade_fact_recall(proxy_contents[-1], _DRIFT_FACTS)
+            _fact_recall_direct = _grade_fact_recall(direct_contents[-1], _DRIFT_FACTS)
+
         # Enforce the non-interleaving invariant: each side is a complete,
         # sorted, non-interleaved multi-turn conversation (proxy fully before
         # direct). Catches any future regression that would interleave/truncate.
@@ -4011,6 +4240,11 @@ def run_benchmark(
                 f"{' '.join(quality_parts)}"
                 f"{direct_error}{proxy_error}"
             )
+
+    # Finalize long-horizon signals on the report (derived from all rounds).
+    report.contradictions = {"proxy": _contradiction_proxy, "direct": _contradiction_direct}
+    report.fact_recall = {"proxy": _fact_recall_proxy, "direct": _fact_recall_direct}
+    report.context_window_wall = _context_window_wall(report.turns)
 
     return report
 
@@ -4492,6 +4726,7 @@ def run_all_scenarios(args) -> int:
 
         # Regression gate across the aggregated mean (review03.md §10).
         agg = aggregated.get("aggregated", {})
+        args._agg_snapshot = agg  # let the gate read semantic_similarity floor
         gate_value, gate_metric = _select_aggregated_gate(agg)
         gate = _check_similarity_gate(args, gate_value, gate_metric)
         if gate:
@@ -4763,9 +4998,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--min-similarity", type=float, default=None,
-        help="Regression gate (review03.md §10): exit non-zero if the mean "
-             "semantic_similarity (proxy vs direct) falls below this threshold. "
-             "Use in CI to block quality regressions.",
+        help="Regression gate (review03.md §10): exit non-zero if the composite "
+             "lexical quality (mean of code_block_ratio, rouge_l_f1, edit_similarity) "
+             "falls below this threshold. Use in CI to block quality regressions.",
+    )
+    parser.add_argument(
+        "--min-semantic", type=float, default=None,
+        help="Hard floor on embedding semantic_similarity for the regression gate "
+             "(review P0.6). Catches the 'proxy dropped all task context' collapse "
+             "where code_block_ratio is high but semantic_similarity ~0. Defaults "
+             "to 0.5 * --min-similarity when unset.",
     )
     parser.add_argument(
         "--scenario", type=str, default="default",
@@ -4851,6 +5093,7 @@ def main() -> None:
         # noisy round cannot swing the decision, while a systematic regression
         # across rounds still fails. Falls back to the pooled mean for 1 round.
         _summary = report.summary()
+        args._agg_snapshot = {"semantic_similarity": _summary.get("semantic_similarity", {})}
         gate_value, gate_metric = _select_quality_gate(_summary)
         gate = _check_similarity_gate(args, gate_value, gate_metric)
         if gate:
@@ -4941,11 +5184,14 @@ def _select_quality_gate(summary: dict[str, Any]) -> tuple[float, str]:
         if val is not None and val > 0:
             return val, metric
 
-    # Lexical battery next (most robust for code).
-    for metric in ("code_block_ratio", "rouge_l_f1", "token_jaccard", "edit_similarity"):
-        val = (qual.get(metric) or {}).get("mean")
-        if val is not None and val > 0:
-            return val, metric
+    # Composite lexical battery (review P0.6): a single lexical metric can pass
+    # while the proxy dropped all task context, so gate on the mean of the
+    # lexical signals that best capture "did the proxy preserve the task".
+    lexical = ("code_block_ratio", "rouge_l_f1", "edit_similarity")
+    vals = [(qual.get(m) or {}).get("mean") for m in lexical]
+    present = [v for v in vals if isinstance(v, (int, float)) and v > 0]
+    if present:
+        return sum(present) / len(present), "composite_lexical"
 
     # Fallback to semantic similarity (informational only), using the robust
     # round-mean-of-means when multiple rounds were run.
@@ -4962,18 +5208,25 @@ def _select_quality_gate(summary: dict[str, Any]) -> tuple[float, str]:
 
 
 def _select_aggregated_gate(agg: dict[str, Any]) -> tuple[float, str]:
-    """Pick the best available aggregated quality metric for the regression gate.
+    """Compute the composite regression-gate value from lexical quality signals.
 
-    Mirrors :func:`_select_quality_gate`: prefers the PRIMARY optimizer
-    signal (``prompt_faithfulness``, ``evicted_content_recall`` — context
-    retention) over lexical signals (``code_block_ratio``, ``rouge_l_f1``,
-    ``token_jaccard``, ``edit_similarity``) over embedding cosine similarity,
-    which is weak on code, so ``semantic_similarity`` is only a fallback.
+    A single-metric gate hides collapse: ``code_block_ratio`` (0.733) can pass a
+    0.85 floor while ``semantic_similarity`` (0.248) is catastrophic, because the
+    proxy removed the code the model needed. We therefore gate on a **composite**
+    of the lexical signals that best capture "did the proxy preserve the task":
+
+      composite = mean(code_block_ratio, rouge_l_f1, edit_similarity)
+
+    and additionally require ``semantic_similarity`` to clear a hard floor
+    (review P0.6). The returned metric name documents which statistic drove the
+    gate. Embedding cosine is intentionally NOT the primary gate (weak on code).
     """
-    for metric in ("prompt_faithfulness", "evicted_content_recall", "code_block_ratio", "rouge_l_f1", "token_jaccard", "edit_similarity"):
-        val = (agg.get(metric) or {}).get("mean")
-        if val is not None and val > 0:
-            return val, metric
+    lexical = ("code_block_ratio", "rouge_l_f1", "edit_similarity")
+    vals = [(agg.get(m) or {}).get("mean") for m in lexical]
+    present = [v for v in vals if isinstance(v, (int, float)) and v > 0]
+    if present:
+        composite = sum(present) / len(present)
+        return composite, "composite_lexical"
     sem = (agg.get("semantic_similarity") or {}).get("mean")
     if sem is not None and sem > 0:
         return sem, "semantic_similarity"
@@ -4981,22 +5234,32 @@ def _select_aggregated_gate(agg: dict[str, Any]) -> tuple[float, str]:
 
 
 def _check_similarity_gate(
-    args: argparse.Namespace, gate_value: float, gate_metric: str = "semantic_similarity"
+    args: argparse.Namespace, gate_value: float, gate_metric: str = "composite_lexical"
 ) -> int:
     """Return 0 if the regression gate passes, 2 if it fails (review03.md §10).
 
-    ``gate_value`` is the robust statistic the gate is evaluated against and
-    ``gate_metric`` names which quality metric it came from (so a lexical
-    fallback is transparent when embeddings are unavailable).
+    ``gate_value`` is the composite lexical statistic. In addition to the
+    composite floor (``--min-similarity``), a hard floor is enforced on
+    ``semantic_similarity`` so a proxy that drops all task context (code_block_ratio
+    high but semantic_similarity ~0) cannot pass (review P0.6). The semantic floor
+    defaults to 0.5 of ``--min-similarity`` when not set explicitly.
     """
     if args.min_similarity is None:
         return 0
+    failed: list[str] = []
     if gate_value < args.min_similarity:
-        _status(
-            args,
-            f"\n  ❌ REGRESSION GATE FAILED: {gate_metric}={gate_value:.4f} "
-            f"< --min-similarity={args.min_similarity:.4f}",
+        failed.append(
+            f"{gate_metric}={gate_value:.4f} < --min-similarity={args.min_similarity:.4f}"
         )
+    # Hard floor on embedding similarity (catches "no code / no context" collapse).
+    sem = (args._agg_snapshot or {}).get("semantic_similarity", {}).get("mean") if hasattr(args, "_agg_snapshot") else None
+    sem_floor = getattr(args, "min_semantic", None)
+    if sem_floor is None:
+        sem_floor = args.min_similarity * 0.5
+    if sem is not None and sem > 0 and sem < sem_floor:
+        failed.append(f"semantic_similarity={sem:.4f} < floor={sem_floor:.4f}")
+    if failed:
+        _status(args, "\n  ❌ REGRESSION GATE FAILED: " + "; ".join(failed))
         return 2
     _status(
         args,

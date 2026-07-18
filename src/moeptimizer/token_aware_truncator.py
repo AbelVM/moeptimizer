@@ -32,6 +32,7 @@ class TokenAwareTruncator:
         frozen_prefix_turns: int = 0,
         context_aligner: ContextAligner | None = None,
         token_calibration: float = 1.0,
+        keep_full_steps: int = 3,
     ) -> None:
         self._model_name = model_name
         self._encoder: tiktoken.Encoding | None = None
@@ -58,6 +59,11 @@ class TokenAwareTruncator:
         # its counts so the budget is enforced against the backend's true token
         # count instead of an estimate.
         self._token_calibration = max(0.5, min(2.0, float(token_calibration)))
+        # Protected-tail size for budget trimming. Must match the optimizer's
+        # `keep_full_steps` so the two eviction stages agree on the boundary
+        # (review §5.3). Previously hardcoded to 3, which could drop turns the
+        # compactor kept and cause inconsistent eviction.
+        self._keep_full_steps = max(1, int(keep_full_steps))
 
     def truncate_to_token_limit(
         self,
@@ -246,7 +252,7 @@ class TokenAwareTruncator:
         complete_turns = [t for t in turns if any(m.get("role") == "assistant" for m in t)]
         pending_turns = [t for t in turns if not any(m.get("role") == "assistant" for m in t)]
 
-        keep = 3  # Default keep_full_steps
+        keep = self._keep_full_steps  # Protected tail size (review §5.3)
         if len(complete_turns) > keep:
             evictable = [m for t in complete_turns[:-keep] for m in t]
             protected = [m for t in complete_turns[-keep:] for m in t]

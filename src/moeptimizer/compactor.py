@@ -34,10 +34,9 @@ class ScratchpadCompactor:
     Eviction drops complete user-assistant pairs from the front of the
     Evictable Body, preserving structural integrity of the conversation.
 
-    When ``hierarchical_summarizer`` is provided and cache-stable summary mode
-    is active, the evictable body is folded into a rolling summary block instead
-    of being deleted. This preserves 5-10x more signal within the same token
-    budget and prevents the quality collapse caused by all-or-nothing deletion.
+    The evicted turns are folded into the cache-stable rolling summary by the
+    optimizer's single summary step (Step 8.5), not here. Pure front-eviction
+    keeps the stable prefix byte-identical for backend prefix-cache reuse.
     """
 
     def __init__(
@@ -66,59 +65,20 @@ class ScratchpadCompactor:
 
         Returns a new message list with three zones:
           1. System Anchor: system + first user-assistant pair (always preserved)
-          2. Evictable Body: historical turns (dropped from front OR summarized)
+          2. Evictable Body: historical turns (dropped from front)
           3. Protected Tail: last N user-assistant pairs (always preserved)
 
-        When ``hierarchical_summarizer`` is provided and cache-stable summary mode
-        is active, the evictable body is folded into a rolling summary block
-        instead of being deleted. This preserves far more signal within the same
-        token budget and prevents the quality collapse caused by all-or-nothing
-        deletion (review §2.1 / P0 fix).
-
-        Tool messages are kept if they belong to a turn that survives eviction.
+        Pure front-eviction only. The evicted turns are folded into the
+        cache-stable rolling summary by the optimizer's single summary step
+        (Step 8.5), NOT here — having two summary paths double-folds content and
+        was a root cause of the quality collapse (review P0.4). Tool messages are
+        kept if they belong to a turn that survives eviction.
         """
         if len(messages) <= self.keep_full + 2:
             return messages
 
         # Partition into zones
-        system_anchor, evictable_body, protected_tail = self._partition_zones(messages)
-
-        # When cache-stable summarization is available, fold the evictable body
-        # into a rolling summary instead of deleting it. This is the P0 fix for
-        # the quality collapse caused by all-or-nothing eviction.
-        if (
-            self._hierarchical_summarizer is not None
-            and self._cache_stable_mode
-            and evictable_body
-        ):
-            try:
-                # Build a temporary message list with just the evictable body so
-                # the summarizer can group it into turns and extract constraints.
-                evictable_messages = list(evictable_body)
-                if evictable_messages:
-                    summary_block = self._hierarchical_summarizer._build_rolling_summary_block()
-                    # Feed the evictable turns into the summarizer's rolling state
-                    # so constraints and topics are retained.
-                    turns = self._hierarchical_summarizer._group_turns(evictable_messages)
-                    new_text = self._hierarchical_summarizer._extract_constraints(turns)
-                    if new_text:
-                        self._hierarchical_summarizer._rolling_summary_text = (
-                            f"{self._hierarchical_summarizer._rolling_summary_text}\n{new_text}"
-                            if self._hierarchical_summarizer._rolling_summary_text
-                            else new_text
-                        )
-                        self._hierarchical_summarizer._stats["turns_summarized"] += sum(len(t) for t in turns)
-                        self._hierarchical_summarizer._stats["turns_compressed"] += 1
-                    self._hierarchical_summarizer._summarized_turn_count += len(turns)
-                    # Return the system anchor + protected tail + rolling summary.
-                    # The summary is appended as a trailing turn so the stable
-                    # leading prefix stays byte-identical (review §1/§9).
-                    return system_anchor + protected_tail + [summary_block]
-            except Exception as e:
-                # Fall back to pure eviction if summarization fails; never block
-                # the request path on summary generation.
-                logger = __import__("logging").getLogger(__name__)
-                logger.warning("ScratchpadCompactor summarization fallback: %s", e)
+        system_anchor, _, protected_tail = self._partition_zones(messages)
 
         # Drop all evictable body (partitioning already determined which turns are evictable)
         return system_anchor + protected_tail
