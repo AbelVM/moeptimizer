@@ -582,3 +582,19 @@ from `REVIEW.md`. Full test suite after changes: **433 passed, 2 skipped**.
   reaches the canonicalization stage under the higher budget. Added
   `tests/test_delta_encoder.py` (delta << full, ratio < 1.0) and
   `tests/test_optimizer.py::TestCodeDeltaInjection` (3 tests).
+
+### v0.7.10 — Delta injection default-on, decided dynamically per re-read (2026-07-18)
+
+Follow-up to the P2.2 delta-encode injection from v0.7.9.
+
+- **`delta_encode_inject` now defaults to `true`.** The static flag was pure
+  conservatism: the injection is already gated at runtime by
+  `_inject_code_deltas`, which only fires when the prior version of the file is
+  already present in the context (verified by substring). So the transform is now
+  **decided dynamically per re-read** — it injects a diff only when the model
+  already has the prior version to apply it against, and keeps the full current
+  code verbatim on a first read or when the prior version was evicted/summarized
+  out of context. No operator action needed; set the flag `false` to always
+  forward the full re-read body. The existing `TestCodeDeltaInjection` suite
+  (inject-on-reread / keep-on-first-read / keep-when-prior-absent) still covers
+  the three runtime paths.

@@ -153,15 +153,17 @@ class AgenticConfig(BaseModel):
         description="Inject model-visible attention-sink markers. Disabled by default to preserve exact prompts.",
     )
     delta_encode_inject: bool = Field(
-        default=False,
+        default=True,
         description=(
             "When a file is re-read after an edit, replace the full re-read file "
             "body in the tool result with a compact unified diff against the prior "
-            "snapshot (review §3.4). OFF by default: the model needs the full file "
-            "to edit it, and a diff is only safe when the prior version is already "
-            "present in the context. Injection is additionally gated so it only "
-            "fires when the prior snapshot content is already in the optimized "
-            "context, keeping edits correct."
+            "snapshot (review §3.4). ON by default: the injection is dynamically "
+            "gated at runtime so it only fires when the prior version of the file "
+            "is already present in the context (verified by substring), which means "
+            "the model can apply the diff to a file it already sees. On a first "
+            "read, or when the prior version has been evicted/summarized out of "
+            "context, the full current code is kept verbatim so edits stay correct. "
+            "Set to false to always forward the full re-read body."
         ),
     )
     reasoning_preseed_enabled: bool = Field(

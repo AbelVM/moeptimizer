@@ -1199,11 +1199,14 @@ class AgentContextOptimizer:
                             file_path = f"inline:{lang}"
                             self.delta_encoder.store_snapshot(file_path, code)
                 # P2.2 (review §3.4): when a file is re-read after an edit, inject
-                # a compact unified diff instead of the full re-read file body. Only
-                # when enabled AND the prior snapshot is already present in the
-                # optimized context (so the model can apply the diff to a file it
-                # already has). This keeps edits correct and never changes what the
-                # model sees on first read.
+                # a compact unified diff instead of the full re-read file body. The
+                # flag is ON by default, but injection is decided dynamically per
+                # re-read: it only fires when the prior snapshot is already present
+                # in the optimized context (verified by substring), so the model can
+                # apply the diff to a file it already has. On a first read, or when
+                # the prior version was evicted/summarized out, the full current code
+                # is kept verbatim — edits stay correct and the model never loses
+                # context it needs.
                 if self._config.agentic.delta_encode_inject:
                     self._inject_code_deltas(optimized, scan_from)
             except Exception as e:
