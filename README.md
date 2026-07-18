@@ -98,10 +98,10 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 |---|---|---|
 | `MOEPT_AGENTIC__KEEP_FULL_STEPS` | `3` | Last N user-assistant pairs kept in full detail; older complete turns are evicted from the top |
 | `MOEPT_AGENTIC__ARCHIVE_THRESHOLD` | `3` | Steps before this index are archived/compressed |
-| `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` | `12000` | Character fallback cap for optimized context |
-| `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS` | `3000` | Token budget cap; takes precedence over character cap |
-| `MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO` | `0.45` | Ratio of max tokens where proactive top-only trimming starts |
-| `MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO` | `0.75` | Ratio of max tokens where compaction/compression starts |
+| `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` | `32000` | Character fallback cap for optimized context. Should be a meaningful fraction of the backend context window, not ~1% of it: evicting/skeletonizing below this starves the model of task context and collapses quality. |
+| `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS` | `8000` | Token budget cap; takes precedence over character cap. Hard cap on the optimized context; a sane fraction (a few %) of the backend window so eviction only triggers when genuinely needed. |
+| `MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO` | `0.45` | Ratio of max tokens where proactive top-only trimming starts (base default; the `balanced` profile raises this to `0.6`) |
+| `MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO` | `0.75` | Ratio of max tokens where compaction/compression starts (base default; the `balanced` profile raises this to `0.85`) |
 | `MOEPT_AGENTIC__THINKING_PROTECT_RECENT` | `2` | Keep full thinking for last N steps |
 | `MOEPT_AGENTIC__SESSION_TIMEOUT` | `3600` | Session inactivity timeout in seconds |
 | `MOEPT_AGENTIC__MAX_SESSIONS` | `256` | Max concurrently tracked sessions; LRU eviction over the cap (`0` disables) |
@@ -109,7 +109,8 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_AGENTIC__FAST_PATH_ENABLED` | `true` | Bypass expensive transformations for contexts already under budget |
 | `MOEPT_AGENTIC__RAG_ENABLED` | `true` | Enable state-based RAG injection for long/over-budget sessions |
 | `MOEPT_AGENTIC__OPTIMIZE_CODE_BLOCKS` | `true` | Run tree-sitter code-block optimization (chunk dedup). Budget-gated: only fires when the context exceeds the proactive trim threshold, so lean contexts keep exact code and avoid proxy latency. |
-| `MOEPT_AGENTIC__CODE_SKELETON_ENABLED` | `true` | Compress large code blocks to skeletons under context pressure |
+| `MOEPT_AGENTIC__CODE_SKELETON_ENABLED` | `false` | Compress large code blocks to skeletons under context pressure. Base default is `true`, but the `balanced` quality profile (the default) sets it `false` so the model keeps full code to edit/extend; only the `aggressive` profile enables skeletonization. |
+| `MOEPT_AGENTIC__CODE_LEDGER_MAX_SIGS` | `40` | Max code-signature lines carried forward into the evicted-turn code ledger. When front-eviction drops a code-bearing turn, its function/class signatures are accumulated into a compact `[Evicted-turn code index]` system message appended to the protected tail, so the model keeps awareness of code that lived in dropped turns (fixes `has_code_proxy=0` / `code_block_loss`). Capped to bound the ledger's own size. |
 | `MOEPT_AGENTIC__PROMPT_TEMPLATE_ENABLED` | `false` | Apply task-template specialization to rewrite the user prompt. OFF by default: for agentic coding the client's exact wording matters and template rewrites risk changing it (cache guide DONT #4). Gated behind the proactive threshold. |
 | `MOEPT_AGENTIC__DELTA_ENCODE_INJECT` | `false` | When a file is re-read after an edit, replace the full re-read file body with a compact unified diff against the prior snapshot (review §3.4). OFF by default: the model needs the full file to edit it, and a diff is only safe when the prior version is already in context. Injection is additionally gated so it only fires when the prior snapshot is already present. |
 | `MOEPT_AGENTIC__ATTENTION_SINKS_ENABLED` | `false` | Inject model-visible attention-sink markers |
@@ -246,7 +247,7 @@ un-proxified baseline. Set `MOEPT_AGENTIC__QUALITY_PROFILE` (or
 - **`quality`** — no middle-history mutation; only lossless boundary compression
   of oversized tool/assistant output. Maximizes similarity to the direct
   baseline (highest token cost).
-- **`balanced`** (default) — current defaults.
+- **`balanced`** (default) — the preset applied at app-build time: 8000-token / 32000-char cap, keep 4 full steps, RAG + cache-stable summary on, code skeletonization off. This is the effective default (the base `AgenticConfig` field defaults are overridden by this profile).
 - **`aggressive`** — lower token cap, earlier compaction, more top-only
   eviction. Maximum token savings (lowest fidelity).
 
@@ -321,7 +322,7 @@ python scripts/benchmark.py --scenario debug_long --turns 30 --no-agentic
 # Stress test with context eviction
 python scripts/benchmark.py --turns 50 --budget 8000
 
-# Aggressive token-savings profile (top-only eviction, 3000-token cap)
+# Aggressive token-savings profile (top-only eviction, 4000-token cap)
 python scripts/benchmark.py --scenario refactor_long --turns 30 --profile aggressive --json > report.json
 
 # Quality-fidelity profile (maximize similarity to the direct baseline)

@@ -183,25 +183,25 @@ The guide is the architectural contract. Score each DO/DONT:
 ## 11. Implementation plan (priority order)
 
 ### P0 — Stop the quality collapse (do first, block release)
-- [ ] **P0.1** Raise `max_optimized_tokens` default to a sane value (e.g. `8192`) and `max_optimized_chars` to `32000`; document that the budget should be a *fraction* of the context window, not 1%. Re-baseline `balanced` so 30-turn `opencode` hits `code_block_ratio ≥ 0.9` and `semantic_similarity ≥ 0.85`.
-- [ ] **P0.2** Restrict `ContextCompressor` / Step 10 to the **live zone only** (use `live_zone_start`); never re-skeletonize the stable prefix. Fix the docstring/scope mismatch.
-- [ ] **P0.3** Replace the keyword-only rolling summary (`_extract_constraints`) with a **state summary**: retain current file path + current file contents (or diff), last error, current plan. Keep it append-only and trailing.
-- [ ] **P0.4** Delete the `ScratchpadCompactor` summarization branch; let the compactor do *pure front-eviction* and a single summary step fold evicted turns. Unify summary placement (trailing) and compute `frozen_prefix_end` *after* summary steps.
-- [ ] **P0.5** Add **active-file tracking**: keep the most-recent `read_file`/`edit` target verbatim; never skeletonize/evict it.
-- [ ] **P0.6** Gate the regression on `code_block_ratio` + `rouge_l_f1` + `edit_similarity` composite, not raw `semantic_similarity`. Re-run `opencode` 30-turn with `--rounds 3` and confirm the gate passes.
+- [x] **P0.1** Raise `max_optimized_tokens` default to a sane value (e.g. `8192`) and `max_optimized_chars` to `32000`; document that the budget should be a *fraction* of the context window, not 1%. Re-baseline `balanced` so 30-turn `opencode` hits `code_block_ratio ≥ 0.9` and `semantic_similarity ≥ 0.85`.
+- [x] **P0.2** Restrict `ContextCompressor` / Step 10 to the **live zone only** (use `live_zone_start`); never re-skeletonize the stable prefix. Fix the docstring/scope mismatch.
+- [x] **P0.3** Replace the keyword-only rolling summary (`_extract_constraints`) with a **state summary**: retain current file path + current file contents (or diff), last error, current plan. Keep it append-only and trailing.
+- [x] **P0.4** Delete the `ScratchpadCompactor` summarization branch; let the compactor do *pure front-eviction* and a single summary step fold evicted turns. Unify summary placement (trailing) and compute `frozen_prefix_end` *after* summary steps.
+- [x] **P0.5** Add **active-file tracking**: keep the most-recent `read_file`/`edit` target verbatim; never skeletonize/evict it.
+- [x] **P0.6** Gate the regression on `code_block_ratio` + `rouge_l_f1` + `edit_similarity` composite, not raw `semantic_similarity`. Re-run `opencode` 30-turn with `--rounds 3` and confirm the gate passes.
 
 ### P1 — Cache-stability wins (DO #2, DO #5)
-- [ ] **P1.1** Reconstruct assistant `reasoning_content`/`<think>` blocks on the request path from the proxy's memory of the prior streaming response, so the next turn's prefix matches the backend's cache regardless of whether the client echoed thinking. (Highest-value cache fix.)
-- [ ] **P1.2** Pin the `tools` schema per session: cache first-seen `tools`, re-emit verbatim (same order/dict) every turn.
-- [ ] **P1.3** Use the *real* backend `cached_tokens` ratio per turn to adapt eviction aggressiveness (close the loop; stop training `hit_prediction` on the proxy-memo hit).
+- [x] **P1.1** Reconstruct assistant `reasoning_content`/`<think>` blocks on the request path from the proxy's memory of the prior streaming response, so the next turn's prefix matches the backend's cache regardless of whether the client echoed thinking. (Highest-value cache fix.)
+- [x] **P1.2** Pin the `tools` schema per session: cache first-seen `tools`, re-emit verbatim (same order/dict) every turn.
+- [x] **P1.3** Use the *real* backend `cached_tokens` ratio per turn to adapt eviction aggressiveness (close the loop; stop training `hit_prediction` on the proxy-memo hit).
 - [ ] **P1.4** When backend exposes `/slots` + context-shift, *reduce* proxy eviction and let the backend shift (avoid double-eviction / prefix shift).
 
 ### P2 — Efficiency / correctness
-- [ ] **P2.1** Count tokens **once** per turn; cache and pass the count; only recompute after mutating stages. (Biggest TTFT win.)
-- [ ] **P2.2** Wire `DeltaEncoder` to inject `diff(old, new)` for re-read files instead of full re-reads.
-- [ ] **P2.3** Fix `TokenAwareTruncator` to use `keep_full_steps` (not hardcoded 3); fix `_append_volatile_context` dedup to scan for any trailing volatile turn; strip internal flags in the optimizer-exception fallback.
-- [ ] **P2.4** Remove dead `goal_relevance_scorer.prune_by_relevance` (prunes the store, not messages) or make it prune messages. Default `prompt_template` specialization off for agentic scenarios.
-- [ ] **P2.5** Bound `cache_registry` in-memory size (LRU); cap `_rolling_summary_text` length.
+- [x] **P2.1** Count tokens **once** per turn; cache and pass the count; only recompute after mutating stages. (Biggest TTFT win.)
+- [x] **P2.2** Wire `DeltaEncoder` to inject `diff(old, new)` for re-read files instead of full re-reads.
+- [x] **P2.3** Fix `TokenAwareTruncator` to use `keep_full_steps` (not hardcoded 3); fix `_append_volatile_context` dedup to scan for any trailing volatile turn; strip internal flags in the optimizer-exception fallback.
+- [x] **P2.4** Remove dead `goal_relevance_scorer.prune_by_relevance` (prunes the store, not messages) or make it prune messages. Default `prompt_template` specialization off for agentic scenarios.
+- [x] **P2.5** Bound `cache_registry` in-memory size (LRU); cap `_rolling_summary_text` length.
 
 ### P3 — MTP / speculative (validate before enabling)
 - [ ] **P3.1** Keep native MTP passthrough (autodetected). Drop dead `mtp_state` bookkeeping.

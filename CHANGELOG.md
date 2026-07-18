@@ -449,6 +449,13 @@ C9, C10). Full test suite after changes: **417 passed, 2 skipped**.
   (`prompt_faithfulness` / `evicted_content_recall` / lexical battery) drops
   beyond `--tolerance` (default `0.05`). Ready to wire into CI when a backend is
   available in the runner. The GitHub Actions workflow itself is deferred.
+- **Evicted-turn code ledger (fixes `has_code_proxy = 0`).** New
+  `code_ledger_max_sigs` config (default `40`). When front-eviction drops a
+  code-bearing turn, its function/class signatures are accumulated into a compact
+  `[Evicted-turn code index]` system message appended to the protected tail, so
+  the model keeps awareness of code that lived in dropped turns. Capped to bound
+  the ledger's own size. This is the change measured in the "code-ledger
+  carry-forward" A/B below.
 
   #### Benchmark validation — code-ledger carry-forward (fix1)
 
@@ -512,7 +519,7 @@ conversation, not just per-turn quality. Full test suite after changes:
 ### v0.7.9 — Quality-collapse re-tune + cache-stability wins (2026-07-18)
 
 Implements the P0 (stop the quality collapse) and P1 (cache-stability) items
-from `REVIEW.md`. Full test suite after changes: **430 passed, 2 skipped**.
+from `REVIEW.md`. Full test suite after changes: **433 passed, 2 skipped**.
 
 - **Re-tuned quality profiles (P0.1).** `QUALITY_PROFILES` budgets raised to a
   sane fraction of the context window: `balanced` 8000 tok / 32000 chars / keep 4
@@ -546,6 +553,32 @@ from `REVIEW.md`. Full test suite after changes: **430 passed, 2 skipped**.
   first-seen `tools` schema per session and re-emits it verbatim (stable
   sorted-by-name order) every turn, ignoring client reordering that would shift
   the backend's cached prefix. Wired into `app.py`.
+- **Rolling cache-hit EMA + drift-mode mutation reduction (P1.3).** The optimizer
+  records the real backend `cached_tokens` ratio per turn (`record_cache_outcome`)
+  into a rolling EMA (`_real_cache_hit_ratio`) and tracks prefix drift
+  (`_prefix_drift`). In drift mode the proxy only *reduces* mutation (skips volatile
+  append, proactive trim, sliding-window trim) — never skipping the hard budget cap,
+  so cache stability always wins.
+- **Consolidated token counting (P2.1).** `optimize_messages` now counts tokens
+  once at the top and only recomputes after a stage that mutates content, instead
+  of re-tokenizing the whole list ~15× per turn. Biggest TTFT win on long contexts.
+- **Delta-encode injection on re-read (P2.2, review §3.4).** Fixed the
+  `DeltaEncoder` no-op (its prior-version lookup was dead) and added
+  `_inject_code_deltas`: when a file is re-read after an edit, the full re-read
+  body is replaced with a compact unified diff against the prior snapshot — but
+  only when the prior version is already in the context (so the model can apply
+  it). Opt-in via `MOEPT_AGENTIC__DELTA_ENCODE_INJECT` (default `false`): the
+  model needs the full file to edit, and a diff is only safe when the prior
+  version is present.
+- **Bounded truncator / summarizer (P2.3/P2.5).** `TokenAwareTruncator` now reads
+  `keep_full_steps` (was hardcoded `3`); `hierarchical_summarizer` rolling summary
+  is capped (`max_rolling_summary_chars=4000`); `cache_registry` confirmed LRU-bounded.
+- **Removed dead code (P2.4).** Deleted the no-op `prune_by_relevance` call and its
+  `goal_relevance_scorer` (it pruned the store, not the messages, so had no effect
+  on output); added `prompt_template_enabled` (default `false`) gating Steps 6/6.5
+  so template specialization is off for agentic coding by default.
 - **Tests.** Updated `tests/test_config.py` QualityProfile assertions to the
   re-tuned budgets; enlarged the degradation-header test prompt so it still
-  reaches the canonicalization stage under the higher budget.
+  reaches the canonicalization stage under the higher budget. Added
+  `tests/test_delta_encoder.py` (delta << full, ratio < 1.0) and
+  `tests/test_optimizer.py::TestCodeDeltaInjection` (3 tests).
