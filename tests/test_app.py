@@ -650,10 +650,14 @@ class TestDegradationHeader:
             _failing_canonicalize,
         )
 
-        # A large enough prompt to exceed the proactive threshold (balanced
-        # profile: max_optimized_tokens=8000, proactive_trim_ratio=0.6 -> ~4800
-        # tokens) and reach the canonicalization stage.
-        big = ("Implement a feature. " * 400) + ("x" * 40000)
+        # A large enough prompt to exceed the proactive threshold and reach the
+        # canonicalization stage. The balanced profile derives its token budget
+        # dynamically from the live backend window (budget_window_fraction=0.06 of
+        # the 262144-token window -> ~15728 tokens) and applies proactive_trim_ratio
+        # 0.6, so the proactive threshold is ~9436 tokens. Size the input well above
+        # that so the stage is actually reached even though the tokenizer compresses
+        # repetitive "x" text efficiently.
+        big = ("Implement a feature. " * 400) + ("x" * 90000)
         app = create_app(AppConfig())
         with TestClient(app) as client:
             resp = client.post(

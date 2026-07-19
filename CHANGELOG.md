@@ -598,3 +598,250 @@ Follow-up to the P2.2 delta-encode injection from v0.7.9.
   forward the full re-read body. The existing `TestCodeDeltaInjection` suite
   (inject-on-reread / keep-on-first-read / keep-when-prior-absent) still covers
   the three runtime paths.
+
+### v0.7.11 — Turn-11 cliff fix: rolling summary runs before compaction (2026-07-19)
+
+Fixes the quality cliff observed in `benchmark_opencode_30_5_0.7.10_baseline`
+where the proxy collapsed to a flat ~1.1K-token stub at turn 11 and never
+recovered (`semantic_similarity` median 0.079, `has_code_proxy` 0.107).
+
+- **Rolling summary now runs BEFORE the scratchpad compactor (Step 7).** The
+  compactor drops the entire evictable middle of the conversation in one shot;
+  when the cache-stable rolling summary ran *after* it, the evicted turns were
+  already gone and the summary had nothing to fold — so all task state was lost
+  at the cliff. Reordering lets the summary fold older dynamic turns into the
+  append-only, byte-stable `_summary_id` block (protected from later
+  front-eviction) before the compactor drops them. The context now grows with
+  the conversation instead of flatlining.
+- **Fact-anchor pinning (REVIEW §6).** `HierarchicalSummarizer.seed_original_request`
+  pins the first user request's anchor facts into the rolling summary's leading,
+  byte-stable section so `fact_recall` survives front-eviction of Turn 1. Seeded
+  once per session and never rewritten, so the summary head stays cache-stable.
+  (The facts also already live in the frozen-prefix first user message, so this
+  is defense-in-depth.)
+- **Softer post-cliff floor (`balanced` profile).** `keep_full_steps` 4 → 6 and
+  `hierarchical_summary_max_full_turns` 5 → 6 (kept in sync so the summary and
+  compactor protect the same recent window); `compaction_trigger_ratio` 0.85 →
+  0.88 so compaction starts a little later, giving the summary more turns to
+  fold first.
+
+### v0.7.12 — Fix fact-recall grader (was 0.0 for both proxy and direct) (2026-07-19)
+
+The `fact_recall_turn30` metric was unmeasurable: it reported **0.0 for BOTH
+proxy and direct** in every run, so it could not distinguish a real compaction
+regression from a healthy run. Root cause was the grader, not the proxy.
+
+- **`_grade_fact_recall` rewritten to grade lexically, not by whole-response
+  embedding similarity.** The old grader embedded the *entire* probe response
+  and compared it to each fact's embedding with a 0.35 cutoff. The bundled
+  embedder (768-d vectors, `embed-gemma:300m`) has a coarse space where even
+  unrelated text scores ~0.6, and a verbose response that *verbatim-lists all 5
+  facts* scored **negative** similarity (~−0.05) because the fact signal was
+  diluted by surrounding boilerplate — so perfect recall graded 0.0.
+- **New primary signal: normalized substring match on each fact's distinctive
+  answer tokens.** `_DRIFT_FACTS` is now a list of `(planted_sentence,
+  answer_tokens)` pairs; recall checks whether every answer token (e.g.
+  `ATLAS`, `Python`+`3.11`, `Postgres`, `retry`+`3`, `platform-infra`) appears
+  in the normalized response. Deterministic, embedding-independent, and honest
+  for concrete agentic facts (codenames, versions, DB names, retry counts, team
+  names). A verbatim recall now grades **1.0**; an unrelated answer grades 0.0.
+- **Embedding kept only as a soft fallback** for paraphrased recalls, and fixed
+  to compare each fact against the *best-matching sentence* (max-over-segments)
+  instead of the whole response. It is consulted only when lexical finds nothing
+  and the embedder is reachable, so the common case stays fast and deterministic.
+- Updated `tests/test_benchmark_long_horizon.py` to assert the lexical path
+  works with the embedder down (the key regression this fixes) and that empty
+  responses return `None` rather than a false zero.
+
+### v0.7.13 — Compactor was dropping the rolling-summary block (turn-10+ collapse) (2026-07-19)
+
+A deeper read of `benchmark_opencode_30_1_0.7.11_baseline` surfaced a second,
+larger bug behind the low `prompt_faithfulness` (median 0.34),
+`evicted_content_recall` (median 0.36), and `semantic_similarity` (median 0.002):
+the folded task state was being thrown away every turn.
+
+- **Root cause:** `ScratchpadCompactor.compact_messages` did pure front-eviction
+  (`system_anchor + protected_tail`, dropping the evictable middle) and ignored
+  the `_summary_id` rolling-summary block. The optimizer's Step 7 (pre-compaction)
+  correctly folds evicted turns into that block (placed as a *trailing* `user`
+  message), but because it is the 7th-from-last message once there are more than
+  `keep_full_steps` complete turns, the compactor's tail-keep logic evicted it.
+  So every turn, the summary was built and then immediately discarded — the model
+  saw only the frozen prefix + last 6 turns, never the folded history. The
+  optimizer comment claimed `_partition_for_budget` already protected `_summary_id`,
+  but `compact_messages` uses `_partition_zones`, which did not.
+- **Fix:** `compact_messages` now extracts any `_summary_id` / `_rolling_summary`
+  message *before* partitioning and re-appends it to the protected tail, so the
+  block is never front-evicted. Verified the summary block (with 3–9 folded turns
+  of task state at turns 20–30) now survives, and the frozen prefix stays
+  byte-stable across turns (cache-reuse invariant preserved: 96.7% hit rate).
+- Added `tests/test_compactor.py::test_compactor_never_evicts_rolling_summary_block`
+  as a regression guard.
+
+**Expected benchmark impact (next run):** `prompt_faithfulness`,
+`evicted_content_recall`, and `semantic_similarity` should rise substantially
+because the model finally receives the folded task state; `has_code_proxy` should
+recover toward `has_code_direct` as code from evicted turns is now in the summary.
+
+### v0.7.14 — Rolling summary was summarizing code away (has_code_proxy = 0) (2026-07-19)
+
+Investigation confirmed the `has_code_proxy` → 0 regression flagged after v0.7.13:
+the cache-stable path (`summarize_turns_cache_stable`) calls `_extract_constraints`,
+which captured only file paths, errors, plans, constraints, and topics — **never
+fenced code blocks**. The only code-pattern extraction in the module lived in
+`_create_hierarchical_summary`, which the cache-stable path never calls. So when a
+turn carrying a fenced code block was folded into the rolling summary, the code
+vanished and the model had nothing to reproduce.
+
+- **Fix:** `_extract_constraints` now extracts fenced code blocks (with language
+  tag) verbatim via a new `_FENCE_RE` and emits them under a `Code:` section in the
+  rolling-summary block (capped at the 6 most recent blocks, each ≤1500 chars, to
+  stay within the rolling-summary budget). The block is preserved byte-for-byte so
+  the model can reproduce it; deduplicated by `lang:code` to avoid bloat.
+- Added `tests/test_hierarchical_summarizer.py::test_summarize_cache_stable_preserves_code_blocks`
+  as a regression guard.
+- **Cache-stability preserved:** the code is appended to the existing append-only
+  `_rolling_summary_text`, so the leading (pinned-facts) bytes stay byte-identical
+  and the backend prefix cache is reused.
+
+**Expected benchmark impact (next run):** `has_code_proxy` should recover from 0.0
+toward `has_code_direct` (0.367); `code_block_ratio` and `code_structure_consistency`
+should rise; `semantic_similarity` should improve further as the model regains the
+evicted code.
+
+### v0.7.15 — Retain more context on deep turns + token-based summary cap (2026-07-19)
+
+Two improvements from reading `benchmark_opencode_30_1_0.7.13_baseline`:
+
+- **#1 — Raise the `balanced` retention budget.** Per-turn token analysis showed
+  the proxy over-compressed deep-context turns 15–29× (backend-facing plateaued at
+  ~2.1K tok while direct grew to 59K tok at turn 30), because the protected tail +
+  summary floor was too small. The backend window is 262K with <1% utilization, so
+  there is ample headroom. Raised `balanced`: `max_optimized_tokens` 8000→12000,
+  `keep_full_steps` 6→8, `max_optimized_chars` 32000→48000, and
+  `hierarchical_summary_max_full_turns` 6→8 (so the rolling summary protects the
+  same recent window as the compactor). Cache-stable prefix is untouched.
+- **#2 — Token-based rolling-summary cap with preferential code retention.** The
+  rolling-summary cap was measured in chars (4000), which over/under-counts for
+  code-heavy vs prose-heavy sessions. Replaced with a token cap
+  (`max_rolling_summary_tokens`, default 1500) enforced by a new
+  `_enforce_rolling_summary_budget`. When over budget, the OLDEST PROSE is dropped
+  first and fenced code blocks (the v0.7.14 `Code:` section) are kept preferentially,
+  because evicted code is the highest-value context the model cannot reconstruct.
+  The byte-stable leading (pinned-facts) section is always preserved. The token
+  counter is attached to the summarizer via `set_token_counter` in the optimizer.
+- Also fixed a latent bug: `_extract_constraints` embedded the full fenced code
+  block inside the `Topic:` line (duplicate of the `Code:` section); the topic
+  sentence now strips fenced code before extraction.
+- Added `tests/test_hierarchical_summarizer.py::test_rolling_summary_budget_keeps_code_over_prose`.
+  Updated `test_config.py` (balanced values), `test_app.py` (degradation test input
+  now exceeds the raised 7200-token proactive threshold), and
+  `test_v050_integration.py` (conversation extended past the new `max_full_turns=8`).
+
+**Expected benchmark impact (next run):** `semantic_similarity` median should rise
+off 0.028 and `low_semantic_similarity_turns` (22/30) should drop, because deep
+turns retain ~8 full recent steps + a denser, code-preferring summary instead of a
+2.1K-tok stub.
+
+### v0.7.16 — Dynamic token budget derived from the live backend window (2026-07-19)
+
+The static `max_optimized_tokens` cap was a guess that did not track the actual
+device. The proxy already knows the real backend window (`capability_probe`
+→ `max_context_window`, e.g. 262144) and learns the true token ratio per turn
+(`_token_calibration` from the backend's authoritative `prompt_tokens`). This
+release makes the budget **dynamic** so it adapts to the device instead of being
+hard-coded.
+
+- **New:** `dynamic_budget_enabled` (default `true`) and `budget_window_fraction`
+  (default `0.06`). When on and the live window is known, the effective budget is
+  `max(window * budget_window_fraction, max_optimized_tokens)`, then scaled by the
+  learned token-calibration ratio so it is enforced against the backend's TRUE
+  token count. On a 262K window this yields ~15.7K tokens (vs the old fixed 12K),
+  retaining more recent verbatim context with headroom for generation + the
+  cache-stable prefix. `max_optimized_tokens` is now a **floor** (never starves the
+  model on a tiny/unknown window) and the value used when dynamic budgeting is off
+  or the window is undetected.
+- The optimizer now stores the `capability_probe` and reads `max_context_window`
+  from its cached snapshot (no network call on the hot path). `_budget_tokens()`
+  is the single source of truth; `proactive_threshold` / `compaction_threshold`
+  derive from it everywhere, so the dynamic value flows through the whole pipeline.
+- Cache-stable prefix is untouched — only the optimized-context ceiling moves.
+- Added `tests/test_optimizer.py` dynamic-budget cases (derives from window,
+  falls back when window unknown, respects floor on tiny window, disabled uses
+  static). Enlarged `test_app.py` degradation-test input so it still exceeds the
+  raised proactive threshold (~9436 tok under the dynamic budget).
+
+**Expected benchmark impact (next run):** deeper turns should retain even more
+verbatim context (budget scales with the real 262K window), further lifting
+`semantic_similarity` and `code_block_ratio` without raising cache-miss risk, since
+the cap stays a small fraction of the window.
+
+### v0.7.17 — Adaptive rolling-summary cap (grows with turns, saturates at window) (2026-07-19)
+
+The rolling-summary token cap was a fixed constant (1500). A constant cap
+undersells deep sessions: a 30-turn conversation needs a denser summary than a
+5-turn one, and the cap should also track the live backend window like the
+context budget now does (v0.7.16). This release makes the summary cap **adaptive**.
+
+- **New:** the effective per-call cap is
+  `min(ceiling, floor + per_turn_growth * summarized_turn_count)`. It starts at a
+  floor (the old 1500 default), grows linearly as more turns are folded into the
+  rolling summary, and **saturates** at `ceiling` — a fraction of the dynamic
+  context budget (`rolling_summary_budget_fraction`, default `0.25`). On a 262K
+  window the ceiling is ~3.9K tokens, so a long session keeps a far denser summary
+  than a short one without ever eating into the verbatim recent window.
+- The optimizer re-derives the ceiling each turn from `_budget_tokens()` (the
+  dynamic, window-aware context budget) via `set_rolling_summary_ceiling`, so the
+  summary cap scales with the real device. The ceiling is clamped to at least the
+  floor so a tiny derived budget never starves the summary of room for the pinned
+  facts + recent code.
+- `_enforce_rolling_summary_budget` now uses the adaptive cap; the code-preferential
+  eviction (v0.7.15) and byte-stable leading section (v0.7.11) are unchanged.
+- Added `tests/test_hierarchical_summarizer.py` cases for turn-aware growth and
+  ceiling clamping.
+
+**Expected benchmark impact (next run):** deep turns (15–30) should show higher
+`semantic_similarity` / `prompt_faithfulness` because the rolling summary retains
+more folded-turn state as the session lengthens, while `cache_hit_rate` is
+unaffected (the leading pinned-facts bytes stay byte-stable).
+
+### v0.7.18 — Dynamic sub-caps derived from the lean budget (2026-07-19)
+
+The context *budget* (v0.7.16) and the rolling-summary *cap* (v0.7.17) were made
+dynamic, but several internal sub-caps were still fixed constants: tool/assistant
+output compression threshold, user-paste compression threshold, RAG code-chunk
+size, `AgentStateStore` step cap, and the quality-anchor constraint cap. On a
+huge backend window these stayed at their small fixed values, so the proxy
+under-used the headroom it now has — and on a tiny window they could over-compress.
+This release derives each from the **lean** dynamic budget (the same 6%-of-window
+value the context budget uses), so they scale with the device while the optimized
+context stays lean even on a 262K window.
+
+- **New fraction fields** (all fractions of the lean dynamic budget, not the raw
+  window — the optimized context is already capped at 6% of the window, so these
+  stay tiny): `tool_output_compression_budget_fraction` (0.10),
+  `user_paste_compression_budget_fraction` (0.10), `state_steps_budget_fraction`
+  (0.025), `anchor_max_constraints_budget_factor` (0.001), and
+  `code_chunking.chunk_budget_fraction` (0.05). Each existing `*_max_chars` /
+  `max_state_steps` value is now a **hard floor** (chars/steps) so a tiny/unknown
+  window keeps the old behavior and is never starved.
+- **New helpers** in `AgentContextOptimizer`: `_dynamic_cap(fraction, floor)` plus
+  `_dynamic_tool_output_max_chars`, `_dynamic_user_paste_max_chars`,
+  `_dynamic_chunk_max_chars`, `_dynamic_max_state_steps`,
+  `_dynamic_max_anchor_constraints`. The tool-output / user-paste compressors and
+  the code-chunk call site now build with the dynamic value each turn; the
+  anchor-constraint cap and the per-turn `AgentStateStore` step cap are refreshed
+  every turn (the store gains `set_max_steps`, applied in Step 1).
+- **Removed dead config**: `HierarchicalSummarizer` no longer takes
+  `max_summary_turns` / `max_rolling_summary_chars` — they were stored but never
+  enforced (the token-based adaptive cap superseded them). Constructor signature
+  simplified to `(max_full_turns, max_rolling_summary_tokens, token_counter)`.
+- Added `tests/test_optimizer.py::TestDynamicSubCaps` (scaling above floor on a
+  262K window, floor honored on a tiny budget, disabled → static floor, per-turn
+  store override).
+
+**Expected benchmark impact (next run):** on the 262K backend, tool/assistant
+output and user pastes keep more verbatim content within the lean budget, RAG
+retrieval uses larger relevant code chunks, and long sessions retain more goal
+state — all without raising the total optimized-context size (still ~6% of window)
+or touching the cache-stable prefix.

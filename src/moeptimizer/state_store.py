@@ -34,6 +34,13 @@ class AgentStateStore:
         self._step_hash_set: set[str] = set()
         self._goal_id: str | None = None
         self._config = get_config().agentic
+        self._max_steps_override: int | None = None
+
+    def set_max_steps(self, max_steps: int) -> None:
+        """Override the configured ``max_state_steps`` cap (e.g. with a value
+        derived from the live backend window). ``None`` restores the config floor.
+        """
+        self._max_steps_override = max_steps if max_steps and max_steps > 0 else None
 
     def add_step(self, step: AgentStep) -> str:
         """Register a step and index it by role, tool, and subtask."""
@@ -62,7 +69,7 @@ class AgentStateStore:
         step count exceeds the configured cap we drop the oldest steps from the
         front (never the recent/protected tail) and rebuild the derived indices.
         """
-        max_steps = self._config.max_state_steps
+        max_steps = self._max_steps_override if self._max_steps_override is not None else self._config.max_state_steps
         if max_steps <= 0 or len(self.steps) <= max_steps:
             return
         excess = len(self.steps) - max_steps

@@ -117,33 +117,43 @@ def test_fact_recall_returns_none_on_empty_response():
     assert bm._grade_fact_recall("", bm._DRIFT_FACTS) is None
 
 
-def test_fact_recall_grades_with_mock_embedding():
-    # Mock the embedding layer so a fact is "recalled" iff its text is a
-    # substring of the response. This exercises _grade_fact_recall's
-    # threshold/counting logic without a real embedding model (which would
-    # score unrelated text near 0 and can't be reproduced by a bag-of-words
-    # mock). The mock returns a 1-element vector carrying the text; the cosine
-    # mock recovers it and applies the substring test.
-    def fake_embed(text):
-        return [text]
-
-    def fake_cosine(fact_vec, resp_vec):
-        fact_text, resp_text = fact_vec[0], resp_vec[0]
-        return 1.0 if fact_text in resp_text else 0.0
-
-    with mock.patch.object(bm, "_embed_text", side_effect=fake_embed), mock.patch.object(
-        bm, "_cosine_similarity", side_effect=fake_cosine
-    ):
-        # Response repeats the exact fact strings -> full recall.
-        response = " ".join(bm._DRIFT_FACTS)
+def test_fact_recall_grades_lexically_without_embedding():
+    # Fact recall is graded primarily by lexical (normalized substring) matching
+    # of each fact's answer tokens, so it must work with NO embedding model
+    # available. We force the embedder down to prove the primary path is
+    # embedding-independent (the old grader returned 0.0 for a verbatim recall
+    # because whole-response embedding similarity was diluted by boilerplate).
+    with mock.patch.object(bm, "_embed_text", side_effect=RuntimeError("no backend")):
+        # Response states every fact's answer tokens -> full recall.
+        response = (
+            "The codename is ATLAS. We target Python 3.11. The database is Postgres. "
+            "The max retry count is 3. The owning team is platform-infra."
+        )
         score = bm._grade_fact_recall(response, bm._DRIFT_FACTS)
         assert score == 1.0
+
+        # Response mentions only some facts -> partial recall.
+        partial = bm._grade_fact_recall(
+            "The codename is ATLAS. The database is Postgres.", bm._DRIFT_FACTS
+        )
+        assert partial == 0.4  # 2 of 5 facts
 
         # Response mentions none of the facts -> zero recall.
         score0 = bm._grade_fact_recall("The weather is sunny today.", bm._DRIFT_FACTS)
         assert score0 == 0.0
 
+        # Empty response -> None (not measured), never a false zero.
+        assert bm._grade_fact_recall("", bm._DRIFT_FACTS) is None
 
-def test_fact_recall_returns_none_when_embedding_unavailable():
+
+def test_fact_recall_uses_embedding_only_as_fallback():
+    # When lexical finds nothing, the embedder is consulted as a soft fallback
+    # for paraphrased recalls. With the embedder forced down, a non-lexical
+    # (paraphrased) response stays at 0.0 rather than erroring.
     with mock.patch.object(bm, "_embed_text", side_effect=RuntimeError("no backend")):
-        assert bm._grade_fact_recall("ATLAS Postgres Python 3.11", bm._DRIFT_FACTS) is None
+        paraphrased = (
+            "I recall we named the initiative ATLAS and chose Postgres for storage."
+        )
+        # "ATLAS" and "Postgres" are lexical matches; "Python 3.11", "retry 3",
+        # "platform-infra" are not stated -> 0.4, not an error.
+        assert bm._grade_fact_recall(paraphrased, bm._DRIFT_FACTS) == 0.4

@@ -50,8 +50,11 @@ class TestQualityProfile:
     def test_balanced_is_default(self) -> None:
         config = AppConfig()
         apply_quality_profile(config)
-        assert config.agentic.keep_full_steps == 4
-        assert config.agentic.max_optimized_tokens == 8000
+        # keep_full_steps raised 6 -> 8 and max_optimized_tokens 8000 -> 12000
+        # (review: deep-context turns were over-compressed 15-29x; the backend
+        # window has <1% utilization so more recent context can be retained).
+        assert config.agentic.keep_full_steps == 8
+        assert config.agentic.max_optimized_tokens == 12000
         # Re-tuned (review P0.1): balanced no longer skeletonizes all code.
         assert config.agentic.code_skeleton_enabled is False
 
@@ -79,7 +82,7 @@ class TestQualityProfile:
         config.agentic.quality_profile = "bogus"
         apply_quality_profile(config)
         assert config.agentic.quality_profile == "balanced"
-        assert config.agentic.max_optimized_tokens == 8000
+        assert config.agentic.max_optimized_tokens == 12000
 
 
 class TestConfigCheck:

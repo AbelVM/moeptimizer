@@ -1023,3 +1023,81 @@ class TestQualityAnchorMonotonic:
         a2 = opt._build_quality_anchor(self._user_turns("Task", "dup constraint", "dup constraint"))
         # The duplicate is deduped against the running set; tail stays byte-identical.
         assert a1 == a2
+
+
+class TestDynamicSubCaps:
+    """v0.7.18: sub-caps (tool output, paste, chunk, state steps, anchor) derive
+    from the lean dynamic budget and stay tiny even on a huge window."""
+
+    def _opt_with_window(self, window: int | None, **overrides: Any) -> AgentContextOptimizer:
+        config = AppConfig()
+        config.agentic.dynamic_budget_enabled = True
+        config.agentic.budget_window_fraction = 0.06
+        config.agentic.max_optimized_tokens = 12000
+        config.agentic.max_optimized_chars = 48000
+        for k, v in overrides.items():
+            setattr(config.agentic, k, v)
+
+        class _Caps:
+            max_context_window = window
+            remote_tokenize = False
+
+        class _Probe:
+            def cached(self) -> _Caps:
+                return _Caps()
+
+        return AgentContextOptimizer(config, capability_probe=_Probe() if window else None)
+
+    def test_tool_output_cap_scales_with_window_above_floor(self) -> None:
+        # 262144 * 0.06 = 15728 budget; 0.10 * 15728 * 4 chars ~= 6291 > 4000 floor
+        opt = self._opt_with_window(262144)
+        assert opt._dynamic_tool_output_max_chars() > 4000
+        # Tiny budget (low floor) -> static floor wins, never starves below it.
+        opt_small = self._opt_with_window(8000, max_optimized_tokens=1000, max_optimized_chars=4000)
+        assert opt_small._dynamic_tool_output_max_chars() == 4000
+
+    def test_user_paste_cap_mirrors_tool_output(self) -> None:
+        opt = self._opt_with_window(262144)
+        assert opt._dynamic_user_paste_max_chars() > 4000
+        opt_small = self._opt_with_window(8000, max_optimized_tokens=1000, max_optimized_chars=4000)
+        assert opt_small._dynamic_user_paste_max_chars() == 4000
+
+    def test_chunk_cap_scales_with_window_above_floor(self) -> None:
+        # 0.05 * 15728 * 4 ~= 3145 > 1500 floor
+        opt = self._opt_with_window(262144)
+        assert opt._dynamic_chunk_max_chars() > 1500
+        opt_small = self._opt_with_window(8000, max_optimized_tokens=1000, max_optimized_chars=4000)
+        assert opt_small._dynamic_chunk_max_chars() == 1500
+
+    def test_state_steps_cap_scales_with_window_above_floor(self) -> None:
+        # 0.025 * 15728 ~= 393 > 200 floor
+        opt = self._opt_with_window(262144)
+        assert opt._dynamic_max_state_steps() > 200
+        opt_small = self._opt_with_window(8000, max_optimized_tokens=1000, max_optimized_chars=4000)
+        assert opt_small._dynamic_max_state_steps() == 200
+
+    def test_anchor_constraints_cap_scales_with_window(self) -> None:
+        # 0.001 * 15728 ~= 15 > 5 floor
+        opt = self._opt_with_window(262144)
+        assert opt._dynamic_max_anchor_constraints() > 5
+        opt_small = self._opt_with_window(8000, max_optimized_tokens=1000, max_optimized_chars=4000)
+        assert opt_small._dynamic_max_anchor_constraints() == 5
+
+    def test_disabled_dynamic_uses_static_floor(self) -> None:
+        opt = self._opt_with_window(262144, dynamic_budget_enabled=False)
+        assert opt._dynamic_tool_output_max_chars() == 4000
+        assert opt._dynamic_chunk_max_chars() == 1500
+        assert opt._dynamic_max_state_steps() == 200
+        assert opt._dynamic_max_anchor_constraints() == 5
+
+    def test_state_store_override_applied_per_turn(self) -> None:
+        opt = self._opt_with_window(262144)
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        opt.optimize_messages(msgs)
+        # The store cap should track the dynamic value, not the static floor.
+        assert opt.store._max_steps_override == opt._dynamic_max_state_steps()
+        assert opt.store._max_steps_override > 200

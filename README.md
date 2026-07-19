@@ -99,8 +99,16 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_AGENTIC__KEEP_FULL_STEPS` | `3` | Last N user-assistant pairs kept in full detail; older complete turns are evicted from the top |
 | `MOEPT_AGENTIC__ARCHIVE_THRESHOLD` | `3` | Steps before this index are archived/compressed |
 | `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` | `32000` | Character fallback cap for optimized context. Should be a meaningful fraction of the backend context window, not ~1% of it: evicting/skeletonizing below this starves the model of task context and collapses quality. |
-| `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS` | `8000` | Token budget cap; takes precedence over character cap. Hard cap on the optimized context; a sane fraction (a few %) of the backend window so eviction only triggers when genuinely needed. |
-| `MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO` | `0.45` | Ratio of max tokens where proactive top-only trimming starts (base default; the `balanced` profile raises this to `0.6`) |
+| `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS` | `8000` | Floor / fallback token budget cap; takes precedence over the character cap. When `dynamic_budget_enabled` is true and the live backend window is known, the effective budget is derived from the real window (`budget_window_fraction`) and this value acts as a hard floor so a tiny/unknown window never starves the model. |
+| `MOEPT_AGENTIC__DYNAMIC_BUDGET_ENABLED` | `true` | Derive the optimized-context token budget from the LIVE backend context window (`capability_probe.max_context_window`) instead of the static `max_optimized_tokens` guess. Budget = `max(window * budget_window_fraction, max_optimized_tokens)`, scaled by the learned token-calibration ratio so it is enforced against the backend's true token count. Falls back to the static `max_optimized_tokens` when the window is unknown. |
+| `MOEPT_AGENTIC__BUDGET_WINDOW_FRACTION` | `0.06` | Fraction of the live backend context window used as the dynamic token budget (only when `dynamic_budget_enabled`). 0.06 = 6% of the window, leaving headroom for generation + the cache-stable prefix while retaining far more recent verbatim context than a fixed cap. |
+| `MOEPT_AGENTIC__ROLLING_SUMMARY_BUDGET_FRACTION` | `0.25` | Fraction of the dynamic context budget used as the SATURATING ceiling for the adaptive rolling-summary cap. The summary cap grows with the number of folded turns up to this ceiling, so a long session keeps a denser summary than a short one without ever eating into the verbatim recent window. 0.25 of a ~15.7K budget ≈ 3.9K tokens. |
+| `MOEPT_AGENTIC__TOOL_OUTPUT_COMPRESSION_BUDGET_FRACTION` | `0.10` | Fraction of the LEAN dynamic context budget (not the raw window) used as the tool/assistant output boundary-compression threshold. The optimized context is already capped at 6% of the window, so this stays tiny even on huge windows — the proxy keeps the context lean. `MOEPT_AGENTIC__TOOL_OUTPUT_COMPRESSION_MAX_CHARS` is the hard floor (chars). |
+| `MOEPT_AGENTIC__USER_PASTE_COMPRESSION_BUDGET_FRACTION` | `0.10` | Fraction of the lean dynamic budget used as the large user-code-paste compression threshold. `MOEPT_AGENTIC__USER_PASTE_COMPRESSION_MAX_CHARS` is the hard floor (chars). |
+| `MOEPT_AGENTIC__STATE_STEPS_BUDGET_FRACTION` | `0.025` | Fraction of the lean dynamic budget (tokens) used as the per-session `AgentStateStore` step cap. `MOEPT_AGENTIC__MAX_STATE_STEPS` is the hard floor. |
+| `MOEPT_AGENTIC__ANCHOR_MAX_CONSTRAINTS_BUDGET_FACTOR` | `0.001` | Per-token factor of the lean dynamic budget that sets the cap on accumulated quality-anchor constraints. The static floor is 5 constraints. |
+| `MOEPT_CODE_CHUNKING__CHUNK_BUDGET_FRACTION` | `0.05` | Fraction of the lean dynamic budget used as the max size of a single tree-sitter code chunk during RAG retrieval. `MOEPT_CODE_CHUNKING__CHUNK_MAX_CHARS` is the hard floor (chars). |
+| `MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO` | `0.45` | Ratio of the (effective) max tokens where proactive top-only trimming starts (base default; the `balanced` profile raises this to `0.6`) |
 | `MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO` | `0.75` | Ratio of max tokens where compaction/compression starts (base default; the `balanced` profile raises this to `0.85`) |
 | `MOEPT_AGENTIC__THINKING_PROTECT_RECENT` | `2` | Keep full thinking for last N steps |
 | `MOEPT_AGENTIC__SESSION_TIMEOUT` | `3600` | Session inactivity timeout in seconds |
@@ -118,7 +126,7 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_AGENTIC__REASONING_PRESEED_ENABLED` | `false` | Inject reasoning scaffolding into user messages |
 | `MOEPT_AGENTIC__MTP_BOUNDARY_ALIGNMENT_ENABLED` | `false` | Pad final context to an MTP prediction boundary |
 | `MOEPT_AGENTIC__IMMUTABLE_PREFIX_ENABLED` | `true` | Freeze the system prompt verbatim across turns so the backend's automatic prefix cache can reuse it. The first user message is not frozen (it is deterministically compressed and stays stable on its own). |
-| `MOEPT_AGENTIC__MAX_STATE_STEPS` | `200` | Maximum steps retained in AgentStateStore per session; oldest archived steps are pruned beyond this cap |
+| `MOEPT_AGENTIC__MAX_STATE_STEPS` | `200` | Hard floor for the per-session `AgentStateStore` step cap. When the live backend window is known, the effective cap is derived from `STATE_STEPS_BUDGET_FRACTION * dynamic budget`; this value is the floor so a tiny/unknown window never starves goal context. |
 | `MOEPT_AGENTIC__GOAL_RELEVANCE_THRESHOLD` | `2.0` | Minimum relevance score for a step to survive task-aware pruning (review §10). Steps scored below this threshold are evicted from the evictable body after goal decomposition. Set to `0.0` to disable. |
 | `MOEPT_AGENTIC__LIVE_ZONE_COMPRESSION_ENABLED` | `true` | Live-zone compression (review §5.1/§7.1). Tracks a content hash of the frozen stable prefix and only re-runs expensive stages (tree-sitter code optimization, tool-output filter/compression) on the *live zone* — messages new or changed since the previous turn. Keeps the prefix byte-identical across turns (guaranteeing backend prefix-cache reuse) and cuts per-turn CPU by avoiding redundant parsing of unchanged code blocks. |
 | `MOEPT_AGENTIC__QUALITY_PROFILE` | `balanced` | Optimization preset trading token savings against response fidelity (review03.md §10). One of `quality` (no summarization/RAG/anchor/code-skeleton; only lossless boundary compression — maximizes similarity to the direct baseline), `balanced` (defaults), `aggressive` (lower token cap, more top-only eviction, earlier compaction). Applied on top of any explicit field overrides, so individual fields can still be tuned. |
@@ -128,7 +136,7 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MOEPT_CODE_CHUNKING__CHUNK_MAX_CHARS` | `1500` | Maximum characters per code chunk |
+| `MOEPT_CODE_CHUNKING__CHUNK_MAX_CHARS` | `1500` | Hard floor (chars) for a single tree-sitter code chunk during RAG retrieval. When the live backend window is known, the effective chunk size is derived from `CHUNK_BUDGET_FRACTION * dynamic budget`; this value is the floor. |
 | `MOEPT_CODE_CHUNKING__TOP_K_CHUNKS` | `5` | Number of top relevant chunks to retrieve |
 | `MOEPT_CODE_CHUNKING__MIN_CHUNK_SCORE` | `0.05` | Minimum embedding similarity score |
 | `MOEPT_CODE_CHUNKING__EMBEDDING_DIM` | `384` | Embedding vector dimension |
@@ -247,7 +255,7 @@ un-proxified baseline. Set `MOEPT_AGENTIC__QUALITY_PROFILE` (or
 - **`quality`** — no middle-history mutation; only lossless boundary compression
   of oversized tool/assistant output. Maximizes similarity to the direct
   baseline (highest token cost).
-- **`balanced`** (default) — the preset applied at app-build time: 8000-token / 32000-char cap, keep 4 full steps, RAG + cache-stable summary on, code skeletonization off. This is the effective default (the base `AgenticConfig` field defaults are overridden by this profile).
+- **`balanced`** (default) — the preset applied at app-build time: 12000-token / 48000-char cap, keep 8 full steps, RAG + cache-stable summary on, code skeletonization off. This is the effective default (the base `AgenticConfig` field defaults are overridden by this profile).
 - **`aggressive`** — lower token cap, earlier compaction, more top-only
   eviction. Maximum token savings (lowest fidelity).
 

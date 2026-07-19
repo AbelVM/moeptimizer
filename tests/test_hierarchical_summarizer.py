@@ -8,7 +8,7 @@ from moeptimizer.hierarchical_summarizer import (
 
 class TestHierarchicalSummarizer:
     def setup_method(self) -> None:
-        self.summarizer = HierarchicalSummarizer(max_full_turns=3, max_summary_turns=10)
+        self.summarizer = HierarchicalSummarizer(max_full_turns=3)
 
     def test_summarize_short(self) -> None:
         messages = [
@@ -175,6 +175,34 @@ class TestHierarchicalSummarizer:
         assert "do not change the public API" in content
         assert "avoid renaming the database tables" in content
 
+    def test_summarize_cache_stable_preserves_code_blocks(self) -> None:
+        """Evicted turns' fenced code survives in the rolling summary (P0.3 fix).
+
+        The old _extract_constraints dropped fenced code entirely, so the model
+        lost the task's code and has_code_proxy collapsed to 0. The summary must
+        now carry the code block verbatim so the model can reproduce it.
+        """
+        summarizer = HierarchicalSummarizer(max_full_turns=2)
+        code = "def process_items(items):\n    return [x for x in items if x]"
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "First user"},
+            {"role": "assistant", "content": "Resp 0"},
+            # Two OLD turns carrying the code that must survive in the summary.
+            {"role": "user", "content": "Here is the helper:\n\n```python\n" + code + "\n```"},
+            {"role": "assistant", "content": "Got it."},
+            # Two RECENT turns kept in full.
+            {"role": "user", "content": "Now use it."},
+            {"role": "assistant", "content": "Resp 3"},
+            {"role": "user", "content": "Then test it."},
+            {"role": "assistant", "content": "Resp 4"},
+        ]
+        result = summarizer.summarize_turns_cache_stable(messages, frozen_prefix_end=3)
+        summary_block = next(m for m in result if m.get("_rolling_summary"))
+        content = summary_block["content"]
+        assert "```python" in content
+        assert code in content
+
     def test_summarize_cache_stable_append_only(self) -> None:
         """Across growing turns the rolling text only appends (leading bytes stable)."""
         summarizer = HierarchicalSummarizer(max_full_turns=2)
@@ -203,3 +231,87 @@ class TestHierarchicalSummarizer:
         assert len(text2) >= len(text1)
         # The summary id is stable across turns.
         assert block1["_summary_id"] == block2["_summary_id"]
+
+    def test_rolling_summary_budget_keeps_code_over_prose(self) -> None:
+        """Token-based cap drops oldest PROSE first, keeps fenced code (v0.7.15).
+
+        When the rolling summary exceeds its token budget, eviction must spare
+        the v0.7.14 ``Code:`` fenced blocks (highest-value evicted context) and
+        drop old prose instead. A fake token counter makes the budget deterministic.
+        """
+        # Fake counter: 1 token per character so a small token cap is easy to hit.
+        class _FakeCounter:
+            def count_tokens_precise(self, text: str) -> int:
+                return len(text)
+
+        summarizer = HierarchicalSummarizer(
+            max_full_turns=2, max_rolling_summary_tokens=110
+        )
+        summarizer.set_token_counter(_FakeCounter())
+
+        # Seed pinned facts (byte-stable leading section, never evicted).
+        summarizer.seed_original_request("API key abc123 base url http://x")
+
+        # Build a conversation whose folded turns produce >120 tokens of summary:
+        # an OLD prose turn, a CODE turn, and a RECENT prose turn.
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "First user"},
+            {"role": "assistant", "content": "Resp 0"},
+            # Old prose (should be evicted first).
+            {"role": "user", "content": "Old context: the project uses flask and a postgres db with redis cache layer."},
+            {"role": "assistant", "content": "Resp 1"},
+            # Code turn (must survive eviction).
+            {"role": "user", "content": "Here is the helper:\n\n```python\ndef helper(x):\n    return x * 2\n```"},
+            {"role": "assistant", "content": "Got it."},
+            # Recent prose (kept: it is the newest folded turn).
+            {"role": "user", "content": "Now wire helper into the request handler and add logging."},
+            {"role": "assistant", "content": "Resp 3"},
+            {"role": "user", "content": "Then add a test for the handler."},
+            {"role": "assistant", "content": "Resp 4"},
+        ]
+        result = summarizer.summarize_turns_cache_stable(messages, frozen_prefix_end=3)
+        block = next(m for m in result if m.get("_rolling_summary"))
+        content = block["content"]
+
+        # Pinned facts always survive (byte-stable leading section).
+        assert "API key abc123" in content
+        # Code block survives eviction (preferential retention).
+        assert "```python" in content
+        assert "def helper(x):" in content
+        # The folded summary text stays within the token budget (110 tokens,
+        # 1 tok/char via the fake counter). The "Context summary (rolling):"
+        # prefix is not part of the budgeted text.
+        assert len(summarizer._rolling_summary_text) <= 110
+        # Old prose was dropped to make room for the code block (it is absent).
+        assert "postgres db with redis" not in content
+
+    def test_rolling_summary_budget_grows_with_turns(self) -> None:
+        """Adaptive cap grows with folded turns, saturates at the ceiling (v0.7.17).
+
+        The effective per-call cap is min(ceiling, floor + per_turn_growth *
+        summarized_turn_count). A short session (few folded turns) gets a small
+        cap; a long session grows toward the ceiling derived from the live backend
+        window. The ceiling is set via set_rolling_summary_ceiling.
+        """
+        summarizer = HierarchicalSummarizer(max_full_turns=2, max_rolling_summary_tokens=200)
+        # floor=200, ceiling defaults to 200 (== max_rolling_summary_tokens).
+        assert summarizer._effective_summary_budget() == 200  # 0 folded turns -> floor
+
+        # Raise the ceiling (as the optimizer does from the dynamic context budget).
+        summarizer.set_rolling_summary_ceiling(2000)
+        # With 0 folded turns the cap is still the floor.
+        assert summarizer._effective_summary_budget() == 200
+        # Simulate folded turns: cap grows by per_turn_growth (120) per turn.
+        summarizer._summarized_turn_count = 5
+        assert summarizer._effective_summary_budget() == 200 + 120 * 5  # 800
+        summarizer._summarized_turn_count = 20
+        # 200 + 120*20 = 2600, but ceiling is 2000 -> saturates.
+        assert summarizer._effective_summary_budget() == 2000
+
+    def test_rolling_summary_ceiling_clamped_to_floor(self) -> None:
+        """A tiny derived ceiling never starves the summary below the floor."""
+        summarizer = HierarchicalSummarizer(max_full_turns=2, max_rolling_summary_tokens=300)
+        summarizer.set_rolling_summary_ceiling(50)  # below floor
+        assert summarizer._rolling_summary_ceiling == 300  # clamped up to floor
+        assert summarizer._effective_summary_budget() == 300

@@ -70,18 +70,36 @@ class ScratchpadCompactor:
 
         Pure front-eviction only. The evicted turns are folded into the
         cache-stable rolling summary by the optimizer's single summary step
-        (Step 8.5), NOT here — having two summary paths double-folds content and
-        was a root cause of the quality collapse (review P0.4). Tool messages are
-        kept if they belong to a turn that survives eviction.
+        (Step 7 pre-compaction), NOT here — having two summary paths double-folds
+        content and was a root cause of the quality collapse (review P0.4). Tool
+        messages are kept if they belong to a turn that survives eviction.
+
+        The rolling-summary block (marked ``_summary_id`` / ``_rolling_summary``)
+        is NEVER evicted: it is the append-only, byte-stable store of all the task
+        state the front-eviction would otherwise discard, so dropping it would
+        throw away exactly the context the summary exists to preserve. The
+        optimizer's ``_partition_for_budget`` already protects this block; the
+        compactor must do the same or the folded state is lost on every turn
+        (the turn-10+ faithfulness/recall collapse).
         """
         if len(messages) <= self.keep_full + 2:
             return messages
+
+        # Pull out the rolling-summary block(s) so front-eviction can never drop
+        # them. They are re-appended to the protected tail below.
+        summary_blocks = [dict(m) for m in messages if m.get("_summary_id") or m.get("_rolling_summary")]
+        if summary_blocks:
+            messages = [m for m in messages if not (m.get("_summary_id") or m.get("_rolling_summary"))]
 
         # Partition into zones
         system_anchor, _, protected_tail = self._partition_zones(messages)
 
         # Drop all evictable body (partitioning already determined which turns are evictable)
-        return system_anchor + protected_tail
+        result = system_anchor + protected_tail
+        # Re-attach the protected rolling-summary block(s) at the tail.
+        if summary_blocks:
+            result = result + summary_blocks
+        return result
 
     def _partition_zones(
         self,

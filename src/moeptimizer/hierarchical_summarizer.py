@@ -49,15 +49,34 @@ class HierarchicalSummarizer:
     def __init__(
         self,
         max_full_turns: int = 5,
-        max_summary_turns: int = 15,
-        max_rolling_summary_chars: int = 4000,
+        max_rolling_summary_tokens: int = 1500,
+        token_counter: Any = None,
     ) -> None:
         self._max_full_turns = max_full_turns
-        self._max_summary_turns = max_summary_turns
         # Cap the append-only rolling summary so a very long session does not
         # grow it without bound (review §8.5). When exceeded, the OLDEST lines
         # are dropped — the most-recent task state is what the model needs.
-        self._max_rolling_summary_chars = max(256, int(max_rolling_summary_chars))
+        # The cap is expressed in TOKENS (not chars) so it tracks the actual
+        # backend budget; a char cap over/under-counts for code-heavy vs
+        # prose-heavy sessions. When over budget, oldest PROSE is dropped first
+        # and fenced code blocks (the v0.7.14 ``Code:`` section) are kept
+        # preferentially, because evicted code is the highest-value context the
+        # model cannot reconstruct on its own.
+        #
+        # The cap is ADAPTIVE (review: dynamic budget). It grows with the number
+        # of folded turns (so a 30-turn session keeps a denser summary than a
+        # 5-turn one) and saturates at ``_rolling_summary_ceiling`` — a fraction
+        # of the live backend context budget, set by the optimizer each turn via
+        # ``set_rolling_summary_ceiling``. The effective per-call cap is
+        # ``min(ceiling, floor + per_turn_growth * summarized_turn_count)``.
+        self._max_rolling_summary_tokens = max(64, int(max_rolling_summary_tokens))
+        # Adaptive-cap parameters (see _effective_summary_budget).
+        self._rolling_summary_floor: int = max(64, int(max_rolling_summary_tokens))
+        self._rolling_summary_ceiling: int = max(
+            self._rolling_summary_floor, int(max_rolling_summary_tokens)
+        )
+        self._rolling_summary_per_turn: int = 120  # tokens added per folded turn
+        self._token_counter = token_counter
         self._summaries: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._stats: dict[str, int] = {
             "turns_summarized": 0,
@@ -71,6 +90,13 @@ class HierarchicalSummarizer:
         self._rolling_summary_text: str = ""
         self._rolling_summary_id: str = ""
         self._summarized_turn_count: int = 0
+        # REVIEW §6: pin the original request's anchor facts (the task's
+        # must-remember constants: API keys, base URLs, fixed constraints) into
+        # the rolling summary's leading, byte-stable section. Front-eviction
+        # drops Turn 1 where those facts live, so without pinning fact_recall
+        # collapses to 0 by turn 30. Seeded once and never rewritten, so the
+        # leading bytes of the summary block stay stable for prefix-cache reuse.
+        self._original_request_facts: str = ""
 
     def summarize_turns(
         self,
@@ -123,6 +149,82 @@ class HierarchicalSummarizer:
         self._stats["turns_compressed"] += 1
 
         return result
+
+    def seed_original_request(self, text: str) -> None:
+        """Pin the original request's anchor facts into the rolling summary (REVIEW §6).
+
+        Called once per session with the first user request. The facts it
+        contains (API keys, base URLs, fixed constraints) live in Turn 1, which
+        front-eviction drops — so without pinning, ``fact_recall`` collapses to 0
+        by turn 30. The seeded text is prepended to the rolling summary block's
+        leading, byte-stable section and never rewritten, so the backend's prefix
+        cache for the summary head is preserved. Only the first non-empty call
+        takes effect; later calls are ignored to keep the head stable.
+        """
+        if self._original_request_facts or not text:
+            return
+        # Compact whitespace; keep it short so it does not dominate the block.
+        compact = " ".join(text.strip().split())
+        if len(compact) > 500:
+            compact = f"{compact[:497].rstrip()}..."
+        self._original_request_facts = f"Key facts (from original request): {compact}"
+
+    def set_token_counter(self, token_counter: Any) -> None:
+        """Attach a token counter so the rolling-summary cap is measured in tokens.
+
+        The cap is enforced in tokens (not chars) so it tracks the real backend
+        budget; without a counter the summarizer falls back to the char cap.
+        """
+        self._token_counter = token_counter
+
+    def set_rolling_summary_ceiling(self, tokens: int) -> None:
+        """Set the SATURATING ceiling for the adaptive summary cap (review: dynamic budget).
+
+        The optimizer calls this each turn from its dynamic context budget (a
+        fraction of the live backend window) so the summary cap scales with the
+        real device instead of being a fixed constant. The effective per-call cap
+        grows with folded turns up to this ceiling (see ``_effective_summary_budget``).
+        Clamped to at least the floor so a tiny derived budget never starves the
+        summary of room for the pinned facts + recent code.
+        """
+        self._rolling_summary_ceiling = max(self._rolling_summary_floor, int(tokens))
+
+    def _effective_summary_budget(self) -> int:
+        """Adaptive per-call token cap: grows with folded turns, saturates at ceiling.
+
+        Early in a session the summary is small (few folded turns), so the cap is
+        near the floor; as more turns are folded the cap rises linearly
+        (``_rolling_summary_per_turn`` per turn) until it reaches the ceiling
+        derived from the live backend window. This keeps a 30-turn session's
+        summary denser than a 5-turn one's without ever eating into the verbatim
+        recent window.
+        """
+        grown = self._rolling_summary_floor + self._rolling_summary_per_turn * self._summarized_turn_count
+        return min(self._rolling_summary_ceiling, grown)
+
+    def set_rolling_summary_budget(self, tokens: int) -> None:
+        """Dynamically set the rolling-summary token cap (review: adaptive budget).
+
+        The optimizer calls this each turn from its dynamic context budget so the
+        summary cap scales with the live backend window instead of being a fixed
+        constant. Clamped to a sane floor so a tiny derived budget never starves
+        the summary of room for the pinned facts + recent code.
+        """
+        self._max_rolling_summary_tokens = max(64, int(tokens))
+
+    def _count_tokens(self, text: str) -> int:
+        """Token count for *text*, using the attached counter if available."""
+        if self._token_counter is not None:
+            try:
+                return int(self._token_counter.count_tokens_precise(text))
+            except Exception:
+                pass
+        # Fallback: ~3.5 chars/token (matches TokenCounter.CHARS_PER_TOKEN generic).
+        return max(1, len(text) // 4)
+
+    def _rolling_summary_leading(self) -> str:
+        """Return the byte-stable leading section (pinned facts) of the summary."""
+        return self._original_request_facts
 
     def summarize_turns_cache_stable(
         self,
@@ -181,15 +283,14 @@ class HierarchicalSummarizer:
                     if self._rolling_summary_text
                     else new_text
                 )
-                # Cap growth: drop oldest lines when over budget (review §8.5).
-                if len(self._rolling_summary_text) > self._max_rolling_summary_chars:
-                    lines = self._rolling_summary_text.split("\n")
-                    while (
-                        lines
-                        and len("\n".join(lines)) > self._max_rolling_summary_chars
-                    ):
-                        lines.pop(0)
-                    self._rolling_summary_text = "\n".join(lines)
+                # Cap growth by TOKENS (not chars). When over budget, drop the
+                # OLDEST PROSE first and keep fenced code blocks (the v0.7.14
+                # ``Code:`` section) preferentially: evicted code is the
+                # highest-value context the model cannot reconstruct, so it must
+                # survive eviction longer than prose. The leading pinned-facts
+                # section is always preserved (it is byte-stable for the prefix
+                # cache), so eviction only touches folded turn state.
+                self._enforce_rolling_summary_budget()
                 self._stats["turns_summarized"] += sum(len(t) for t in new_turns)
                 self._stats["turns_compressed"] += 1
             self._summarized_turn_count = end
@@ -203,12 +304,23 @@ class HierarchicalSummarizer:
         return [*frozen, *keep_recent, self._build_rolling_summary_block()]
 
     def _build_rolling_summary_block(self) -> dict[str, Any]:
-        """Return the single rolling-summary message (append-only content)."""
+        """Return the single rolling-summary message (append-only content).
+
+        The pinned original-request facts (REVIEW §6) are prepended as the
+        leading, byte-stable section so they survive front-eviction of Turn 1
+        and keep ``fact_recall`` measurable. The leading section is seeded once
+        and never rewritten, so the backend's prefix cache for the summary head
+        is preserved across turns.
+        """
         if not self._rolling_summary_id:
             self._rolling_summary_id = hashlib.md5(
                 b"rolling-summary"
             ).hexdigest()[:16]
-        text = self._rolling_summary_text or "Earlier context summarized."
+        leading = self._rolling_summary_leading()
+        if leading:
+            text = f"{leading}\n{self._rolling_summary_text}" if self._rolling_summary_text else leading
+        else:
+            text = self._rolling_summary_text or "Earlier context summarized."
         return {
             "role": "user",
             "content": f"Context summary (rolling):\n{text}",
@@ -216,6 +328,69 @@ class HierarchicalSummarizer:
             "_summary_level": 1,
             "_rolling_summary": True,
         }
+
+    def _enforce_rolling_summary_budget(self) -> None:
+        """Cap the rolling summary by TOKENS, keeping code blocks preferentially.
+
+        The cap is ADAPTIVE (review: dynamic budget): it grows with the number of
+        folded turns and saturates at the ceiling derived from the live backend
+        window (see ``_effective_summary_budget``). The leading pinned-facts
+        section (REVIEW §6) is always preserved because it is byte-stable for the
+        backend prefix cache. The remaining folded-turn text is split into
+        segments; when the token budget is exceeded, the OLDEST PROSE segments are
+        dropped first and fenced code-block segments (the v0.7.14 ``Code:`` section)
+        are retained as long as possible, because evicted code is the highest-value
+        context the model cannot reconstruct.
+        """
+        text = self._rolling_summary_text
+        if not text:
+            return
+        leading = self._rolling_summary_leading()
+        # Never evict the byte-stable leading section.
+        body = text[len(leading):].lstrip("\n") if leading and text.startswith(leading) else text
+
+        # Split body into segments, tracking whether each is a fenced code block.
+        segments: list[tuple[str, bool]] = []  # (segment_text, is_code)
+        buf: list[str] = []
+        in_code = False
+        for line in body.split("\n"):
+            if line.strip().startswith("```"):
+                if buf:
+                    segments.append(("\n".join(buf), in_code))
+                    buf = []
+                in_code = not in_code
+                buf.append(line)
+            else:
+                buf.append(line)
+        if buf:
+            segments.append(("\n".join(buf), in_code))
+
+        budget = self._effective_summary_budget()
+        total = self._count_tokens(text)
+        if total <= budget:
+            return
+
+        # Drop oldest (front) segments first, but spare code segments until only
+        # code remains. Re-evaluate the budget after each drop.
+        idx = 0
+        while idx < len(segments) and self._count_tokens(
+            leading + "\n" + "\n".join(s for s, _ in segments[idx:])
+        ) > budget:
+            # Prefer dropping prose; if the front segment is code, skip past all
+            # contiguous code and drop the next prose segment instead.
+            if segments[idx][1]:
+                # Find the end of this code run.
+                j = idx
+                while j < len(segments) and segments[j][1]:
+                    j += 1
+                idx = j
+                if idx >= len(segments):
+                    break
+            del segments[idx]
+
+        self._rolling_summary_text = (leading + "\n" if leading else "") + "\n".join(
+            s for s, _ in segments
+        )
 
     @staticmethod
     def _group_turns(
@@ -252,6 +427,13 @@ class HierarchicalSummarizer:
            module\s+not\s+found|no\s+such\s+file|syntax\s+error|type\s+error)
         """,
     )
+    # Fenced code block WITH its language tag: ```lang ... ```. Capturing the
+    # code verbatim is what keeps the rolling summary from "summarizing away"
+    # the task's code (review P0.3 follow-up): when a turn carrying a fenced
+    # block is evicted, the old _extract_constraints kept only file paths and
+    # prose, so the model lost the actual code and has_code_proxy collapsed to
+    # 0. The block is preserved byte-for-byte so the model can reproduce it.
+    _FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
 
     def _extract_constraints(
         self,
@@ -276,7 +458,9 @@ class HierarchicalSummarizer:
         errors: list[str] = []
         files: list[str] = []
         topics: list[str] = []
+        code_blocks: list[str] = []
         seen_files: set[str] = set()
+        seen_code: set[str] = set()
 
         for turn in turns:
             for msg in turn:
@@ -284,6 +468,19 @@ class HierarchicalSummarizer:
                 if not isinstance(content, str) or not content:
                     continue
                 role = msg.get("role", "")
+                # Fenced code blocks (from any role) — preserved verbatim so the
+                # evicted turn's code survives in the rolling summary. Without
+                # this the model loses the code and has_code_proxy collapses.
+                for cm in self._FENCE_RE.finditer(content):
+                    lang = cm.group(1).strip() or "text"
+                    code = cm.group(2).strip("\n")
+                    if not code:
+                        continue
+                    key = f"{lang}:{code}"
+                    if key in seen_code or len(code) > 1500:
+                        continue
+                    seen_code.add(key)
+                    code_blocks.append(f"```{lang}\n{code}\n```")
                 # File paths (from any role).
                 for m in self._FILE_PATH_RE.finditer(content):
                     fp = m.group(1)
@@ -304,7 +501,11 @@ class HierarchicalSummarizer:
                     ):
                         constraints.append(line)
                 if role == "user":
-                    sentences = re.split(r"[.?!]", content)
+                    # Strip fenced code before taking the topic sentence so a
+                    # code-carrying user turn does not embed the whole block in
+                    # the Topic: line (it is already preserved verbatim in Code:).
+                    prose = self._FENCE_RE.sub("", content)
+                    sentences = re.split(r"[.?!]", prose)
                     for sent in sentences:
                         sent = sent.strip()
                         if 12 < len(sent) < 160:
@@ -323,6 +524,12 @@ class HierarchicalSummarizer:
         if files:
             uniq_files = list(dict.fromkeys(files))[:10]
             parts.append("Files touched: " + ", ".join(uniq_files))
+        if code_blocks:
+            # Preserve the evicted turn's code verbatim so the model can
+            # reproduce it (fixes has_code_proxy collapse). Cap to keep the
+            # summary within budget; the most recent blocks matter most.
+            uniq_c: list[str] = code_blocks[-6:]
+            parts.append("Code:\n" + "\n".join(uniq_c))
         if errors:
             seen_e: set[str] = set()
             uniq_e: list[str] = []

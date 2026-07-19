@@ -89,10 +89,64 @@ class AgenticConfig(BaseModel):
     )
     max_optimized_tokens: int = Field(
         default=8000,
-        description="Hard cap on optimized context window (tokens). Takes precedence over "
-                    "max_optimized_chars if set. Should be a sane fraction (a few %) of the backend "
-                    "context window so eviction only triggers when genuinely needed; a cap near 1% of "
-                    "the window forces aggressive lossy eviction on every long agentic turn.",
+        description="Floor / fallback cap on optimized context window (tokens). When "
+                    "dynamic_budget_enabled is true and the backend window is known, the effective "
+                    "budget is derived from the real window (budget_window_fraction) and this value "
+                    "acts as a hard floor so a tiny/unknown window never starves the model. Takes "
+                    "precedence over max_optimized_chars if set.",
+    )
+    dynamic_budget_enabled: bool = Field(
+        default=True,
+        description="Derive the optimized-context token budget from the LIVE backend context "
+                    "window (capability_probe.max_context_window) instead of the static "
+                    "max_optimized_tokens guess. The budget = max(window * budget_window_fraction, "
+                    "max_optimized_tokens), then scaled by the learned token-calibration ratio so it "
+                    "is enforced against the backend's true token count. Falls back to the static "
+                    "max_optimized_tokens when the window is unknown or the probe is unavailable.",
+    )
+    budget_window_fraction: float = Field(
+        default=0.06,
+        description="Fraction of the live backend context window used as the dynamic token budget "
+                    "(only when dynamic_budget_enabled). 0.06 = 6% of the window, leaving ample "
+                    "headroom for the model's own generation and the cache-stable prefix while "
+                    "retaining far more recent verbatim context than a fixed ~12K cap on a 262K window.",
+    )
+    rolling_summary_budget_fraction: float = Field(
+        default=0.25,
+        description="Fraction of the dynamic context budget (or the static max_optimized_tokens "
+                    "fallback) used as the SATURATING ceiling for the adaptive rolling-summary cap. "
+                    "The summary cap grows with the number of folded turns up to this ceiling, so a "
+                    "long session keeps a denser summary than a short one without ever eating into "
+                    "the verbatim recent window. 0.25 of a 15.7K budget ~= 3.9K tokens.",
+    )
+    tool_output_compression_budget_fraction: float = Field(
+        default=0.10,
+        description="Fraction of the LEAN dynamic context budget (not the raw backend window) used "
+                    "as the boundary-compression threshold for tool/assistant outputs. The optimized "
+                    "context is already capped at budget_window_fraction (6%) of the window, so this "
+                    "stays tiny even on huge windows — the proxy keeps the context lean. The configured "
+                    "tool_output_compression_max_chars is the hard FLOOR (chars) so a tiny/unknown "
+                    "window keeps the old behavior; on a large window the threshold rises modestly "
+                    "(more verbatim tool output within the lean budget) but never approaches the window.",
+    )
+    user_paste_compression_budget_fraction: float = Field(
+        default=0.10,
+        description="Fraction of the lean dynamic context budget used as the boundary-compression "
+                    "threshold for large user code pastes. Mirrors tool_output_compression_budget_fraction; "
+                    "user_paste_compression_max_chars is the hard floor (chars).",
+    )
+    state_steps_budget_fraction: float = Field(
+        default=0.025,
+        description="Fraction of the lean dynamic context budget (tokens) used as the per-session "
+                    "AgentStateStore step cap. Long sessions on big windows retain more goal context, "
+                    "but the cap stays a small fraction of the lean budget; max_state_steps is the "
+                    "hard floor.",
+    )
+    anchor_max_constraints_budget_factor: float = Field(
+        default=0.001,
+        description="Per-token factor of the lean dynamic context budget that sets the cap on "
+                    "accumulated quality-anchor constraints. Grows the anchor with the window so more "
+                    "constraints survive, but stays tiny; the static floor is 5 constraints.",
     )
     proactive_trim_ratio: float = Field(
         default=0.45,
@@ -184,7 +238,10 @@ class AgenticConfig(BaseModel):
     )
     tool_output_compression_max_chars: int = Field(
         default=4000,
-        description="Tool/assistant outputs longer than this (chars) are boundary-compressed.",
+        description="Hard floor (chars) for tool/assistant boundary-compression threshold. When the "
+                    "live backend window is known, the effective threshold is derived from "
+                    "tool_output_compression_budget_fraction * dynamic budget; this value is the floor "
+                    "so a tiny/unknown window never compresses everything.",
     )
     user_paste_compression_enabled: bool = Field(
         default=True,
@@ -198,7 +255,9 @@ class AgenticConfig(BaseModel):
     )
     user_paste_compression_max_chars: int = Field(
         default=4000,
-        description="User code pastes longer than this (chars) are boundary-compressed.",
+        description="Hard floor (chars) for large user-code-paste boundary-compression threshold. "
+                    "When the live backend window is known, the effective threshold is derived from "
+                    "user_paste_compression_budget_fraction * dynamic budget; this value is the floor.",
     )
     config_hot_reload_enabled: bool = Field(
         default=True,
@@ -244,8 +303,10 @@ class AgenticConfig(BaseModel):
     )
     max_state_steps: int = Field(
         default=200,
-        description="Maximum steps retained in AgentStateStore per session. Oldest archived steps are "
-                    "pruned beyond this cap to bound memory growth over long agentic sessions.",
+        description="Hard floor for the per-session AgentStateStore step cap. When the live backend "
+                    "window is known, the effective cap is derived from state_steps_budget_fraction * "
+                    "dynamic budget (tokens); this value is the floor so a tiny/unknown window never "
+                    "starves goal context.",
     )
     goal_relevance_threshold: float = Field(
         default=2.0,
@@ -304,7 +365,19 @@ class AgenticConfig(BaseModel):
 class CodeChunkingConfig(BaseModel):
     """Code chunking parameters."""
 
-    chunk_max_chars: int = Field(default=1500)
+    chunk_max_chars: int = Field(
+        default=1500,
+        description="Hard floor (chars) for a single tree-sitter code chunk during RAG retrieval. "
+                    "When the live backend window is known, the effective chunk size is derived from "
+                    "chunk_budget_fraction * dynamic budget; this value is the floor.",
+    )
+    chunk_budget_fraction: float = Field(
+        default=0.05,
+        description="Fraction of the lean dynamic context budget used as the max size of a single "
+                    "tree-sitter code chunk during RAG retrieval. Larger chunks keep more relevant code "
+                    "in context on big windows, but stay a small fraction of the lean budget; "
+                    "chunk_max_chars is the hard floor (chars).",
+    )
     top_k_chunks: int = Field(default=5)
     min_chunk_score: float = Field(
         default=0.2,
@@ -417,8 +490,8 @@ class V050Config(BaseModel):
         ),
     )
     hierarchical_summary_max_full_turns: int = Field(
-        default=5,
-        description="Max recent turns to keep in full",
+        default=6,
+        description="Max recent turns to keep in full. Tracks agentic.keep_full_steps so the rolling summary and the compactor protect the same recent window (review: soften post-cliff floor).",
     )
     persist_state_to_disk: bool = Field(
         default=False,
@@ -571,17 +644,32 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         # Default: keep task-critical context. Budget is a sane fraction of the
         # backend window so eviction only triggers when needed; code is kept
         # verbatim (no skeletonization) so the model can still edit/extend it.
+        # keep_full_steps raised from 4 to 6 (review: soften the post-cliff floor
+        # so more recent task context survives front-eviction instead of the
+        # proxy collapsing to a flat ~1.1K-token stub). hierarchical_summary
+        # max_full_turns tracks it so the rolling summary keeps the same recent
+        # window. compaction_trigger_ratio nudged up so compaction starts a
+        # little later, giving the rolling summary more turns to fold first.
         "hierarchical_summary_enabled": False,
         "rag_enabled": True,
         "reasoning_preseed_enabled": False,
         "code_skeleton_enabled": False,
         "attention_sinks_enabled": False,
         "cache_stable_summary_enabled": True,
-        "keep_full_steps": 4,
-        "max_optimized_tokens": 8000,
-        "max_optimized_chars": 32000,
+        # keep_full_steps raised 6 -> 8 (review: deep-context turns 19-30 were
+        # over-compressed 15-29x because the protected tail + summary floor
+        # plateaued at ~2.1K tok while direct grew to 59K tok). The token budget is
+        # now DYNAMIC (dynamic_budget_enabled): derived from the live backend window
+        # (budget_window_fraction=0.06) and floored by max_optimized_tokens, so on a
+        # 262K window the effective cap is ~15.7K rather than a fixed 12K. The 12000
+        # here is the floor, not the effective cap. hierarchical_summary_max_full_turns
+        # tracks keep_full_steps so the rolling summary protects the same window.
+        "keep_full_steps": 8,
+        "max_optimized_tokens": 12000,
+        "max_optimized_chars": 48000,
+        "hierarchical_summary_max_full_turns": 8,
         "proactive_trim_ratio": 0.6,
-        "compaction_trigger_ratio": 0.85,
+        "compaction_trigger_ratio": 0.88,
     },
     "aggressive": {
         # Maximize token savings: lower cap, earlier compaction, more full steps

@@ -117,6 +117,11 @@ class AgentContextOptimizer:
     ) -> None:
         self._config = config or AppConfig()
         self._lock = threading.RLock()
+        self._capability_probe = capability_probe
+        # Token-count calibration (review §1/§9, priority fix #6). Initialized
+        # early so _budget_tokens() can be called during __init__ (e.g. to seed
+        # the adaptive summary-cap ceiling) before the later detailed setup.
+        self._token_calibration: float = 1.0
         self.store = AgentStateStore()
         self.context_aligner = get_context_aligner()
 
@@ -161,6 +166,16 @@ class AgentContextOptimizer:
             tokenizer=self._config.server.tokenizer,
             capability_probe=capability_probe,
         )
+        if self.hierarchical_summarizer is not None:
+            # Attach the token counter so the rolling-summary cap is enforced in
+            # tokens (not chars) and can preferentially keep code blocks.
+            self.hierarchical_summarizer.set_token_counter(self.token_counter)
+            # Seed the adaptive summary-cap ceiling from the dynamic context budget
+            # (re-derived each turn in _optimize_messages_locked so it tracks the
+            # live backend window).
+            self.hierarchical_summarizer.set_rolling_summary_ceiling(
+                int(self._budget_tokens() * self._config.agentic.rolling_summary_budget_fraction)
+            )
         self.goal_decomposer = GoalDecomposer()
         self.embedding_service = EmbeddingService()
         self.symbol_index = SymbolIndex()
@@ -178,7 +193,7 @@ class AgentContextOptimizer:
         self.mtp_state_manager = get_mtp_state_manager()  # NON-FUNCTIONAL placeholder: cannot capture real MTP state (review03.md §2.1/§10)
         self.tool_streamer = get_tool_streamer()
         self.tool_output_compressor = ToolOutputCompressor(
-            max_chars=self._config.agentic.tool_output_compression_max_chars
+            max_chars=self._dynamic_tool_output_max_chars()
         )
         self.tool_output_filter = ToolOutputFilter()
         self._task_type: str = "default"
@@ -211,11 +226,10 @@ class AgentContextOptimizer:
         # it reflects only the current turn. Cheap: no allocation on the hot path
         # when no stage fails (the list stays empty and the header is omitted).
         self._last_degradation: list[str] = []
-        # Token-count calibration (review §1/§9, priority fix #6). Scales the
-        # proxy's tiktoken estimate toward the backend's real tokenizer so the
-        # budget is enforced against true token counts. Learned from the backend's
-        # actual `prompt_tokens` on the previous turn; clamped to [0.5, 2.0].
-        self._token_calibration: float = 1.0
+        # Token-count calibration (review §1/§9, priority fix #6) is initialized
+        # earlier in __init__ (see top) so _budget_tokens() is safe during setup.
+        # It is later updated by set_token_calibration() from the backend's real
+        # prompt_tokens; clamped to [0.5, 2.0].
         # Set once the calibration ratio has been anchored to the backend's exact
         # tokenizer (native /tokenize) so the seed is not re-fetched every turn.
         self._calibration_seeded: bool = False
@@ -281,14 +295,102 @@ class AgentContextOptimizer:
         self._pinned_tools: list[dict[str, Any]] | None = None
 
     def _budget_tokens(self) -> int:
-        """Return the configured token budget without letting defaults override chars."""
+        """Return the effective token budget for the optimized context.
+
+        When ``dynamic_budget_enabled`` is on and the live backend window is known,
+        the budget is derived from the REAL context window
+        (``max(window * budget_window_fraction, max_optimized_tokens)``) and scaled
+        by the learned token-calibration ratio, so it is enforced against the
+        backend's true token count rather than a static guess. This adapts the cap
+        to the actual device (e.g. a 262K window yields ~15.7K vs the old fixed
+        12K) and keeps headroom for generation + the cache-stable prefix. Falls back
+        to the static ``max_optimized_tokens`` (floored by the char budget) when the
+        window is unknown or dynamic budgeting is disabled.
+        """
         cfg = self._config.agentic
         char_budget = max(1, cfg.max_optimized_chars // 4)
+        static = char_budget if cfg.max_optimized_tokens <= 0 else min(char_budget, cfg.max_optimized_tokens)
 
-        if cfg.max_optimized_tokens <= 0:
-            return char_budget
+        if not cfg.dynamic_budget_enabled:
+            return static
 
-        return min(char_budget, cfg.max_optimized_tokens)
+        window = self._backend_context_window()
+        if window is None or window <= 0:
+            return static
+
+        derived = int(window * cfg.budget_window_fraction)
+        # Never go below the configured floor, and never below the char budget.
+        budget = max(derived, cfg.max_optimized_tokens, char_budget)
+        # Scale by the learned backend-tokenizer ratio so the cap is enforced
+        # against true backend tokens (clamped to [0.5, 2.0] upstream).
+        return max(1, round(budget * self._token_calibration))
+
+    def _backend_context_window(self) -> int | None:
+        """Return the live backend context window in tokens, or None if unknown.
+
+        Reads the cached capability probe so the budget tracks the active device
+        (GPU/NPU) without a network call on the hot path. Returns None when no
+        probe is wired or the window has not been detected yet.
+        """
+        probe = self._capability_probe
+        if probe is None:
+            return None
+        try:
+            caps = probe.cached()
+        except Exception:
+            return None
+        if caps is None:
+            return None
+        return caps.max_context_window
+
+    def _dynamic_cap(self, fraction: float, floor: int) -> int:
+        """Return ``max(fraction * dynamic_budget, floor)`` in tokens.
+
+        Used to derive the various sub-caps (tool-output compression threshold,
+        code-chunk size, state-step cap, anchor constraints) from the live
+        backend window so they scale with the device instead of being fixed.
+        Falls back to ``floor`` when the window is unknown or dynamic budgeting
+        is disabled (the floor is the configured static value).
+        """
+        if not self._config.agentic.dynamic_budget_enabled:
+            return floor
+        return max(floor, int(self._budget_tokens() * fraction))
+
+    def _dynamic_tool_output_max_chars(self) -> int:
+        """Boundary-compression threshold (chars) for tool/assistant output.
+
+        Derived from ``tool_output_compression_budget_fraction * dynamic budget``
+        (tokens), converted to a char floor via ~4 chars/token, then clamped to
+        the configured ``tool_output_compression_max_chars`` floor.
+        """
+        cfg = self._config.agentic
+        derived = self._dynamic_cap(cfg.tool_output_compression_budget_fraction, 0) * 4
+        return max(cfg.tool_output_compression_max_chars, derived)
+
+    def _dynamic_user_paste_max_chars(self) -> int:
+        """Boundary-compression threshold (chars) for large user code pastes."""
+        cfg = self._config.agentic
+        derived = self._dynamic_cap(cfg.user_paste_compression_budget_fraction, 0) * 4
+        return max(cfg.user_paste_compression_max_chars, derived)
+
+    def _dynamic_chunk_max_chars(self) -> int:
+        """Max size (chars) of a single tree-sitter code chunk for RAG retrieval."""
+        cfg = self._config.code_chunking
+        derived = self._dynamic_cap(cfg.chunk_budget_fraction, 0) * 4
+        return max(cfg.chunk_max_chars, derived)
+
+    def _dynamic_max_state_steps(self) -> int:
+        """Per-session AgentStateStore step cap derived from the dynamic budget."""
+        cfg = self._config.agentic
+        return self._dynamic_cap(cfg.state_steps_budget_fraction, cfg.max_state_steps)
+
+    def _dynamic_max_anchor_constraints(self) -> int:
+        """Cap on accumulated quality-anchor constraints, scaled by the budget."""
+        cfg = self._config.agentic
+        if not cfg.dynamic_budget_enabled:
+            return 5
+        derived = int(self._budget_tokens() * cfg.anchor_max_constraints_budget_factor)
+        return max(5, derived)
 
     def set_token_calibration(self, ratio: float | None) -> None:
         """Learn the backend tokenizer ratio from the previous turn (review §1/§9, #6).
@@ -620,6 +722,10 @@ class AgentContextOptimizer:
 
         # Step 1: Populate the state store from messages
         self._ingest_messages(messages)
+        # Keep the per-session step cap in sync with the live (lean) budget so a
+        # long session on a big window retains more goal context without ever
+        # growing the optimized context toward the window size.
+        self.store.set_max_steps(self._dynamic_max_state_steps())
 
         # Step 2: Set the root goal if not already set
         if not self.store.get_goal() and original_prompt:
@@ -632,6 +738,19 @@ class AgentContextOptimizer:
                     subtasks = self.goal_decomposer.decompose(goal_text)
                     self.progress_tracker.set_subtasks(subtasks)
                     break
+
+        # REVIEW §6: pin the original request's anchor facts into the rolling
+        # summary so they survive front-eviction of Turn 1 (fact_recall would
+        # otherwise collapse to 0 by turn 30). Seed once per session from the
+        # first user request; the summarizer ignores later calls to keep the
+        # summary head byte-stable for prefix-cache reuse.
+        if self.hierarchical_summarizer is not None and self._cache_stable_summary:
+            first_user = next(
+                (m.get("content") or "" for m in messages if m.get("role") == "user"),
+                "",
+            )
+            if first_user:
+                self.hierarchical_summarizer.seed_original_request(first_user)
 
         # Step 3: Run loop detection on each step
         loop_warnings: list[LoopWarning] = []
@@ -832,9 +951,49 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Context template matching failed: %s", e)
 
+        # Step 7 (pre-compaction): Cache-stable tiered rolling-summary compaction
+        # (review §1/§3/§5, #7). MUST run BEFORE the scratchpad compactor (Step 7
+        # below): the compactor drops the entire evictable middle of the
+        # conversation in one shot, so if the summary runs after it the evicted
+        # turns are already gone and the summary has nothing to fold — that was
+        # the turn-11 quality cliff (proxy collapsed to a flat ~1.1K-token stub
+        # and never recovered). Running the summary first folds the older dynamic
+        # turns into the append-only rolling-summary block (placed right after the
+        # frozen prefix, protected from later front-eviction by its _summary_id
+        # marker) so the model keeps the task state the compactor would otherwise
+        # discard. The compactor's _partition_for_budget already preserves
+        # _summary_id messages, so the block survives the later trim.
+        if (
+            self.hierarchical_summarizer is not None
+            and self._cache_stable_summary
+            and self._config.v050.cache_stable_mode
+            and not is_lean_context
+            and current_tokens > proactive_threshold_tokens
+        ):
+            try:
+                # Re-derive the adaptive summary-cap ceiling from the dynamic
+                # context budget so it tracks the live backend window (the cap
+                # then grows with folded turns up to this ceiling inside the
+                # summarizer). Cheap: a single int multiply + attribute set.
+                self.hierarchical_summarizer.set_rolling_summary_ceiling(
+                    int(max_tokens * self._config.agentic.rolling_summary_budget_fraction)
+                )
+                frozen_end = self.context_aligner.frozen_prefix_end(
+                    optimized, self._config.v050.frozen_prefix_turns
+                )
+                optimized = self.hierarchical_summarizer.summarize_turns_cache_stable(
+                    optimized, frozen_end
+                )
+                current_tokens = self.token_counter.count_messages(optimized)
+            except Exception as e:
+                logger.warning("Rolling summary compaction failed: %s", e)
+
         # Step 7: Apply scratchpad compaction only when the context is already
         # above the proactive threshold. This keeps compaction budget-driven
-        # instead of letting it bypass proactive trim on short contexts.
+        # instead of letting it bypass proactive trim on short contexts. The
+        # rolling summary (Step 7 pre-compaction) has already folded the evicted
+        # turns into the protected _summary_id block, so this only drops what the
+        # summary has already captured.
         try:
             if current_tokens > compaction_threshold_tokens:
                 optimized = self.compactor.compact_messages(optimized)
@@ -931,32 +1090,6 @@ class AgentContextOptimizer:
             total_chars = sum(len(m.get("content") or "") for m in optimized)
         except Exception as e:
             logger.warning("Post-RAG recount failed: %s", e)
-
-        # Step 8.5: Cache-stable tiered rolling-summary compaction (review §1/§3/§5, #7).
-        # When enabled, older dynamic turns are folded into a single append-only
-        # rolling summary block placed right after the frozen prefix (never in the
-        # middle of history). The block retains constraints / the task's "don'ts"
-        # so the model does not re-derive them verbosely (the 2.17x verbosity
-        # regression). The block is protected from later front-eviction by
-        # _partition_for_budget / _sliding_window_trim via its _summary_id marker,
-        # so the leading prefix stays byte-stable and the backend reuses its cache.
-        if (
-            self.hierarchical_summarizer is not None
-            and self._cache_stable_summary
-            and self._config.v050.cache_stable_mode
-            and not is_lean_context
-            and current_tokens > proactive_threshold_tokens
-        ):
-            try:
-                frozen_end = self.context_aligner.frozen_prefix_end(
-                    optimized, self._config.v050.frozen_prefix_turns
-                )
-                optimized = self.hierarchical_summarizer.summarize_turns_cache_stable(
-                    optimized, frozen_end
-                )
-                current_tokens = self.token_counter.count_messages(optimized)
-            except Exception as e:
-                logger.warning("Rolling summary compaction failed: %s", e)
 
         # Step 9: Pre-seed reasoning prefix only when explicitly enabled.
         # Disabled by default because direct-request semantics are the quality target.
@@ -1448,7 +1581,7 @@ class AgentContextOptimizer:
             self._anchor_constraints.append(f"- {compact}")
 
         # Cap by dropping from the FRONT (oldest), keeping the recent tail stable.
-        max_constraints = 5
+        max_constraints = self._dynamic_max_anchor_constraints()
         if len(self._anchor_constraints) > max_constraints:
             self._anchor_constraints = self._anchor_constraints[-max_constraints:]
 
@@ -1749,7 +1882,7 @@ class AgentContextOptimizer:
             detected_langs.add(lang_id if lang_id != "generic" else "unknown-text")
             block_langs.append(first_line if first_line in LANG_MAP else (lang_id if lang_id != "generic" else ""))
 
-            chunks = chunk_code_with_treesitter(code, lang_id or "generic", self._config.code_chunking.chunk_max_chars)
+            chunks = chunk_code_with_treesitter(code, lang_id or "generic", self._dynamic_chunk_max_chars())
             all_chunks.extend(chunks)
 
         if not all_chunks:
@@ -2417,7 +2550,9 @@ class AgentContextOptimizer:
                     if cache_key in self._tool_output_cache:
                         result.append(self._tool_output_cache[cache_key])
                         continue
-                    compressed = compress_tool_messages([msg], self.tool_output_compressor)
+                    compressed = compress_tool_messages(
+                        [msg], ToolOutputCompressor(max_chars=self._dynamic_tool_output_max_chars())
+                    )
                     compressed_msg = compressed[0] if compressed else msg
                     self._tool_output_cache[cache_key] = compressed_msg
                     if len(self._tool_output_cache) > self._tool_output_cache_max:
@@ -2444,7 +2579,7 @@ class AgentContextOptimizer:
         Uses a content-hash cache to avoid re-compressing identical pastes that appear
         across turns (P3 live-zone compression).
         """
-        max_chars = self._config.agentic.user_paste_compression_max_chars
+        max_chars = self._dynamic_user_paste_max_chars()
         compressor = ToolOutputCompressor(max_chars=max_chars)
         result: list[dict[str, Any]] = []
         for msg in messages:

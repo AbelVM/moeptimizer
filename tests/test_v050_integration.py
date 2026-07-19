@@ -196,6 +196,16 @@ class TestV050Integration:
             ("assistant", "Response 4"),
             ("user", "Turn 5"),
             ("assistant", "Response 5"),
+            ("user", "Turn 6"),
+            ("assistant", "Response 6"),
+            ("user", "Turn 7"),
+            ("assistant", "Response 7"),
+            ("user", "Turn 8"),
+            ("assistant", "Response 8"),
+            ("user", "Turn 9"),
+            ("assistant", "Response 9"),
+            ("user", "Turn 10"),
+            ("assistant", "Response 10"),
         )
 
         result = summarizer.summarize_turns(messages)
