@@ -1951,6 +1951,31 @@ def _message_text(content: Any) -> str:
     return json.dumps(content)
 
 
+def _tool_calls_text(tool_calls: Any) -> str:
+    """Serialize assistant ``tool_calls`` arguments to text for content grading.
+
+    Agentic coding models frequently emit code INSIDE a tool-call argument (e.g. a
+    ``str_replace``/``bash`` tool call that rewrites a source file) rather than in
+    the message ``content`` text. The code-preservation grader
+    (:func:`_code_block_preservation`, :func:`_has_code_content`) only inspects the
+    captured text, so code hidden in tool calls is invisible and ``has_code_proxy``
+    collapses to a false zero (REVIEW.md P2). Concatenating the arguments here lets
+    the grader see tool-emitted code without changing the model-facing payload.
+    """
+    if not tool_calls:
+        return ""
+    parts: list[str] = []
+    for tc in tool_calls:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if not fn:
+            continue
+        name = fn.get("name") or ""
+        args = fn.get("arguments")
+        if args:
+            parts.append(f"[{name}]\n{args if isinstance(args, str) else json.dumps(args)}")
+    return "\n".join(parts)
+
+
 def _serialize_messages_text(messages: list[dict]) -> str:
     """Render a message list as plain text (role + content), newline-joined.
 
@@ -2505,6 +2530,68 @@ def _code_block_fingerprint(block: str, fence_tag: str) -> str:
     return norm
 
 
+def _has_code_content(text: str) -> bool:
+    """Robustly detect whether ``text`` contains code (fenced, inline, or indented).
+
+    The naive check (``"```" in text``) misses code the model emits WITHOUT fences
+    — inline backtick code, 4-space-indented blocks, or prose with def/class/import
+    lines. A proxy that compacts the input context can shift the model from a
+    fenced-block answer to an unfenced one, which would make ``has_code_proxy`` a
+    false zero and hide a real quality signal (REVIEW.md P2). This helper catches
+    those cases so the metric reflects genuine code presence, not formatting.
+    """
+    if not text:
+        return False
+    # Fenced blocks (```lang ... ```) or bare ``` fences.
+    if "```" in text:
+        return True
+    # Inline backtick code: `something`.
+    if re.search(r"`[^`\n]{3,}`", text):
+        return True
+    # Indented code block: a line starting with 4+ spaces and a code-like token.
+    if re.search(r"(?m)^ {4,}(def |class |import |from |return |async |#!|</?|func |function )", text):
+        return True
+    # Code-like keyword lines anywhere (loose signal, last resort).
+    code_kw = (
+        "def ", "class ", "import ", "async def ", "return ", "=>", "function ",
+        "public ", "private ", "const ", "let ", "var ", "package ", "fn ",
+    )
+    return any(kw in text for kw in code_kw)
+
+
+def _code_likeness(text: str) -> float:
+    """Fraction of lines in ``text`` that look like code (0.0–1.0).
+
+    Diagnostic companion to :func:`_has_code_content`: distinguishes "genuinely no
+    code" from "code without fences" so a benchmark run can tell whether a low
+    ``has_code_proxy`` is a real model-behavior regression or just unfenced code
+    (REVIEW.md P2). Counts a line as code-like if it is indented with a code
+    keyword, contains an assignment/control-flow token, or is inside a fenced block.
+    """
+    if not text:
+        return 0.0
+    lines = text.splitlines()
+    if not lines:
+        return 0.0
+    in_fence = False
+    code_lines = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            code_lines += 1
+            continue
+        if in_fence:
+            code_lines += 1
+            continue
+        if re.match(r" {4,}(def |class |import |from |return |async |func |function )", line):
+            code_lines += 1
+            continue
+        if re.search(r"(=|\bif\b|\bfor\b|\bwhile\b|\bdef\b|\bclass\b|\breturn\b|\bimport\b)", stripped) and len(stripped) > 8:
+            code_lines += 1
+    return round(code_lines / len(lines), 4)
+
+
 def _code_block_preserved(dblock: str, dtag: str, proxy_blocks: list[tuple[str, str]]) -> bool:
     """Decide whether a direct code block is preserved in the proxy response.
 
@@ -2553,7 +2640,7 @@ def _code_block_preservation(direct_content: str, proxy_content: str) -> dict[st
     proxy_blocks = [(m.group(2), m.group(1).strip()) for m in fence_re.finditer(proxy_content)]
 
     if not direct_blocks:
-        return {"block_ratio": 1.0, "has_code_direct": False, "has_code_proxy": bool(proxy_blocks)}
+        return {"block_ratio": 1.0, "has_code_direct": False, "has_code_proxy": _has_code_content(proxy_content)}
 
     preserved = 0
     for dblock, dtag in direct_blocks:
@@ -2584,7 +2671,7 @@ def _code_block_preservation(direct_content: str, proxy_content: str) -> dict[st
     return {
         "block_ratio": round(preserved / max(len(direct_blocks), 1), 6),
         "has_code_direct": True,
-        "has_code_proxy": bool(proxy_blocks) or ("```" in proxy_content),
+        "has_code_proxy": _has_code_content(proxy_content),
     }
 
 
@@ -3646,6 +3733,7 @@ def _collect_direct_conversation(
             f"(raw {direct_context['messages']} msgs/{direct_context['chars']:,} chars, no proxy)"
         )
 
+        d_tool_calls: list[dict] | None = None
         try:
             if stream:
                 d_content, d_reasoning, d_usage, d_ttft, d_latency, _, _, d_tool_calls = _direct_stream_request(
@@ -3672,6 +3760,7 @@ def _collect_direct_conversation(
                 d_usage = direct_resp.get("usage", {}) or {}
                 d_msg = direct_resp["choices"][0]["message"]
                 d_content = (d_msg.get("content") or "") + (d_msg.get("reasoning_content") or "")
+                d_tool_calls = d_msg.get("tool_calls")
                 d_ttft = None
                 d_finish_reason = direct_resp["choices"][0].get("finish_reason", "")
 
@@ -3715,7 +3804,9 @@ def _collect_direct_conversation(
 
         if d_content or d_msg.get("tool_calls"):
             _append_assistant_message(messages, d_msg)
-            direct_contents.append(d_content)
+            # Include tool-call arguments so code emitted inside tool calls is
+            # visible to the code-preservation grader (REVIEW.md P2).
+            direct_contents.append(d_content + _tool_calls_text(d_tool_calls))
         else:
             direct_contents.append("")
 
@@ -3773,6 +3864,7 @@ def _collect_proxy_conversation(
             f"~{proxy_context['estimated_tokens']:,} tok (pre-optimization)"
         )
 
+        p_tool_calls: list[dict] | None = None
         try:
             if stream:
                 p_content, p_reasoning, p_usage, p_ttft, p_latency, p_headers, p_prefix_hit, p_tool_calls = _proxy_stream_request(
@@ -3797,6 +3889,7 @@ def _collect_proxy_conversation(
                 p_usage = proxy_resp.get("usage", {}) or {}
                 p_msg = proxy_resp["choices"][0]["message"]
                 p_content = (p_msg.get("content") or "") + (p_msg.get("reasoning_content") or "")
+                p_tool_calls = p_msg.get("tool_calls")
                 p_ttft = None
                 # Non-streaming: the proxy surfaces its authoritative prefix-cache
                 # hit count as a response header (app.py: X-Prefix-Cache-Hit-Tokens).
@@ -3908,7 +4001,9 @@ def _collect_proxy_conversation(
 
         if p_content or (isinstance(p_msg, dict) and p_msg.get("tool_calls")):
             _append_assistant_message(messages, p_msg)
-            proxy_contents.append(p_content)
+            # Include tool-call arguments so code emitted inside tool calls is
+            # visible to the code-preservation grader (REVIEW.md P2).
+            proxy_contents.append(p_content + _tool_calls_text(p_tool_calls))
         else:
             proxy_contents.append("")
 

@@ -105,11 +105,25 @@ class AgenticConfig(BaseModel):
                     "max_optimized_tokens when the window is unknown or the probe is unavailable.",
     )
     budget_window_fraction: float = Field(
-        default=0.06,
+        default=0.025,
         description="Fraction of the live backend context window used as the dynamic token budget "
-                    "(only when dynamic_budget_enabled). 0.06 = 6% of the window, leaving ample "
-                    "headroom for the model's own generation and the cache-stable prefix while "
-                    "retaining far more recent verbatim context than a fixed ~12K cap on a 262K window.",
+                    "(only when dynamic_budget_enabled). 0.025 = 2.5% of the window. Kept deliberately "
+                    "small for cache-stable workloads: on a 262K window this yields ~6.5K effective cap "
+                    "(floored by max_optimized_tokens), which is large enough for a dense recent window "
+                    "but small enough that over-cap eviction never forces a mid-body rewrite that would "
+                    "break the backend's prefix-cache reuse (the v0.7.18 turn-13 regression). The "
+                    "growth ceiling (max_context_growth_per_turn) bounds per-turn expansion further.",
+    )
+    max_context_growth_per_turn: int = Field(
+        default=1500,
+        description="Hard ceiling on how much the OPTIMIZED context may GROW in a single turn "
+                    "(tokens). Prevents one turn from jumping straight to the dynamic budget cap and "
+                    "forcing a large mid-body rewrite that breaks backend prefix-cache reuse (the "
+                    "v0.7.18 turn-13 regression). When the next turn's optimized size would exceed "
+                    "the previous turn's size by more than this, the optimizer trims back to "
+                    "prev_size + max_context_growth_per_turn instead of the full budget, so growth is "
+                    "gradual and the cached prefix stays valid. Set to 0 to disable the growth cap "
+                    "(use the full dynamic budget immediately).",
     )
     rolling_summary_budget_fraction: float = Field(
         default=0.25,
@@ -660,8 +674,8 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         # over-compressed 15-29x because the protected tail + summary floor
         # plateaued at ~2.1K tok while direct grew to 59K tok). The token budget is
         # now DYNAMIC (dynamic_budget_enabled): derived from the live backend window
-        # (budget_window_fraction=0.06) and floored by max_optimized_tokens, so on a
-        # 262K window the effective cap is ~15.7K rather than a fixed 12K. The 12000
+        # (budget_window_fraction=0.025) and floored by max_optimized_tokens, so on a
+        # 262K window the effective cap is ~6.5K rather than a fixed 12K. The 12000
         # here is the floor, not the effective cap. hierarchical_summary_max_full_turns
         # tracks keep_full_steps so the rolling summary protects the same window.
         "keep_full_steps": 8,

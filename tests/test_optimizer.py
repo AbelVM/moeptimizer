@@ -1101,3 +1101,126 @@ class TestDynamicSubCaps:
         # The store cap should track the dynamic value, not the static floor.
         assert opt.store._max_steps_override == opt._dynamic_max_state_steps()
         assert opt.store._max_steps_override > 200
+
+
+class TestCacheStabilityAcrossTurns:
+    """P0.3 (REVIEW.md): the frozen prefix + rolling-summary head must stay
+    byte-stable across a long agentic session so the backend's prefix-cache KV
+    is reused every turn. The v0.7.18 regression mutated the middle of the
+    dynamic body at turn 13, collapsing reuse to the frozen prefix only.
+    """
+
+    def _opt(self) -> AgentContextOptimizer:
+        config = AppConfig()
+        config.agentic.dynamic_budget_enabled = True
+        config.agentic.budget_window_fraction = 0.025
+        config.agentic.max_optimized_tokens = 12000
+        config.agentic.max_optimized_chars = 48000
+        config.agentic.max_context_growth_per_turn = 1500
+        config.agentic.keep_full_steps = 8
+        config.agentic.quality_profile = "balanced"
+        config.v050.cache_stable_mode = True
+        config.v050.frozen_prefix_turns = 2
+        config.v050.cache_stable_summary_enabled = True
+        config.v050.hierarchical_summary_max_full_turns = 8
+
+        class _Caps:
+            max_context_window = 262144
+            remote_tokenize = False
+
+        class _Probe:
+            def cached(self) -> _Caps:
+                return _Caps()
+
+        return AgentContextOptimizer(config, capability_probe=_Probe())
+
+    def _build_turn(self, n: int) -> list[dict[str, Any]]:
+        """A realistic agentic turn: user request + assistant reply with code."""
+        return [
+            {
+                "role": "user",
+                "content": (
+                    f"Turn {n}: refactor module_{n} to use async def process_{n}() "
+                    f"and handle the edge case where input_{n} is None. "
+                    f"Keep the public API stable and do not change the return type."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    f"Here is the change for turn {n}:\n"
+                    f"```python\n"
+                    f"async def process_{n}(input_{n}):\n"
+                    f"    if input_{n} is None:\n"
+                    f"        return default_{n}\n"
+                    f"    return await transform_{n}(input_{n})\n"
+                    f"```\n"
+                    f"I kept the return type unchanged and added the None guard."
+                ),
+            },
+        ]
+
+    def _frozen_prefix_hash(self, opt: AgentContextOptimizer, msgs: list[dict[str, Any]]) -> str:
+        """Hash the byte-stable leading section: frozen prefix + summary head."""
+        import hashlib
+
+        optimized = opt.optimize_messages(msgs)
+        # The frozen prefix is system + first user + frozen_prefix_turns turns.
+        frozen_end = opt.context_aligner.frozen_prefix_end(
+            optimized, opt._config.v050.frozen_prefix_turns
+        )
+        stable = optimized[:frozen_end]
+        # Include any rolling-summary block (append-only, byte-stable head).
+        for m in optimized[frozen_end:]:
+            if m.get("_summary_id") or m.get("_rolling_summary"):
+                stable.append(m)
+            else:
+                break
+        blob = "\n".join(
+            f"{m.get('role')}:{m.get('content')}" for m in stable
+        ).encode("utf-8")
+        return hashlib.md5(blob).hexdigest(), len(optimized), optimized
+
+    def test_frozen_prefix_stable_across_30_turns(self) -> None:
+        opt = self._opt()
+        # Seed with system + first user so the frozen prefix exists.
+        conversation: list[dict[str, Any]] = [
+            {"role": "system", "content": "You are a coding agent. Keep APIs stable."},
+            {"role": "user", "content": "Initial task: build the pipeline."},
+            {"role": "assistant", "content": "I will build the pipeline step by step."},
+        ]
+        prev_hash: str | None = None
+        for n in range(1, 31):
+            conversation.extend(self._build_turn(n))
+            h, _opt_len, _ = self._frozen_prefix_hash(opt, list(conversation))
+            # The frozen prefix + summary head must not change byte-for-byte
+            # across turns (backend prefix-cache reuse invariant). The prefix is
+            # still GROWING until frozen_prefix_turns complete turns have
+            # accumulated (turn 2 here), so only assert stability once it has
+            # fully formed (turn 3+). This is the exact invariant that broke at
+            # turn 13 in v0.7.18 (the over-cap mid-body rewrite).
+            if n >= 3:
+                assert prev_hash is not None
+                assert h == prev_hash, (
+                    f"prefix hash changed at turn {n}: {prev_hash} -> {h}"
+                )
+            prev_hash = h
+
+    def test_growth_ceiling_bounds_per_turn_expansion(self) -> None:
+        """The effective budget must not exceed prev_size + growth cap."""
+        opt = self._opt()
+        # First turn establishes a baseline size.
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        opt.optimize_messages(msgs)
+        base = opt._last_optimized_token_count or 0
+        # A much larger second turn would otherwise jump to the full ~6.5K budget.
+        big = [*msgs, {"role": "user", "content": "x" * 4000}, {"role": "assistant", "content": "y" * 4000}]
+        opt.optimize_messages(big)
+        grown = (opt._last_optimized_token_count or 0) - base
+        assert grown <= opt._config.agentic.max_context_growth_per_turn + 50, (
+            f"context grew {grown} tokens in one turn, exceeds growth ceiling"
+        )

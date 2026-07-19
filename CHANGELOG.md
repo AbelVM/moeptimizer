@@ -845,3 +845,68 @@ output and user pastes keep more verbatim content within the lean budget, RAG
 retrieval uses larger relevant code chunks, and long sessions retain more goal
 state — all without raising the total optimized-context size (still ~6% of window)
 or touching the cache-stable prefix.
+
+### v0.7.19 — Stop the prefix-cache break (P0 from REVIEW.md) (2026-07-19)
+
+The v0.7.16–v0.7.18 dynamic-budget work was functionally correct but over-expanded
+the optimized context for long agentic sessions, which triggered a **prefix-cache
+stability break at turn 13** (REVIEW.md): the context grew to ~12K tokens, the
+over-cap eviction/compaction rewrote the *middle* of the dynamic body, the
+backend's cached KV for that body was invalidated, and the model drifted
+(`contradictions` 2 → 78). This release caps growth so the stable prefix is never
+mutated mid-session.
+
+- **Changed `budget_window_fraction` 0.06 → 0.025** (default). On a 262K window
+  this yields a ~6.5K effective cap (floored by `max_optimized_tokens`) instead of
+  ~15.7K — large enough for a dense recent window, small enough that over-cap
+  eviction never forces a mid-body rewrite. The `balanced` profile comment updated
+  to match.
+- **New `max_context_growth_per_turn` (default 1500 tokens)** — a hard ceiling on
+  how much the optimized context may GROW in a single turn. `AgentContextOptimizer`
+  gains `_effective_budget_tokens()`, which wraps `_budget_tokens()` with
+  `min(budget, prev_size + max_context_growth_per_turn)`; the main eviction /
+  compaction gate (Step 7 + Step 12) now uses it, so the context grows gradually
+  and the cached prefix stays valid. Set to `0` to disable the growth cap.
+- **New regression test** `tests/test_optimizer.py::TestCacheStabilityAcrossTurns`:
+  - `test_frozen_prefix_stable_across_30_turns` — runs a 30-turn agentic
+    conversation on one optimizer instance and asserts the frozen prefix +
+    rolling-summary head bytes are byte-stable once the prefix has fully formed
+    (the exact invariant that broke at turn 13 in v0.7.18).
+  - `test_growth_ceiling_bounds_per_turn_expansion` — asserts a single oversized
+    turn cannot expand the context beyond `prev_size + max_context_growth_per_turn`.
+- README config table updated for `budget_window_fraction` (0.025) and the new
+  `max_context_growth_per_turn` field.
+
+**Regression gate (REVIEW.md §6):** accepted only if a re-run of
+`benchmark_opencode_30_1_0.7.19` shows `prefix_cache_reuse_ratio` ≥ 1.0 at every
+turn 1–30, `contradictions` (proxy) ≤ 5, `prompt_faithfulness` median ≥ 0.36,
+`token_savings_pct` ≥ 80%, `fact_recall_turn30` = 1.0, and the full suite green.
+
+### v0.7.20 — Fix `has_code_proxy = 0.0` grader blind spot (P2 from REVIEW.md) (2026-07-19)
+
+`has_code_proxy` was a **false zero**, not a model-behavior regression. In the
+agentic `opencode` coding scenario the model emits code *inside tool-call
+arguments* (e.g. a `str_replace`/`bash` tool call that rewrites a source file),
+not in the message `content` text. The benchmark captured only `content` +
+`reasoning` into the graded text and never concatenated `tool_calls` arguments,
+so `_code_block_preservation` / `_has_code_content` could not see tool-emitted
+code and `has_code_proxy` collapsed to 0.0 across all 30 turns.
+
+- **New `_tool_calls_text()`** — serializes assistant `tool_calls[].function.arguments`
+  into text. `direct_contents` / `proxy_contents` now append it so the
+  code-preservation grader sees code emitted via tool calls (the model-facing
+  payload is unchanged). `d_tool_calls` / `p_tool_calls` are now initialized in
+  both stream and non-stream paths (and the error branch) so the helper is always
+  safe.
+- **Hardened `_has_code_content()`** — also detects unfenced code (inline backtick
+  code, 4-space-indented blocks, code keywords), so a low `has_code_proxy` reflects
+  genuine absence rather than formatting. `_code_block_preservation` now reports
+  `has_code_proxy` via this helper instead of the bare `"```" in text` check.
+- **New `_code_likeness()` diagnostic** — fraction of code-like lines, so future
+  runs can distinguish "genuinely no code" from "code without fences".
+- **New regression test** `tests/test_benchmark_code_capture.py` — guards
+  tool-call code capture, unfenced-code detection, and the
+  `_code_block_preservation` path.
+
+**Next step:** re-run `benchmark_opencode_30_1_0.7.20` to confirm `has_code_proxy`
+now tracks tool-emitted code (expected to rise well above 0.0).

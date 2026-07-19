@@ -325,6 +325,26 @@ class AgentContextOptimizer:
         # against true backend tokens (clamped to [0.5, 2.0] upstream).
         return max(1, round(budget * self._token_calibration))
 
+    def _effective_budget_tokens(self) -> int:
+        """Return the budget actually enforced this turn, with the growth ceiling.
+
+        Wraps :meth:`_budget_tokens` with the per-turn growth cap
+        (``max_context_growth_per_turn``). The dynamic budget can be much larger
+        than the previous turn's optimized context (e.g. ~6.5K on a 262K window);
+        without a growth cap a single turn could jump straight to the cap and force
+        a large mid-body rewrite that breaks the backend's prefix-cache reuse (the
+        v0.7.18 turn-13 regression). The growth ceiling limits expansion to
+        ``prev_size + max_context_growth_per_turn`` so the context grows gradually
+        and the cached prefix stays valid. On the first turn (no previous size) or
+        when the cap is disabled (0), the full dynamic budget applies.
+        """
+        budget = self._budget_tokens()
+        cap = self._config.agentic.max_context_growth_per_turn
+        if cap <= 0 or self._last_optimized_token_count is None:
+            return budget
+        ceiling = self._last_optimized_token_count + cap
+        return min(budget, ceiling)
+
     def _backend_context_window(self) -> int | None:
         """Return the live backend context window in tokens, or None if unknown.
 
@@ -773,7 +793,7 @@ class AgentContextOptimizer:
         # ``current_tokens`` and only recompute it right after a stage mutates
         # ``optimized``. Every gate below reads this variable instead of calling
         # count_messages again.
-        max_tokens = self._budget_tokens()
+        max_tokens = self._effective_budget_tokens()
         proactive_threshold_tokens = int(max_tokens * self._config.agentic.proactive_trim_ratio)
         compaction_threshold_tokens = int(max_tokens * self._config.agentic.compaction_trigger_ratio)
         current_tokens = self.token_counter.count_messages(optimized)
