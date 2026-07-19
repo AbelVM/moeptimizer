@@ -75,6 +75,7 @@ from moeptimizer.mtp_state import get_mtp_state_manager
 from moeptimizer.pattern_injector import get_pattern_injector
 from moeptimizer.progress_tracker import ProgressTracker
 from moeptimizer.prompt_templates import classify_and_template
+from moeptimizer.quality_guard import AdaptiveQualityGuard
 from moeptimizer.selective_truncator import get_selective_truncator
 from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
@@ -145,6 +146,19 @@ class AgentContextOptimizer:
         self.hit_prediction = get_hit_prediction_model(retrain_threshold=v050.hit_prediction_retrain_threshold) if v050.hit_prediction_enabled else None
         self.delta_encoder = get_delta_encoder() if v050.delta_encoding_enabled else None
         self.async_io = get_async_io_stage(max_thread_workers=v050.async_io_max_thread_workers, max_async_concurrency=v050.async_io_max_concurrency) if v050.async_io_enabled else None
+
+        # Adaptive Context Quality Guard (ACQG) — closed-loop response quality regulation.
+        # Analyzes each assistant response and adjusts compression aggressiveness
+        # adaptively. Each optimizer gets its own guard instance so per-session
+        # state does not leak across sessions or tests.
+        acqg_config = self._config.agentic
+        self._quality_guard = AdaptiveQualityGuard(
+            enabled=acqg_config.quality_guard_enabled,
+            quality_ema_alpha=acqg_config.quality_guard_alpha,
+            quality_critical=acqg_config.quality_guard_critical_threshold,
+            quality_degraded=acqg_config.quality_guard_degraded_threshold,
+            quality_healthy=acqg_config.quality_guard_healthy_threshold,
+        )
 
         self.compactor = ScratchpadCompactor(
             keep_full=self._config.agentic.keep_full_steps,
@@ -659,6 +673,41 @@ class AgentContextOptimizer:
         compaction_threshold_tokens = int(max_tokens * self._config.agentic.compaction_trigger_ratio)
         current_tokens = self.token_counter.count_messages(optimized)
         total_tokens = current_tokens
+
+        # ── Adaptive Context Quality Guard (ACQG) ─────────────────────────────
+        # Check the quality guard's compression multiplier. When quality has
+        # degraded, we raise the effective budget thresholds to apply less
+        # compression. When quality is critically low, we skip aggressive stages.
+        # This creates a closed feedback loop: bad responses → less compression
+        # → more context preserved → better responses.
+        qg = self._quality_guard
+        qg_compression_mult = qg.get_compression_multiplier()
+        qg_skip_aggressive = qg.should_skip_compression()
+
+        if qg_skip_aggressive:
+            logger.info(
+                "[QualityGuard] Pausing aggressive compression (ema=%.3f, collapsed=%d)",
+                qg.quality_score,
+                qg.consecutive_collapsed,
+            )
+            # Set thresholds high enough that most stages gate themselves out,
+            # but keep the hard budget cap for safety.
+            proactive_threshold_tokens = int(max_tokens * 1.5)  # Effectively off
+            compaction_threshold_tokens = int(max_tokens * 1.8)  # Effectively off
+        elif qg_compression_mult < 1.0:
+            # Scale thresholds UP (less aggressive compression) when quality is
+            # degraded. E.g. mult=0.5 → thresholds are 2x higher.
+            scale = 1.0 / max(0.1, qg_compression_mult)
+            orig_proactive = int(max_tokens * self._config.agentic.proactive_trim_ratio)
+            orig_compaction = int(max_tokens * self._config.agentic.compaction_trigger_ratio)
+            proactive_threshold_tokens = int(orig_proactive * scale)
+            compaction_threshold_tokens = int(orig_compaction * scale)
+            logger.debug(
+                "[QualityGuard] Scaling thresholds by %.2f (ema=%.3f, mult=%.2f): "
+                "proactive=%d compaction=%d",
+                scale, qg.quality_score, qg_compression_mult,
+                proactive_threshold_tokens, compaction_threshold_tokens,
+            )
 
         # Single lean-context signal (review §2 / C14). The fast path is the
         # primary early-return gate, but it can be bypassed for lean contexts that
@@ -1551,6 +1600,11 @@ class AgentContextOptimizer:
             self._active_file_order.remove(norm)
         self._active_files[norm] = content
         self._active_file_order.append(norm)
+
+        # Also register with the ACQG content protection so the file survives
+        # eviction even when quality is degraded.
+        self._quality_guard.content_protection.protect(norm, turns=3)
+
         # Keep only the most recent few files.
         while len(self._active_file_order) > 5:
             old = self._active_file_order.pop(0)

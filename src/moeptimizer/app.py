@@ -861,6 +861,19 @@ def _make_streaming_generator(
                 except Exception:
                     logger.debug("Failed to capture thinking block", exc_info=True)
 
+            # ACQG (Adaptive Context Quality Guard): record the assistant response
+            # for quality analysis. This feeds into the closed-loop feedback that
+            # adaptively adjusts compression aggressiveness based on response quality.
+            if optimizer is not None and _acc_content:
+                try:
+                    qg = getattr(optimizer, "_quality_guard", None)
+                    if qg is not None:
+                        _full_content = "".join(_acc_content)
+                        max_tok = body.get("max_tokens")
+                        qg.record_response(_full_content, max_tokens_hint=max_tok)
+                except Exception:
+                    logger.debug("Failed to record quality indicator", exc_info=True)
+
             # Aggregate process-wide metrics from the authoritative backend signal.
             PROXY_METRICS.record_turn(
                 session_id=session_id,
@@ -994,6 +1007,23 @@ async def _do_non_streaming(
                 optimizer.record_cache_outcome(cache_hit_tokens)
             except Exception:
                 logger.debug("Failed to record cache outcome", exc_info=True)
+
+        # ACQG (Adaptive Context Quality Guard): record the assistant response
+        # for quality analysis. This feeds into the closed-loop feedback that
+        # adaptively adjusts compression aggressiveness based on response quality.
+        if optimizer is not None:
+            try:
+                qg = getattr(optimizer, "_quality_guard", None)
+                if qg is not None:
+                    choices = backend_data.get("choices", [])
+                    if choices:
+                        msg = choices[0].get("message", {})
+                        content = (msg.get("content") or "") + (msg.get("reasoning_content") or "")
+                        if content:
+                            max_tok = body.get("max_tokens")
+                            qg.record_response(content, max_tokens_hint=max_tok)
+            except Exception:
+                logger.debug("Failed to record quality indicator", exc_info=True)
 
         # Aggregate process-wide metrics from the authoritative backend signal.
         PROXY_METRICS.record_turn(
