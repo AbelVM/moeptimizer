@@ -156,7 +156,61 @@ The front-eviction path itself (`_proactive_trim`, `optimizer.py:2378`; `_slidin
 - Added `_code_likeness()` diagnostic (fraction of code-like lines) for future runs to distinguish "genuinely no code" from "code without fences".
 - Initialized `d_tool_calls` / `p_tool_calls` in both stream and non-stream paths (and the error branch) so the helper is always safe.
 
-**Verification:** unit-checked `_tool_calls_text` surfaces `def f(): ...` from a tool-call argument and `_has_code_content` returns `True`. Re-run `benchmark_opencode_30_1_0.7.20` to confirm `has_code_proxy` now tracks tool-emitted code (expected to rise well above 0.0). `tests/test_benchmark_code_capture.py` added as a regression guard.
+**Verification (v0.7.20 run):** `has_code_proxy` mean **0.0 → 0.9333** (median 1.0), `has_code_direct` 0.367 → 0.1667. Confirms the false-zero was a grader blind spot; tool-call-emitted code is now captured. `tests/test_benchmark_code_capture.py` added as a regression guard.
+
+### P0.4 — v0.7.19 growth-ceiling fix FAILED the regression gate (prefix break persists)
+
+**Benchmark `benchmark_opencode_30_1_0.7.20_baseline` (first run after the P0 fix) shows the turn-13 prefix-cache break is NOT fixed — it moved one turn earlier (turn 13) and is otherwise identical to v0.7.18.**
+
+Per-turn `prefix_cache_reuse_ratio` (from the run log `cache=<hit>/<ratio>`):
+- Turns 1–12: healthy, ratio **≥ 1.0** (1.26, 1.24, 1.37, 1.36, 1.35, 1.34, 1.2, 1.3, 1.39, 1.0, 1.1).
+- **Turn 13: `cache=881/0.43`** — collapses. `faith=0.273 evict=0.372` (was 0.995/0.997 at turn 12).
+- Turns 14–30: stuck at **881 cached tokens** (the frozen prefix only), ratio **0.19–0.34**.
+
+The aggregate `prefix_cache_reuse_ratio=1.0537` is **misleading** — it is dominated by the healthy early turns and hides the deep-turn collapse. The REVIEW.md §6 gate requires `prefix_cache_reuse_ratio >= 1.0 at EVERY turn 1–30`; this run **FAILS** at turns 13–30.
+
+**Why the growth ceiling did not fix it:** `_effective_budget_tokens()` only caps how much the context *grows* per turn. The break is not about growth — it is that the **body between the frozen prefix (881 tok) and the live zone is rewritten every turn** (rolling summary re-folds, eviction reorders), so the backend can only reuse the 881-token frozen head. The v0.7.19 fix bounded growth but left the body non-stable. The v0.7.13 baseline (`prefix_reuse=1.064`, `contradictions=2`) had a *stable body*; the v0.7.16+ dynamic-budget work broke that stability and v0.7.19 did not restore it.
+
+**Required next fix (P0.5):** make the body between the frozen prefix and the live zone **byte-stable across turns** — only append (incremental fold), never re-fold/reorder existing content. The rolling summary must append new folded turns rather than re-summarize the whole history each turn. Until the entire prompt up to the live zone is byte-stable, the backend prefix cache cannot reuse the body and the ratio stays ≤ ~0.34.
+
+### P0.5 — Byte-stable body (rolling summary placed right after frozen prefix) — IMPLEMENTED, pending v0.7.21 verification run
+
+**Root cause (confirmed):** the rolling-summary block was placed at the **trailing** position (after `keep_recent`), so the leading bytes of the prompt were `[frozen][keep_recent]` — which change every turn as turns shift out of `keep_recent` into the folded set. The backend could only reuse the 881-token frozen prefix. The v0.19 growth ceiling bounded *growth* but did not make the body byte-stable.
+
+**Fix (v0.7.21):**
+- `hierarchical_summarizer.py` `summarize_turns_cache_stable`: the rolling-summary block is now placed **immediately after the frozen prefix** (`return [*frozen, self._build_rolling_summary_block(), *keep_recent]`), matching the docstring contract. The summary is append-only, so the leading bytes `[frozen][summary]` are byte-stable across turns (the summary only grows by appending).
+- `compactor.py` `compact_messages`: the protected rolling-summary block is re-inserted **right after the system anchor (frozen prefix)**, not at the tail.
+- `optimizer.py`: new `_stable_prefix_end()` extends the stable prefix to include the append-only summary block (when present) so optimizer stages (e.g. Step 10 code-block skeletonize) never mutate it; `_update_stable_prefix` uses it.
+
+**Verification:** `tests/test_optimizer.py::TestCacheStabilityAcrossTurns::test_frozen_prefix_stable_across_30_turns` asserts the frozen-prefix + summary-head hash is byte-identical across turns 3–30 (the exact invariant that broke at turn 13 in v0.7.18). Full suite: **455 passed, 2 skipped**; `ruff` clean. A live `benchmark_opencode_30_1_0.7.21` run is required to confirm `prefix_cache_reuse_ratio >= 1.0` at every turn 1–30 and `contradictions <= 5`.
+
+### P0.6 — Per-turn shrink cap (P0.5 alone did NOT fix the break) — IMPLEMENTED, pending v0.7.23 verification run
+
+**The v0.7.21 run proved P0.5 insufficient:** the prefix-cache break was byte-for-byte identical to v0.7.20 — at turn 13 the proxy context collapsed 8,524→2,015 tok and only the 882-token frozen prefix was reused (`cache=882/0.44`, then 0.19–0.43 turns 14–30). The summary-block placement (P0.5) is correct but irrelevant when the **whole dynamic body is evicted in a single turn**. The real invariant the backend needs is: *the body bytes it cached last turn must still be present this turn.* A 6.5K-tok one-shot front-eviction destroys that regardless of where the summary sits.
+
+**Root cause:** the v0.7.19 growth ceiling (`max_context_growth_per_turn`) bounds *growth* but not *shrinkage*. At turn 13 the raw input jumps to 10,197 tok; after optimization the context exceeds the hard budget and the **scratchpad compactor (Step 7) drops the entire evictable body in one batch** (8,524→2,015). `_trim_to_budget` (Step 12) then sees it already under budget and is a no-op — so the 6.5K drop happens in the compactor, not the trimmer.
+
+**Fix (v0.7.22):** a symmetric per-turn **shrink cap**, derived dynamically (smart default) from the live backend window:
+- `config.agentic.max_context_shrink_per_turn` (default **0 = AUTO**) and `shrink_window_fraction` (default **0.006** of the window ≈ 1.5K tok on 262K).
+- `optimizer._effective_shrink_cap()` — when `max_context_shrink_per_turn=0`, derives `max(window * shrink_window_fraction, max_context_growth_per_turn)` so the cap scales with the device and never falls below the growth rate (a session that grows 1.5K/turn must be allowed to shrink at least as fast or it can never return to budget).
+- `optimizer._effective_shrink_floor()` = `prev_size - shrink_cap`.
+- `compactor.compact_messages(min_keep_tokens=...)` now **retains evictable pairs from the front** until the kept context reaches the floor, instead of dropping the whole body. Threaded with a token counter so the floor is measured in tokens.
+- `_trim_to_budget` / `_evict_for_budget` also honor the floor (stop evicting once `total <= min(low_water, shrink_floor)`), leaving the context slightly over budget when needed — the rest is shed gradually on later turns.
+
+**v0.7.23 follow-up (the cap was incomplete + tied to the wrong scale):** the v0.7.22 cap bounded the compactor and the front-eviction trimmer, but two content-rewrite stages still collapsed the body in one shot, and the floor was `None` on the first over-budget turn after a run of lean turns. The `benchmark_opencode_30_1_0.7.22_baseline` log showed a **turn-11 cliff** (`4091 → 1553` tokens) caused by `filter_tool_messages` (Step 11.5) replacing matched tool/assistant content with a tiny marker, unbounded. Fixes:
+- `optimizer._apply_transform_with_floor()` — applies a per-message content transform front-to-back, stopping before the next transform would drop the total below `shrink_floor` (P0.6 for content-rewrite stages). Step 11.5/11.6/11.7 (tool-output filter, tool-output compression, user-paste compression) now use it, scoped to the live zone when `live_zone_start > 0`.
+- `optimizer._finalize_optimized()` — sets `_last_optimized` / `_last_optimized_token_count` / `_last_original_token_count` on **every** return path (fast path, static-prefix KV hit, high cache-hit-rate, main pipeline end) so the shrink floor is always defined. This fixes the turn-11 `None`-floor cliff (turns 1–10 took the fast path and never set the count).
+- **Smart, context-relative cap** — `_effective_shrink_cap()` no longer derives the AUTO cap from the model's full window. It is now `max(current_size * shrink_context_fraction, max_context_growth_per_turn, shrink_min_tokens)`, proportional to the **current lean context size** (the target is a lean context, not the 262K window): a 12K-tok context may shrink ~1.8K/turn while a 2K-tok context only ~300/turn. Floored by the growth rate and an absolute `shrink_min_tokens` floor. `shrink_window_fraction` → `shrink_context_fraction` (default 0.15); new `shrink_min_tokens` (default 800).
+
+ **Verification:** `scripts/diag_shrink.py` (per-stage shrink diagnostic over `build_fixture_agentic_tasks(max_turns=30)`) now shows **no per-turn delta below `-shrink_cap`** across turns 1–30, with the cap scaling with the live context size (~1.5K at 11K context, ~800 floor at small contexts). Regression tests `test_shrink_cap_bounds_per_turn_contraction`, `test_fast_path_updates_last_optimized_token_count`, `test_filter_tool_messages_respects_shrink_floor` (optimizer) and `test_compactor_honors_shrink_floor` / `test_compactor_no_floor_drops_evictable_body` (compactor) assert the context never shrinks more than the per-turn cap and the floor is honored. Full suite: **460 passed, 2 skipped**; `ruff` clean. A live `benchmark_opencode_30_1_0.7.23` run is required to confirm `prefix_cache_reuse_ratio >= 1.0` at every turn 1–30 (the body should now shrink gradually, proportional to its size, instead of collapsing at turn 11/13) and `contradictions <= 5`.
+
+ **v0.7.24 follow-up (the turn-11 cliff was a PREFIX-CACHE break, not a token-count shrink):** re-reading the live `benchmark_opencode_30_1_0.7.23_baseline.log` showed the turn-11 drop is `cached=3192` (turn 10) → `cached=882` (turn 11) — i.e. the backend's cached KV fell to the frozen prefix only. That is a **prefix mutation**, not a context-size shrink: the rolling-summary block (part of the STABLE PREFIX) had its **leading bytes rewritten** when `_enforce_rolling_summary_budget()` front-trimmed the oldest segments to stay under the token budget. The backend had cached the old summary head; the new leading bytes no longer matched, so the whole body's cached KV was invalidated. The per-turn shrink cap (above) correctly bounds the *context size*, but it does not protect the *summary's leading bytes* — and the summary is in the cached prefix. Fixes:
+ - `hierarchical_summarizer._enforce_rolling_summary_budget()` is now a **no-op** (documents why front-trim is forbidden for a cache-stable summary).
+ - `summarize_turns_cache_stable()` now enforces the budget at **append time**: the NEW folded text is truncated to fit the *remaining* budget (`_truncate_to_budget`, keeps the front) before being appended; existing summary content is **never rewritten**. Because the adaptive budget (`_effective_summary_budget`) is monotonic (grows with folded turns, saturates at the ceiling), a later turn can always append more — the leading bytes stay byte-identical.
+ - `_truncate_to_budget(text, budget)` keeps the FRONT because `_extract_constraints` already orders high-value content (files, code) before prose, so truncation-by-front retains code over prose (the v0.7.15 "keep code over prose" guarantee is preserved at extract time, not by post-hoc front-trim).
+ - `scripts/diag_shrink.py` now also tracks the stable-prefix token size (`_live_zone_start`) and flags a **PREFIX BREAK** when it drops by >50 tokens in one turn, so a future regression is caught by the diagnostic, not only by a live run.
+
+ **Verification:** the fixture `build_fixture_agentic_tasks(max_turns=30)` does **not** reproduce the turn-11 break (stable prefix stays 467 tok through turn 11), confirming the break is content-driven in the live run (real tool outputs push the summary over budget). The append-only invariant is covered by `test_summarize_cache_stable_append_only`, `test_rolling_summary_is_append_only_and_budget_capped`, and `test_leading_prefix_byte_stable_across_turns`. Full suite: **461 passed, 2 skipped**; `ruff` clean. A live `benchmark_opencode_30_1_0.7.24` run is required to confirm `cached` stays high (no 882 drop) at turn 11 and `prefix_cache_reuse_ratio >= 1.0` turns 1–30.
 
 ### P3 — Benchmark hardening
 
@@ -166,21 +220,23 @@ The front-eviction path itself (`_proactive_trim`, `optimizer.py:2378`; `_slidin
 
 ## 6. Regression gate (definition of done for P0)
 
-A P0 change is accepted only if, on `benchmark_opencode_30_1_0.7.19`:
+A P0 change is accepted only if, on `benchmark_opencode_30_1_0.7.20` (or later):
 
-- `prefix_cache_reuse_ratio` >= 1.0 at **every** turn 1 to 30 (no post-turn-13 collapse).
-- `contradictions` (proxy) <= 5 (was 2 at v0.7.13; allow small margin).
-- `prompt_faithfulness` median >= 0.36 (keeps the v0.7.18 win).
-- `token_savings_pct` >= 80% (budget still meaningfully smaller than raw input).
-- `cache_hit_rate` >= 0.95 (unchanged).
-- `fact_recall_turn30` (proxy) = 1.0 (pinned facts intact).
-- `semantic_similarity` mean >= v0.7.13 (0.286) or, if lower, justified by the faithfulness/contradiction improvement.
-- Full suite (`pytest`) + `ruff` + `mypy` + `--check-config` green.
+- `prefix_cache_reuse_ratio` >= 1.0 at **every** turn 1 to 30 (no post-turn-13 collapse). **STATUS: PENDING v0.7.22** — P0.5 (byte-stable body) + P0.6 (per-turn shrink cap) implemented; unit tests `test_frozen_prefix_stable_across_30_turns` and `test_shrink_cap_bounds_per_turn_contraction` cover the invariants. Live run `benchmark_opencode_30_1_0.7.22` required to confirm.
+- `contradictions` (proxy) <= 5 (was 2 at v0.7.13; allow small margin). **STATUS: PENDING v0.7.22** — v0.7.20 = 31 (down from 78 at v0.7.18). Expected to drop further once the stable prefix is reused throughout the session (no mid-session drift). Live run required to confirm.
+- `prompt_faithfulness` median >= 0.36 (keeps the v0.7.18 win). **PASS** — v0.7.20 = 0.4053.
+- `token_savings_pct` >= 80% (budget still meaningfully smaller than raw input). **PASS** — v0.7.20 = 85.75.
+- `cache_hit_rate` >= 0.95 (unchanged). **PASS** — v0.7.20 = 0.9667.
+- `fact_recall_turn30` (proxy) = 1.0 (pinned facts intact). **PASS** — v0.7.20 = 1.0.
+- `semantic_similarity` mean >= v0.7.13 (0.286) or, if lower, justified by the faithfulness/contradiction improvement. **FAIL** — v0.7.20 mean = 0.1653 (justified by the faithfulness/contradiction improvement, but still below 0.286).
+- Full suite (`pytest`) + `ruff` + `mypy` + `--check-config` green. **PASS** — 458 passed, 2 skipped; `ruff` clean.
+
+**Gate verdict: PENDING v0.7.22 verification run.** P0.5 (byte-stable body) + P0.6 (per-turn shrink cap) are implemented and covered by regression tests; the prefix-cache break and contradiction count are expected to pass once the live `benchmark_opencode_30_1_0.7.22` run confirms `prefix_cache_reuse_ratio >= 1.0` at every turn 1–30 and `contradictions <= 5`.
 
 ---
 
 ## 7. Open questions
 
-1. Is `budget_window_fraction=0.02` enough headroom for the `balanced` profile's `keep_full_steps=8` + `hierarchical_summary_max_full_turns=8`? May need the growth ceiling (P0.2) rather than a flat lower fraction.
-2. Does the scratchpad compactor (`compact_messages`) rewrite middle bytes, or only drop? Needs a byte-hash diff test (P0.3) to confirm.
-3. `has_code_proxy=0.0` — RESOLVED (v0.7.20): grader blind spot for tool-call-emitted code, not model behavior. Re-run to confirm.
+1. Is `budget_window_fraction=0.025` enough headroom for the `balanced` profile's `keep_full_steps=8` + `hierarchical_summary_max_full_turns=8`? The growth ceiling (P0.2) bounded growth but did not restore body stability — the real fix is incremental (append-only) folding, not a smaller fraction.
+2. Does the scratchpad compactor (`compact_messages`) rewrite middle bytes, or only drop? Needs a byte-hash diff test (P0.3) to confirm — likely the body-rewrite source.
+3. `has_code_proxy=0.0` — RESOLVED (v0.7.20): grader blind spot for tool-call-emitted code, not model behavior. Confirmed by the v0.7.20 run (`has_code_proxy`=0.9333).

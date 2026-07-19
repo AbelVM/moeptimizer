@@ -1,5 +1,7 @@
 """Tests for hierarchical_summarizer module."""
 
+from typing import Any
+
 from moeptimizer.hierarchical_summarizer import (
     HierarchicalSummarizer,
     get_hierarchical_summarizer,
@@ -134,22 +136,23 @@ class TestHierarchicalSummarizer:
         assert result[3] == messages[3]
         assert result[4] == messages[4]
 
-        # The rolling summary block is now a TRAILING turn (review §1/§9, priority
-        # fix #1): inserting it right after the frozen prefix shifts every later
-        # turn's token offset and invalidates the backend's prefix cache. As a
-        # trailing turn it never alters the stable leading prefix, so the backend
-        # reuses its cached KV for the frozen + recent turns.
-        summary_block = result[-1]
+        # P0.5: the rolling summary block is placed IMMEDIATELY AFTER the frozen
+        # prefix (not as a trailing turn). The backend prefix cache reuses the
+        # LEADING bytes [frozen][summary], which are byte-stable across turns
+        # (the summary only appends). The old trailing placement put [frozen]
+        # [keep_recent] as the leading bytes, which change every turn and broke
+        # prefix-cache reuse at turn 13.
+        summary_block = result[5]
         assert summary_block.get("_summary_id")
         assert summary_block.get("_rolling_summary") is True
         assert summary_block["role"] == "user"
         assert "Context summary (rolling):" in summary_block["content"]
 
-        # Most recent max_full_turns (3) turns retained in full, verbatim, between
-        # the frozen prefix and the trailing summary block. Dynamic layer =
-        # Turn2..Turn5 (4 turns); the oldest folds into the summary, so the 3 most
-        # recent (Turn3..Turn5) stay verbatim at result[5:-1].
-        assert result[5:-1] == messages[7:]
+        # Most recent max_full_turns (3) turns retained in full, verbatim, AFTER
+        # the summary block. Dynamic layer = Turn2..Turn5 (4 turns); the oldest
+        # folds into the summary, so the 3 most recent (Turn3..Turn5) stay verbatim
+        # at result[6:].
+        assert result[6:] == messages[7:]
 
     def test_summarize_cache_stable_retains_constraints(self) -> None:
         """The rolling summary retains the task's 'don't' constraints."""
@@ -232,12 +235,72 @@ class TestHierarchicalSummarizer:
         # The summary id is stable across turns.
         assert block1["_summary_id"] == block2["_summary_id"]
 
-    def test_rolling_summary_budget_keeps_code_over_prose(self) -> None:
-        """Token-based cap drops oldest PROSE first, keeps fenced code (v0.7.15).
+    def test_rolling_summary_is_append_only_and_budget_capped(self) -> None:
+        """Cache-stable summary: leading bytes never change; budget capped at append.
 
-        When the rolling summary exceeds its token budget, eviction must spare
-        the v0.7.14 ``Code:`` fenced blocks (highest-value evicted context) and
-        drop old prose instead. A fake token counter makes the budget deterministic.
+        The rolling summary is part of the STABLE PREFIX, so its leading bytes must
+        stay byte-identical across turns (the backend reuses the cached KV for them).
+        The v0.7.23 turn-11 cliff was caused by front-trimming the summary when it
+        exceeded the token budget, which rewrote the leading bytes and dropped the
+        cached prefix from 3192 -> 882 tokens. The fix enforces the budget at APPEND
+        time (truncate the new text) and never rewrites existing content. A fake
+        token counter (1 tok/char) makes the budget deterministic.
+        """
+        # Fake counter: 1 token per character so a small token cap is easy to hit.
+        class _FakeCounter:
+            def count_tokens_precise(self, text: str) -> int:
+                return len(text)
+
+        summarizer = HierarchicalSummarizer(
+            max_full_turns=2, max_rolling_summary_tokens=110
+        )
+        summarizer.set_token_counter(_FakeCounter())
+
+        # Seed pinned facts (byte-stable leading section, never evicted).
+        summarizer.seed_original_request("API key abc123 base url http://x")
+
+        def conv(n: int) -> list[dict]:
+            msgs = [
+                {"role": "system", "content": "System"},
+                {"role": "user", "content": "First user"},
+                {"role": "assistant", "content": "Resp 0"},
+            ]
+            for i in range(n):
+                msgs.append(
+                    {"role": "user", "content": f"Turn {i} prose about the service"}
+                )
+                msgs.append({"role": "assistant", "content": f"Resp {i}"})
+            return msgs
+
+        # Build the summary incrementally across several turns. Each call must only
+        # APPEND; the previously-cached leading bytes must remain identical.
+        prev_text = ""
+        for n in range(5, 12):
+            result = summarizer.summarize_turns_cache_stable(
+                conv(n), frozen_prefix_end=3
+            )
+            block = next(m for m in result if m.get("_rolling_summary"))
+            text = summarizer._rolling_summary_text
+            # Append-only: the new summary must start with the previous one.
+            if prev_text:
+                assert text.startswith(prev_text), (
+                    f"turn {n}: summary leading bytes changed (cache break)"
+                )
+            # Budget enforced at append time: never exceeds the cap by much.
+            assert len(text) <= 110 + 40, f"turn {n}: summary over budget ({len(text)})"
+            prev_text = text
+
+        # Pinned facts always survive (byte-stable leading section, prepended at
+        # build time and never rewritten).
+        assert "API key abc123" in block["content"]
+
+    def test_rolling_summary_budget_keeps_code_over_prose(self) -> None:
+        """High-value code is ordered before prose in extracted constraints (v0.7.15).
+
+        The summary no longer front-trims (that broke the prefix cache). Instead
+        :meth:`_extract_constraints` orders files/code before prose, so when the
+        budget is enforced at append time the most valuable content sits at the
+        front and survives. A fake token counter (1 tok/char) makes this visible.
         """
         # Fake counter: 1 token per character so a small token cap is easy to hit.
         class _FakeCounter:
@@ -276,15 +339,12 @@ class TestHierarchicalSummarizer:
 
         # Pinned facts always survive (byte-stable leading section).
         assert "API key abc123" in content
-        # Code block survives eviction (preferential retention).
+        # Code block survives (it is ordered before prose in the extracted text).
         assert "```python" in content
         assert "def helper(x):" in content
-        # The folded summary text stays within the token budget (110 tokens,
-        # 1 tok/char via the fake counter). The "Context summary (rolling):"
-        # prefix is not part of the budgeted text.
-        assert len(summarizer._rolling_summary_text) <= 110
-        # Old prose was dropped to make room for the code block (it is absent).
-        assert "postgres db with redis" not in content
+        # The leading bytes of the summary are stable (no front-trim rewrite):
+        # the code block appears before the old prose in the extracted text.
+        assert content.index("```python") < content.index("postgres db with redis")
 
     def test_rolling_summary_budget_grows_with_turns(self) -> None:
         """Adaptive cap grows with folded turns, saturates at the ceiling (v0.7.17).
@@ -315,3 +375,73 @@ class TestHierarchicalSummarizer:
         summarizer.set_rolling_summary_ceiling(50)  # below floor
         assert summarizer._rolling_summary_ceiling == 300  # clamped up to floor
         assert summarizer._effective_summary_budget() == 300
+
+    def test_summary_block_placed_right_after_frozen_prefix(self) -> None:
+        """P0.5: the summary block must sit immediately after the frozen prefix.
+
+        The backend prefix cache reuses the LEADING bytes of the prompt. If the
+        summary were a trailing turn, the leading bytes would be [frozen]
+        [keep_recent], which change every turn (turns shift out of keep_recent
+        into the folded set) and break prefix-cache reuse. Placing the summary
+        right after the frozen prefix makes [frozen][summary] byte-stable.
+        """
+        summarizer = HierarchicalSummarizer(max_full_turns=3)
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "First user"},
+            {"role": "assistant", "content": "Resp 0"},
+            {"role": "user", "content": "Turn 1"},
+            {"role": "assistant", "content": "Resp 1"},
+            {"role": "user", "content": "Turn 2"},
+            {"role": "assistant", "content": "Resp 2"},
+            {"role": "user", "content": "Turn 3"},
+            {"role": "assistant", "content": "Resp 3"},
+            {"role": "user", "content": "Turn 4"},
+            {"role": "assistant", "content": "Resp 4"},
+            {"role": "user", "content": "Turn 5"},
+            {"role": "assistant", "content": "Resp 5"},
+        ]
+        result = summarizer.summarize_turns_cache_stable(messages, frozen_prefix_end=5)
+        # Summary block is at index 5 (right after the 5-message frozen prefix).
+        assert result[5].get("_summary_id")
+        # It is NOT the last element (would be a trailing turn).
+        assert result[5] is not result[-1]
+        # keep_recent turns follow the summary block.
+        assert result[6:] == messages[7:]
+
+    def test_leading_prefix_byte_stable_across_turns(self) -> None:
+        """P0.5: [frozen][summary] leading bytes are byte-stable as the summary grows.
+
+        Simulates two consecutive turns where the summary appends new folded text.
+        The leading bytes of the summary block (everything before the newly
+        appended text) must be identical, so the backend reuses the KV for the
+        frozen prefix + summary head instead of re-prefilling.
+        """
+        summarizer = HierarchicalSummarizer(max_full_turns=3)
+
+        def conv(n_turns: int) -> list[dict[str, Any]]:
+            msgs = [
+                {"role": "system", "content": "System"},
+                {"role": "user", "content": "First user"},
+                {"role": "assistant", "content": "Resp 0"},
+            ]
+            for i in range(n_turns):
+                msgs.append({"role": "user", "content": f"Turn {i}"})
+                msgs.append({"role": "assistant", "content": f"Resp {i}"})
+            return msgs
+
+        # Turn N: 6 dynamic turns (Turn0..Turn5), frozen_prefix_end=3.
+        r1 = summarizer.summarize_turns_cache_stable(conv(6), frozen_prefix_end=3)
+        summary1 = next(m for m in r1 if m.get("_summary_id"))
+        # Turn N+1: one more turn added; the summary should APPEND, not rewrite.
+        r2 = summarizer.summarize_turns_cache_stable(conv(7), frozen_prefix_end=3)
+        summary2 = next(m for m in r2 if m.get("_summary_id"))
+
+        # The summary block is right after the frozen prefix in both.
+        assert r1[3] is summary1
+        assert r2[3] is summary2
+        # The leading bytes of the summary (before the appended text) are stable.
+        # summary2's content must START WITH summary1's content (append-only).
+        assert summary2["content"].startswith(summary1["content"])
+        # And the frozen prefix is byte-identical.
+        assert [m.get("content") for m in r1[:3]] == [m.get("content") for m in r2[:3]]

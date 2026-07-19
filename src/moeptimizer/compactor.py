@@ -46,6 +46,7 @@ class ScratchpadCompactor:
         frozen_prefix_turns: int = 0,
         context_aligner: ContextAligner | None = None,
         hierarchical_summarizer: Any = None,
+        token_counter: Any = None,
     ) -> None:
         config = get_config().agentic
         self.keep_full = keep_full if keep_full is not None else config.keep_full_steps
@@ -58,8 +59,15 @@ class ScratchpadCompactor:
         self._frozen_prefix_turns = frozen_prefix_turns
         self._context_aligner = context_aligner or get_context_aligner()
         self._hierarchical_summarizer = hierarchical_summarizer
+        # Optional token counter (P0.6): used to honor a per-turn shrink floor so
+        # the compactor never drops the body below min_keep_tokens in one call.
+        self._token_counter = token_counter
 
-    def compact_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def compact_messages(
+        self,
+        messages: list[dict[str, Any]],
+        min_keep_tokens: int | None = None,
+    ) -> list[dict[str, Any]]:
         """
         Apply front-loading eviction to a message list.
 
@@ -81,6 +89,15 @@ class ScratchpadCompactor:
         optimizer's ``_partition_for_budget`` already protects this block; the
         compactor must do the same or the folded state is lost on every turn
         (the turn-10+ faithfulness/recall collapse).
+
+        P0.6 (per-turn shrink cap): when ``min_keep_tokens`` is set, the compactor
+        retains enough of the evictable body that the resulting context is never
+        smaller than that floor in a single call. This bounds the one-shot
+        front-eviction rate so the backend's cached KV for the body head stays
+        valid (the v0.7.21 turn-13 break was an 8.5K->2K tok collapse that
+        invalidated the whole cached body). When honoring the floor leaves the
+        context over the hard budget, the remaining over-budget tokens are shed
+        gradually on later turns.
         """
         if len(messages) <= self.keep_full + 2:
             return messages
@@ -94,12 +111,58 @@ class ScratchpadCompactor:
         # Partition into zones
         system_anchor, _, protected_tail = self._partition_zones(messages)
 
-        # Drop all evictable body (partitioning already determined which turns are evictable)
-        result = system_anchor + protected_tail
-        # Re-attach the protected rolling-summary block(s) at the tail.
+        # P0.6: decide how much of the evictable body to keep. By default the
+        # compactor drops the entire evictable body (system_anchor + protected_tail
+        # only). When a shrink floor is requested, retain evictable pairs from the
+        # front until the kept context reaches the floor, so the body never
+        # collapses below min_keep_tokens in one call.
+        kept_evictable: list[dict[str, Any]] = []
+        if min_keep_tokens is not None and self._token_counter is not None:
+            # Group the evictable body into complete user-led turns (pairs) so we
+            # can retain whole turns, not split mid-turn.
+            pairs = self._group_pairs(messages)
+            # The non-evictable baseline (system anchor + protected tail) in tokens.
+            base_tokens = self._token_counter.count_messages(system_anchor)
+            base_tokens += self._token_counter.count_messages(protected_tail)
+            # Retain pairs from the front until we reach the floor (or run out).
+            running = base_tokens
+            for pair in pairs:
+                pair_tokens = self._token_counter.count_messages(pair)
+                if running + pair_tokens > min_keep_tokens and kept_evictable:
+                    # Adding this pair would exceed the floor and we already kept
+                    # at least one evictable turn — stop (gradual shrink).
+                    break
+                kept_evictable.extend(pair)
+                running += pair_tokens
+        # else: drop all evictable body (legacy behavior).
+
+        # Build the result: system anchor + retained evictable body + protected tail.
+        result = list(system_anchor) + list(kept_evictable) + list(protected_tail)
+        # Re-attach the protected rolling-summary block(s) IMMEDIATELY AFTER the
+        # system anchor (frozen prefix), NOT at the tail. The summary block must
+        # stay right after the frozen prefix so the leading bytes
+        # [frozen][summary] remain byte-stable for backend prefix-cache reuse
+        # (REVIEW.md P0.5). Placing it at the tail would put [frozen][keep_recent]
+        # as the leading bytes, which change every turn and break the cache.
         if summary_blocks:
-            result = result + summary_blocks
+            result = list(system_anchor) + summary_blocks + list(kept_evictable) + list(protected_tail)
         return result
+
+    def _group_pairs(self, messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        """Group messages into complete user-led turns (pairs) for retention."""
+        pairs: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role", "")
+            if role == "user":
+                if current:
+                    pairs.append(current)
+                current = [dict(msg)]
+            else:
+                current.append(dict(msg))
+        if current:
+            pairs.append(current)
+        return pairs
 
     def _partition_zones(
         self,

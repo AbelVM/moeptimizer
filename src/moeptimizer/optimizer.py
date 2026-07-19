@@ -30,6 +30,7 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from typing import Any
 
@@ -84,7 +85,7 @@ from moeptimizer.thinking_preserver import ThinkingPreserver
 from moeptimizer.token_aware_truncator import TokenAwareTruncator
 from moeptimizer.token_counter import TokenCounter
 from moeptimizer.tool_output_compressor import ToolOutputCompressor, compress_tool_messages
-from moeptimizer.tool_output_filter import ToolOutputFilter, filter_tool_messages
+from moeptimizer.tool_output_filter import ToolOutputFilter
 from moeptimizer.tool_streamer import get_tool_streamer
 
 logger = logging.getLogger(__name__)
@@ -151,13 +152,6 @@ class AgentContextOptimizer:
         self.delta_encoder = get_delta_encoder() if v050.delta_encoding_enabled else None
         self.async_io = get_async_io_stage(max_thread_workers=v050.async_io_max_thread_workers, max_async_concurrency=v050.async_io_max_concurrency) if v050.async_io_enabled else None
 
-        self.compactor = ScratchpadCompactor(
-            keep_full=self._config.agentic.keep_full_steps,
-            cache_stable_mode=self._config.v050.cache_stable_mode,
-            frozen_prefix_turns=self._config.v050.frozen_prefix_turns,
-            context_aligner=self.context_aligner,
-            hierarchical_summarizer=self.hierarchical_summarizer,
-        )
         self.thinking_preserver = ThinkingPreserver()
         self.state_rag = StateBasedRAG(self.store)
         self.loop_detector = LoopDetector(threshold=3)
@@ -165,6 +159,14 @@ class AgentContextOptimizer:
         self.token_counter = TokenCounter(
             tokenizer=self._config.server.tokenizer,
             capability_probe=capability_probe,
+        )
+        self.compactor = ScratchpadCompactor(
+            keep_full=self._config.agentic.keep_full_steps,
+            cache_stable_mode=self._config.v050.cache_stable_mode,
+            frozen_prefix_turns=self._config.v050.frozen_prefix_turns,
+            context_aligner=self.context_aligner,
+            hierarchical_summarizer=self.hierarchical_summarizer,
+            token_counter=self.token_counter,
         )
         if self.hierarchical_summarizer is not None:
             # Attach the token counter so the rolling-summary cap is enforced in
@@ -345,6 +347,52 @@ class AgentContextOptimizer:
         ceiling = self._last_optimized_token_count + cap
         return min(budget, ceiling)
 
+    def _effective_shrink_cap(self) -> int:
+        """Return the per-turn SHRINK ceiling (max tokens the context may drop).
+
+        Symmetric to :meth:`_effective_budget_tokens`'s growth ceiling (P0.6).
+        Bounds the front-eviction rate so the body never collapses in a single
+        over-budget turn — the v0.7.21 turn-13 break was an 8.5K->2K tok drop that
+        invalidated the backend's cached KV for the whole body. When the next
+        turn's optimized size would fall below ``prev_size - shrink_cap``, the
+        trimmer only drops down to that floor and leaves the rest for later turns,
+        so the cached head stays valid.
+
+        The cap is DYNAMIC (smart default) when ``max_context_shrink_per_turn=0``:
+        it is proportional to the CURRENT lean context size
+        (``current_size * shrink_context_fraction``), not the model's full window.
+        The target is a lean context, so a 12K-tok context may shrink ~1.8K/turn
+        while a 2K-tok context only ~300/turn. The cap is floored by the growth
+        ceiling (a session that grows fast must be allowed to shrink at least as
+        fast) and by ``shrink_min_tokens`` (an absolute floor so tiny contexts
+        still have a bounded, non-trivial shrink rate).
+        """
+        cfg = self._config.agentic
+        if cfg.max_context_shrink_per_turn > 0:
+            return cfg.max_context_shrink_per_turn
+        # Auto: proportional to the current lean context size, floored by the
+        # growth rate and an absolute minimum.
+        growth = cfg.max_context_growth_per_turn
+        current = self._last_optimized_token_count
+        if current is None or current <= 0:
+            # No baseline yet: fall back to the growth ceiling so shrink is at
+            # least as fast as growth.
+            return max(growth, cfg.shrink_min_tokens)
+        derived = int(current * cfg.shrink_context_fraction)
+        return max(derived, growth, cfg.shrink_min_tokens)
+
+    def _effective_shrink_floor(self) -> int | None:
+        """Return the minimum optimized size allowed this turn, or None if N/A.
+
+        ``prev_size - shrink_cap``. Returns None on the first turn (no previous
+        size) or when the shrink cap is disabled (<= 0 and no window), so the
+        full budget applies.
+        """
+        cap = self._effective_shrink_cap()
+        if cap <= 0 or self._last_optimized_token_count is None:
+            return None
+        return max(0, self._last_optimized_token_count - cap)
+
     def _backend_context_window(self) -> int | None:
         """Return the live backend context window in tokens, or None if unknown.
 
@@ -362,6 +410,33 @@ class AgentContextOptimizer:
         if caps is None:
             return None
         return caps.max_context_window
+
+    def _finalize_optimized(
+        self,
+        optimized: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Record the final optimized prompt and its token counts.
+
+        Centralizes the bookkeeping that the main pipeline path does at its end
+        (Step 14.7 / 14.11) so that EVERY return path — including the fast path
+        and the early-exit branches — keeps ``_last_optimized_token_count`` fresh.
+        Without this, lean-context turns that take the fast path never update the
+        count, so the next over-budget turn sees ``_last_optimized_token_count is
+        None`` and computes a ``None`` shrink floor (P0.6 per-turn shrink cap),
+        which lets the context collapse in a single turn (the v0.7.22 turn-11
+        cliff).
+        """
+        self._last_optimized = optimized
+        try:
+            self._last_optimized_token_count = self.token_counter.count_messages(optimized)
+        except Exception:  # pragma: no cover - defensive
+            self._last_optimized_token_count = None
+        try:
+            self._last_original_token_count = self.token_counter.count_messages(messages)
+        except Exception:  # pragma: no cover - defensive
+            self._last_original_token_count = None
+        return optimized
 
     def _dynamic_cap(self, fraction: float, floor: int) -> int:
         """Return ``max(fraction * dynamic_budget, floor)`` in tokens.
@@ -488,6 +563,28 @@ class AgentContextOptimizer:
             self.set_token_calibration(exact_tokens / local)
             self._calibration_seeded = True
 
+    def _stable_prefix_end(self, messages: list[dict[str, Any]]) -> int:
+        """Return the index just past the byte-stable prefix (frozen + summary).
+
+        The stable prefix is the frozen prefix (system + first user +
+        ``frozen_prefix_turns``) PLUS the append-only rolling-summary block, when
+        present. The summary block is recognized by its ``_summary_id`` marker, not
+        by byte-equality, because it grows by appending each turn — its LEADING
+        bytes stay byte-identical, which is exactly what the backend prefix cache
+        reuses. Everything at/after this index is the live zone and may be
+        re-optimized without breaking cache reuse (REVIEW.md P0.5).
+        """
+        frozen_end = self.context_aligner.frozen_prefix_end(
+            messages, self._config.v050.frozen_prefix_turns
+        )
+        # The summary block sits immediately after the frozen prefix (P0.5 fix).
+        # Include it in the stable prefix so optimizer stages never mutate it.
+        if frozen_end < len(messages) and (
+            messages[frozen_end].get("_summary_id") or messages[frozen_end].get("_rolling_summary")
+        ):
+            return frozen_end + 1
+        return frozen_end
+
     def _compute_live_zone_start(self, messages: list[dict[str, Any]]) -> int:
         """Return the index where the live zone begins.
 
@@ -531,10 +628,13 @@ class AgentContextOptimizer:
         frozen_end = self.context_aligner.frozen_prefix_end(
             optimized, self._config.v050.frozen_prefix_turns
         )
-        self._live_zone_start = frozen_end
+        # P0.5: the stable prefix includes the append-only rolling-summary block
+        # (when present) so optimizer stages never mutate it and the backend reuses
+        # its KV. Use _stable_prefix_end, not just frozen_end.
+        self._live_zone_start = self._stable_prefix_end(optimized)
         self._last_stable_prefix = [
             {k: v for k, v in m.items() if k in ("role", "content")}
-            for m in optimized[:frozen_end]
+            for m in optimized[: self._live_zone_start]
         ]
         # Incremental-optimization memo (review §4). Cache the fully-optimized
         # stable prefix keyed by the content hash of the *incoming* stable prefix,
@@ -735,10 +835,7 @@ class AgentContextOptimizer:
                 # so its optimized form is unchanged; only the live zone grew.
                 self._stable_prefix_optimized = stable_base
                 self._stable_prefix_hash = incoming_prefix_hash
-                self._last_optimized = merged
-                self._last_optimized_token_count = self.token_counter.count_messages(merged)
-                self._last_original_token_count = self.token_counter.count_messages(messages)
-                return merged
+                return self._finalize_optimized(merged, messages)
 
         # Step 1: Populate the state store from messages
         self._ingest_messages(messages)
@@ -809,7 +906,7 @@ class AgentContextOptimizer:
         fast_path = self._maybe_fast_path(optimized, total_tokens, proactive_threshold_tokens)
         if fast_path is not None:
             self._update_stable_prefix(fast_path, live_zone_start)
-            return fast_path
+            return self._finalize_optimized(fast_path, messages)
 
         # Step 5.0: Check static prefix KV-cache for early exit.
         # Only skip the rest of the pipeline when the context is already lean.
@@ -823,7 +920,7 @@ class AgentContextOptimizer:
                     optimized = self._strip_internal_flags(optimized)
                     self._register_context(optimized)
                     self._update_stable_prefix(optimized, live_zone_start)
-                    return optimized
+                    return self._finalize_optimized(optimized, messages)
                 logger.info(
                     "[AgentOptimizer] Static prefix KV-cache hit, but context is over budget "
                     "(tokens=%d, threshold=%d); continuing compaction",
@@ -842,7 +939,7 @@ class AgentContextOptimizer:
                 optimized = self._strip_internal_flags(optimized)
                 self._register_context(optimized)
                 self._update_stable_prefix(optimized, live_zone_start)
-                return optimized
+                return self._finalize_optimized(optimized, messages)
             logger.info(
                 "[AgentOptimizer] High cache hit rate (%.2f), but context is over budget "
                 "(tokens=%d, threshold=%d); continuing compaction",
@@ -864,7 +961,7 @@ class AgentContextOptimizer:
             optimized = self._strip_internal_flags(optimized)
             self._register_context(optimized)
             self._update_stable_prefix(optimized, live_zone_start)
-            return optimized
+            return self._finalize_optimized(optimized, messages)
 
         # Static layer end is recomputed after compaction/RAG because those stages
         # can change the message list.
@@ -1016,7 +1113,14 @@ class AgentContextOptimizer:
         # summary has already captured.
         try:
             if current_tokens > compaction_threshold_tokens:
-                optimized = self.compactor.compact_messages(optimized)
+                # P0.6: bound the per-turn shrink so the compactor never collapses
+                # the body below prev_size - shrink_cap in one call (which would
+                # invalidate the backend's cached KV for the whole body). The
+                # remaining over-budget tokens are shed gradually on later turns.
+                shrink_floor = self._effective_shrink_floor()
+                optimized = self.compactor.compact_messages(
+                    optimized, min_keep_tokens=shrink_floor
+                )
                 current_tokens = self.token_counter.count_messages(optimized)
             else:
                 logger.debug(
@@ -1186,64 +1290,90 @@ class AgentContextOptimizer:
         # shrinking the context further until reuse recovers.
         if total_tokens > proactive_threshold_tokens and not self._prefix_drift:
             try:
-                optimized = self._proactive_trim(optimized, proactive_threshold_tokens, use_tokens=True)
+                optimized = self._proactive_trim(
+                    optimized, proactive_threshold_tokens, use_tokens=True,
+                    shrink_floor=self._effective_shrink_floor(),
+                )
             except Exception as e:
                 logger.warning("Proactive trimming failed: %s", e)
 
-        # Step 11.5: Filter large tool/assistant outputs (rtk/snip pattern, review §3/§5.1).
-        # Applied before compression so the filter's concise markers enter the
-        # stable prefix instead of the verbose original. Idempotent on already-
-        # filtered content.
+        # Step 11.5/11.6/11.7: Boundary-compress large tool/assistant outputs and
+        # user code pastes (review §3/§5.1/§5/C13). These are content-rewrite stages
+        # that replace verbose tool output / pasted files with concise markers. They
+        # are applied before the content enters the stable prefix so the compressed
+        # form is frozen and the backend's prefix cache stays valid. Idempotent on
+        # already-compressed content, so re-running is safe.
+        #
+        # P0.6 (per-turn shrink cap): these rewrites can collapse the WHOLE body in
+        # a single turn when many messages match (the v0.7.22 turn-11 cliff was
+        # ``filter_tool_messages`` dropping 19K->2.5K tok at once, invalidating the
+        # backend's cached KV for the entire body). We therefore bound them by the
+        # same per-turn shrink floor used for eviction: transform messages
+        # front-to-back (oldest first) and stop once the next transform would drop
+        # the total below ``prev_size - shrink_cap``. Recent messages are left
+        # verbatim for later turns to compress gradually, so the cached body head
+        # stays valid.
+        shrink_floor = self._effective_shrink_floor()
         if self._config.agentic.tool_output_compression_enabled:
             try:
                 if live_zone_start > 0 and live_zone_start < len(optimized):
                     stable_prefix, live_zone = self._split_live_zone(optimized, live_zone_start)
-                    live_zone = filter_tool_messages(live_zone, self.tool_output_filter)
+                    live_zone = self._apply_transform_with_floor(
+                        live_zone,
+                        lambda m: self._filter_tool_message(m),
+                        shrink_floor=shrink_floor,
+                    )
                     optimized = self._merge_live_zone(stable_prefix, live_zone)
                 else:
-                    optimized = filter_tool_messages(optimized, self.tool_output_filter)
+                    optimized = self._apply_transform_with_floor(
+                        optimized,
+                        lambda m: self._filter_tool_message(m),
+                        shrink_floor=shrink_floor,
+                    )
             except Exception as e:
                 logger.warning("Tool output filtering failed: %s", e)
                 self._record_degradation("tool_output_filtering", e)
 
-        # Step 11.6: Boundary-compress large tool/assistant outputs (headroom/
-        # snip-style, review §3/§5.1). Applied once when a tool message first
-        # appears, so the compressed form is frozen into the stable leading
-        # prefix and the backend's prefix cache stays valid. Idempotent on
-        # already-compressed (small) outputs, so re-running is safe.
         if self._config.agentic.tool_output_compression_enabled:
             try:
                 if live_zone_start > 0 and live_zone_start < len(optimized):
                     stable_prefix, live_zone = self._split_live_zone(optimized, live_zone_start)
-                    live_zone = self._compress_tool_outputs(live_zone)
+                    live_zone = self._apply_transform_with_floor(
+                        live_zone,
+                        lambda m: self._compress_tool_output_message(m),
+                        shrink_floor=shrink_floor,
+                    )
                     optimized = self._merge_live_zone(stable_prefix, live_zone)
                 else:
-                    optimized = self._compress_tool_outputs(optimized)
+                    optimized = self._apply_transform_with_floor(
+                        optimized,
+                        lambda m: self._compress_tool_output_message(m),
+                        shrink_floor=shrink_floor,
+                    )
             except Exception as e:
                 logger.warning("Tool output compression failed: %s", e)
                 self._record_degradation("tool_output_compression", e)
 
         # Step 11.7: Boundary-compress large user code pastes (review §5 / C13).
-        # Agentic coding also bloats on *user* messages that paste whole files. The
-        # same cheap, lossless-ish transforms are applied before the paste enters the
-        # stable prefix, so the compressed form is frozen into the prefix and the
-        # backend's prefix cache stays valid (the paste is never mutated after it is
-        # cached). Idempotent on small/already-compressed content, so re-running is
-        # safe. This is intentionally NOT a reversible placeholder+side-store: that
-        # would require re-inlining into the cached prefix, which would invalidate
-        # the prefix cache. The boundary compression keeps the prefix byte-stable.
         if self._config.agentic.user_paste_compression_enabled:
             try:
                 if live_zone_start > 0 and live_zone_start < len(optimized):
                     stable_prefix, live_zone = self._split_live_zone(optimized, live_zone_start)
-                    live_zone = self._compress_user_pastes(live_zone)
+                    live_zone = self._apply_transform_with_floor(
+                        live_zone,
+                        lambda m: self._compress_user_paste_message(m),
+                        shrink_floor=shrink_floor,
+                    )
                     optimized = self._merge_live_zone(stable_prefix, live_zone)
                 else:
-                    optimized = self._compress_user_pastes(optimized)
+                    optimized = self._apply_transform_with_floor(
+                        optimized,
+                        lambda m: self._compress_user_paste_message(m),
+                        shrink_floor=shrink_floor,
+                    )
             except Exception as e:
                 logger.warning("User paste compression failed: %s", e)
                 self._record_degradation("user_paste_compression", e)
-
         # Step 11.7 mutations above may have changed the token count; refresh the
         # local so the Step 11.8 gate below reads the post-filter size.
         current_tokens = self.token_counter.count_messages(optimized)
@@ -1265,7 +1395,9 @@ class AgentContextOptimizer:
         # it is a prefix-shifting mutation we avoid while reuse is collapsed.
         if total_tokens > int(max_tokens * 0.8) and not self._prefix_drift:
             try:
-                optimized = self._sliding_window_trim(optimized, use_tokens=True)
+                optimized = self._sliding_window_trim(
+                    optimized, use_tokens=True, shrink_floor=self._effective_shrink_floor()
+                )
             except Exception as e:
                 logger.warning("Sliding window trim failed: %s", e)
 
@@ -1408,7 +1540,8 @@ class AgentContextOptimizer:
             len(loop_warnings),
         )
 
-        # Step 14.11: Freeze the stable prefix verbatim so the backend's automatic
+        self._last_optimized = optimized
+        # Cache the token count of the optimized prompt so the app layer can set
         # prefix cache can reuse it across turns. This is the core KV-cache
         # preservation guarantee (review §1/§3/§7). When cache-stable mode is on,
         # the frozen block is system + first user + the next `frozen_prefix_turns`
@@ -1999,6 +2132,14 @@ class AgentContextOptimizer:
 
         This preserves token offsets and sequence patterns for MTP heads.
 
+        P0.6 (per-turn shrink cap): the evictable body is never dropped below
+        ``_effective_shrink_floor()`` (``prev_size - shrink_cap``) in a single
+        turn, even if that leaves the context slightly over the hard budget. The
+        remaining over-budget tokens are left for later turns to shed gradually,
+        so the backend's cached KV for the body head stays valid (the v0.7.21
+        turn-13 break was an 8.5K->2K tok one-shot collapse that invalidated the
+        whole cached body).
+
         Args:
             messages: The message list to trim
             use_tokens: If True, use token-based budget; if False, use character-based
@@ -2021,8 +2162,30 @@ class AgentContextOptimizer:
                         + sum(len(m.get("content") or "") for m in protected_tail))
             evictable_budget = max(0, max_chars - reserved)
 
-        # Evict from front of evictable body until under remaining budget
-        evictable_body = self._evict_for_budget(evictable_body, evictable_budget, use_tokens)
+        # P0.6: bound the per-turn shrink. The evictable body may not drop below
+        # the shrink floor (prev_size - shrink_cap). Compute the floor in the same
+        # unit as evictable_budget (tokens or chars).
+        shrink_floor: int | None = None
+        if use_tokens:
+            shrink_floor = self._effective_shrink_floor()
+            if shrink_floor is not None:
+                # Floor applies to the WHOLE optimized context; convert to an
+                # evictable-body floor by subtracting the non-evictable reserved
+                # tokens (never below 0).
+                shrink_floor = max(0, shrink_floor - reserved)
+        else:
+            # Char mode: derive a floor from the token shrink cap if available.
+            cap = self._effective_shrink_cap()
+            if cap > 0 and self._last_optimized_token_count is not None:
+                # Approximate char floor: prev_chars - cap*4 (4 chars/token).
+                prev_chars = (self._last_optimized_token_count - cap) * 4
+                shrink_floor = max(0, prev_chars - reserved)
+
+        # Evict from front of evictable body until under remaining budget AND
+        # not below the per-turn shrink floor.
+        evictable_body = self._evict_for_budget(
+            evictable_body, evictable_budget, use_tokens, shrink_floor=shrink_floor
+        )
 
         return system_anchor + evictable_body + protected_tail
 
@@ -2119,6 +2282,7 @@ class AgentContextOptimizer:
         evictable_body: list[dict[str, Any]],
         budget: int,
         use_tokens: bool = False,
+        shrink_floor: int | None = None,
     ) -> list[dict[str, Any]]:
         """Drop pairs from front of evictable body until under budget.
 
@@ -2126,6 +2290,11 @@ class AgentContextOptimizer:
             evictable_body: Messages to potentially evict
             budget: Target budget (tokens or chars depending on use_tokens)
             use_tokens: If True, use token-based budget; if False, use character-based
+            shrink_floor: If set, the evictable body may not be reduced below this
+                size in a single call (P0.6 per-turn shrink cap). When evicting
+                would drop below the floor, stop early and leave the context
+                slightly over budget — the remaining over-budget tokens are shed
+                gradually on later turns so the backend's cached KV stays valid.
         """
         if not evictable_body:
             return evictable_body
@@ -2166,13 +2335,25 @@ class AgentContextOptimizer:
         ratio = max(0.1, min(1.0, ratio))
         low_water = int(budget * ratio)
 
+        # P0.6: the per-turn shrink floor bounds how far we may drop the body in
+        # one call. Evict down to at most the low water, BUT never below the
+        # shrink floor (prev_size - shrink_cap). So the target is the LARGER of
+        # the two: we shed down to low_water normally, but if low_water would
+        # drop the body below the floor we stop at the floor and leave the
+        # context slightly over budget, shedding the rest gradually on later
+        # turns. This prevents the one-shot collapse that invalidated the
+        # backend's cached KV for the whole body (the v0.7.21 turn-13 break).
+        target = low_water
+        if shrink_floor is not None:
+            target = max(low_water, shrink_floor)
+
         # Carry-forward ledger: when a front pair is evicted, extract any code
         # signatures it contained so the model retains awareness of code that
         # existed in dropped turns (fixes has_code_proxy=0 / code_block_loss).
         # The ledger is appended to the protected tail, never the frozen prefix,
         # so backend prefix-cache reuse is preserved.
         ledger_sigs: list[str] = []
-        while total > low_water:
+        while total > target:
             if not pairs:
                 break
             if use_tokens:
@@ -2190,6 +2371,56 @@ class AgentContextOptimizer:
         result = [m for pair in pairs for m in pair]
         if ledger_sigs:
             result.extend(self._build_code_ledger(ledger_sigs))
+        return result
+
+    def _apply_transform_with_floor(
+        self,
+        messages: list[dict[str, Any]],
+        transform: Callable[[dict[str, Any]], dict[str, Any]],
+        shrink_floor: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Apply a per-message content ``transform`` while honoring the shrink floor.
+
+        P0.6 (per-turn shrink cap) for *content-rewrite* stages (tool-output
+        filtering/compression, user-paste compression). Unlike front-eviction,
+        these stages rewrite message content in place, so they can collapse the
+        whole body in a single turn when many messages match (the v0.7.22 turn-11
+        cliff was ``filter_tool_messages`` dropping 19K->2.5K tok at once, which
+        invalidated the backend's cached KV for the entire body).
+
+        To keep the per-turn shrink rate bounded, we transform messages
+        **front-to-back** (oldest first) and stop as soon as transforming the next
+        message would bring the total below ``shrink_floor`` (``prev_size -
+        shrink_cap``). The remaining (recent) messages are left verbatim for later
+        turns to compress gradually, so the cached body head stays valid.
+
+        Args:
+            messages: Message list to transform.
+            transform: Maps a message to its (possibly rewritten) form. Must return
+                the SAME message object when no change is made, so unchanged
+                messages are not double-counted.
+            shrink_floor: Minimum total size (tokens) allowed this turn, or None to
+                skip the bound (full transform).
+        """
+        if shrink_floor is None:
+            return [transform(m) for m in messages]
+
+        total = self.token_counter.count_messages(messages)
+        if total <= shrink_floor:
+            # Already at/under the floor: do not shrink further this turn.
+            return list(messages)
+
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            transformed = transform(msg)
+            candidate = [*result, transformed]
+            candidate_tokens = self.token_counter.count_messages(candidate)
+            if candidate_tokens < shrink_floor and result:
+                # Transforming this message would breach the floor; keep original.
+                result.append(msg)
+            else:
+                result.append(transformed)
+                total = candidate_tokens
         return result
 
     def _extract_code_signatures(self, pair: list[dict[str, Any]]) -> list[str]:
@@ -2397,20 +2628,27 @@ class AgentContextOptimizer:
         messages: list[dict[str, Any]],
         target: int,
         use_tokens: bool = False,
+        shrink_floor: int | None = None,
     ) -> list[dict[str, Any]]:
         """Proactively trim context while preserving complete recent turns.
-
-        For MoE models, KV-cache fill is expensive, so context is trimmed before
         it becomes a problem. This method evicts complete user-assistant turns
         from the front of the evictable body instead of dropping the newest
         dynamic message when it cannot fit. That prevents the optimizer from
         collapsing long conversations down to only the static system/first-user
         prefix.
 
+        P0.6 (per-turn shrink cap): when ``shrink_floor`` is set, the evictable
+        body is never dropped below it in a single call, even if that leaves the
+        context slightly over the proactive target. The remaining over-budget
+        tokens are shed gradually on later turns so the backend's cached KV for
+        the body head stays valid.
+
         Args:
             messages: The message list to trim
             target: Target size (chars or tokens depending on use_tokens)
             use_tokens: If True, target is in tokens; if False, in characters
+            shrink_floor: If set, the evictable body may not be reduced below this
+                size in tokens (P0.6 per-turn shrink cap).
         """
         if use_tokens:
             total_tokens = self.token_counter.count_messages(messages)
@@ -2427,12 +2665,17 @@ class AgentContextOptimizer:
             reserved = (self.token_counter.count_messages(system_anchor)
                         + self.token_counter.count_messages(protected_tail))
             evictable_budget = max(0, target - reserved)
+            # P0.6: convert the whole-context floor to an evictable-body floor.
+            if shrink_floor is not None:
+                shrink_floor = max(0, shrink_floor - reserved)
         else:
             reserved = (sum(len(m.get("content") or "") for m in system_anchor)
                         + sum(len(m.get("content") or "") for m in protected_tail))
             evictable_budget = max(0, target - reserved)
 
-        evictable_body = self._evict_for_budget(evictable_body, evictable_budget, use_tokens)
+        evictable_body = self._evict_for_budget(
+            evictable_body, evictable_budget, use_tokens, shrink_floor=shrink_floor
+        )
         return system_anchor + evictable_body + protected_tail
 
     def _sliding_window_trim(
@@ -2441,6 +2684,7 @@ class AgentContextOptimizer:
         window_size: int | None = None,
         overlap_size: int = 256,
         use_tokens: bool = False,
+        shrink_floor: int | None = None,
     ) -> list[dict[str, Any]]:
         """Drop whole old turns from the top while preserving the static prefix.
 
@@ -2448,6 +2692,11 @@ class AgentContextOptimizer:
         method never truncates message content and never inserts a middle summary;
         it only removes complete user/assistant turns from the front of the
         dynamic layer after the immutable system message.
+
+        P0.6 (per-turn shrink cap): when ``shrink_floor`` is set, eviction stops
+        once the kept context reaches the floor, even if that leaves the context
+        over ``window_size``. The remaining over-budget tokens are shed gradually
+        on later turns so the backend's cached KV for the body head stays valid.
         """
         del overlap_size
 
@@ -2520,6 +2769,14 @@ class AgentContextOptimizer:
         while result_turns and static_size + sum(
             sum(msg_size(msg) for msg in turn) for turn in [*result_turns, active_turn]
         ) > window_size:
+            # P0.6: stop evicting once the kept context would drop below the
+            # per-turn shrink floor. Leave the rest for later turns.
+            if shrink_floor is not None:
+                kept = static_size + sum(
+                    sum(msg_size(msg) for msg in turn) for turn in [*result_turns[1:], active_turn]
+                )
+                if kept <= shrink_floor:
+                    break
             result_turns = result_turns[1:]
 
         result = list(static_messages)
@@ -2623,6 +2880,66 @@ class AgentContextOptimizer:
             else:
                 result.append(msg)
         return result
+
+    def _filter_tool_message(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Per-message wrapper around :func:`filter_tool_messages` for the floor-bound transform.
+
+        Returns the message unchanged when it is not a filterable tool/assistant
+        output or no rule matches, so the floor logic can detect "no change" and
+        avoid double-counting.
+        """
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role not in ("tool", "assistant") or not isinstance(content, str):
+            return msg
+        if not self.tool_output_filter.should_filter(content):
+            return msg
+        filtered = self.tool_output_filter.filter(content)
+        if filtered is content:
+            return msg
+        new_msg = dict(msg)
+        new_msg["content"] = filtered
+        return new_msg
+
+    def _compress_tool_output_message(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Per-message wrapper around tool-output compression for the floor-bound transform."""
+        if msg.get("role") != "tool":
+            return msg
+        content = msg.get("content") or ""
+        if not isinstance(content, str):
+            return msg
+        compressor = ToolOutputCompressor(max_chars=self._dynamic_tool_output_max_chars())
+        if not compressor.should_compress(content):
+            return msg
+        cache_key = self._content_hash([msg])
+        if cache_key in self._tool_output_cache:
+            return self._tool_output_cache[cache_key]
+        compressed = compress_tool_messages([msg], compressor)
+        compressed_msg = compressed[0] if compressed else msg
+        self._tool_output_cache[cache_key] = compressed_msg
+        if len(self._tool_output_cache) > self._tool_output_cache_max:
+            self._tool_output_cache.pop(next(iter(self._tool_output_cache)))
+        return compressed_msg
+
+    def _compress_user_paste_message(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Per-message wrapper around user-paste compression for the floor-bound transform."""
+        if msg.get("role") != "user":
+            return msg
+        content = msg.get("content") or ""
+        if not isinstance(content, str):
+            return msg
+        compressor = ToolOutputCompressor(max_chars=self._dynamic_user_paste_max_chars())
+        if not compressor.should_compress(content):
+            return msg
+        cache_key = self._content_hash([msg])
+        if cache_key in self._tool_output_cache:
+            return self._tool_output_cache[cache_key]
+        compressed = compress_tool_messages([msg], compressor, roles=("user",))
+        compressed_msg = compressed[0] if compressed else msg
+        self._tool_output_cache[cache_key] = compressed_msg
+        if len(self._tool_output_cache) > self._tool_output_cache_max:
+            self._tool_output_cache.pop(next(iter(self._tool_output_cache)))
+        return compressed_msg
 
     def get_optimal_temperature(
         self,

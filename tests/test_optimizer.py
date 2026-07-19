@@ -1224,3 +1224,114 @@ class TestCacheStabilityAcrossTurns:
         assert grown <= opt._config.agentic.max_context_growth_per_turn + 50, (
             f"context grew {grown} tokens in one turn, exceeds growth ceiling"
         )
+
+    def test_shrink_cap_bounds_per_turn_contraction(self) -> None:
+        """P0.6: the context must not SHRINK more than the per-turn shrink cap.
+
+        The v0.7.21 turn-13 break was an 8.5K->2K tok one-shot collapse that
+        invalidated the backend's cached KV for the whole body. The shrink cap
+        (symmetric to the growth ceiling) bounds the front-eviction rate so the
+        body never drops more than ``prev_size - shrink_cap`` in a single turn.
+        """
+        opt = self._opt()
+        # Establish a large baseline (turn 1), then a much smaller turn 2 that
+        # would otherwise collapse the body in one shot.
+        big = [
+            {"role": "system", "content": "sys " + "x" * 2000},
+            {"role": "user", "content": "start " + "y" * 2000},
+            {"role": "assistant", "content": "ok " + "z" * 2000},
+        ]
+        opt.optimize_messages(big)
+        base = opt._last_optimized_token_count or 0
+        # A tiny next turn would otherwise let the compactor drop the whole body.
+        small = [
+            {"role": "system", "content": "sys " + "x" * 2000},
+            {"role": "user", "content": "start " + "y" * 2000},
+            {"role": "assistant", "content": "ok " + "z" * 2000},
+            {"role": "user", "content": "tiny follow-up"},
+            {"role": "assistant", "content": "ack"},
+        ]
+        opt.optimize_messages(small)
+        shrunk = base - (opt._last_optimized_token_count or 0)
+        # The shrink must be bounded by the per-turn cap (allow small slack for
+        # the protected tail / summary which are never evicted).
+        cap = opt._effective_shrink_cap()
+        assert shrunk <= cap + 200, (
+            f"context shrank {shrunk} tokens in one turn, exceeds shrink cap {cap}"
+        )
+
+    def test_fast_path_updates_last_optimized_token_count(self) -> None:
+        """P0.6 regression: lean turns that hit the fast path must still record
+        ``_last_optimized_token_count``.
+
+        The v0.7.22 turn-11 cliff was caused by turns 1-10 taking the fast path
+        (never setting ``_last_optimized_token_count`` -> stayed ``None``), so at
+        turn 11 the shrink floor was ``None`` and the tool-output filter collapsed
+        the whole body in one shot. Every early-return path must now finalize the
+        token count so the floor is always defined.
+        """
+        opt = self._opt()
+        lean = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"},
+        ]
+        opt.optimize_messages(lean)
+        assert opt._last_optimized_token_count is not None, (
+            "fast path left _last_optimized_token_count unset -> shrink floor is None"
+        )
+        # A subsequent over-budget turn must now see a real floor and stay bounded.
+        big = [
+            *lean,
+            {"role": "user", "content": "x" * 4000},
+            {"role": "assistant", "content": "y" * 4000},
+        ]
+        opt.optimize_messages(big)
+        assert opt._last_optimized_token_count is not None
+
+    def test_filter_tool_messages_respects_shrink_floor(self) -> None:
+        """P0.6 regression: tool-output filtering must not drop the context below
+        the per-turn shrink floor.
+
+        The v0.7.22 turn-11 cliff was the unbounded ``filter_tool_messages`` stage
+        replacing matched tool/assistant content with a tiny marker in one call,
+        collapsing 4091 -> 1553 tokens. The stage now runs through
+        ``_apply_transform_with_floor`` which stops before crossing the floor.
+        """
+        opt = self._opt()
+        # Establish a large baseline with a tool call + oversized tool output.
+        big_log = "\n".join(["DEBUG worker heartbeat ok"] * 400)
+        base_msgs = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Run the suite."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "run_command", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "name": "run_command", "content": big_log},
+        ]
+        opt.optimize_messages(base_msgs)
+        base = opt._last_optimized_token_count or 0
+        # A tiny follow-up turn would otherwise let the filter collapse the body.
+        small = [
+            *base_msgs,
+            {"role": "user", "content": "tiny follow-up"},
+            {"role": "assistant", "content": "ack"},
+        ]
+        opt.optimize_messages(small)
+        shrunk = base - (opt._last_optimized_token_count or 0)
+        floor = opt._effective_shrink_floor()
+        # The shrink must be bounded by the per-turn cap (small slack for the
+        # protected tail / summary which are never evicted).
+        cap = opt._effective_shrink_cap()
+        assert shrunk <= cap + 200, (
+            f"tool-output filter shrank {shrunk} tokens in one turn, "
+            f"exceeds shrink cap {cap} (floor={floor})"
+        )

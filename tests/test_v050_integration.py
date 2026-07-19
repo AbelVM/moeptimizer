@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 
 from moeptimizer.config import AppConfig
+from moeptimizer.hierarchical_summarizer import get_hierarchical_summarizer
 from moeptimizer.optimizer import AgentContextOptimizer
 
 
@@ -39,6 +40,10 @@ class TestV050Integration:
 
         self.config = config
         self.optimizer = AgentContextOptimizer(config)
+        # The optimizer shares a global HierarchicalSummarizer singleton; reset
+        # it so this test is isolated from other tests (e.g. test_app.py) that
+        # pollute the singleton's seeded facts / rolling summary state.
+        get_hierarchical_summarizer().clear()
 
     def test_basic_optimization_with_v050(self) -> None:
         """Basic optimization works with all v0.5.0 features enabled."""

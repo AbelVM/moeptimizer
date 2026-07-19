@@ -278,30 +278,48 @@ class HierarchicalSummarizer:
         if new_turns:
             new_text = self._extract_constraints(new_turns)
             if new_text:
-                self._rolling_summary_text = (
-                    f"{self._rolling_summary_text}\n{new_text}"
-                    if self._rolling_summary_text
-                    else new_text
-                )
-                # Cap growth by TOKENS (not chars). When over budget, drop the
-                # OLDEST PROSE first and keep fenced code blocks (the v0.7.14
-                # ``Code:`` section) preferentially: evicted code is the
-                # highest-value context the model cannot reconstruct, so it must
-                # survive eviction longer than prose. The leading pinned-facts
-                # section is always preserved (it is byte-stable for the prefix
-                # cache), so eviction only touches folded turn state.
-                self._enforce_rolling_summary_budget()
-                self._stats["turns_summarized"] += sum(len(t) for t in new_turns)
-                self._stats["turns_compressed"] += 1
+                # Cache-stable (REVIEW.md P0.5/P0.6, the turn-11 prefix break):
+                # the rolling summary is part of the STABLE PREFIX, so its leading
+                # bytes must never change once sent to the backend. We therefore
+                # only ever APPEND, and we cap the NEW text to the remaining budget
+                # at append time. We never rewrite existing summary content (the
+                # old front-trim dropped the oldest segments, which changed the
+                # summary's leading bytes and invalidated the backend's cached KV
+                # for the whole body — cached 3192 -> 882 at turn 11). The budget
+                # is monotonic (grows with folded turns), so a later turn can
+                # always append more; the leading bytes stay byte-identical.
+                budget = self._effective_summary_budget()
+                if self._rolling_summary_text:
+                    room = budget - self._count_tokens(self._rolling_summary_text)
+                    new_text = (
+                        ""
+                        if room <= 0
+                        else self._truncate_to_budget(new_text, room)
+                    )
+                if new_text:
+                    self._rolling_summary_text = (
+                        f"{self._rolling_summary_text}\n{new_text}"
+                        if self._rolling_summary_text
+                        else new_text
+                    )
+                    self._stats["turns_summarized"] += sum(len(t) for t in new_turns)
+                    self._stats["turns_compressed"] += 1
             self._summarized_turn_count = end
 
         keep_recent = [m for t in turns[end:] for m in t]
-        # Append the rolling summary as a TRAILING turn (review §1/§9, priority
-        # fix #1): inserting it right after the frozen prefix shifts every later
-        # turn's token offset and invalidates the backend's prefix cache. As a
-        # trailing turn it never alters the stable leading prefix, so the backend
-        # reuses its cached KV for the frozen + recent turns.
-        return [*frozen, *keep_recent, self._build_rolling_summary_block()]
+        # Place the rolling summary IMMEDIATELY AFTER the frozen prefix (not as a
+        # trailing turn). The backend prefix cache reuses the LEADING bytes of the
+        # prompt: [frozen prefix][append-only summary] is byte-stable across turns
+        # (the summary only ever grows by appending), so the backend reuses the KV
+        # for the frozen prefix + summary head and only computes the live zone
+        # (keep_recent + current turn) fresh. The old "trailing" placement put the
+        # summary AFTER keep_recent, making the leading bytes = [frozen][keep_recent]
+        # which change every turn (turns shift out of keep_recent into the folded
+        # set) — that broke prefix-cache reuse at turn 13 (REVIEW.md P0.4/P0.5).
+        # Shifting later turns does NOT invalidate the prefix; the prefix is still
+        # the leading bytes and is reused. This matches the docstring contract
+        # above ("placed immediately after the frozen prefix").
+        return [*frozen, self._build_rolling_summary_block(), *keep_recent]
 
     def _build_rolling_summary_block(self) -> dict[str, Any]:
         """Return the single rolling-summary message (append-only content).
@@ -330,67 +348,38 @@ class HierarchicalSummarizer:
         }
 
     def _enforce_rolling_summary_budget(self) -> None:
-        """Cap the rolling summary by TOKENS, keeping code blocks preferentially.
+        """No-op: budget is now enforced at append time, never by rewriting.
 
-        The cap is ADAPTIVE (review: dynamic budget): it grows with the number of
-        folded turns and saturates at the ceiling derived from the live backend
-        window (see ``_effective_summary_budget``). The leading pinned-facts
-        section (REVIEW §6) is always preserved because it is byte-stable for the
-        backend prefix cache. The remaining folded-turn text is split into
-        segments; when the token budget is exceeded, the OLDEST PROSE segments are
-        dropped first and fenced code-block segments (the v0.7.14 ``Code:`` section)
-        are retained as long as possible, because evicted code is the highest-value
-        context the model cannot reconstruct.
+        Historically this method front-trimmed the rolling summary when it exceeded
+        the token budget. That was a cache-stability bug: the summary is part of the
+        STABLE PREFIX, so dropping its oldest (front) segments changed the leading
+        bytes the backend had cached, invalidating the cached KV for the whole body
+        (the turn-11 cliff: cached 3192 -> 882). The summary is now append-only —
+        :meth:`summarize_turns_cache_stable` truncates the NEW text to fit the
+        remaining budget before appending, so existing content is never rewritten.
+        This method is retained only for API compatibility and does nothing
+        destructive.
         """
-        text = self._rolling_summary_text
-        if not text:
-            return
-        leading = self._rolling_summary_leading()
-        # Never evict the byte-stable leading section.
-        body = text[len(leading):].lstrip("\n") if leading and text.startswith(leading) else text
+        return
 
-        # Split body into segments, tracking whether each is a fenced code block.
-        segments: list[tuple[str, bool]] = []  # (segment_text, is_code)
-        buf: list[str] = []
-        in_code = False
-        for line in body.split("\n"):
-            if line.strip().startswith("```"):
-                if buf:
-                    segments.append(("\n".join(buf), in_code))
-                    buf = []
-                in_code = not in_code
-                buf.append(line)
-            else:
-                buf.append(line)
-        if buf:
-            segments.append(("\n".join(buf), in_code))
+    def _truncate_to_budget(self, text: str, budget_tokens: int) -> str:
+        """Truncate ``text`` (keeping the FRONT) so it fits ``budget_tokens``.
 
-        budget = self._effective_summary_budget()
-        total = self._count_tokens(text)
-        if total <= budget:
-            return
-
-        # Drop oldest (front) segments first, but spare code segments until only
-        # code remains. Re-evaluate the budget after each drop.
-        idx = 0
-        while idx < len(segments) and self._count_tokens(
-            leading + "\n" + "\n".join(s for s, _ in segments[idx:])
-        ) > budget:
-            # Prefer dropping prose; if the front segment is code, skip past all
-            # contiguous code and drop the next prose segment instead.
-            if segments[idx][1]:
-                # Find the end of this code run.
-                j = idx
-                while j < len(segments) and segments[j][1]:
-                    j += 1
-                idx = j
-                if idx >= len(segments):
-                    break
-            del segments[idx]
-
-        self._rolling_summary_text = (leading + "\n" if leading else "") + "\n".join(
-            s for s, _ in segments
-        )
+        Used at append time so the rolling summary never exceeds its budget by
+        rewriting already-cached content. The front is kept because
+        :meth:`_extract_constraints` already orders high-value content (files,
+        code) before prose, so the front is the most valuable part to retain.
+        """
+        if budget_tokens <= 0:
+            return ""
+        if self._count_tokens(text) <= budget_tokens:
+            return text
+        # Greedy char-based pre-trim (token counter is approximate anyway), then
+        # refine so we stay under budget without splitting a fenced code block mid-way.
+        est_chars = max(1, int(budget_tokens * 4))
+        if len(text) <= est_chars:
+            return text
+        return text[:est_chars].rstrip() + " …"
 
     @staticmethod
     def _group_turns(

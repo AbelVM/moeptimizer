@@ -125,6 +125,40 @@ class AgenticConfig(BaseModel):
                     "gradual and the cached prefix stays valid. Set to 0 to disable the growth cap "
                     "(use the full dynamic budget immediately).",
     )
+    max_context_shrink_per_turn: int = Field(
+        default=0,
+        description="Hard ceiling on how much the OPTIMIZED context may SHRINK in a single turn "
+                    "(tokens). Symmetric to max_context_growth_per_turn: bounds the per-turn "
+                    "front-eviction rate so the body never drops more than this in one turn. This is "
+                    "the P0.6 fix for the turn-13 prefix-cache break — the v0.7.19 growth ceiling "
+                    "bounded growth but left the body free to collapse in a single over-budget turn "
+                    "(8.5K -> 2K tok at turn 13), which invalidated the backend's cached KV for the "
+                    "entire body. When the next turn's optimized size would fall below "
+                    "prev_size - max_context_shrink_per_turn, the optimizer only trims down to that "
+                    "floor (leaving the rest for later turns), so the cached head stays valid. "
+                    "Default 0 = AUTO: the effective cap is derived dynamically from the CURRENT lean "
+                    "context size (shrink_context_fraction) and floored by the growth rate and "
+                    "shrink_min_tokens, so it scales with what we are actually carrying instead of "
+                    "being a fixed magic number tied to the model's full window.",
+    )
+    shrink_context_fraction: float = Field(
+        default=0.15,
+        description="Fraction of the CURRENT lean context size used as the AUTO per-turn shrink "
+                    "ceiling when max_context_shrink_per_turn=0. The cap is proportional to what we "
+                    "are actually carrying (the target is a lean context, not the model's full "
+                    "window), so a 12K-tok context may shrink ~1.8K/turn while a 2K-tok context only "
+                    "~300/turn. The effective cap is "
+                    "max(current_size * shrink_context_fraction, max_context_growth_per_turn, "
+                    "shrink_min_tokens) so it never falls below the growth rate (a session that grows "
+                    "fast must be allowed to shrink at least as fast) nor below an absolute floor. "
+                    "Ignored when max_context_shrink_per_turn > 0.",
+    )
+    shrink_min_tokens: int = Field(
+        default=800,
+        description="Absolute floor on the AUTO per-turn shrink cap (tokens). Guarantees even a tiny "
+                    "lean context still has a bounded, non-trivial shrink rate so the optimizer can "
+                    "return to budget. Only used when max_context_shrink_per_turn=0.",
+    )
     rolling_summary_budget_fraction: float = Field(
         default=0.25,
         description="Fraction of the dynamic context budget (or the static max_optimized_tokens "
