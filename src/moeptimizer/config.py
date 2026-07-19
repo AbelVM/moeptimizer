@@ -234,6 +234,54 @@ class AgenticConfig(BaseModel):
             "to 1.0 to restore trim-to-exact-budget behavior."
         ),
     )
+    quality_guard_enabled: bool = Field(
+        default=True,
+        description=(
+            "Adaptive Context Quality Guard (ACQG) — closed-loop response quality "
+            "regulation. When enabled, the proxy analyzes each assistant response for "
+            "quality indicators (stub detection, hallucination markers, code block "
+            "presence, repetition, truncation) and feeds them into an exponential "
+            "moving average. When quality degrades, compression aggressiveness is "
+            "automatically dialed back for the next turn; when quality is critically "
+            "low, compression is paused entirely. This prevents the feedback loop "
+            "where aggressive compression causes poor responses, which then undergo "
+            "more compression, deepening the collapse."
+        ),
+    )
+    quality_guard_alpha: float = Field(
+        default=0.3,
+        description=(
+            "EMA smoothing factor for the quality score. Higher values make the "
+            "guard respond faster to quality changes (more reactive); lower values "
+            "make it more conservative and require sustained degradation before "
+            "backing off compression."
+        ),
+    )
+    quality_guard_critical_threshold: float = Field(
+        default=0.3,
+        description=(
+            "Quality score below which compression is paused entirely. At this "
+            "level, the model's responses are likely collapsed (stubs, refusals, "
+            "hallucinations). The guard forwards the full context with only the "
+            "immutable-prefix guard active."
+        ),
+    )
+    quality_guard_degraded_threshold: float = Field(
+        default=0.55,
+        description=(
+            "Quality score below which compression aggressiveness is linearly "
+            "reduced. Between degraded and critical, the compression multiplier "
+            "interpolates from 1.0 (full compression) to 0.0 (pause)."
+        ),
+    )
+    quality_guard_healthy_threshold: float = Field(
+        default=0.75,
+        description=(
+            "Quality score above which the configured compression is used as-is. "
+            "At this level the guard is confident the model is producing healthy "
+            "responses."
+        ),
+    )
     immutable_prefix_enabled: bool = Field(
         default=True,
         description="Freeze the system prompt verbatim across turns so the backend's automatic "

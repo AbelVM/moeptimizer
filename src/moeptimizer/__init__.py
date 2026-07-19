@@ -86,6 +86,13 @@ from moeptimizer.prompt_templates import (
     classify_and_template,
     get_template_manager,
 )
+from moeptimizer.quality_guard import (
+    AdaptiveQualityGuard,
+    ContentProtection,
+    QualityIndicators,
+    get_quality_guard,
+    reset_quality_guard,
+)
 from moeptimizer.selective_truncator import SelectiveTruncator, get_selective_truncator
 from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
@@ -102,6 +109,7 @@ from moeptimizer.tool_streamer import get_tool_streamer
 __all__ = [
     "CONTEXT_BLOCK_SIZE",
     "LANG_MAP",
+    "AdaptiveQualityGuard",
     "AgentContextOptimizer",
     "AgentStateStore",
     "AgentStep",
@@ -113,6 +121,7 @@ __all__ = [
     "ChunkFingerprintCache",
     "CircuitBreaker",
     "CodeDeltaEncoder",
+    "ContentProtection",
     "ContextAligner",
     "ContextCanonicalizer",
     "ContextCompressor",
@@ -131,6 +140,7 @@ __all__ = [
     "PatternInjector",
     "ProgressTracker",
     "PromptTemplateManager",
+    "QualityIndicators",
     "ScratchpadCompactor",
     "SelectiveTruncator",
     "StateBasedRAG",
@@ -176,6 +186,7 @@ __all__ = [
     "get_kv_slot_tracker",
     "get_mtp_state_manager",
     "get_pattern_injector",
+    "get_quality_guard",
     "get_selective_truncator",
     "get_static_prefix_kv_cache",
     "get_summarize_old_turns",
@@ -183,4 +194,5 @@ __all__ = [
     "get_tool_streamer",
     "has_code_blocks",
     "optimize_code_in_text",
+    "reset_quality_guard",
 ]
