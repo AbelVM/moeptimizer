@@ -40,7 +40,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter, deque
-from typing import Any
+from typing import Any, Self
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +51,14 @@ _MIN_CODE_LINES = 3               # Expected code lines in a coding response
 _REPETITION_NGRAM = 4             # N-gram size for repetition detection
 _REPETITION_THRESHOLD = 0.45      # Fraction of repeated n-grams → flagged
 _HALLUCINATION_PATTERNS = re.compile(
-    r"(?i)\b(I (don't|do not) know|I cannot|I'm not able|"
-    r"I am not able|I don't have access|unable to (determine|find|access)|"
-    r"as an AI|as a language model|I was not (provided|given)|"
-    r"no information (about|on)|not specified in the|"
-    r"the provided (context|code) does not)\b"
+    r"(?i)\b(I (?:don't|do not) know|I cannot|I'm not able|"
+    r"I am not able|I don't have access|unable to (?:determine|find|access)|"
+    r"as an AI|as a language model|I was not (?:provided|given)|"
+    r"no information (?:about|on)|not specified in the|"
+    r"the provided (?:context|code) does not)\b"
 )
 _STUB_PATTERNS = re.compile(
-    r"(?i)^(let me |i(?:'ll)? (check|look|try|see|investigate)|"
+    r"(?i)^(?:let me |i(?:'ll)? (?:check|look|try|see|investigate)|"
     r"i need to |i should |one moment|give me a moment|"
     r"based on the |looking at the |analyzing|examining|"
     r"i (?:will|can) (?:help|assist|explain|provide))\b"
@@ -74,7 +74,11 @@ _PROTECTED_TURNS = 3              # Turns a referenced item stays protected
 
 
 class QualityIndicators:
-    """Per-response quality indicators, cheap to compute."""
+    """Per-response quality indicators, cheap to compute.
+
+    All indicators are derived from the response text alone with no external
+    context, making them O(1) to compute and safe to call on every turn.
+    """
 
     __slots__ = (
         "code_line_count",
@@ -103,7 +107,7 @@ class QualityIndicators:
         content: str,
         role: str = "assistant",
         max_tokens_hint: int | None = None,
-    ) -> QualityIndicators:
+    ) -> Self:
         """Compute indicators from an assistant response."""
         ind = cls()
         ind.response_role = role
@@ -112,9 +116,7 @@ class QualityIndicators:
         # Code block detection
         code_blocks = re.findall(r"```[\s\S]*?```", content)
         ind.has_code_block = bool(code_blocks)
-        ind.code_line_count = sum(
-            len(b.split("\n")) for b in code_blocks
-        )
+        ind.code_line_count = sum(len(b.split("\n")) for b in code_blocks)
 
         # Repetition score (n-gram overlap within response)
         tokens = re.findall(r"\S+", content.lower())
@@ -130,9 +132,7 @@ class QualityIndicators:
                 ind.repetition_score = repeated / total
 
         # Hallucination / refusal markers
-        ind.has_hallucination_markers = bool(
-            _HALLUCINATION_PATTERNS.search(content)
-        )
+        ind.has_hallucination_markers = bool(_HALLUCINATION_PATTERNS.search(content))
 
         # Stub detection (short, formulaic openings)
         ind.is_stub = (
@@ -142,8 +142,7 @@ class QualityIndicators:
 
         # Truncation hint
         if max_tokens_hint is not None and max_tokens_hint > 0:
-            # Rough estimate: if response is suspiciously close to max_tokens
-            token_estimate = ind.response_chars / 4  # rough chars→tokens
+            token_estimate = ind.response_chars // 4  # rough chars→tokens
             ind.truncated = token_estimate >= max_tokens_hint * 0.9
 
         return ind
@@ -155,37 +154,37 @@ class QualityIndicators:
         """
         penalties = 0.0
 
-        # Stub → severe penalty
+        # Each penalty is additive (a response can be both stubby and hallucinated)
         if self.is_stub:
             penalties += 0.5
-
-        # Hallucination markers → severe penalty
         if self.has_hallucination_markers:
             penalties += 0.4
 
-        # Very short response (even if not stub)
-        if self.response_chars < _MIN_RESPONSE_CHARS:
-            penalties += 0.2
-        elif self.response_chars < _MIN_RESPONSE_CHARS * 3:
-            penalties += 0.05
+        # Short-response penalties scale with severity
+        match self.response_chars:
+            case c if c < _MIN_RESPONSE_CHARS:
+                penalties += 0.2
+            case c if c < _MIN_RESPONSE_CHARS * 3:
+                penalties += 0.05
 
         # Repetition penalty
         if self.repetition_score > _REPETITION_THRESHOLD:
             excess = self.repetition_score - _REPETITION_THRESHOLD
             penalties += min(0.3, excess)
 
-        # Missing code when expected (heuristic: if user message contains code)
-        # This is context-dependent; we apply a small penalty for missing code
-        # only when the indicator is explicitly set. Caller can override.
+        # Contradiction guard
         if self.code_line_count == 0 and self.has_code_block:
-            # Contradiction: has_code_block=True but code_line_count=0
             penalties += 0.1
 
         return max(0.0, 1.0 - penalties)
 
 
 class ContentProtection:
-    """Tracks protected content zones that should survive eviction."""
+    """Tracks protected content zones that should survive eviction.
+
+    Each file path is registered with a turn count. After that many turns,
+    protection expires automatically.
+    """
 
     __slots__ = ("_protected_paths", "_turn_counters")
 
@@ -200,14 +199,17 @@ class ContentProtection:
 
     def tick(self) -> None:
         """Decrement all protection counters; remove expired entries."""
-        expired: list[str] = []
-        for path in list(self._protected_paths):
-            self._turn_counters[path] = self._turn_counters.get(path, 0) + 1
-            if self._turn_counters[path] >= self._protected_paths[path]:
-                expired.append(path)
+        expired = [
+            path
+            for path in list(self._protected_paths)
+            if self._turn_counters.get(path, 0) + 1 >= self._protected_paths[path]
+        ]
         for path in expired:
             del self._protected_paths[path]
             del self._turn_counters[path]
+        # Bump counters for survivors
+        for path in self._protected_paths:
+            self._turn_counters[path] = self._turn_counters.get(path, 0) + 1
 
     def is_protected(self, path: str) -> bool:
         """Check if a path is currently protected."""
@@ -215,7 +217,7 @@ class ContentProtection:
 
     def protected_paths(self) -> set[str]:
         """Return the set of currently protected paths."""
-        return set(self._protected_paths.keys())
+        return set(self._protected_paths)
 
     def reset(self) -> None:
         """Clear all protection. Used on session reset."""
@@ -225,7 +227,7 @@ class ContentProtection:
     def state(self) -> dict[str, object]:
         """Return serializable state snapshot."""
         return {
-            "protected_paths": list(self._protected_paths.keys()),
+            "protected_paths": list(self._protected_paths),
             "turn_counters": dict(self._turn_counters),
         }
 
@@ -241,6 +243,19 @@ class AdaptiveQualityGuard:
       3. When content is protected (files read), call ``content_protection.protect(path)``.
       4. At the start of each turn, call ``content_protection.tick()``.
     """
+
+    __slots__ = (
+        "_alpha",
+        "_consecutive_collapsed",
+        "_critical_threshold",
+        "_degraded_threshold",
+        "_enabled",
+        "_healthy_threshold",
+        "_indicators_history",
+        "_quality_ema",
+        "_total_responses",
+        "content_protection",
+    )
 
     def __init__(
         self,
@@ -263,7 +278,7 @@ class AdaptiveQualityGuard:
 
         self.content_protection = ContentProtection()
 
-    # ── Public API ──────────────────────────────────────────────────────────
+    # ── Properties ──────────────────────────────────────────────────────────
 
     @property
     def enabled(self) -> bool:
@@ -293,6 +308,8 @@ class AdaptiveQualityGuard:
         """How many consecutive turns had critically low quality."""
         return self._consecutive_collapsed
 
+    # ── Public API ──────────────────────────────────────────────────────────
+
     def record_response(
         self,
         content: str,
@@ -305,7 +322,7 @@ class AdaptiveQualityGuard:
         after receiving the full assistant response.
         """
         indicators = QualityIndicators.from_response(
-            content, role=role, max_tokens_hint=max_tokens_hint
+            content, role=role, max_tokens_hint=max_tokens_hint,
         )
         score = indicators.score()
 
@@ -313,28 +330,16 @@ class AdaptiveQualityGuard:
         self._total_responses += 1
 
         # Update EMA
-        self._quality_ema = (
-            self._alpha * score + (1 - self._alpha) * self._quality_ema
-        )
+        self._quality_ema = self._alpha * score + (1 - self._alpha) * self._quality_ema
 
         # Track consecutive collapsed turns
-        if score < self._critical_threshold:
-            self._consecutive_collapsed += 1
-        else:
-            self._consecutive_collapsed = 0
+        self._consecutive_collapsed = (
+            self._consecutive_collapsed + 1 if score < self._critical_threshold else 0
+        )
 
         logger.debug(
-            "[QualityGuard] score=%.3f ema=%.3f collapsed=%d indicator=%s",
+            "[QualityGuard] score=%.3f ema=%.3f collapsed=%d",
             score, self._quality_ema, self._consecutive_collapsed,
-            {
-                "chars": indicators.response_chars,
-                "code": indicators.has_code_block,
-                "code_lines": indicators.code_line_count,
-                "repetition": round(indicators.repetition_score, 3),
-                "hallucination": indicators.has_hallucination_markers,
-                "stub": indicators.is_stub,
-                "truncated": indicators.truncated,
-            },
         )
 
         return score
@@ -349,29 +354,28 @@ class AdaptiveQualityGuard:
         if not self._enabled:
             return 1.0
 
-        if self._quality_ema >= self._healthy_threshold:
-            return 1.0
-
-        if self._quality_ema < self._critical_threshold:
-            logger.info(
-                "[QualityGuard] CRITICAL quality ema=%.3f — pausing compression",
-                self._quality_ema,
-            )
-            return 0.0
-
-        # Linear interpolation between critical and degraded
-        # At degraded threshold → 1.0, at critical → 0.0
-        t = (
-            (self._quality_ema - self._critical_threshold)
-            / (self._degraded_threshold - self._critical_threshold)
-        )
-        return max(0.0, min(1.0, t))
+        match self._quality_ema:
+            case _ if self._quality_ema >= self._healthy_threshold:
+                return 1.0
+            case _ if self._quality_ema < self._critical_threshold:
+                logger.info(
+                    "[QualityGuard] CRITICAL quality ema=%.3f — pausing compression",
+                    self._quality_ema,
+                )
+                return 0.0
+            case _:
+                # Linear interpolation between critical and degraded
+                t = (
+                    (self._quality_ema - self._critical_threshold)
+                    / (self._degraded_threshold - self._critical_threshold)
+                )
+                return max(0.0, min(1.0, t))
 
     def should_skip_compression(self) -> bool:
         """True when quality is so degraded that all compression should pause.
 
-        This is a stronger signal than get_compression_multiplier returning 0:
-        it means we skip not just aggressive stages but also moderate ones.
+        This is a stronger signal than ``get_compression_multiplier()`` returning
+        0: it means we skip not just aggressive stages but also moderate ones.
         """
         return self._enabled and (
             self._quality_ema < self._critical_threshold

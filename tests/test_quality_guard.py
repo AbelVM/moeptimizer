@@ -1,5 +1,6 @@
 """Tests for quality_guard.py — Adaptive Context Quality Guard."""
 
+from __future__ import annotations
 
 from moeptimizer.quality_guard import (
     AdaptiveQualityGuard,
@@ -49,11 +50,11 @@ class TestQualityIndicators:
         assert ind.score() < 0.7
 
     def test_repetitive_response(self) -> None:
-        # Build a response with heavy repetition
+        """Build a response with heavy repetition — n-gram overlap should flag it."""
         part = "the quick brown fox jumps over the lazy dog "
         content = part * 20
         ind = QualityIndicators.from_response(content)
-        assert ind.repetition_score > 0.45  # High repetition
+        assert ind.repetition_score > 0.45
         assert ind.score() < 0.8
 
     def test_empty_response(self) -> None:
@@ -63,7 +64,6 @@ class TestQualityIndicators:
         assert ind.score() < 0.4
 
     def test_truncation_detection(self) -> None:
-        # Response close to max_tokens limit
         content = "word " * 800  # ~4000 chars ≈ 1000 tokens
         ind = QualityIndicators.from_response(content, max_tokens_hint=1100)
         assert ind.truncated is True
@@ -87,6 +87,11 @@ class TestQualityIndicators:
         assert ind.code_line_count >= 2
         assert ind.has_hallucination_markers is False
         assert ind.score() > 0.7
+
+    def test_from_response_returns_self_type(self) -> None:
+        """Verify the classmethod returns Self (type-checking)."""
+        ind = QualityIndicators.from_response("hello")
+        _: QualityIndicators = ind  # type narrowing check
 
 
 class TestContentProtection:
@@ -164,17 +169,16 @@ class TestAdaptiveQualityGuard:
 
     def test_stub_lowers_score(self) -> None:
         guard = AdaptiveQualityGuard()
-        guard.record_response("Let me check that.")  # stub
+        guard.record_response("Let me check that.")
         assert guard.quality_score < 0.8
-        assert guard.is_collapsed is False  # one stub shouldn't trigger critical
 
     def test_critical_collapse(self) -> None:
         guard = AdaptiveQualityGuard(
-            quality_ema_alpha=1.0,  # Instant update
-            quality_critical=0.35,  # Slightly above the 0.3 score of empty
+            quality_ema_alpha=1.0,
+            quality_critical=0.35,
         )
         for _ in range(5):
-            guard.record_response("")  # empty = severe degradation
+            guard.record_response("")
         assert guard.is_collapsed is True
         assert guard.consecutive_collapsed >= 2
 
@@ -185,18 +189,17 @@ class TestAdaptiveQualityGuard:
         assert guard.get_compression_multiplier() == 1.0
 
     def test_compression_multiplier_critical(self) -> None:
-        guard = AdaptiveQualityGuard(quality_ema_alpha=1.0)  # Instant update
+        guard = AdaptiveQualityGuard(quality_ema_alpha=1.0)
         guard.record_response("I don't know how to do that.")
         assert guard.get_compression_multiplier() == 0.0
 
     def test_compression_multiplier_degraded(self) -> None:
         guard = AdaptiveQualityGuard(
-            quality_ema_alpha=1.0,  # Instant update
+            quality_ema_alpha=1.0,
             quality_critical=0.2,
             quality_degraded=0.6,
             quality_healthy=0.8,
         )
-        # Score around 0.5 (degraded but not critical)
         guard.record_response("Let me look into this and get back to you.")
         mult = guard.get_compression_multiplier()
         assert 0.0 < mult < 1.0
@@ -213,17 +216,17 @@ class TestAdaptiveQualityGuard:
 
     def test_disabled_guard(self) -> None:
         guard = AdaptiveQualityGuard(enabled=False)
-        guard.record_response("")  # would collapse if enabled
+        guard.record_response("")
         assert guard.get_compression_multiplier() == 1.0
         assert guard.should_skip_compression() is False
 
     def test_consecutive_collapsed_tracking(self) -> None:
         guard = AdaptiveQualityGuard(quality_ema_alpha=1.0)
-        guard.record_response("I cannot do that.")  # bad
+        guard.record_response("I cannot do that.")
         assert guard.consecutive_collapsed == 1
-        guard.record_response("I don't know.")  # bad
+        guard.record_response("I don't know.")
         assert guard.consecutive_collapsed == 2
-        guard.record_response("```python\npass\n```")  # good
+        guard.record_response("```python\npass\n```")
         assert guard.consecutive_collapsed == 0
 
     def test_state_snapshot(self) -> None:
@@ -302,5 +305,4 @@ class TestIntegration:
             "    return 42\n"
             "```\n"
         )
-        # Quality should start recovering
         assert guard.quality_score > 0.5
