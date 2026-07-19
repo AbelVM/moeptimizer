@@ -89,6 +89,7 @@ from moeptimizer.prompt_templates import (
 from moeptimizer.quality_guard import (
     AdaptiveQualityGuard,
     ContentProtection,
+    MustKeepProtector,
     QualityIndicators,
     get_quality_guard,
     reset_quality_guard,
@@ -136,6 +137,7 @@ __all__ = [
     "LoopDetector",
     "LoopWarning",
     "MTPStateManager",
+    "MustKeepProtector",
     "OutputShaper",
     "PatternInjector",
     "ProgressTracker",

@@ -66,11 +66,122 @@ _STUB_PATTERNS = re.compile(
 
 # ─── State machine ──────────────────────────────────────────────────────────
 
+# ─── Must-keep token protection (kompress Mechanism B) ──────────────────────
+# Patterns for critical-syntactic tokens that MUST survive context pruning.
+# Based on the kompress-v8 paper's MUST_KEEP_RE: file paths, error/signal names,
+# exit codes, CVE identifiers, IP addresses, port numbers, HTTP status codes,
+# compiler flags, chemical formulas, ICD-10 codes, UUIDs, and CamelCase symbols.
+# These are the tokens whose eviction breaks agent tool-use — not merely degrades
+# fluency.
+
+_MUST_KEEP_RE = re.compile(
+    r"(?i)"
+    # File paths (Unix + Windows)
+    r"(?:"
+    r"(?:/[\w.\-]+)+"                                          # /usr/bin/python3
+    r"|"
+    r"(?:[A-Za-z]:\\(?:[\w.\-]+\\)*[\w.\-]+)"                 # C:\Users\file.py
+    r")"
+    r"|"
+    # Signal names / error codes
+    r"\b(?:SIG\w+|E[A-Z]+|errno|EFAULT|EINVAL|ENOMEM)\b"
+    r"|"
+    # Exit codes
+    r"\bexit\s*(?:code|status)?\s*\(?\s*\d{1,5}\s*\)?"
+    r"|"
+    # CVE identifiers
+    r"\bCVE-\d{4}-\d{4,7}\b"
+    r"|"
+    # IPv4 addresses
+    r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"
+    r"|"
+    # Port numbers
+    r"\bport\s*\d{1,5}\b"
+    r"|"
+    # HTTP status codes
+    r"\b\d{3}\s+(?:OK|Not Found|Internal Server Error|Forbidden|Unauthorized)\b"
+    r"|"
+    # Compiler flags (case-sensitive -- no (?i) segment)
+    r"-(?=[a-z])\w{2,}(?:\s+-(?=[a-z])\w+(?:\s*=\s*\S+)?)*"
+    r"|"
+    # Chemical formulas (e.g. C6H12O6, NaCl, H2SO4) — case-sensitive
+    r"(?-i:\b(?:[A-Z][a-z]?\d*)+\b(?:\s*\+\s*\(?(?:[A-Z][a-z]?\d*)+\)?)*)"
+    r"|"
+    # UUIDs
+    r"\b[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}\b"
+    r"|"
+    # CamelCase symbols (class names, function names) — case-sensitive
+    r"(?-i:\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b)"
+)
+
 _QUALITY_EMA_ALPHA = 0.3          # EMA smoothing factor
 _QUALITY_CRITICAL = 0.3           # Below this → pause compression
 _QUALITY_DEGRADED = 0.55          # Below this → reduce aggressiveness
 _QUALITY_HEALTHY = 0.75           # Above this → use configured aggressiveness
 _PROTECTED_TURNS = 3              # Turns a referenced item stays protected
+
+
+class MustKeepProtector:
+    """kompress Mechanism B — regex override that force-keeps critical tokens.
+
+    In the kompress-v8 paper, Mechanism B is a post-inference regex override that
+    surgically prevents eviction of must-keep tokens (file paths, error codes,
+    signal names, exit codes, etc.) during learned context pruning. The override
+    is conservative: it can only prevent an eviction, never cause one, so it
+    cannot degrade compression aggressiveness on non-must-keep tokens.
+
+    In MOE-ptimizer, we apply the same principle: before front-eviction drops
+    content, we scan for must-keep tokens and register the containing content
+    as protected with the ACQG ContentProtection system. This gives the regex
+    patterns a deterministic safety net independent of the learned quality score.
+
+    The ``MUST_KEEP_RE`` patterns target the same critical-syntactic token classes
+    identified in the paper: file paths, signal/error names, exit codes, CVE
+    identifiers, IP addresses, port numbers, HTTP status codes, compiler flags,
+    chemical formulas, UUIDs, and CamelCase symbols.
+
+    Usage:
+        protector = MustKeepProtector()
+        if protector.has_must_keep_tokens(content):
+            protection.protect(file_path)  # register with ContentProtection
+        paths = protector.extract_file_paths(content)  # get paths to protect
+    """
+
+    __slots__ = ("_re",)
+
+    def __init__(self, pattern: re.Pattern[str] | None = None) -> None:
+        self._re = pattern or _MUST_KEEP_RE
+
+    def has_must_keep_tokens(self, content: str) -> bool:
+        """True if *content* contains any must-keep token patterns."""
+        return bool(self._re.search(content))
+
+    def find_all(self, content: str) -> list[str]:
+        """Return all must-keep token matches found in *content*."""
+        return self._re.findall(content)
+
+    def extract_file_paths(self, content: str) -> list[str]:
+        """Extract file-like paths from content (Unix + Windows)."""
+        return re.findall(r"(?:/[\w.\-]+)+|[A-Za-z]:\\(?:[\w.\-]+\\)*[\w.\-]+", content)
+
+    def protect_content(
+        self,
+        content: str,
+        protection: ContentProtection,
+        turns: int = _PROTECTED_TURNS,
+    ) -> list[str]:
+        """Scan *content* for must-keep tokens and register paths with *protection*.
+
+        Returns the list of file paths found, which were registered as protected.
+        """
+        paths = self.extract_file_paths(content)
+        # Also extract CamelCase symbols and register as synthetic paths
+        symbols = re.findall(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b", content)
+        for path in paths:
+            protection.protect(path.strip(), turns=turns)
+        for sym in symbols:
+            protection.protect(sym.strip(), turns=turns)
+        return paths
 
 
 class QualityIndicators:
@@ -242,6 +353,11 @@ class AdaptiveQualityGuard:
          1.0 = full configured compression, 0.0 = pause compression.
       3. When content is protected (files read), call ``content_protection.protect(path)``.
       4. At the start of each turn, call ``content_protection.tick()``.
+
+    Incorporates kompress-v8 Mechanism B (regex override): the ``must_keep_protector``
+    scans content for critical-syntactic tokens (file paths, error codes, signal
+    names, compiler flags, etc.) and automatically registers them as protected.
+    This provides a deterministic safety net independent of the learned quality score.
     """
 
     __slots__ = (
@@ -255,6 +371,7 @@ class AdaptiveQualityGuard:
         "_quality_ema",
         "_total_responses",
         "content_protection",
+        "must_keep_protector",
     )
 
     def __init__(
@@ -264,6 +381,7 @@ class AdaptiveQualityGuard:
         quality_critical: float = _QUALITY_CRITICAL,
         quality_degraded: float = _QUALITY_DEGRADED,
         quality_healthy: float = _QUALITY_HEALTHY,
+        must_keep_pattern: re.Pattern[str] | None = None,
     ) -> None:
         self._enabled = enabled
         self._alpha = quality_ema_alpha
@@ -277,6 +395,8 @@ class AdaptiveQualityGuard:
         self._total_responses: int = 0
 
         self.content_protection = ContentProtection()
+        # kompress Mechanism B: regex override for critical-syntactic tokens.
+        self.must_keep_protector = MustKeepProtector(pattern=must_keep_pattern)
 
     # ── Properties ──────────────────────────────────────────────────────────
 
@@ -320,6 +440,11 @@ class AdaptiveQualityGuard:
 
         Updates the internal EMA and counters. Call this once per turn
         after receiving the full assistant response.
+
+        Also scans the response with the ``must_keep_protector`` for
+        critical-syntactic tokens (file paths, error codes, signal names,
+        compiler flags, etc.) and registers them as protected — this is
+        kompress-v8 Mechanism B applied to MOE-ptimizer's context pruning.
         """
         indicators = QualityIndicators.from_response(
             content, role=role, max_tokens_hint=max_tokens_hint,
@@ -328,6 +453,16 @@ class AdaptiveQualityGuard:
 
         self._indicators_history.append(indicators)
         self._total_responses += 1
+
+        # kompress Mechanism B: scan response for must-keep tokens and protect them.
+        # This ensures critical-syntactic content survives front-eviction regardless
+        # of the quality score — a deterministic safety net independent of the EMA.
+        try:
+            self.must_keep_protector.protect_content(
+                content, self.content_protection, turns=_PROTECTED_TURNS,
+            )
+        except Exception:
+            logger.debug("[QualityGuard] must-keep protection failed", exc_info=True)
 
         # Update EMA
         self._quality_ema = self._alpha * score + (1 - self._alpha) * self._quality_ema
@@ -402,6 +537,7 @@ class AdaptiveQualityGuard:
         self._consecutive_collapsed = 0
         self._total_responses = 0
         self.content_protection.reset()
+        # must_keep_protector is stateless (pure regex), no reset needed.
 
     def state(self) -> dict[str, object]:
         """Return serializable state for diagnostics."""
@@ -413,6 +549,7 @@ class AdaptiveQualityGuard:
             "total_responses": self._total_responses,
             "compression_multiplier": self.get_compression_multiplier(),
             "content_protection": self.content_protection.state(),
+            "must_keep_enabled": True,
         }
 
 

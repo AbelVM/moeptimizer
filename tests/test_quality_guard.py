@@ -5,6 +5,7 @@ from __future__ import annotations
 from moeptimizer.quality_guard import (
     AdaptiveQualityGuard,
     ContentProtection,
+    MustKeepProtector,
     QualityIndicators,
     get_quality_guard,
     reset_quality_guard,
@@ -92,6 +93,84 @@ class TestQualityIndicators:
         """Verify the classmethod returns Self (type-checking)."""
         ind = QualityIndicators.from_response("hello")
         _: QualityIndicators = ind  # type narrowing check
+
+
+class TestMustKeepProtector:
+    """MustKeepProtector tests — kompress-v8 Mechanism B."""
+
+    def test_detects_file_path(self) -> None:
+        p = MustKeepProtector()
+        assert p.has_must_keep_tokens("/usr/bin/python3 --version") is True
+        assert p.has_must_keep_tokens("/home/user/projects/src/main.py") is True
+
+    def test_detects_windows_path(self) -> None:
+        p = MustKeepProtector()
+        assert p.has_must_keep_tokens("C:\\Users\\admin\\file.txt") is True
+
+    def test_detects_signal_name(self) -> None:
+        p = MustKeepProtector()
+        assert p.has_must_keep_tokens("SIGSEGV") is True
+        assert p.has_must_keep_tokens("SIGKILL") is True
+
+    def test_detects_error_code(self) -> None:
+        p = MustKeepProtector()
+        assert p.has_must_keep_tokens("EFAULT") is True
+        assert p.has_must_keep_tokens("EINVAL") is True
+
+    def test_detects_cve(self) -> None:
+        p = MustKeepProtector()
+        assert p.has_must_keep_tokens("CVE-2024-1234") is True
+
+    def test_detects_ip_address(self) -> None:
+        p = MustKeepProtector()
+        assert p.has_must_keep_tokens("192.168.1.1") is True
+
+    def test_detects_camel_case(self) -> None:
+        p = MustKeepProtector()
+        assert p.has_must_keep_tokens("ProcessDataHandler") is True
+        assert p.has_must_keep_tokens("AbstractFactoryBean") is True
+
+    def test_no_false_positive_on_plain_text(self) -> None:
+        p = MustKeepProtector()
+        assert p.has_must_keep_tokens("the quick brown fox") is False
+        assert p.has_must_keep_tokens("hello world this is normal text") is False
+
+    def test_extract_file_paths(self) -> None:
+        p = MustKeepProtector()
+        content = "Look at /var/log/syslog and /etc/hosts"
+        paths = p.extract_file_paths(content)
+        assert "/var/log/syslog" in paths
+        assert "/etc/hosts" in paths
+
+    def test_protect_content_registers_with_protection(self) -> None:
+        p = MustKeepProtector()
+        cp = ContentProtection()
+        content = "Read /etc/config.json and check ProcessDataManager"
+        paths = p.protect_content(content, cp, turns=2)
+        assert len(paths) >= 1
+        assert "/etc/config.json" in paths
+        # CamelCase symbols should also be protected
+        assert cp.is_protected("ProcessDataManager") is True
+
+    def test_plain_text_no_protection(self) -> None:
+        p = MustKeepProtector()
+        cp = ContentProtection()
+        content = "hello world this is normal text"
+        p.protect_content(content, cp)
+        assert len(cp.protected_paths()) == 0
+
+    def test_integration_with_guard(self) -> None:
+        """When a response contains must-keep tokens, they get protected."""
+        guard = AdaptiveQualityGuard()
+        content = (
+            "Check /etc/nginx/nginx.conf for the configuration\n"
+            "Then restart with SIGTERM signal\n"
+            "Error code: EINVAL at /usr/lib/lib.so\n"
+        )
+        guard.record_response(content)
+        # File paths and symbols should be protected
+        assert guard.content_protection.is_protected("/etc/nginx/nginx.conf") is True
+        assert guard.content_protection.is_protected("/usr/lib/lib.so") is True
 
 
 class TestContentProtection:
