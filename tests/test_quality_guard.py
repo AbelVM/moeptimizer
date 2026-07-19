@@ -134,6 +134,17 @@ class TestMustKeepProtector:
         p = MustKeepProtector()
         assert p.has_must_keep_tokens("the quick brown fox") is False
         assert p.has_must_keep_tokens("hello world this is normal text") is False
+        assert p.has_must_keep_tokens("this is a test of the emergency broadcast system") is False
+        assert p.has_must_keep_tokens("one two three four five six seven eight") is False
+        assert p.has_must_keep_tokens("the cat sat on the mat and looked at the dog") is False
+        assert p.has_must_keep_tokens("i went to the store to buy some groceries") is False
+        assert p.has_must_keep_tokens("the weather today is sunny and warm") is False
+        assert p.has_must_keep_tokens("she opened the door and walked inside") is False
+        assert p.has_must_keep_tokens("he said hello to his friend across the street") is False
+        # Words that look like signal names but are lowercase should not match
+        assert p.has_must_keep_tokens("an emergency exit sign") is False
+        # Common English words starting with E
+        assert p.has_must_keep_tokens("eagle early effort element elephant") is False
 
     def test_extract_file_paths(self) -> None:
         p = MustKeepProtector()

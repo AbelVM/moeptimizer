@@ -83,8 +83,8 @@ _MUST_KEEP_RE = re.compile(
     r"(?:[A-Za-z]:\\(?:[\w.\-]+\\)*[\w.\-]+)"                 # C:\Users\file.py
     r")"
     r"|"
-    # Signal names / error codes
-    r"\b(?:SIG\w+|E[A-Z]+|errno|EFAULT|EINVAL|ENOMEM)\b"
+    # Signal names / error codes (case-sensitive — only uppercase signal/error names)
+    r"(?-i:\b(?:SIG\w+|E[A-Z]+|errno|EFAULT|EINVAL|ENOMEM)\b)"
     r"|"
     # Exit codes
     r"\bexit\s*(?:code|status)?\s*\(?\s*\d{1,5}\s*\)?"
