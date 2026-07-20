@@ -66,7 +66,10 @@ from moeptimizer.dependency_orderer import get_dependency_orderer
 from moeptimizer.embedding import EmbeddingService
 from moeptimizer.goal_decomposer import GoalDecomposer
 from moeptimizer.hierarchical_index import get_hierarchical_index
-from moeptimizer.hierarchical_summarizer import get_hierarchical_summarizer
+from moeptimizer.hierarchical_summarizer import (
+    ROLLING_SUMMARY_MARKER,
+    get_hierarchical_summarizer,
+)
 from moeptimizer.hit_prediction_model import get_hit_prediction_model
 from moeptimizer.incremental_updater import get_incremental_updater
 from moeptimizer.kv_slot_tracker import get_kv_slot_tracker
@@ -241,6 +244,13 @@ class AgentContextOptimizer:
         # the stable prefix is unchanged across turns, only the live zone is
         # re-processed by expensive stages (tree-sitter, RAG, tool compression).
         self._last_stable_prefix: list[dict[str, Any]] = []
+        # Raw (incoming, un-optimized) stable prefix from the previous turn. The
+        # live-zone boundary is computed by comparing the *incoming raw* prefix of
+        # the new turn against this, NOT against the optimized prefix — the client
+        # sends raw messages every turn, so comparing raw-to-optimized would never
+        # match and the whole conversation would be re-optimized (and re-mutated)
+        # each turn, breaking prefix-cache reuse.
+        self._last_raw_prefix: list[dict[str, Any]] = []
         self._live_zone_start: int = 0
         # Incremental-optimization memo (review §4). When
         # ``incremental_optimization_enabled`` is on, the fully-optimized stable
@@ -563,25 +573,43 @@ class AgentContextOptimizer:
             self.set_token_calibration(exact_tokens / local)
             self._calibration_seeded = True
 
+    @staticmethod
+    def _is_summary_block(msg: dict[str, Any]) -> bool:
+        """Return True if ``msg`` is the append-only rolling-summary block.
+
+        Detected by its internal ``_summary_id`` / ``_rolling_summary`` markers OR
+        by its content marker (``ROLLING_SUMMARY_MARKER``). The content check is
+        required because ``_strip_internal_flags`` removes the ``_summary_id`` key
+        before the prompt is sent to the backend, and the stable-prefix detection
+        runs on the stripped list on the *next* turn. Without content detection the
+        summary would fall into the live zone and be re-optimized every turn,
+        breaking the backend's prefix-cache reuse (the turn-11 cliff: cached 3192
+        -> 882). The block is part of the STABLE PREFIX, so it must be recognized
+        whether or not the internal marker survived stripping.
+        """
+        if msg.get("_summary_id") or msg.get("_rolling_summary"):
+            return True
+        content = msg.get("content")
+        return isinstance(content, str) and content.startswith(ROLLING_SUMMARY_MARKER)
+
     def _stable_prefix_end(self, messages: list[dict[str, Any]]) -> int:
         """Return the index just past the byte-stable prefix (frozen + summary).
 
         The stable prefix is the frozen prefix (system + first user +
         ``frozen_prefix_turns``) PLUS the append-only rolling-summary block, when
-        present. The summary block is recognized by its ``_summary_id`` marker, not
-        by byte-equality, because it grows by appending each turn — its LEADING
-        bytes stay byte-identical, which is exactly what the backend prefix cache
-        reuses. Everything at/after this index is the live zone and may be
-        re-optimized without breaking cache reuse (REVIEW.md P0.5).
+        present. The summary block is recognized by its ``_summary_id`` marker OR
+        its content marker (see :meth:`_is_summary_block`), not by byte-equality,
+        because it grows by appending each turn — its LEADING bytes stay
+        byte-identical, which is exactly what the backend prefix cache reuses.
+        Everything at/after this index is the live zone and may be re-optimized
+        without breaking cache reuse (REVIEW.md P0.5).
         """
         frozen_end = self.context_aligner.frozen_prefix_end(
             messages, self._config.v050.frozen_prefix_turns
         )
         # The summary block sits immediately after the frozen prefix (P0.5 fix).
         # Include it in the stable prefix so optimizer stages never mutate it.
-        if frozen_end < len(messages) and (
-            messages[frozen_end].get("_summary_id") or messages[frozen_end].get("_rolling_summary")
-        ):
+        if frozen_end < len(messages) and self._is_summary_block(messages[frozen_end]):
             return frozen_end + 1
         return frozen_end
 
@@ -593,20 +621,25 @@ class AgentContextOptimizer:
         it is the live zone and can be re-optimized without breaking cache reuse.
         When it does not match (e.g. context reset, first turn), the entire list
         is treated as live.
+
+        The comparison is against the *raw* (incoming) stable prefix stored from the
+        previous turn, because the client sends raw messages every turn and the
+        stored optimized prefix would never equal the raw incoming prefix.
         """
-        if not self._last_stable_prefix:
+        if not self._last_raw_prefix:
             return 0
 
-        # Compare role+content of the current prefix against the stored one.
+        # Compare role+content of the current raw prefix against the stored raw one.
         def _norm(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             return [{"role": m.get("role"), "content": m.get("content")} for m in msgs]
 
-        current_prefix = _norm(messages[: len(self._last_stable_prefix)])
-        if current_prefix == _norm(self._last_stable_prefix):
+        current_prefix = _norm(messages[: len(self._last_raw_prefix)])
+        if current_prefix == _norm(self._last_raw_prefix):
             return self._live_zone_start
 
         # Prefix changed (new session, reset, or different history). Treat all
         # as live and reset the stored prefix.
+        self._last_raw_prefix = []
         self._last_stable_prefix = []
         self._live_zone_start = 0
         return 0
@@ -615,6 +648,7 @@ class AgentContextOptimizer:
         self,
         optimized: list[dict[str, Any]],
         live_zone_start: int = 0,
+        raw_messages: list[dict[str, Any]] | None = None,
     ) -> None:
         """Record the stable prefix boundary after a successful optimization.
 
@@ -625,9 +659,6 @@ class AgentContextOptimizer:
         reused. On the first turn the memo stays empty so the next turn establishes
         it.
         """
-        frozen_end = self.context_aligner.frozen_prefix_end(
-            optimized, self._config.v050.frozen_prefix_turns
-        )
         # P0.5: the stable prefix includes the append-only rolling-summary block
         # (when present) so optimizer stages never mutate it and the backend reuses
         # its KV. Use _stable_prefix_end, not just frozen_end.
@@ -636,6 +667,22 @@ class AgentContextOptimizer:
             {k: v for k, v in m.items() if k in ("role", "content")}
             for m in optimized[: self._live_zone_start]
         ]
+        # Store the RAW (incoming) stable prefix so the next turn's
+        # _compute_live_zone_start can compare like-for-like. The client sends raw
+        # messages every turn; comparing the incoming raw prefix against the stored
+        # *optimized* prefix would never match, forcing a full re-optimization (and
+        # re-mutation) of the frozen prefix + summary every turn and breaking
+        # prefix-cache reuse. We key on the *computed* stable boundary
+        # (self._live_zone_start), not the incoming live_zone_start, so the raw
+        # prefix is established on the very first turn that has a stable prefix
+        # (turn 1 here) and the next turn can reuse it.
+        if raw_messages is not None and self._live_zone_start > 0:
+            self._last_raw_prefix = [
+                {k: v for k, v in m.items() if k in ("role", "content")}
+                for m in raw_messages[: self._live_zone_start]
+            ]
+        else:
+            self._last_raw_prefix = []
         # Incremental-optimization memo (review §4). Cache the fully-optimized
         # stable prefix keyed by the content hash of the *incoming* stable prefix,
         # so the next turn can reuse it verbatim when the prefix is unchanged.
@@ -649,9 +696,23 @@ class AgentContextOptimizer:
             and live_zone_start > 0
         ):
             try:
-                incoming_prefix_hash = self._content_hash(self._last_stable_prefix)
+                # The incremental path (see _optimize_messages_locked) compares the
+                # *incoming raw* prefix against this memo's hash. The client sends
+                # raw messages every turn, so the memo hash MUST be derived from the
+                # RAW stable prefix (self._last_raw_prefix), NOT the optimized one —
+                # otherwise raw never equals optimized, the hash never matches, and
+                # the incremental path is never taken (the full pipeline re-runs
+                # every turn, re-applying the tool-output filter inconsistently and
+                # breaking prefix-cache reuse). This is the same raw-vs-optimized
+                # mismatch class as _compute_live_zone_start (root cause #3).
+                incoming_prefix_hash = self._content_hash(self._last_raw_prefix)
+                # Cache the FULL optimized stable prefix (frozen prefix + append-only
+                # rolling-summary block), bounded by self._live_zone_start — NOT just
+                # frozen_end. The summary block is part of the stable prefix and must
+                # be reused verbatim; otherwise the next turn regenerates it and the
+                # leading bytes change.
                 self._stable_prefix_optimized = [
-                    dict(m) for m in optimized[:frozen_end]
+                    dict(m) for m in optimized[: self._live_zone_start]
                 ]
                 self._stable_prefix_hash = incoming_prefix_hash
             except Exception as e:  # pragma: no cover - defensive
@@ -905,7 +966,10 @@ class AgentContextOptimizer:
 
         fast_path = self._maybe_fast_path(optimized, total_tokens, proactive_threshold_tokens)
         if fast_path is not None:
-            self._update_stable_prefix(fast_path, live_zone_start)
+            # Cache-stable boundary transforms must still run on the fast path so the
+            # form sent to (and cached by) the backend is the filtered/compressed one.
+            fast_path = self._apply_boundary_transforms(fast_path, live_zone_start)
+            self._update_stable_prefix(fast_path, live_zone_start, raw_messages=messages)
             return self._finalize_optimized(fast_path, messages)
 
         # Step 5.0: Check static prefix KV-cache for early exit.
@@ -918,8 +982,9 @@ class AgentContextOptimizer:
                 if current_tokens <= proactive_threshold_tokens:
                     logger.info("[AgentOptimizer] Static prefix KV-cache hit, skipping optimization")
                     optimized = self._strip_internal_flags(optimized)
+                    optimized = self._apply_boundary_transforms(optimized, live_zone_start)
                     self._register_context(optimized)
-                    self._update_stable_prefix(optimized, live_zone_start)
+                    self._update_stable_prefix(optimized, live_zone_start, raw_messages=messages)
                     return self._finalize_optimized(optimized, messages)
                 logger.info(
                     "[AgentOptimizer] Static prefix KV-cache hit, but context is over budget "
@@ -937,8 +1002,9 @@ class AgentContextOptimizer:
                     cache_hit_rate,
                 )
                 optimized = self._strip_internal_flags(optimized)
+                optimized = self._apply_boundary_transforms(optimized, live_zone_start)
                 self._register_context(optimized)
-                self._update_stable_prefix(optimized, live_zone_start)
+                self._update_stable_prefix(optimized, live_zone_start, raw_messages=messages)
                 return self._finalize_optimized(optimized, messages)
             logger.info(
                 "[AgentOptimizer] High cache hit rate (%.2f), but context is over budget "
@@ -959,8 +1025,9 @@ class AgentContextOptimizer:
                 total_tokens, max_tokens,
             )
             optimized = self._strip_internal_flags(optimized)
+            optimized = self._apply_boundary_transforms(optimized, live_zone_start)
             self._register_context(optimized)
-            self._update_stable_prefix(optimized, live_zone_start)
+            self._update_stable_prefix(optimized, live_zone_start, raw_messages=messages)
             return self._finalize_optimized(optimized, messages)
 
         # Static layer end is recomputed after compaction/RAG because those stages
@@ -1242,6 +1309,11 @@ class AgentContextOptimizer:
                 if current_tokens > proactive_threshold_tokens:
                     live_start = max(0, live_zone_start)
                     for msg in optimized[live_start:]:
+                        # Never skeletonize the append-only rolling-summary block:
+                        # it is part of the STABLE PREFIX, so rewriting its code
+                        # changes the leading bytes and breaks prefix-cache reuse.
+                        if self._is_summary_block(msg):
+                            continue
                         content = msg.get("content") or ""
                         if isinstance(content, str) and self._has_code_blocks(content):
                             # P0.5: never skeletonize the active file body — it is
@@ -1313,67 +1385,7 @@ class AgentContextOptimizer:
         # the total below ``prev_size - shrink_cap``. Recent messages are left
         # verbatim for later turns to compress gradually, so the cached body head
         # stays valid.
-        shrink_floor = self._effective_shrink_floor()
-        if self._config.agentic.tool_output_compression_enabled:
-            try:
-                if live_zone_start > 0 and live_zone_start < len(optimized):
-                    stable_prefix, live_zone = self._split_live_zone(optimized, live_zone_start)
-                    live_zone = self._apply_transform_with_floor(
-                        live_zone,
-                        lambda m: self._filter_tool_message(m),
-                        shrink_floor=shrink_floor,
-                    )
-                    optimized = self._merge_live_zone(stable_prefix, live_zone)
-                else:
-                    optimized = self._apply_transform_with_floor(
-                        optimized,
-                        lambda m: self._filter_tool_message(m),
-                        shrink_floor=shrink_floor,
-                    )
-            except Exception as e:
-                logger.warning("Tool output filtering failed: %s", e)
-                self._record_degradation("tool_output_filtering", e)
-
-        if self._config.agentic.tool_output_compression_enabled:
-            try:
-                if live_zone_start > 0 and live_zone_start < len(optimized):
-                    stable_prefix, live_zone = self._split_live_zone(optimized, live_zone_start)
-                    live_zone = self._apply_transform_with_floor(
-                        live_zone,
-                        lambda m: self._compress_tool_output_message(m),
-                        shrink_floor=shrink_floor,
-                    )
-                    optimized = self._merge_live_zone(stable_prefix, live_zone)
-                else:
-                    optimized = self._apply_transform_with_floor(
-                        optimized,
-                        lambda m: self._compress_tool_output_message(m),
-                        shrink_floor=shrink_floor,
-                    )
-            except Exception as e:
-                logger.warning("Tool output compression failed: %s", e)
-                self._record_degradation("tool_output_compression", e)
-
-        # Step 11.7: Boundary-compress large user code pastes (review §5 / C13).
-        if self._config.agentic.user_paste_compression_enabled:
-            try:
-                if live_zone_start > 0 and live_zone_start < len(optimized):
-                    stable_prefix, live_zone = self._split_live_zone(optimized, live_zone_start)
-                    live_zone = self._apply_transform_with_floor(
-                        live_zone,
-                        lambda m: self._compress_user_paste_message(m),
-                        shrink_floor=shrink_floor,
-                    )
-                    optimized = self._merge_live_zone(stable_prefix, live_zone)
-                else:
-                    optimized = self._apply_transform_with_floor(
-                        optimized,
-                        lambda m: self._compress_user_paste_message(m),
-                        shrink_floor=shrink_floor,
-                    )
-            except Exception as e:
-                logger.warning("User paste compression failed: %s", e)
-                self._record_degradation("user_paste_compression", e)
+        optimized = self._apply_boundary_transforms(optimized, live_zone_start)
         # Step 11.7 mutations above may have changed the token count; refresh the
         # local so the Step 11.8 gate below reads the post-filter size.
         current_tokens = self.token_counter.count_messages(optimized)
@@ -1474,6 +1486,13 @@ class AgentContextOptimizer:
                 # new/mutated turns.
                 scan_from = max(0, live_zone_start)
                 for msg in optimized[scan_from:]:
+                    # Skip the append-only rolling-summary block: its verbatim code
+                    # is a folded historical snapshot, not a live file. Storing it as
+                    # a delta-encoder snapshot would let a later turn inject a diff
+                    # into the summary (mutating its leading bytes and breaking the
+                    # backend's prefix-cache reuse — the turn-11 cliff).
+                    if self._is_summary_block(msg):
+                        continue
                     content = msg.get("content") or ""
                     if isinstance(content, str) and "```" in content:
                         for match in re.finditer(r"```(\w*)\n(.*?)```", content, re.DOTALL):
@@ -1592,7 +1611,7 @@ class AgentContextOptimizer:
         # next turn can skip re-optimizing unchanged content.
         if self._config.agentic.live_zone_compression_enabled:
             try:
-                self._update_stable_prefix(optimized, live_zone_start)
+                self._update_stable_prefix(optimized, live_zone_start, raw_messages=messages)
             except Exception as e:
                 logger.debug("Live-zone prefix update failed: %s", e)
 
@@ -1873,6 +1892,14 @@ class AgentContextOptimizer:
             for m in optimized
         )
         for msg in optimized[scan_from:]:
+            # Never mutate the append-only rolling-summary block: it is part of the
+            # STABLE PREFIX, so rewriting its (verbatim-preserved) code block with a
+            # delta diff changes its leading bytes and invalidates the backend's
+            # cached KV for the whole body (the turn-11 cliff: cached 3192 -> 882).
+            # The summary's code is a folded historical snapshot, not a live file
+            # the model is actively editing, so delta injection does not apply.
+            if self._is_summary_block(msg):
+                continue
             content = msg.get("content")
             if not isinstance(content, str) or "```" not in content:
                 continue
@@ -2373,6 +2400,40 @@ class AgentContextOptimizer:
             result.extend(self._build_code_ledger(ledger_sigs))
         return result
 
+    def _transform_stable_then_live(
+        self,
+        messages: list[dict[str, Any]],
+        live_zone_start: int,
+        transform: Callable[[dict[str, Any]], dict[str, Any]],
+        shrink_floor: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Apply a content ``transform`` with cache-stable live-zone bounding.
+
+        The stable prefix (messages before ``live_zone_start``) is transformed
+        WITHOUT the shrink floor: it arrives raw from the client every turn but
+        was sent (and cached by the backend) in its transformed form on previous
+        turns, so re-applying the (idempotent) transform reproduces that exact
+        byte form and the backend reuses its cached KV. The live zone is
+        transformed WITH the floor (gradual, bounded compression) so new content
+        is never collapsed more than the per-turn cap in a single turn.
+
+        When ``live_zone_start <= 0`` (first turn / reset) the whole list is the
+        live zone and the floor applies throughout.
+        """
+        if live_zone_start <= 0 or live_zone_start >= len(messages):
+            return self._apply_transform_with_floor(
+                messages, transform, shrink_floor=shrink_floor
+            )
+        stable_prefix = messages[:live_zone_start]
+        live_zone = messages[live_zone_start:]
+        # Stable prefix: no floor — idempotent transform reproduces the cached form.
+        transformed_stable = [transform(m) for m in stable_prefix]
+        # Live zone: floor-bounded gradual compression.
+        transformed_live = self._apply_transform_with_floor(
+            live_zone, transform, shrink_floor=shrink_floor
+        )
+        return [*transformed_stable, *transformed_live]
+
     def _apply_transform_with_floor(
         self,
         messages: list[dict[str, Any]],
@@ -2422,6 +2483,65 @@ class AgentContextOptimizer:
                 result.append(transformed)
                 total = candidate_tokens
         return result
+
+    def _apply_boundary_transforms(
+        self,
+        messages: list[dict[str, Any]],
+        live_zone_start: int,
+    ) -> list[dict[str, Any]]:
+        """Apply the cache-stable boundary transforms (tool-output filter,
+        tool-output compression, user-paste compression) to ``messages``.
+
+        These idempotent, lossless-ish transforms must run on EVERY turn, including
+        turns that take an early-exit gate (fast path / static-KV hit / cache-hit /
+        hit-prediction). Running them before an early-exit return guarantees the form
+        sent to (and cached by) the backend is the filtered/compressed one, so the
+        next turn's re-filter is a no-op and the cached KV is reused. Skipping them on
+        an early exit left the raw (unfiltered) form cached, then collapsed it on the
+        following turn — the v0.7.22 turn-11 cliff class (P0.6 regression).
+
+        Uses the same cache-stability split as the main pipeline: the stable prefix is
+        transformed WITHOUT the shrink floor (idempotent, reproduces the cached form),
+        the live zone WITH the floor (gradual compression).
+        """
+        optimized = messages
+        shrink_floor = self._effective_shrink_floor()
+        if self._config.agentic.tool_output_compression_enabled:
+            try:
+                optimized = self._transform_stable_then_live(
+                    optimized,
+                    live_zone_start,
+                    lambda m: self._filter_tool_message(m),
+                    shrink_floor=shrink_floor,
+                )
+            except Exception as e:
+                logger.warning("Tool output filtering failed: %s", e)
+                self._record_degradation("tool_output_filtering", e)
+
+        if self._config.agentic.tool_output_compression_enabled:
+            try:
+                optimized = self._transform_stable_then_live(
+                    optimized,
+                    live_zone_start,
+                    lambda m: self._compress_tool_output_message(m),
+                    shrink_floor=shrink_floor,
+                )
+            except Exception as e:
+                logger.warning("Tool output compression failed: %s", e)
+                self._record_degradation("tool_output_compression", e)
+
+        if self._config.agentic.user_paste_compression_enabled:
+            try:
+                optimized = self._transform_stable_then_live(
+                    optimized,
+                    live_zone_start,
+                    lambda m: self._compress_user_paste_message(m),
+                    shrink_floor=shrink_floor,
+                )
+            except Exception as e:
+                logger.warning("User paste compression failed: %s", e)
+                self._record_degradation("user_paste_compression", e)
+        return optimized
 
     def _extract_code_signatures(self, pair: list[dict[str, Any]]) -> list[str]:
         """Extract compact code signatures from an evicted turn pair.
@@ -2892,6 +3012,11 @@ class AgentContextOptimizer:
         content = msg.get("content", "")
         if role not in ("tool", "assistant") or not isinstance(content, str):
             return msg
+        # Never rewrite the append-only rolling-summary block: it is part of the
+        # STABLE PREFIX, so re-compressing/re-filtering it changes its leading
+        # bytes and breaks backend prefix-cache reuse (the turn-11 cliff class).
+        if self._is_summary_block(msg):
+            return msg
         if not self.tool_output_filter.should_filter(content):
             return msg
         filtered = self.tool_output_filter.filter(content)
@@ -2904,6 +3029,9 @@ class AgentContextOptimizer:
     def _compress_tool_output_message(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Per-message wrapper around tool-output compression for the floor-bound transform."""
         if msg.get("role") != "tool":
+            return msg
+        # Never rewrite the append-only rolling-summary block (see _filter_tool_message).
+        if self._is_summary_block(msg):
             return msg
         content = msg.get("content") or ""
         if not isinstance(content, str):
@@ -2924,6 +3052,9 @@ class AgentContextOptimizer:
     def _compress_user_paste_message(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Per-message wrapper around user-paste compression for the floor-bound transform."""
         if msg.get("role") != "user":
+            return msg
+        # Never rewrite the append-only rolling-summary block (see _filter_tool_message).
+        if self._is_summary_block(msg):
             return msg
         content = msg.get("content") or ""
         if not isinstance(content, str):

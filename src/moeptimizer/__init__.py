@@ -25,7 +25,7 @@ Enhanced with:
 
 from __future__ import annotations
 
-__version__ = "0.7.24"
+__version__ = "0.7.25"
 
 from moeptimizer.async_io_stage import AsyncIOStage, get_async_io_stage
 from moeptimizer.attention_sink import AttentionSinkManager, apply_attention_sinks
@@ -70,7 +70,11 @@ from moeptimizer.embedding import EmbeddingService
 from moeptimizer.goal_decomposer import GoalDecomposer
 from moeptimizer.goal_relevance_scorer import GoalRelevanceScorer
 from moeptimizer.hierarchical_index import get_hierarchical_index
-from moeptimizer.hierarchical_summarizer import HierarchicalSummarizer, get_hierarchical_summarizer
+from moeptimizer.hierarchical_summarizer import (
+    ROLLING_SUMMARY_MARKER,
+    HierarchicalSummarizer,
+    get_hierarchical_summarizer,
+)
 from moeptimizer.hit_prediction_model import HitPredictionModel, get_hit_prediction_model
 from moeptimizer.incremental_updater import IncrementalUpdater, get_incremental_updater
 from moeptimizer.kv_slot_tracker import get_kv_slot_tracker
@@ -102,6 +106,7 @@ from moeptimizer.tool_streamer import get_tool_streamer
 __all__ = [
     "CONTEXT_BLOCK_SIZE",
     "LANG_MAP",
+    "ROLLING_SUMMARY_MARKER",
     "AgentContextOptimizer",
     "AgentStateStore",
     "AgentStep",
@@ -131,6 +136,8 @@ __all__ = [
     "PatternInjector",
     "ProgressTracker",
     "PromptTemplateManager",
+    "RAGContextCompressor",
+    "ReasoningPreserver",
     "ScratchpadCompactor",
     "SelectiveTruncator",
     "StateBasedRAG",

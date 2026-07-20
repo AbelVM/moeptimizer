@@ -4,6 +4,7 @@ import json
 from typing import Any
 from unittest.mock import patch
 
+from moeptimizer import ROLLING_SUMMARY_MARKER
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer
 
@@ -766,9 +767,12 @@ class TestFastPathSingleGate:
         # RAG was not invoked because the context is lean (single gate).
         assert rag_calls == []
         # The tool output is still present (not evicted) and the volatile turn is
-        # appended without RAG context.
+        # appended without RAG context. The cache-stable boundary transform collapses
+        # the repeated tool output in place (idempotent, frozen into the prefix), so
+        # the content is the compressed form, not the raw one.
         tool_msg = next(m for m in result if m.get("role") == "tool")
-        assert tool_msg["content"] == big_tool
+        assert tool_msg["content"] != big_tool
+        assert "repeated" in tool_msg["content"]
 
     def test_rag_runs_on_over_threshold_context(self) -> None:
         opt = self._make_optimizer()
@@ -1160,10 +1164,22 @@ class TestCacheStabilityAcrossTurns:
             },
         ]
 
-    def _frozen_prefix_hash(self, opt: AgentContextOptimizer, msgs: list[dict[str, Any]]) -> str:
-        """Hash the byte-stable leading section: frozen prefix + summary head."""
-        import hashlib
+    def _stable_prefix_blob(self, opt: AgentContextOptimizer, msgs: list[dict[str, Any]]) -> tuple[str, int, bool]:
+        """Serialize the byte-stable leading section: frozen prefix + summary head.
 
+        The summary block is detected by its content marker (``ROLLING_SUMMARY_MARKER``)
+        as well as by its internal ``_summary_id`` key, because ``_strip_internal_flags``
+        removes the ``_summary_id`` key before the prompt is sent to the backend — and
+        the stable-prefix detection on the *next* turn runs on the stripped list. The
+        production ``_stable_prefix_end`` uses the same content-based detection; this
+        helper must match it or it would miss the summary and report a false break.
+
+        Returns ``(blob, opt_len, summary_present)`` where ``blob`` is the serialized
+        leading section. The backend caches the LEADING bytes of the prompt, so the
+        cache-stability invariant is APPEND-ONLY: this turn's blob must be a prefix of
+        next turn's blob (the summary only ever grows by appending). It is NOT required
+        to be byte-identical, because the summary legitimately appends new folded text.
+        """
         optimized = opt.optimize_messages(msgs)
         # The frozen prefix is system + first user + frozen_prefix_turns turns.
         frozen_end = opt.context_aligner.frozen_prefix_end(
@@ -1171,15 +1187,23 @@ class TestCacheStabilityAcrossTurns:
         )
         stable = optimized[:frozen_end]
         # Include any rolling-summary block (append-only, byte-stable head).
+        # Detect by content marker too, since _strip_internal_flags drops _summary_id.
+        summary_present = False
         for m in optimized[frozen_end:]:
-            if m.get("_summary_id") or m.get("_rolling_summary"):
+            content = m.get("content") or ""
+            if (
+                m.get("_summary_id")
+                or m.get("_rolling_summary")
+                or content.startswith(ROLLING_SUMMARY_MARKER)
+            ):
                 stable.append(m)
+                summary_present = True
             else:
                 break
         blob = "\n".join(
             f"{m.get('role')}:{m.get('content')}" for m in stable
-        ).encode("utf-8")
-        return hashlib.md5(blob).hexdigest(), len(optimized), optimized
+        )
+        return blob, len(optimized), summary_present
 
     def test_frozen_prefix_stable_across_30_turns(self) -> None:
         opt = self._opt()
@@ -1189,22 +1213,41 @@ class TestCacheStabilityAcrossTurns:
             {"role": "user", "content": "Initial task: build the pipeline."},
             {"role": "assistant", "content": "I will build the pipeline step by step."},
         ]
-        prev_hash: str | None = None
+        prev_blob: str | None = None
+        prev_summary_present = False
         for n in range(1, 31):
             conversation.extend(self._build_turn(n))
-            h, _opt_len, _ = self._frozen_prefix_hash(opt, list(conversation))
-            # The frozen prefix + summary head must not change byte-for-byte
-            # across turns (backend prefix-cache reuse invariant). The prefix is
-            # still GROWING until frozen_prefix_turns complete turns have
-            # accumulated (turn 2 here), so only assert stability once it has
-            # fully formed (turn 3+). This is the exact invariant that broke at
-            # turn 13 in v0.7.18 (the over-cap mid-body rewrite).
-            if n >= 3:
-                assert prev_hash is not None
-                assert h == prev_hash, (
-                    f"prefix hash changed at turn {n}: {prev_hash} -> {h}"
-                )
-            prev_hash = h
+            blob, _opt_len, summary_present = self._stable_prefix_blob(opt, list(conversation))
+            # The leading bytes [frozen][summary] must be APPEND-ONLY across turns:
+            # this turn's stable prefix must be a prefix of next turn's. The backend
+            # caches the leading bytes, so as long as they are preserved (the summary
+            # only ever grows by appending) the cached KV is reused. The prefix is
+            # still GROWING until frozen_prefix_turns complete turns have accumulated
+            # (turn 2 here), so only assert stability once it has fully formed (turn 3+).
+            # This is the exact invariant that broke at turn 13 in v0.7.18 (over-cap
+            # mid-body rewrite), at turn 11 in v0.7.23 (rolling-summary front-trim),
+            # and at turn 11 in v0.7.24 (the summary fell out of the stable prefix
+            # because _strip_internal_flags dropped _summary_id, so it was re-optimized
+            # every turn and the cached KV was invalidated: cached 3192 -> 882).
+            if n >= 3 and prev_blob is not None:
+                if prev_summary_present:
+                    # Once the summary has appeared it is append-only: the leading
+                    # bytes [frozen][summary] must be a prefix of the previous turn's
+                    # leading bytes. A violation here is the cache break.
+                    assert blob.startswith(prev_blob), (
+                        f"stable prefix leading bytes changed at turn {n} "
+                        f"(append-only violated): previous was not a prefix of current"
+                    )
+                elif not summary_present:
+                    # Frozen-only phase: the frozen prefix alone must be stable.
+                    assert blob == prev_blob, (
+                        f"frozen prefix changed before summary appeared at turn {n}"
+                    )
+                # else: summary's first-appearance turn (prev=False, curr=True) —
+                # the one-time frozen-only -> frozen+summary transition is expected
+                # and not a cache break, so we skip the assertion here.
+            prev_blob = blob
+            prev_summary_present = summary_present
 
     def test_growth_ceiling_bounds_per_turn_expansion(self) -> None:
         """The effective budget must not exceed prev_size + growth cap."""

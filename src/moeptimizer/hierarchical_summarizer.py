@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 # Persistence path
 _PERSISTENCE_PATH = Path.home() / ".moeptimizer" / "hierarchical_summaries.json"
 
+# Leading marker of the rolling-summary block's content. The block is recognized
+# by this marker (not only by its internal ``_summary_id`` key) so that the
+# optimizer's cache-stable prefix detection still finds it AFTER
+# ``_strip_internal_flags`` removes the ``_summary_id`` key. The block is part of
+# the STABLE PREFIX (append-only, byte-stable leading bytes), so it must be
+# detected whether or not the internal marker survived stripping — otherwise the
+# summary falls into the live zone and gets re-optimized every turn, breaking the
+# backend's prefix-cache reuse (the turn-11 cliff: cached 3192 -> 882).
+ROLLING_SUMMARY_MARKER = "Context summary (rolling):"
+
 
 class HierarchicalSummarizer:
     """
@@ -341,7 +351,7 @@ class HierarchicalSummarizer:
             text = self._rolling_summary_text or "Earlier context summarized."
         return {
             "role": "user",
-            "content": f"Context summary (rolling):\n{text}",
+            "content": f"{ROLLING_SUMMARY_MARKER}\n{text}",
             "_summary_id": self._rolling_summary_id,
             "_summary_level": 1,
             "_rolling_summary": True,

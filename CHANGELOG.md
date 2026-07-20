@@ -1066,3 +1066,55 @@ covered by `test_summarize_cache_stable_append_only`,
 skipped**; `ruff` clean. A live `benchmark_opencode_30_1_0.7.24` run is required
 to confirm `cached` stays high (no 882 drop) at turn 11 and
 `prefix_cache_reuse_ratio >= 1.0` turns 1–30.
+
+### v0.7.25 — Stable-prefix reuse fix: raw-vs-optimized mismatch + summary guards (2026-07-20)
+
+The v0.7.24 append-only summary fixed the *summarizer*, but the orchestration
+layer still re-optimized (and re-mutated) the entire conversation every turn, so
+the frozen prefix + summary were not actually held byte-stable across turns. Two
+compounding root causes:
+
+1. **Raw-vs-optimized stable-prefix mismatch.** `_compute_live_zone_start()`
+   compared the *incoming raw* message prefix against the *optimized* stable
+   prefix stored from the previous turn. The client sends raw messages every
+   turn, so raw never equals optimized → the comparison always failed →
+   `live_zone_start` returned 0 → the whole conversation (including the frozen
+   prefix and summary) was re-run through every content-rewrite stage each turn.
+   Once token pressure crossed the proactive threshold (turn 10–12), the
+   tool-output filter collapsed the frozen prefix's assistant code blocks to
+   `[git status]` placeholders, mutating the leading bytes and breaking the
+   backend's cached KV.
+2. **Delta-encoder / skeletonizer mutated the summary block.** Even when the
+   live zone was correctly bounded, `_inject_code_deltas`, the delta-encoder
+   snapshot loop, and the code-block skeletonizer rewrote the append-only
+   rolling-summary block's verbatim code fences (the summary is a folded
+   historical snapshot, not a live file), changing its leading bytes.
+
+Fixes:
+
+- **`optimizer.py`** — `_compute_live_zone_start()` now compares the incoming raw
+  prefix against a newly stored **raw** stable prefix (`_last_raw_prefix`), not
+  the optimized one, so a unchanged raw prefix is correctly recognized and the
+  live zone is bounded. `_update_stable_prefix()` stores `_last_raw_prefix` from
+  the incoming `raw_messages` keyed on the *computed* stable boundary
+  (`self._live_zone_start`), so the raw prefix is established on the first turn
+  that has a stable prefix and reused thereafter.
+- **`optimizer.py`** — added `_is_summary_block()` (detects by `_summary_id` /
+  `_rolling_summary` OR the `ROLLING_SUMMARY_MARKER` content marker) and used it
+  to skip the summary block in `_inject_code_deltas`, the delta-encoder snapshot
+  loop, and the code-block skeletonizer, so the append-only summary is never
+  rewritten by those stages.
+- **`hierarchical_summarizer.py`** — added the `ROLLING_SUMMARY_MARKER` constant
+  and used it in `_build_rolling_summary_block`; exported from
+  `moeptimizer/__init__.py`.
+- **`tests/test_optimizer.py`** — `test_frozen_prefix_stable_across_30_turns`
+  rewritten to assert the APPEND-ONLY invariant (`blob.startswith(prev_blob)`
+  once the summary is present) instead of byte-identical equality, and to detect
+  the summary by `ROLLING_SUMMARY_MARKER`.
+
+**Verification:** `test_frozen_prefix_stable_across_30_turns` now passes — the
+frozen prefix + summary head stay byte-stable (append-only) across all 30 turns,
+and the assistant code blocks in the frozen prefix are no longer collapsed to
+`[git status]`. Full suite: **461 passed, 2 skipped**; `ruff` clean. A live
+`benchmark_opencode_30_1_0.7.25` run is required to confirm `cached` stays high
+at turn 11+ and `prefix_cache_reuse_ratio >= 1.0`.

@@ -60,7 +60,7 @@ class IncrementalUpdater:
     ) -> str:
         """Get key for current context."""
         content = "".join(
-            m.get("content", "") for m in messages
+            m.get("content") or "" for m in messages
         )
         return hashlib.md5(content.encode()).hexdigest()[:16]
 
