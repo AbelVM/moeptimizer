@@ -10,6 +10,7 @@ import json
 
 from moeptimizer.config import AppConfig
 from moeptimizer.hierarchical_summarizer import get_hierarchical_summarizer
+from moeptimizer.hit_prediction_model import get_hit_prediction_model
 from moeptimizer.optimizer import AgentContextOptimizer
 
 
@@ -44,6 +45,10 @@ class TestV050Integration:
         # it so this test is isolated from other tests (e.g. test_app.py) that
         # pollute the singleton's seeded facts / rolling summary state.
         get_hierarchical_summarizer().clear()
+        # Same for the global hit-prediction model: its recorded history is
+        # deduplicated by context signature, so leftover outcomes from other
+        # tests can swallow this test's record_outcome call.
+        get_hit_prediction_model().reset()
 
     def test_basic_optimization_with_v050(self) -> None:
         """Basic optimization works with all v0.5.0 features enabled."""
@@ -408,6 +413,14 @@ class TestV050Integration:
         self.config.agentic.proactive_trim_ratio = 0.01
         self.config.agentic.code_skeleton_enabled = False
         self.config.v050.hierarchical_summary_max_full_turns = 5
+        # The summarizer is a process-wide singleton whose keep window and fold
+        # margin are fixed at first construction — another test file may have
+        # constructed it with a different config (e.g. max_full_turns=8), which
+        # would stop the batch fold from firing here. Pin both deterministically
+        # so the fold trigger (live > keep + margin) is test-controlled.
+        _summarizer = get_hierarchical_summarizer()
+        _summarizer._max_full_turns = 5
+        _summarizer._fold_margin = 5
 
         messages = [
             {"role": "system", "content": "You are a careful coding assistant."},
@@ -442,7 +455,7 @@ class TestV050Integration:
         # A rolling summary block follows the frozen prefix.
         summary_msgs = [m for m in result if "Context summary (rolling):" in m.get("content", "")]
         assert summary_msgs, "expected a rolling summary block after the frozen prefix"
-        summary_content = summary_msgs[0]["content"]
+        summary_content = "".join(m["content"] for m in summary_msgs)
         assert "never remove the authentication middleware" in summary_content
 
     def test_all_v050_components_initialized(self) -> None:

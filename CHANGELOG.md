@@ -1118,3 +1118,73 @@ and the assistant code blocks in the frozen prefix are no longer collapsed to
 `[git status]`. Full suite: **461 passed, 2 skipped**; `ruff` clean. A live
 `benchmark_opencode_30_1_0.7.25` run is required to confirm `cached` stays high
 at turn 11+ and `prefix_cache_reuse_ratio >= 1.0`.
+
+### v0.7.26 — Batch rolling-summary folding: cache-stable size control (turn-12 cliff fix) (2026-07-23)
+
+**Problem:** the 30-turn opencode benchmark showed a cache cliff at turn 12
+(`cached` 7,014 → 881) and `cached=0` from turn 14 — the proxy re-prefilled the
+whole ~8K-token live zone every turn while the direct no-proxy path (pure
+append-only) computed only the new turn. Five stacked front-evictors each slid
+the live zone every turn: the rolling summary folded one turn per turn (its
+keep window slid and the summary grew each turn), Step 11 proactive trim and
+Step 11.8 sliding window front-evicted over their thresholds, the scratchpad
+compactor slid its fixed-size tail window, and the pressure-fold target was the
+growth-capped budget, which chases the previous turn's size by construction.
+
+**Fix — the batch fold is the single size governor; every front-evictor yields to it:**
+
+- **`hierarchical_summarizer.py`** — `summarize_turns_cache_stable` now folds in
+  BATCHES with **growth-relative hysteresis**: the first fold fires at the
+  pressure target (static budget × `compaction_trigger_ratio`); each later fold
+  fires only once the context has grown a growth budget
+  (`max(2048, target//3)`) past the previous fold's post-fold size. Absolute
+  targets cannot work — the keep-window floor sits at the target, so
+  "fold until under target" re-triggers every turn. The emitted size is
+  measured with `count_messages` (the same measurement the pipeline gates use —
+  content-only counting undercounts tool-call payloads and let the compactor
+  drop turns the summary had not captured, which was the
+  `evicted_content_recall` regression to 0.51). The block keeps its leading
+  placement `[frozen][append-only summary][live zone]` (trailing placement is
+  worse on fold turns — the fold removes the live zone's HEAD — and the
+  compactor undoes it anyway). New `has_rolling_summary()` accessor.
+- **`optimizer.py`** — `skip_front_eviction` gate: Step 11 proactive trim and
+  Step 11.8 sliding window stay off while the fold is armed (over the proactive
+  threshold) and able (already folding, or still under the compaction
+  threshold); they remain the valves for short/fat contexts the fold cannot
+  shrink (`live <= keep`, over compaction). `_effective_budget_tokens` bypasses
+  the per-turn growth ceiling while the cache-stable summary governs sizing —
+  between folds the growth is pure tail append (cache-safe at any size), and
+  the chasing ceiling was forcing a fold every turn.
+- **`compactor.py`** — `_group_pairs` now groups only the evictable body (it
+  grouped the full list, so anchor/tail pairs consumed the shrink-floor budget
+  first and the floor was never reached); the floor loop stops once satisfied.
+- **`token_aware_truncator.py`** — summary blocks are detected by content
+  marker as well as `_summary_id` (which `_strip_internal_flags` removes before
+  the backend sees the prompt), so budget trimming never drops the block and
+  keeps it right after the frozen prefix.
+- **`backend_client.py`** — `MOEPT_DUMP_REQUESTS=1` dumps each backend request
+  payload to `/tmp/moept_req_NNN.json` for body-level prefix diffs.
+- **Tests** — fixed two singleton-isolation bugs: `test_optimizer.py` stubbed
+  `record_outcome` on the shared hit-prediction model without restoring it
+  (now try/finally + delete), and `test_v050_integration.py` setup resets the
+  hit-prediction singleton alongside the summarizer.
+
+**Verification (16-turn opencode benchmark, before → after):**
+
+- Per-turn `cached`: grew 0 → 7,014 then cliffed to 881/0 → now grows
+  0 → **10,524** through turn 13, one fold invalidation at turns 14-15, back to
+  **15,092** (98% of the prompt) at turn 16.
+- Request-body LCP (dumped payloads): turns 1-13 are **100% prefix-reusable**
+  (pure tail appends), turns 14-15 fold at ~20% (the designed one-time cost),
+  turn 16 98%.
+- Total cached tokens 44,918 → **84,320** (1.88x); proxy latency mean
+  26.9s → 14.8s (-45%), p90 78.9s → 24.4s (-69%).
+- Quality recovered: `prompt_faithfulness` 0.969 → 0.975,
+  `evicted_content_recall` 0.996 → 0.997 (min 0.99).
+- Full suite: **464 passed, 2 skipped**; `ruff` clean.
+
+**Note:** residual `cached=882` on turns 14-15 was traced to **external slot
+contention** — the Lemonade backend runs `--parallel 1` (one KV slot) and a
+concurrent browser client evicted the benchmark's cached prompt between turns
+(the dumped bodies still shared a ~2.5K-token prefix the backend did not
+report). Benchmark runs need an exclusive/quiescent backend for clean numbers.

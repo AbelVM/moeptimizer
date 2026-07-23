@@ -13,7 +13,10 @@ Enhanced with:
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
 import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -23,6 +26,8 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 
 _CUSTOM_SESSION_FIELDS = {"_session_id", "_session_state"}
+# Counter for MOEPT_DUMP_REQUESTS diagnostic dumps (one file per backend request).
+_REQUEST_DUMP_COUNTER = itertools.count()
 _UNSUPPORTED_EXTRA_BODY_KEYS = {
     "speculative_decoding",
     "mtp_heads",
@@ -248,6 +253,16 @@ class LemonadeClient:
         stream: bool,
     ) -> Any:
         """Send a chat completion request without re-entering speculative decoding."""
+        if os.environ.get("MOEPT_DUMP_REQUESTS"):
+            # Diagnostic: dump the exact request payload sent to the backend
+            # (messages + tools as the chat template will render them) so
+            # consecutive turns can be diffed to locate prefix breaks.
+            try:
+                n = next(_REQUEST_DUMP_COUNTER)
+                with open(f"/tmp/moept_req_{n:03d}.json", "w") as _f:
+                    json.dump(params, _f, default=str)
+            except Exception:  # pragma: no cover - diagnostic only
+                pass
         response = await self._client.chat.completions.create(
             **_strip_custom_session_fields(
                 _strip_unsupported_extra_body(params, self._native_mtp_passthrough)

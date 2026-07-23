@@ -67,8 +67,7 @@ _DEFAULT_RULES: list[tuple[str, re.Pattern[str], str]] = [
     (
         "git_status",
         re.compile(
-            r"(?im)^(On branch \S+\n(?:Changes to be committed:\n(?:.*\n)*?(?:new file|modified|deleted|renamed):.*\n)*"
-            r"(?:Changes not staged for commit:\n(?:.*\n)*?(?:modified:.*\n)*)?)?$"
+            r"(?im)^On branch \S+[\s\S]*?(?:Changes to be committed|Changes not staged for commit|nothing to commit|Untracked files)"
         ),
         "[git status]",
     ),

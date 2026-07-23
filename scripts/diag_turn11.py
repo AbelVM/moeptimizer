@@ -104,9 +104,21 @@ def run_trace(n_turns: int = 20) -> None:
     opt = make_optimizer()
     prev = None
     prev_tok = None
+    # Build conversation CUMULATIVELY (like a real client does): each turn adds
+    # to the same message list, rather than rebuilding from scratch. The optimizer
+    # is stateful and expects cumulative message history; rebuilding from scratch
+    # each turn causes the optimizer's internal state (_last_raw_prefix,
+    # _live_zone_start) to mismatch the incoming messages, producing false BREAK
+    # readings.
+    messages: list[dict] = [
+        {"role": "system", "content": "You are a coding agent. Keep APIs stable."},
+    ]
     for n in range(1, n_turns + 1):
-        conv = build_conversation(n)
-        result = opt.optimize_messages(conv)
+        # Add one turn's worth of messages (user, assistant, tool, assistant)
+        turn_msgs = build_conversation(1)
+        # Skip the system message (already added) and append the rest
+        messages.extend(turn_msgs[1:])
+        result = opt.optimize_messages(messages)
         blob, tok, has_sum = leading_bytes(opt, result)
         if prev is None:
             status = "(first)"

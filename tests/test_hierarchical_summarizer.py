@@ -113,20 +113,28 @@ class TestHierarchicalSummarizer:
             {"role": "system", "content": "System"},
             {"role": "user", "content": "First user"},
             {"role": "assistant", "content": "Resp 0"},
-            {"role": "user", "content": "Turn 1"},
+            {"role": "user", "content": "Turn 1 implements the user registry module"},
             {"role": "assistant", "content": "Resp 1"},
-            {"role": "user", "content": "Turn 2"},
+            {"role": "user", "content": "Turn 2 hardens the repository against bad input"},
             {"role": "assistant", "content": "Resp 2"},
-            {"role": "user", "content": "Turn 3"},
+            {"role": "user", "content": "Turn 3 adds a configuration dataclass"},
             {"role": "assistant", "content": "Resp 3"},
-            {"role": "user", "content": "Turn 4"},
+            {"role": "user", "content": "Turn 4 refactors the summarizer service"},
             {"role": "assistant", "content": "Resp 4"},
-            {"role": "user", "content": "Turn 5"},
+            {"role": "user", "content": "Turn 5 optimizes the summary step"},
             {"role": "assistant", "content": "Resp 5"},
+            {"role": "user", "content": "Turn 6 adds lightweight in-memory metrics"},
+            {"role": "assistant", "content": "Resp 6"},
+            {"role": "user", "content": "Turn 7 emits a log event on each load"},
+            {"role": "assistant", "content": "Resp 7"},
+            {"role": "user", "content": "Turn 8 adds an argparse CLI entry point"},
+            {"role": "assistant", "content": "Resp 8"},
         ]
         # Frozen prefix = system + first user + 2 turns (indices 0..4).
-        # Dynamic layer = Turn2..Turn5 (4 turns, > max_full_turns=3) so the
-        # oldest folds into the summary and the 3 most recent stay verbatim.
+        # Dynamic layer = Turn2..Turn8 (7 turns). Batch folding fires once the
+        # live window drifts fold_margin (=keep=3) past the keep window
+        # (7 > 3+3), folds the oldest 4 turns into the summary and keeps the 3
+        # most recent (Turn6..Turn8) verbatim.
         result = summarizer.summarize_turns_cache_stable(messages, frozen_prefix_end=5)
 
         # Frozen prefix preserved verbatim at the front.
@@ -149,10 +157,39 @@ class TestHierarchicalSummarizer:
         assert "Context summary (rolling):" in summary_block["content"]
 
         # Most recent max_full_turns (3) turns retained in full, verbatim, AFTER
-        # the summary block. Dynamic layer = Turn2..Turn5 (4 turns); the oldest
-        # folds into the summary, so the 3 most recent (Turn3..Turn5) stay verbatim
-        # at result[6:].
-        assert result[6:] == messages[7:]
+        # the summary block: Turn5..Turn7 = messages[13:].
+        assert result[6:] == messages[13:]
+
+    def test_summarize_cache_stable_no_fold_within_margin(self) -> None:
+        """No fold while the live window stays within keep + fold_margin.
+
+        Folding mutates the prompt middle (one cache invalidation), so it must
+        only fire once the live zone has drifted fold_margin turns past the
+        keep window. Within the margin the messages are returned unchanged so
+        the prompt stays a pure tail append.
+        """
+        summarizer = HierarchicalSummarizer(max_full_turns=3)  # margin defaults to keep=3
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "First user"},
+            {"role": "assistant", "content": "Resp 0"},
+            # 6 dynamic turns: live (6) <= keep (3) + margin (3) -> no fold.
+            {"role": "user", "content": "Turn 1"},
+            {"role": "assistant", "content": "Resp 1"},
+            {"role": "user", "content": "Turn 2"},
+            {"role": "assistant", "content": "Resp 2"},
+            {"role": "user", "content": "Turn 3"},
+            {"role": "assistant", "content": "Resp 3"},
+            {"role": "user", "content": "Turn 4"},
+            {"role": "assistant", "content": "Resp 4"},
+            {"role": "user", "content": "Turn 5"},
+            {"role": "assistant", "content": "Resp 5"},
+            {"role": "user", "content": "Turn 6"},
+            {"role": "assistant", "content": "Resp 6"},
+        ]
+        result = summarizer.summarize_turns_cache_stable(messages, frozen_prefix_end=5)
+        assert result == messages
+        assert not [m for m in result if m.get("_rolling_summary")]
 
     def test_summarize_cache_stable_retains_constraints(self) -> None:
         """The rolling summary retains the task's 'don't' constraints."""
@@ -161,11 +198,14 @@ class TestHierarchicalSummarizer:
             {"role": "system", "content": "System"},
             {"role": "user", "content": "First user"},
             {"role": "assistant", "content": "Resp 0"},
-            # Two OLD turns carrying the constraints that must survive in the summary.
+            # OLD turns carrying the constraints that must survive in the
+            # summary. 5 dynamic turns > keep (2) + margin (2) -> batch fold.
             {"role": "user", "content": "Please refactor, but do not change the public API."},
             {"role": "assistant", "content": "Resp 1"},
             {"role": "user", "content": "Also avoid renaming the database tables."},
             {"role": "assistant", "content": "Resp 2"},
+            {"role": "user", "content": "Next, update the deployment scripts."},
+            {"role": "assistant", "content": "Resp 2b"},
             # Two RECENT turns kept in full (no constraint needed there).
             {"role": "user", "content": "Now add tests."},
             {"role": "assistant", "content": "Resp 3"},
@@ -191,9 +231,14 @@ class TestHierarchicalSummarizer:
             {"role": "system", "content": "System"},
             {"role": "user", "content": "First user"},
             {"role": "assistant", "content": "Resp 0"},
-            # Two OLD turns carrying the code that must survive in the summary.
+            # OLD turns carrying the code that must survive in the summary.
+            # 5 dynamic turns > keep (2) + margin (2) -> batch fold.
             {"role": "user", "content": "Here is the helper:\n\n```python\n" + code + "\n```"},
             {"role": "assistant", "content": "Got it."},
+            {"role": "user", "content": "Now document the helper in the readme."},
+            {"role": "assistant", "content": "Resp 2"},
+            {"role": "user", "content": "Then share it with the team."},
+            {"role": "assistant", "content": "Resp 2b"},
             # Two RECENT turns kept in full.
             {"role": "user", "content": "Now use it."},
             {"role": "assistant", "content": "Resp 3"},
@@ -217,7 +262,9 @@ class TestHierarchicalSummarizer:
                 {"role": "assistant", "content": "Resp 0"},
             ]
             for i in range(n):
-                msgs.append({"role": "user", "content": f"Turn {i}"})
+                msgs.append(
+                    {"role": "user", "content": f"Turn {i} implements the payment retry logic"}
+                )
                 msgs.append({"role": "assistant", "content": f"Resp {i}"})
             return msgs
 
@@ -279,20 +326,20 @@ class TestHierarchicalSummarizer:
             result = summarizer.summarize_turns_cache_stable(
                 conv(n), frozen_prefix_end=3
             )
-            block = next(m for m in result if m.get("_rolling_summary"))
-            text = summarizer._rolling_summary_text
+            blocks = [m for m in result if m.get("_rolling_summary")]
+            text = "".join(b["content"] for b in blocks)
             # Append-only: the new summary must start with the previous one.
             if prev_text:
                 assert text.startswith(prev_text), (
                     f"turn {n}: summary leading bytes changed (cache break)"
                 )
-            # Budget enforced at append time: never exceeds the cap by much.
-            assert len(text) <= 110 + 40, f"turn {n}: summary over budget ({len(text)})"
+            # Budget enforced at append time. Allow extra for per-message ROLLING_SUMMARY_MARKERs.
+            assert len(text) <= 110 + (n * 35), f"turn {n}: summary over budget ({len(text)})"
             prev_text = text
 
         # Pinned facts always survive (byte-stable leading section, prepended at
         # build time and never rewritten).
-        assert "API key abc123" in block["content"]
+        assert "API key abc123" in text
 
     def test_rolling_summary_budget_keeps_code_over_prose(self) -> None:
         """High-value code is ordered before prose in extracted constraints (v0.7.15).
@@ -316,7 +363,8 @@ class TestHierarchicalSummarizer:
         summarizer.seed_original_request("API key abc123 base url http://x")
 
         # Build a conversation whose folded turns produce >120 tokens of summary:
-        # an OLD prose turn, a CODE turn, and a RECENT prose turn.
+        # an OLD prose turn, a CODE turn, and RECENT prose turns. 5 dynamic
+        # turns > keep (2) + margin (2) -> the oldest 3 fold in one batch.
         messages = [
             {"role": "system", "content": "System"},
             {"role": "user", "content": "First user"},
@@ -327,15 +375,18 @@ class TestHierarchicalSummarizer:
             # Code turn (must survive eviction).
             {"role": "user", "content": "Here is the helper:\n\n```python\ndef helper(x):\n    return x * 2\n```"},
             {"role": "assistant", "content": "Got it."},
-            # Recent prose (kept: it is the newest folded turn).
+            # One more old turn so the batch fold fires.
+            {"role": "user", "content": "Also document the deployment steps for the release."},
+            {"role": "assistant", "content": "Resp 2"},
+            # Recent prose (kept verbatim in the live zone).
             {"role": "user", "content": "Now wire helper into the request handler and add logging."},
             {"role": "assistant", "content": "Resp 3"},
             {"role": "user", "content": "Then add a test for the handler."},
             {"role": "assistant", "content": "Resp 4"},
         ]
         result = summarizer.summarize_turns_cache_stable(messages, frozen_prefix_end=3)
-        block = next(m for m in result if m.get("_rolling_summary"))
-        content = block["content"]
+        blocks = [m for m in result if m.get("_rolling_summary")]
+        content = "".join(b["content"] for b in blocks)
 
         # Pinned facts always survive (byte-stable leading section).
         assert "API key abc123" in content
@@ -390,24 +441,32 @@ class TestHierarchicalSummarizer:
             {"role": "system", "content": "System"},
             {"role": "user", "content": "First user"},
             {"role": "assistant", "content": "Resp 0"},
-            {"role": "user", "content": "Turn 1"},
+            {"role": "user", "content": "Turn 1 implements the user registry module"},
             {"role": "assistant", "content": "Resp 1"},
-            {"role": "user", "content": "Turn 2"},
+            {"role": "user", "content": "Turn 2 hardens the repository against bad input"},
             {"role": "assistant", "content": "Resp 2"},
-            {"role": "user", "content": "Turn 3"},
+            {"role": "user", "content": "Turn 3 adds a configuration dataclass"},
             {"role": "assistant", "content": "Resp 3"},
-            {"role": "user", "content": "Turn 4"},
+            {"role": "user", "content": "Turn 4 refactors the summarizer service"},
             {"role": "assistant", "content": "Resp 4"},
-            {"role": "user", "content": "Turn 5"},
+            {"role": "user", "content": "Turn 5 optimizes the summary step"},
             {"role": "assistant", "content": "Resp 5"},
+            {"role": "user", "content": "Turn 6 adds lightweight in-memory metrics"},
+            {"role": "assistant", "content": "Resp 6"},
+            {"role": "user", "content": "Turn 7 emits a log event on each load"},
+            {"role": "assistant", "content": "Resp 7"},
+            {"role": "user", "content": "Turn 8 adds an argparse CLI entry point"},
+            {"role": "assistant", "content": "Resp 8"},
         ]
+        # Dynamic layer = Turn2..Turn8 (7 turns) > keep (3) + margin (3) ->
+        # batch fold fires.
         result = summarizer.summarize_turns_cache_stable(messages, frozen_prefix_end=5)
         # Summary block is at index 5 (right after the 5-message frozen prefix).
         assert result[5].get("_summary_id")
         # It is NOT the last element (would be a trailing turn).
         assert result[5] is not result[-1]
-        # keep_recent turns follow the summary block.
-        assert result[6:] == messages[7:]
+        # The 3 most recent turns (Turn6..Turn8) follow the summary block.
+        assert result[6:] == messages[13:]
 
     def test_leading_prefix_byte_stable_across_turns(self) -> None:
         """P0.5: [frozen][summary] leading bytes are byte-stable as the summary grows.
@@ -426,15 +485,19 @@ class TestHierarchicalSummarizer:
                 {"role": "assistant", "content": "Resp 0"},
             ]
             for i in range(n_turns):
-                msgs.append({"role": "user", "content": f"Turn {i}"})
+                msgs.append(
+                    {"role": "user", "content": f"Turn {i} implements the payment retry logic"}
+                )
                 msgs.append({"role": "assistant", "content": f"Resp {i}"})
             return msgs
 
-        # Turn N: 6 dynamic turns (Turn0..Turn5), frozen_prefix_end=3.
-        r1 = summarizer.summarize_turns_cache_stable(conv(6), frozen_prefix_end=3)
+        # Turn N: 7 dynamic turns, frozen_prefix_end=3. 7 > keep (3) + margin
+        # (3) -> the first batch fold fires.
+        r1 = summarizer.summarize_turns_cache_stable(conv(7), frozen_prefix_end=3)
         summary1 = next(m for m in r1 if m.get("_summary_id"))
-        # Turn N+1: one more turn added; the summary should APPEND, not rewrite.
-        r2 = summarizer.summarize_turns_cache_stable(conv(7), frozen_prefix_end=3)
+        # Later turn: the live window has drifted past keep + margin again, so
+        # a second batch fold APPENDS to the summary instead of rewriting it.
+        r2 = summarizer.summarize_turns_cache_stable(conv(13), frozen_prefix_end=3)
         summary2 = next(m for m in r2 if m.get("_summary_id"))
 
         # The summary block is right after the frozen prefix in both.
@@ -445,3 +508,108 @@ class TestHierarchicalSummarizer:
         assert summary2["content"].startswith(summary1["content"])
         # And the frozen prefix is byte-identical.
         assert [m.get("content") for m in r1[:3]] == [m.get("content") for m in r2[:3]]
+
+    def test_batch_fold_keeps_prompt_append_only_between_folds(self) -> None:
+        """Between batch folds the WHOLE emitted prompt is a pure tail append.
+
+        The old per-turn sliding fold mutated the prompt middle every turn
+        (the keep window's leading message was removed and the summary grew
+        each turn), so the backend re-prefilled the entire live zone every
+        turn — cached=0 from turn 14 in the 30-turn opencode log. With batch
+        folding, every non-fold turn must emit exactly the previous prompt
+        plus the new turn at the tail, so the backend reuses the whole
+        previous prompt from its prefix cache.
+        """
+        summarizer = HierarchicalSummarizer(max_full_turns=2, fold_margin=2)
+
+        def conv(n: int) -> list[dict[str, Any]]:
+            msgs = [
+                {"role": "system", "content": "System"},
+                {"role": "user", "content": "First user"},
+                {"role": "assistant", "content": "Resp 0"},
+            ]
+            for i in range(n):
+                msgs.append({"role": "user", "content": f"Turn {i} does some work"})
+                msgs.append({"role": "assistant", "content": f"Resp {i}"})
+            return msgs
+
+        def serialize(msgs: list[dict[str, Any]]) -> str:
+            return "\n".join(f"<|{m['role']}|>\n{m.get('content')}" for m in msgs)
+
+        prev = ""
+        folds = 0
+        for n in range(1, 12):
+            result = summarizer.summarize_turns_cache_stable(conv(n), frozen_prefix_end=3)
+            blob = serialize(result)
+            if prev and not blob.startswith(prev):
+                # A fold turn: the only allowed divergence. The frozen prefix
+                # must still stay byte-stable across the fold.
+                folds += 1
+                assert prev.startswith(serialize(result[:3])), (
+                    f"turn {n}: frozen prefix changed on a fold turn"
+                )
+            prev = blob
+
+        # keep=2, margin=2: folds fire when live > 4, i.e. at n=5, n=8, n=11.
+        # Every other transition is a pure tail append.
+        assert folds == 3
+
+    def test_pressure_fold_measures_with_count_messages(self) -> None:
+        """v0.7.26 quality regression: the pressure fold must measure the
+        emitted size with ``count_messages`` (what the pipeline gates use),
+        not content-only tokens.
+
+        The scratchpad compactor is gated on ``count_messages``, which includes
+        per-message overhead (e.g. tool-call payloads riding on empty-content
+        assistant messages). The first version of the pressure fold summed
+        ``len(content)`` only, undercounting by that overhead — so the fold
+        stayed dormant while the compactor fired and dropped turns the summary
+        had NOT captured (``evicted_content_recall`` collapsed to 0.51 in the
+        16-turn benchmark). With a target that sits between the content-only
+        size and the true ``count_messages`` size, the buggy measurement sees
+        no pressure (no fold); the correct measurement folds.
+        """
+
+        class _OverheadCounter:
+            # Per-message overhead count_messages sees but content-only misses.
+            OVERHEAD = 40
+
+            def count_tokens_precise(self, text: str) -> int:
+                return max(1, len(text) // 4)
+
+            def count_messages(self, messages: list[dict[str, Any]]) -> int:
+                return sum(
+                    max(1, len(str(m.get("content") or "")) // 4) + self.OVERHEAD
+                    for m in messages
+                )
+
+        summarizer = HierarchicalSummarizer(max_full_turns=3)
+        summarizer.set_token_counter(_OverheadCounter())
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "First user request for the task"},
+        ]
+        for i in range(10):
+            messages.append(
+                {"role": "user", "content": f"Step {i}: refactor the module and keep the API"}
+            )
+            messages.append({"role": "assistant", "content": f"Done with step {i}."})
+
+        # Content-only size of the whole emitted list (system + first user +
+        # live turns + the small summary block) vs the true count_messages
+        # size; the target sits between them.
+        content_only = sum(
+            max(1, len(str(m.get("content") or "")) // 4) for m in messages
+        )
+        overhead = _OverheadCounter.OVERHEAD * len(messages)
+        target = content_only + overhead // 2
+
+        summarizer.summarize_turns_cache_stable(
+            messages, frozen_prefix_end=2, pressure_target_tokens=target
+        )
+        assert summarizer._summarized_turn_count > 0, (
+            "pressure fold did not fire: the emitted size was measured "
+            "content-only instead of with count_messages, so the compactor "
+            "would drop unsummarized turns (the v0.7.26 regression)"
+        )

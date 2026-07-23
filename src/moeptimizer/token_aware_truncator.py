@@ -12,6 +12,7 @@ from typing import Any
 import tiktoken
 
 from moeptimizer.context_aligner import ContextAligner, get_context_aligner
+from moeptimizer.hierarchical_summarizer import ROLLING_SUMMARY_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,21 @@ class TokenAwareTruncator:
     truncation happens only at token boundaries, preserving model input
     integrity and avoiding partial-token artifacts.
     """
+
+    @staticmethod
+    def _is_summary_block(msg: dict[str, Any]) -> bool:
+        """Return True if msg is the append-only rolling-summary block.
+
+        Detected by its internal ``_summary_id`` / ``_rolling_summary`` markers
+        OR by its content marker (``ROLLING_SUMMARY_MARKER``). The content check
+        is required because ``_strip_internal_flags`` removes the ``_summary_id``
+        key before the prompt is sent to the backend, and the stable-prefix
+        detection must still recognize the summary on subsequent turns.
+        """
+        if msg.get("_summary_id") or msg.get("_rolling_summary"):
+            return True
+        content = msg.get("content")
+        return isinstance(content, str) and content.startswith(ROLLING_SUMMARY_MARKER)
 
     def __init__(
         self,
@@ -203,7 +219,7 @@ class TokenAwareTruncator:
             i += 1
 
         summary_messages: list[dict[str, Any]] = []
-        while i < len(messages) and messages[i].get("_summary_id"):
+        while i < len(messages) and self._is_summary_block(messages[i]):
             summary_messages.append(messages[i])
             i += 1
 
@@ -221,6 +237,18 @@ class TokenAwareTruncator:
             if frozen_end > i:
                 system_anchor.extend(dict(m) for m in messages[i:frozen_end])
                 i = frozen_end
+
+        # Keep a rolling summary block (placed right after the frozen prefix)
+        # in the immutable anchor so budget trimming never drops it
+        # (review §1/§3/§5, #7). Use _is_summary_block to detect it by both
+        # _summary_id marker and content marker (ROLLING_SUMMARY_MARKER),
+        # because _strip_internal_flags removes _summary_id before the backend
+        # sees the prompt. Append directly to system_anchor (not protected_tail)
+        # so the block stays right after the frozen prefix and the leading bytes
+        # remain byte-stable for backend prefix-cache reuse.
+        while i < len(messages) and self._is_summary_block(messages[i]):
+            system_anchor.append(dict(messages[i]))
+            i += 1
 
         # Group remaining into user-assistant pairs
         turns: list[list[dict[str, Any]]] = []
@@ -317,21 +345,41 @@ class TokenAwareTruncator:
                 messages, self._frozen_prefix_turns
             )
 
-        # Preserve the last user turn as the active request whenever possible.
+        # Preserve the rolling-summary block(s) by content marker as well as
+        # _summary_id, because _strip_internal_flags removes _summary_id before
+        # the backend sees the prompt. Scan the full list so all summary blocks
+        # are included in the immutable prefix, not just the ones immediately
+        # after the frozen prefix (review §1/§3/§5, #7).
+        summary_end = frozen_end
+        while summary_end < len(messages) and self._is_summary_block(messages[summary_end]):
+            summary_end += 1
+
+        # If there are summary blocks further in the list (e.g. placed in the
+        # protected tail by _partition_for_budget), extend the immutable prefix
+        # to include them so the budget loop never drops them.
         last_user_idx = -1
         for idx in range(len(messages) - 1, -1, -1):
             if messages[idx].get("role") == "user":
                 last_user_idx = idx
                 break
 
+        if last_user_idx >= 0:
+            furthest_summary = -1
+            for idx in range(summary_end, last_user_idx):
+                if self._is_summary_block(messages[idx]):
+                    furthest_summary = idx
+            if furthest_summary >= 0:
+                summary_end = furthest_summary + 1
+
+        # Preserve the last user turn as the active request whenever possible.
         protected_tail: list[dict[str, Any]] = []
         if last_user_idx >= 0:
             protected_tail = [dict(msg) for msg in messages[last_user_idx:]]
-            dynamic_middle = messages[frozen_end:last_user_idx]
+            dynamic_middle = messages[summary_end:last_user_idx]
         else:
-            dynamic_middle = messages[frozen_end:]
+            dynamic_middle = messages[summary_end:]
 
-        result = [dict(msg) for msg in messages[:frozen_end]]
+        result = [dict(msg) for msg in messages[:summary_end]]
         for msg in dynamic_middle:
             if self.count_messages_tokens([*result, msg, *protected_tail]) <= max_tokens:
                 result.append(dict(msg))

@@ -61,8 +61,17 @@ class HierarchicalSummarizer:
         max_full_turns: int = 5,
         max_rolling_summary_tokens: int = 1500,
         token_counter: Any = None,
+        fold_margin: int | None = None,
     ) -> None:
         self._max_full_turns = max_full_turns
+        # Batch-fold margin (the turn-12-30 cache-collapse fix): the live zone
+        # may drift this many turns past the keep window before the older turns
+        # are folded into the rolling summary in ONE batch. Between folds the
+        # emitted prompt is a pure tail append, so the backend reuses its whole
+        # prefix cache; each fold eats one invalidation, then the next
+        # ``fold_margin`` turns are append-only again. Defaults to the keep
+        # window (the live zone may double before a fold).
+        self._fold_margin = max(1, int(fold_margin)) if fold_margin is not None else max_full_turns
         # Cap the append-only rolling summary so a very long session does not
         # grow it without bound (review §8.5). When exceeded, the OLDEST lines
         # are dropped — the most-recent task state is what the model needs.
@@ -97,9 +106,15 @@ class HierarchicalSummarizer:
         # Cache-stable rolling-summary state (review §1/§3/§5, #7). The rolling
         # summary block only ever grows by appending, so its leading bytes stay
         # byte-identical across turns and the backend reuses the prefix cache.
-        self._rolling_summary_text: str = ""
         self._rolling_summary_id: str = ""
+        self._leading_summary_id: str = ""
+        self._rolling_summary_texts: list[str] = []
         self._summarized_turn_count: int = 0
+        # Emitted size right after the last pressure fold (growth-relative
+        # hysteresis baseline: the next pressure fold fires only once the
+        # context has grown a growth budget past this). None until the first
+        # pressure fold; reset whenever the rolling state resets.
+        self._last_fold_emitted_tokens: int | None = None
         # REVIEW §6: pin the original request's anchor facts (the task's
         # must-remember constants: API keys, base URLs, fixed constraints) into
         # the rolling summary's leading, byte-stable section. Front-eviction
@@ -240,21 +255,43 @@ class HierarchicalSummarizer:
         self,
         messages: list[dict[str, Any]],
         frozen_prefix_end: int,
+        pressure_target_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Cache-stable tiered rolling-summary compaction (review §1/§3/§5, #7).
+        """Cache-stable BATCH rolling-summary compaction (review §1/§3/§5, #7).
 
         Folds older dynamic turns into a single append-only rolling summary
         block placed immediately after the frozen prefix. The block retains
         constraints (the task's "don'ts") and key decisions so the model does
-        not re-derive them verbosely (the 2.17x verbosity regression). Because
-        the block only ever grows by appending, its leading bytes stay
-        byte-identical across turns, so the backend's prefix cache reuses the
-        frozen prefix + summary head instead of re-prefilling.
+        not re-derive them verbosely (the 2.17x verbosity regression).
+
+        Folding happens in BATCHES, not one turn at a time: the live zone is
+        allowed to drift ``fold_margin`` turns past the keep window before the
+        drifted turns are folded in one shot. Between folds the emitted prompt
+        is byte-identical to the previous turn plus the appended new turn, so
+        the backend's prefix cache reuses the WHOLE previous prompt and only
+        computes the new turn. The old per-turn sliding fold mutated the
+        middle of the prompt every turn (the keep window's leading message
+        was removed and the summary grew each turn), so the backend re-prefilled
+        the entire live zone (~8K tokens) every turn while the direct no-proxy
+        path — pure append-only — computed only the new turn (~800 tokens).
+        That made the proxy worse than no proxy at all (cached=0 from turn 14
+        in the 30-turn opencode log).
 
         Args:
             messages: Full optimized message list.
             frozen_prefix_end: Index just past the stable prefix block
                 (system + first user + frozen early turns).
+            pressure_target_tokens: When set (the optimizer passes its
+                compaction threshold), fold turns one at a time once the
+                EMITTED size (frozen prefix + summary block + unfolded live
+                turns) crosses this target, down to ``target - margin``
+                (hysteresis: ~25% of the target, so the next fold is several
+                append-only turns away). Measured on the post-summary list,
+                NOT the raw input, which always exceeds the threshold. This
+                makes the cycle self-regulating: one fold turn drops the
+                context well under the target, then the following turns are
+                pure tail appends until the growing live zone crosses the
+                target again.
 
         Returns:
             Message list with older dynamic turns replaced by the rolling
@@ -270,6 +307,8 @@ class HierarchicalSummarizer:
             # Nothing old enough to summarize; reset the rolling counter so a
             # later long context starts fresh.
             self._summarized_turn_count = 0
+            self._rolling_summary_texts = []
+            self._last_fold_emitted_tokens = None
             return messages
 
         # Group the dynamic layer into user-led turns.
@@ -278,84 +317,228 @@ class HierarchicalSummarizer:
         keep = self._max_full_turns
         if total_turns <= keep:
             self._summarized_turn_count = 0
+            self._rolling_summary_texts = []
+            self._last_fold_emitted_tokens = None
             return messages
 
-        # Turns already folded into the rolling summary (append-only, stable).
-        end = total_turns - keep
-        start = min(self._summarized_turn_count, end)
-        new_turns = turns[start:end]
-
-        if new_turns:
-            new_text = self._extract_constraints(new_turns)
-            if new_text:
-                # Cache-stable (REVIEW.md P0.5/P0.6, the turn-11 prefix break):
-                # the rolling summary is part of the STABLE PREFIX, so its leading
-                # bytes must never change once sent to the backend. We therefore
-                # only ever APPEND, and we cap the NEW text to the remaining budget
-                # at append time. We never rewrite existing summary content (the
-                # old front-trim dropped the oldest segments, which changed the
-                # summary's leading bytes and invalidated the backend's cached KV
-                # for the whole body — cached 3192 -> 882 at turn 11). The budget
-                # is monotonic (grows with folded turns), so a later turn can
-                # always append more; the leading bytes stay byte-identical.
+        # Batch fold. Two triggers, both folding by appending to the rolling
+        # summary (cache-stable: REVIEW.md P0.5/P0.6 — the summary is part of
+        # the STABLE PREFIX, so existing content is never rewritten; the NEW
+        # text is capped to the remaining budget at append time. The old
+        # front-trim rewrote the leading bytes and invalidated the backend's
+        # cached KV for the whole body — cached 3192 -> 882 at turn 11):
+        #
+        # 1. PRESSURE (pressure_target_tokens set by the optimizer): fold
+        #    turns one at a time until the EMITTED size — frozen prefix +
+        #    summary block + UNFOLDED live turns — fits under the target.
+        #    Measured on the post-summary list, never the raw input (the raw
+        #    input is the client's full cumulative history and always exceeds
+        #    the threshold, which would fold EVERY turn and slide the live
+        #    zone daily — exactly the per-turn cache break this replaces).
+        #    The cycle is self-regulating: one fold turn drops the context
+        #    well under the target, then the following turns are pure tail
+        #    appends until the growing live zone crosses the target again.
+        #    This fold MUST shed the tokens before the scratchpad compactor
+        #    runs: the compactor keeps a fixed-size tail window, so every
+        #    turn it runs it front-evicts one more turn, sliding the whole
+        #    post-compact body and breaking the prefix cache every turn (the
+        #    turn-12 cliff: cached 7014 -> 881).
+        # 2. DRIFT (no pressure target): fold once the live window has drifted
+        #    ``fold_margin`` turns past the keep window, back down to keep.
+        #
+        # On a fold turn the prompt diverges once (the summary tail grows and
+        # the live zone's head jumps forward); between folds the emitted
+        # prompt is a pure tail append.
+        live_count = total_turns - self._summarized_turn_count
+        # DRIFT trigger: once the live window has drifted fold_margin turns
+        # past the keep window, fold it back down to keep in ONE batch. The
+        # batch extracts across all folded turns at once so the high-value
+        # sections (Files/Code) are ordered before prose — the append-time
+        # truncation keeps the front, so code survives budget pressure.
+        if live_count > keep + self._fold_margin:
+            end = total_turns - keep
+            new_turns = turns[self._summarized_turn_count:end]
+            extracted = self._extract_constraints(new_turns) if new_turns else ""
+            if not extracted:
+                # Nothing worth remembering (vacuous content): drop the turns
+                # so the live zone stays bounded; no state is lost.
+                self._summarized_turn_count = end
+            else:
                 budget = self._effective_summary_budget()
-                if self._rolling_summary_text:
-                    room = budget - self._count_tokens(self._rolling_summary_text)
-                    new_text = (
-                        ""
-                        if room <= 0
-                        else self._truncate_to_budget(new_text, room)
-                    )
+                current_tokens = sum(self._count_tokens(t) for t in self._rolling_summary_texts)
+                room = budget - current_tokens
+                new_text = (
+                    ""
+                    if room <= 0
+                    else self._truncate_to_budget(extracted, room)
+                )
                 if new_text:
-                    self._rolling_summary_text = (
-                        f"{self._rolling_summary_text}\n{new_text}"
-                        if self._rolling_summary_text
-                        else new_text
-                    )
+                    self._rolling_summary_texts.append(new_text)
                     self._stats["turns_summarized"] += sum(len(t) for t in new_turns)
                     self._stats["turns_compressed"] += 1
-            self._summarized_turn_count = end
+                    self._summarized_turn_count = end
+                # else: summary budget full — leave the turns live (see below).
+            live_count = total_turns - self._summarized_turn_count
 
-        keep_recent = [m for t in turns[end:] for m in t]
-        # Place the rolling summary IMMEDIATELY AFTER the frozen prefix (not as a
-        # trailing turn). The backend prefix cache reuses the LEADING bytes of the
-        # prompt: [frozen prefix][append-only summary] is byte-stable across turns
-        # (the summary only ever grows by appending), so the backend reuses the KV
-        # for the frozen prefix + summary head and only computes the live zone
-        # (keep_recent + current turn) fresh. The old "trailing" placement put the
-        # summary AFTER keep_recent, making the leading bytes = [frozen][keep_recent]
-        # which change every turn (turns shift out of keep_recent into the folded
-        # set) — that broke prefix-cache reuse at turn 13 (REVIEW.md P0.4/P0.5).
-        # Shifting later turns does NOT invalidate the prefix; the prefix is still
-        # the leading bytes and is reused. This matches the docstring contract
-        # above ("placed immediately after the frozen prefix").
-        return [*frozen, self._build_rolling_summary_block(), *keep_recent]
+        # PRESSURE trigger with GROWTH-RELATIVE hysteresis. An absolute
+        # "fold until under target" cannot work: the keep window floor
+        # (frozen + keep verbatim turns + block) sits AT the target, so the
+        # loop always exits at the floor and the very next turn — one turn's
+        # growth above the floor — re-triggers. Result: a fold EVERY turn
+        # (the per-turn summary append + live-zone slide this replaces).
+        # Instead: the FIRST fold fires at the absolute target; each later
+        # fold fires only once the context has grown a growth budget past the
+        # POST-FOLD size of the previous fold. Between folds the emitted
+        # prompt is a pure tail append (fully prefix-cached); one fold buys
+        # as many append-only turns as the growth budget covers.
+        if pressure_target_tokens is not None and live_count > keep:
+            growth_budget = max(2048, pressure_target_tokens // 3)
 
-    def _build_rolling_summary_block(self) -> dict[str, Any]:
-        """Return the single rolling-summary message (append-only content).
+            def emitted_tokens() -> int:
+                # Measure the EMITTED list with count_messages — the SAME
+                # measurement the pipeline's gates use (role + tool-call
+                # overhead included). Content-only counting undercounts by
+                # the tool-call payload, so the scratchpad compactor (gated
+                # on count_messages) would fire BEFORE the fold and drop
+                # turns the summary never captured — losing their state.
+                emitted = [*frozen, *self._build_rolling_summary_blocks()]
+                for t in turns[self._summarized_turn_count:]:
+                    emitted.extend(t)
+                if self._token_counter is not None:
+                    try:
+                        return int(self._token_counter.count_messages(emitted))
+                    except Exception:
+                        pass
+                return sum(
+                    self._count_tokens(str(m.get("content") or "")) for m in emitted
+                )
 
-        The pinned original-request facts (REVIEW §6) are prepended as the
-        leading, byte-stable section so they survive front-eviction of Turn 1
-        and keep ``fact_recall`` measurable. The leading section is seeded once
-        and never rewritten, so the backend's prefix cache for the summary head
-        is preserved across turns.
+            if self._last_fold_emitted_tokens is None:
+                trigger = emitted_tokens() > pressure_target_tokens
+                fold_target = pressure_target_tokens
+            else:
+                trigger = emitted_tokens() > self._last_fold_emitted_tokens + growth_budget
+                fold_target = self._last_fold_emitted_tokens
+            if trigger:
+                while live_count > keep and emitted_tokens() > fold_target:
+                    if not self._fold_one_turn(turns[self._summarized_turn_count]):
+                        # Summary budget full: stop folding and leave the turn
+                        # in the live zone. Never drop state the budget
+                        # refused to store; the scratchpad compactor (bounded
+                        # per-turn shrink floor) is the size safety valve then.
+                        break
+                    self._summarized_turn_count += 1
+                    live_count -= 1
+                # The loop also exits at the keep floor (cannot fold below
+                # the verbatim window); record the actual post-fold size so
+                # the next trigger is relative to reality, not the wish.
+                self._last_fold_emitted_tokens = emitted_tokens()
+
+        if not self._rolling_summary_texts:
+            # Nothing folded yet: emit the messages unchanged. The block
+            # first appears on the first fold turn — the same turn that
+            # invalidates the body anyway, so the insertion costs nothing
+            # extra. (Emitting an empty block before any fold would add
+            # noise without state; the pinned original-request facts are
+            # prepended to the first real fold's block.)
+            return messages
+
+        keep_recent = [m for t in turns[self._summarized_turn_count:] for m in t]
+        # Place the rolling summary IMMEDIATELY AFTER the frozen prefix:
+        # [frozen][append-only summary][live zone]. The summary's index and
+        # leading bytes never change; between folds the live zone only grows
+        # by appending at the tail, so the whole prompt is a prefix of the
+        # next turn's prompt and the backend reuses ALL of it. On a fold turn
+        # the divergence is at the summary TAIL (the cached prefix is frozen
+        # + the old summary), and the live zone's head jumps forward once.
+        #
+        # Trailing placement ([frozen][live][summary]) is worse on fold
+        # turns: the fold removes the live zone's HEAD, so the divergence is
+        # right after the frozen prefix and the old summary's cache is lost
+        # too. It is also undone by the scratchpad compactor, which keeps
+        # _summary_id messages in the static layer — the block would jump
+        # from the tail to the static boundary whenever the compactor
+        # toggles, an extra structural break.
+        return [*frozen, *self._build_rolling_summary_blocks(), *keep_recent]
+
+    def has_rolling_summary(self) -> bool:
+        """Whether any turns have been folded into the rolling summary.
+
+        When True, the batch fold is the active size mechanism and per-turn
+        sliding trims must stay off (they would slide the live zone every
+        turn and break the prefix cache the fold preserves). When False
+        (nothing folded yet), the sliding window is still the size valve for
+        short contexts the fold cannot shrink (live window <= keep).
         """
-        if not self._rolling_summary_id:
-            self._rolling_summary_id = hashlib.md5(
-                b"rolling-summary"
-            ).hexdigest()[:16]
+        return bool(self._rolling_summary_texts)
+
+    def _fold_one_turn(self, turn: list[dict[str, Any]]) -> bool:
+        """Extract one turn's state and append it to the rolling summary.
+
+        Returns False when the append was refused (the summary budget is
+        full) — the caller must then stop folding and leave the turn in the
+        live zone rather than dropping unsummarized state. Vacuous turns
+        (nothing extractable) return True: there is no state to store, so
+        dropping them is safe.
+        """
+        extracted = self._extract_constraints([turn])
+        if not extracted:
+            return True
+        budget = self._effective_summary_budget()
+        current_tokens = sum(self._count_tokens(t) for t in self._rolling_summary_texts)
+        room = budget - current_tokens
+        if room <= 0:
+            return False
+        new_text = self._truncate_to_budget(extracted, room)
+        if not new_text:
+            return False
+        self._rolling_summary_texts.append(new_text)
+        self._stats["turns_summarized"] += len(turn)
+        self._stats["turns_compressed"] += 1
+        return True
+
+    def _rolling_summary_content(self) -> str:
+        """Return the full append-only content of the rolling summary block."""
+        parts: list[str] = []
         leading = self._rolling_summary_leading()
         if leading:
-            text = f"{leading}\n{self._rolling_summary_text}" if self._rolling_summary_text else leading
-        else:
-            text = self._rolling_summary_text or "Earlier context summarized."
-        return {
+            parts.append(leading)
+        parts.extend(self._rolling_summary_texts)
+        if not parts:
+            parts.append("Earlier context summarized.")
+        return f"{ROLLING_SUMMARY_MARKER}\n" + "\n".join(parts)
+
+    def _build_rolling_summary_blocks(self) -> list[dict[str, Any]]:
+        """Return the rolling summary as a SINGLE append-only user message.
+
+        The pinned original-request facts (REVIEW §6) form the leading,
+        byte-stable section so they survive front-eviction of Turn 1 and keep
+        ``fact_recall`` measurable.  Each folded turn appends its extracted
+        state to ``self._rolling_summary_texts``; the content is the
+        concatenation of the leading facts and ALL appended texts, joined by
+        newlines.
+
+        **Why a single message instead of one-per-text?**  The backend
+        (Lemonade / llama.cpp) uses TOKEN-LEVEL prefix matching for its KV
+        cache — the direct path's smooth ``cached`` growth (1 374 → 2 122 →
+        2 920 → …) proves this.  With separate messages, each new summary
+        block was INSERTED at the summary / keep_recent boundary, shifting
+        every subsequent message forward and breaking the prefix cache at the
+        insertion point (the turn-12 cliff: cached 8 050 → 882, then stuck).
+        A single message whose content grows by appending keeps the leading
+        bytes identical across turns; the backend reuses the cached KV for
+        the frozen prefix + summary head and only computes the new tail.
+        """
+        content = self._rolling_summary_content()
+        if not self._rolling_summary_id:
+            self._rolling_summary_id = hashlib.md5(b"rolling-summary").hexdigest()[:16]
+        return [{
             "role": "user",
-            "content": f"{ROLLING_SUMMARY_MARKER}\n{text}",
+            "content": content,
             "_summary_id": self._rolling_summary_id,
             "_summary_level": 1,
             "_rolling_summary": True,
-        }
+        }]
 
     def _enforce_rolling_summary_budget(self) -> None:
         """No-op: budget is now enforced at append time, never by rewriting.
@@ -715,15 +898,19 @@ class HierarchicalSummarizer:
     def clear(self) -> None:
         """Clear all stored summaries."""
         self._summaries.clear()
+        # Keep all stat keys: ``recall_tokens_created`` is incremented elsewhere
+        # and a missing key would raise KeyError after clear().
         self._stats = {
             "turns_summarized": 0,
             "turns_compressed": 0,
             "recall_tokens_created": 0,
         }
         self._last_context_changed = True
-        self._rolling_summary_text = ""
         self._rolling_summary_id = ""
+        self._leading_summary_id = ""
+        self._rolling_summary_texts = []
         self._summarized_turn_count = 0
+        self._last_fold_emitted_tokens = None
 
     def save_to_disk(self, force: bool = False) -> None:
         """Persist summaries to disk."""

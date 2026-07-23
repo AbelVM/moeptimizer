@@ -1684,7 +1684,6 @@ def _start_proxy(port: int, wait: float = 60.0) -> subprocess.Popen | None:
         proc = subprocess.Popen(
             [sys.executable, "-m", "moeptimizer"],
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
             env=env,
         )
         _PROXY_PROCESS = proc

@@ -16,6 +16,7 @@ Strategy:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from moeptimizer.config import get_config
@@ -109,7 +110,7 @@ class ScratchpadCompactor:
             messages = [m for m in messages if not (m.get("_summary_id") or m.get("_rolling_summary"))]
 
         # Partition into zones
-        system_anchor, _, protected_tail = self._partition_zones(messages)
+        system_anchor, evictable_body, protected_tail = self._partition_zones(messages)
 
         # P0.6: decide how much of the evictable body to keep. By default the
         # compactor drops the entire evictable body (system_anchor + protected_tail
@@ -118,22 +119,23 @@ class ScratchpadCompactor:
         # collapses below min_keep_tokens in one call.
         kept_evictable: list[dict[str, Any]] = []
         if min_keep_tokens is not None and self._token_counter is not None:
-            # Group the evictable body into complete user-led turns (pairs) so we
-            # can retain whole turns, not split mid-turn.
-            pairs = self._group_pairs(messages)
+            # Group only the evictable body into complete user-led turns (pairs).
+            # Using the full messages list here (before the fix) caused system_anchor
+            # and protected_tail pairs to be iterated first, bumping `running` before
+            # any evictable content and causing the loop to stop too early — the
+            # shrink floor was never reached.
+            pairs = self._group_pairs(evictable_body)
             # The non-evictable baseline (system anchor + protected tail) in tokens.
             base_tokens = self._token_counter.count_messages(system_anchor)
             base_tokens += self._token_counter.count_messages(protected_tail)
             # Retain pairs from the front until we reach the floor (or run out).
             running = base_tokens
             for pair in pairs:
-                pair_tokens = self._token_counter.count_messages(pair)
-                if running + pair_tokens > min_keep_tokens and kept_evictable:
-                    # Adding this pair would exceed the floor and we already kept
-                    # at least one evictable turn — stop (gradual shrink).
+                if running >= min_keep_tokens:
+                    # Floor is already satisfied — stop adding more evictable turns.
                     break
                 kept_evictable.extend(pair)
-                running += pair_tokens
+                running += self._token_counter.count_messages(pair)
         # else: drop all evictable body (legacy behavior).
 
         # Build the result: system anchor + retained evictable body + protected tail.
@@ -146,6 +148,24 @@ class ScratchpadCompactor:
         # as the leading bytes, which change every turn and break the cache.
         if summary_blocks:
             result = list(system_anchor) + summary_blocks + list(kept_evictable) + list(protected_tail)
+        if os.environ.get("MOEPT_DIAG_DUMP"):
+            import sys
+
+            fu = None
+            for m in messages:
+                if m.get("role") == "user":
+                    fu = m.get("content")
+                    break
+            dup_zones = []
+            for zname, z in (("sa", system_anchor), ("kept", kept_evictable), ("pt", protected_tail)):
+                for i, m in enumerate(z):
+                    if m.get("role") == "user" and m.get("content") == fu:
+                        dup_zones.append(f"{zname}[{i}]")
+            if dup_zones:
+                sys.stderr.write(
+                    f"[COMPACT-DUP] first-user also in: {dup_zones} | sa={len(system_anchor)} kept={len(kept_evictable)} pt={len(protected_tail)} sb={len(summary_blocks)}\n"
+                )
+                sys.stderr.flush()
         return result
 
     def _group_pairs(self, messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -162,6 +182,13 @@ class ScratchpadCompactor:
                 current.append(dict(msg))
         if current:
             pairs.append(current)
+        if os.environ.get("MOEPT_DIAG_DUMP"):
+            import sys
+
+            sys.stderr.write(
+                f"[GROUP-PAIRS] n={len(pairs)} pair0_roles={[m.get('role') for m in pairs[0]] if pairs else []}\n"
+            )
+            sys.stderr.flush()
         return pairs
 
     def _partition_zones(

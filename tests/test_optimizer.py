@@ -56,20 +56,27 @@ class TestAgentContextOptimizer:
         """
         assert self.optimizer.hit_prediction is not None
         calls: list[tuple] = []
+        # hit_prediction is a process-wide singleton: stub the instance
+        # attribute and always delete it again so the class method is
+        # restored for later tests (leaving the stub in place made
+        # test_v050_integration::test_hit_prediction_model record into a
+        # no-op and see an empty history).
         self.optimizer.hit_prediction.record_outcome = lambda *a, **kw: calls.append((a, kw))
+        try:
+            # No cached_tokens -> no training (weak label avoided).
+            self.optimizer.record_cache_outcome(None)
+            assert calls == []
 
-        # No cached_tokens -> no training (weak label avoided).
-        self.optimizer.record_cache_outcome(None)
-        assert calls == []
+            # Authoritative signal present -> trains with hit = (cached_tokens > 0).
+            self.optimizer.record_cache_outcome(123)
+            assert len(calls) == 1
+            assert calls[0][1]["hit"] is True
 
-        # Authoritative signal present -> trains with hit = (cached_tokens > 0).
-        self.optimizer.record_cache_outcome(123)
-        assert len(calls) == 1
-        assert calls[0][1]["hit"] is True
-
-        self.optimizer.record_cache_outcome(0)
-        assert len(calls) == 2
-        assert calls[1][1]["hit"] is False
+            self.optimizer.record_cache_outcome(0)
+            assert len(calls) == 2
+            assert calls[1][1]["hit"] is False
+        finally:
+            del self.optimizer.hit_prediction.record_outcome
 
     def test_seed_token_calibration_anchors_from_exact_count(self) -> None:
         sample = "hello world test"
@@ -431,6 +438,12 @@ class TestAgentContextOptimizer:
         config.agentic.proactive_trim_ratio = 0.4
         config.agentic.compaction_trigger_ratio = 0.9
         config.agentic.fast_path_enabled = False
+        # Disable the cache-stable rolling summary: while it is armed, the
+        # front-evicting proactive trim is skipped below the compaction
+        # threshold (the batch fold is the size mechanism then), so this
+        # threshold-plumbing test exercises the classic path.
+        config.v050.cache_stable_summary_enabled = False
+        config.v050.hierarchical_summary_enabled = False
         optimizer = AgentContextOptimizer(config)
         messages = [
             {"role": "system", "content": "System"},
@@ -1249,6 +1262,80 @@ class TestCacheStabilityAcrossTurns:
             prev_blob = blob
             prev_summary_present = summary_present
 
+    def test_whole_prompt_append_only_between_batch_folds(self) -> None:
+        """v0.7.26 turn-12 cliff regression: the WHOLE optimized prompt must be
+        a pure tail append on every non-fold turn.
+
+        ``test_frozen_prefix_stable_across_30_turns`` passed while the live
+        benchmark still cliffed (cached 7,014 -> 881 -> 0 from turn 14): the
+        frozen+summary HEAD was append-only, but five front-evictors (the
+        per-turn rolling fold, proactive trim, sliding window, the scratchpad
+        compactor, and the growth-chasing pressure target) slid the live zone
+        EVERY turn, so the backend re-prefilled the whole ~8K-token body each
+        turn while the direct no-proxy path appended only the new turn. This
+        test asserts the stronger whole-prompt invariant the fix establishes:
+        non-fold turns append the new turn at the tail (the backend reuses the
+        ENTIRE previous prompt), and folds are rare one-time invalidations
+        whose divergence sits at or after the frozen head — never inside it.
+        """
+        opt = self._opt()
+        conversation: list[dict[str, Any]] = [
+            {"role": "system", "content": "You are a coding agent. Keep APIs stable."},
+            {"role": "user", "content": "Initial task: build the pipeline."},
+            {"role": "assistant", "content": "I will build the pipeline step by step."},
+        ]
+
+        def serialize(msgs: list[dict[str, Any]]) -> str:
+            return "\n".join(f"<|{m.get('role')}|>\n{m.get('content') or ''}" for m in msgs)
+
+        prev_blob: str | None = None
+        frozen_head: str | None = None
+        fold_turns = 0
+        total_turns = 20
+        for n in range(1, total_turns + 1):
+            conversation.extend(self._build_turn(n))
+            optimized = opt.optimize_messages(list(conversation))
+            blob = serialize(optimized)
+            frozen_end = opt.context_aligner.frozen_prefix_end(
+                optimized, opt._config.v050.frozen_prefix_turns
+            )
+            head = serialize(optimized[:frozen_end])
+            if n >= 3:
+                if frozen_head is not None:
+                    # The frozen head never changes — fold turn or not.
+                    assert head == frozen_head, f"frozen head mutated at turn {n}"
+                frozen_head = head
+            if prev_blob is not None and n >= 4 and frozen_head is not None:
+                if not blob.startswith(prev_blob):
+                    # A fold turn: the divergence must sit at or after the
+                    # frozen head. The fold appends to the summary and slides
+                    # the live zone; it never touches the frozen prefix. A
+                    # divergence INSIDE the head means a front-evictor slid
+                    # the cached prefix — the v0.7.26 regression.
+                    fold_turns += 1
+                    div = next(
+                        (
+                            i
+                            for i in range(min(len(blob), len(prev_blob)))
+                            if blob[i] != prev_blob[i]
+                        ),
+                        min(len(blob), len(prev_blob)),
+                    )
+                    assert div >= len(frozen_head), (
+                        f"turn {n}: divergence at char {div} is inside the frozen "
+                        f"head ({len(frozen_head)} chars) — a front-evictor slid "
+                        f"the cached prefix"
+                    )
+            prev_blob = blob
+
+        # The old code broke EVERY turn once pressure built up (turns 12-30 in
+        # the 30-turn opencode log). Batch folding must invalidate rarely: at
+        # most one fold per ~3 turns over the run. A per-turn slide trips this.
+        assert fold_turns <= total_turns // 3, (
+            f"{fold_turns} fold turns out of {total_turns} — the fold degraded "
+            f"to per-turn sliding (the v0.7.26 regression)"
+        )
+
     def test_growth_ceiling_bounds_per_turn_expansion(self) -> None:
         """The effective budget must not exceed prev_size + growth cap."""
         opt = self._opt()
@@ -1378,3 +1465,42 @@ class TestCacheStabilityAcrossTurns:
             f"tool-output filter shrank {shrunk} tokens in one turn, "
             f"exceeds shrink cap {cap} (floor={floor})"
         )
+
+    def test_stabilize_summary_position_places_summary_in_stable_prefix(self) -> None:
+        """The rolling-summary block must sit inside the stable prefix, not at the tail.
+
+        Without this, the summary drifts to the tail as new turns are appended and
+        the leading bytes change on every turn, defeating the backend's prefix
+        cache.  The summary is part of the stable prefix and must be byte-stable.
+        """
+        opt = self._opt()
+        messages = [
+            {"role": "system", "content": "System rules"},
+            {"role": "user", "content": "Old task " + "x" * 200},
+            {"role": "assistant", "content": "Old response " + "y" * 200},
+            {"role": "user", "content": "Another old task " + "x" * 200},
+            {"role": "assistant", "content": "Another old response " + "y" * 200},
+            {
+                "role": "assistant",
+                "content": "Context summary (rolling): earlier tasks were about X.",
+                "_rolling_summary": True,
+                "_summary_id": "abc123",
+            },
+            {"role": "user", "content": "Recent task " + "x" * 200},
+            {"role": "assistant", "content": "Recent response " + "y" * 200},
+        ]
+        result = opt._stabilize_summary_position(messages)
+        summary_indices = [
+            i for i, m in enumerate(result) if m.get("_rolling_summary")
+        ]
+        assert summary_indices, "expected a rolling-summary block in the result"
+        # The summary must be inside the stable prefix (not at the tail).
+        # In cache-stable mode the stable prefix is the frozen prefix, which
+        # includes system + first user + frozen_prefix_turns complete turns.
+        frozen_end = opt.context_aligner.frozen_prefix_end(messages, opt._config.v050.frozen_prefix_turns)
+        assert summary_indices[0] < frozen_end, (
+            f"rolling summary should be inside the frozen prefix (index < {frozen_end}), got {summary_indices[0]}"
+        )
+        # Everything after the summary must still be present (not dropped).
+        assert result[-1]["role"] == "assistant"
+        assert result[-2]["role"] == "user"

@@ -252,6 +252,7 @@ class AgentContextOptimizer:
         # each turn, breaking prefix-cache reuse.
         self._last_raw_prefix: list[dict[str, Any]] = []
         self._live_zone_start: int = 0
+        self._last_raw_stable_end: int = 0
         # Incremental-optimization memo (review §4). When
         # ``incremental_optimization_enabled`` is on, the fully-optimized stable
         # prefix from the previous turn is cached here keyed by its content hash,
@@ -354,6 +355,20 @@ class AgentContextOptimizer:
         cap = self._config.agentic.max_context_growth_per_turn
         if cap <= 0 or self._last_optimized_token_count is None:
             return budget
+        # With the cache-stable rolling summary active, the BATCH FOLD is the
+        # size governor: between folds the context grows by pure tail append
+        # (cache-safe at any size), and the fold sheds tokens the turn the
+        # context crosses its target. The growth ceiling was designed to stop
+        # a single turn from forcing a large MID-BODY rewrite (v0.7.18), but
+        # here it does the opposite: it chases the previous turn's size with
+        # only ``cap`` tokens of slack, so any turn growing more than that
+        # (the fixture's turns vary 230-2300 tokens) trips the pressure fold
+        # EVERY turn, appending to the summary and sliding the live zone —
+        # the per-turn prefix break the fold is supposed to prevent. Let the
+        # full (static) budget apply; the fold target derived from it keeps
+        # the size bounded with rare, batched invalidations.
+        if self._cache_stable_summary and self.hierarchical_summarizer is not None:
+            return budget
         ceiling = self._last_optimized_token_count + cap
         return min(budget, ceiling)
 
@@ -437,6 +452,12 @@ class AgentContextOptimizer:
         which lets the context collapse in a single turn (the v0.7.22 turn-11
         cliff).
         """
+        # KV-cache stability: stabilize the rolling-summary position on EVERY
+        # return path, not just the main pipeline. Early exits (fast path,
+        # KV-cache hit, high cache hit rate, hit prediction) previously skipped
+        # this, leaving the summary at the tail where its changing content
+        # defeated the backend's prefix cache.
+        optimized = self._stabilize_summary_position(optimized)
         self._last_optimized = optimized
         try:
             self._last_optimized_token_count = self.token_counter.count_messages(optimized)
@@ -607,11 +628,12 @@ class AgentContextOptimizer:
         frozen_end = self.context_aligner.frozen_prefix_end(
             messages, self._config.v050.frozen_prefix_turns
         )
-        # The summary block sits immediately after the frozen prefix (P0.5 fix).
-        # Include it in the stable prefix so optimizer stages never mutate it.
-        if frozen_end < len(messages) and self._is_summary_block(messages[frozen_end]):
-            return frozen_end + 1
-        return frozen_end
+        # The summary blocks sit immediately after the frozen prefix (P0.5 fix).
+        # Include them in the stable prefix so optimizer stages never mutate them.
+        i = frozen_end
+        while i < len(messages) and self._is_summary_block(messages[i]):
+            i += 1
+        return i
 
     def _compute_live_zone_start(self, messages: list[dict[str, Any]]) -> int:
         """Return the index where the live zone begins.
@@ -635,13 +657,14 @@ class AgentContextOptimizer:
 
         current_prefix = _norm(messages[: len(self._last_raw_prefix)])
         if current_prefix == _norm(self._last_raw_prefix):
-            return self._live_zone_start
+            return self._last_raw_stable_end
 
         # Prefix changed (new session, reset, or different history). Treat all
         # as live and reset the stored prefix.
         self._last_raw_prefix = []
         self._last_stable_prefix = []
         self._live_zone_start = 0
+        self._last_raw_stable_end = 0
         return 0
 
     def _update_stable_prefix(
@@ -676,10 +699,14 @@ class AgentContextOptimizer:
         # (self._live_zone_start), not the incoming live_zone_start, so the raw
         # prefix is established on the very first turn that has a stable prefix
         # (turn 1 here) and the next turn can reuse it.
+        # P0.5: use _stable_prefix_end (not just frozen_end) to include the
+        # rolling-summary block in the raw prefix, matching the optimized boundary.
         if raw_messages is not None and self._live_zone_start > 0:
+            raw_stable_end = self._stable_prefix_end(raw_messages)
+            self._last_raw_stable_end = raw_stable_end
             self._last_raw_prefix = [
                 {k: v for k, v in m.items() if k in ("role", "content")}
-                for m in raw_messages[: self._live_zone_start]
+                for m in raw_messages[:raw_stable_end]
             ]
         else:
             self._last_raw_prefix = []
@@ -1053,6 +1080,7 @@ class AgentContextOptimizer:
             if current_tokens > proactive_threshold_tokens:
                 optimized = self.context_canonicalizer.canonicalize(optimized)
                 current_tokens = self.token_counter.count_messages(optimized)
+                self._diag_sys("after-5.5-canon", optimized)
             else:
                 logger.debug(
                     "[AgentOptimizer] Context canonicalization skipped: tokens=%d <= threshold=%d",
@@ -1084,6 +1112,7 @@ class AgentContextOptimizer:
                         optimized, skip_predicate=self._is_active_file_content
                     )
                 current_tokens = self.token_counter.count_messages(optimized)
+                self._diag_sys("after-5.7-code", optimized)
             else:
                 logger.debug(
                     "[AgentOptimizer] Context compression skipped: tokens=%d <= threshold=%d",
@@ -1132,6 +1161,7 @@ class AgentContextOptimizer:
                     if template_name:
                         optimized = self.context_template_matcher.apply_template(optimized)
                         current_tokens = self.token_counter.count_messages(optimized)
+                        self._diag_sys("after-6.5-template", optimized)
             except Exception as e:
                 logger.warning("Context template matching failed: %s", e)
 
@@ -1151,8 +1181,6 @@ class AgentContextOptimizer:
             self.hierarchical_summarizer is not None
             and self._cache_stable_summary
             and self._config.v050.cache_stable_mode
-            and not is_lean_context
-            and current_tokens > proactive_threshold_tokens
         ):
             try:
                 # Re-derive the adaptive summary-cap ceiling from the dynamic
@@ -1165,10 +1193,26 @@ class AgentContextOptimizer:
                 frozen_end = self.context_aligner.frozen_prefix_end(
                     optimized, self._config.v050.frozen_prefix_turns
                 )
+                # Pressure target = the compaction threshold derived from the
+                # FULL (static) budget — max_tokens here, since the growth
+                # ceiling is bypassed while the summary governs sizing. The
+                # summarizer measures pressure on its EMITTED size (frozen +
+                # summary + unfolded live turns) and folds only once it
+                # crosses this target, then down to target minus a hysteresis
+                # margin: one fold turn drops the context well under it, and
+                # the following turns are pure tail appends (fully prefix-
+                # cached) until the live zone grows back over the target.
+                # (Targeting the growth-chasing ceiling instead folded EVERY
+                # turn — its slack is one turn's growth by construction.)
                 optimized = self.hierarchical_summarizer.summarize_turns_cache_stable(
-                    optimized, frozen_end
+                    optimized,
+                    frozen_end,
+                    pressure_target_tokens=int(
+                        max_tokens * self._config.agentic.compaction_trigger_ratio
+                    ),
                 )
                 current_tokens = self.token_counter.count_messages(optimized)
+                self._diag_sys("after-7-summary", optimized)
             except Exception as e:
                 logger.warning("Rolling summary compaction failed: %s", e)
 
@@ -1189,6 +1233,7 @@ class AgentContextOptimizer:
                     optimized, min_keep_tokens=shrink_floor
                 )
                 current_tokens = self.token_counter.count_messages(optimized)
+                self._diag_sys("after-7-compact", optimized)
             else:
                 logger.debug(
                     "[AgentOptimizer] Scratchpad compaction skipped: tokens=%d <= threshold=%d",
@@ -1211,12 +1256,14 @@ class AgentContextOptimizer:
         if self._config.agentic.attention_sinks_enabled and total_chars > 4000:
             try:
                 optimized = apply_attention_sinks(optimized, self._find_static_layer_end(optimized))
+                self._diag_sys("after-7.25-sinks", optimized)
             except Exception as e:
                 logger.warning("Attention sink management failed: %s", e)
 
         # Step 7.5: Apply selective truncation (remove duplicate code blocks)
         try:
             optimized = self.selective_truncator.remove_duplicates(optimized)
+            self._diag_sys("after-7.5-dedup", optimized)
         except Exception as e:
             logger.warning("Selective truncation failed: %s", e)
 
@@ -1231,6 +1278,7 @@ class AgentContextOptimizer:
         try:
             optimized = self.incremental_updater.update_context(optimized, "")
             current_tokens = self.token_counter.count_messages(optimized)
+            self._diag_sys("after-7.8-incremental", optimized)
         except Exception as e:
             logger.warning("Incremental update failed: %s", e)
 
@@ -1282,6 +1330,8 @@ class AgentContextOptimizer:
         except Exception as e:
             logger.warning("Post-RAG recount failed: %s", e)
 
+        self._diag_sys("after-8-rag", optimized)
+
         # Step 9: Pre-seed reasoning prefix only when explicitly enabled.
         # Disabled by default because direct-request semantics are the quality target.
         max_tokens = self._budget_tokens()
@@ -1290,6 +1340,8 @@ class AgentContextOptimizer:
                 optimized = self._preseed_reasoning(optimized)
             except Exception as e:
                 logger.warning("Reasoning pre-seeding failed: %s", e)
+
+        self._diag_sys("after-9-preseed", optimized)
 
         # Step 10: Optimize code blocks only when explicitly enabled AND the
         # context is under real pressure. Exact code is preferred for quality,
@@ -1332,6 +1384,8 @@ class AgentContextOptimizer:
                 logger.warning("Code block optimization failed: %s", e)
                 self._record_degradation("code_block_optimization", e)
 
+        self._diag_sys("after-10-code", optimized)
+
         try:
             total_tokens = current_tokens
         except Exception as e:
@@ -1346,21 +1400,54 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Cache-aware chunking failed: %s", e)
 
+        self._diag_sys("after-10.5-chunk", optimized)
+
         try:
             total_tokens = current_tokens
         except Exception as e:
             logger.warning("Post-chunking recount failed: %s", e)
 
+        # KV-cache stability: the rolling-summary block must sit immediately
+        # after the frozen prefix so its position is fixed across turns.
+        # Do this unconditionally — the summary's drift to the tail is what
+        # makes the leading bytes change on every turn and defeats the backend
+        # prefix cache.
+        optimized = self._stabilize_summary_position(optimized)
+
         # Step 11: Proactive context trimming for MoE KV-cache efficiency.
         # Keep this aligned with the configured proactive threshold so early gates
         # and final trimming use the same quality/leanness policy.
         proactive_threshold_tokens = int(max_tokens * self._config.agentic.proactive_trim_ratio)
+        # The front-evicting trimmers below (proactive trim, sliding window)
+        # slide the live zone every turn they fire: each front-eviction shifts
+        # the whole body and breaks the backend prefix cache (the turn-12-30
+        # break — proactive trim dropped one more turn every turn). They are
+        # redundant once the batch fold is ARMED (over the proactive threshold,
+        # so Step 7 runs): the fold sheds the same oldest turns, records their
+        # state in the append-only summary, and fires in batches, leaving the
+        # turns between folds as pure tail appends. Keep the trimmers as valves
+        # only where the fold cannot help: over the COMPACTION threshold with
+        # nothing folded yet (few turns carrying huge content, live window <=
+        # keep — nothing to fold). Step 12's hard cap backs both up.
+        summary_armed = (
+            self._cache_stable_summary
+            and self.hierarchical_summarizer is not None
+            and current_tokens > proactive_threshold_tokens
+        )
+        skip_front_eviction = summary_armed and (
+            self.hierarchical_summarizer.has_rolling_summary()
+            or current_tokens <= compaction_threshold_tokens
+        )
         # Drift-safe mode (review P1.3): when real prefix-cache reuse has
         # collapsed, skip the aggressive proactive trim — it is the mutation most
         # likely to have shifted the prefix. The hard budget cap (Step 12) still
         # runs, so we never exceed the model window; we only stop *voluntarily*
         # shrinking the context further until reuse recovers.
-        if total_tokens > proactive_threshold_tokens and not self._prefix_drift:
+        if (
+            total_tokens > proactive_threshold_tokens
+            and not self._prefix_drift
+            and not skip_front_eviction
+        ):
             try:
                 optimized = self._proactive_trim(
                     optimized, proactive_threshold_tokens, use_tokens=True,
@@ -1368,6 +1455,8 @@ class AgentContextOptimizer:
                 )
             except Exception as e:
                 logger.warning("Proactive trimming failed: %s", e)
+
+        self._diag_sys("after-11-trim", optimized)
 
         # Step 11.5/11.6/11.7: Boundary-compress large tool/assistant outputs and
         # user code pastes (review §3/§5.1/§5/C13). These are content-rewrite stages
@@ -1381,11 +1470,19 @@ class AgentContextOptimizer:
         # ``filter_tool_messages`` dropping 19K->2.5K tok at once, invalidating the
         # backend's cached KV for the entire body). We therefore bound them by the
         # same per-turn shrink floor used for eviction: transform messages
-        # front-to-back (oldest first) and stop once the next transform would drop
-        # the total below ``prev_size - shrink_cap``. Recent messages are left
-        # verbatim for later turns to compress gradually, so the cached body head
-        # stays valid.
-        optimized = self._apply_boundary_transforms(optimized, live_zone_start)
+        # back-to-front (newest first) and stop once the next transform would drop
+        # the total below ``prev_size - shrink_cap``. The leading prefix stays
+        # byte-identical so the backend's cached KV is reused.
+        #
+        # Recompute the stable/live boundary from the OPTIMIZED list: the summary
+        # (step 7) and compaction stages may have removed messages, making the
+        # raw-based ``live_zone_start`` stale.  Using the stale index splits the
+        # stable/live zone at the wrong position, causing the boundary transforms
+        # to compress messages that should be frozen (or freeze messages that
+        # should be compressed), breaking the backend's prefix cache every turn.
+        boundary_live_start = self._stable_prefix_end(optimized)
+        optimized = self._apply_boundary_transforms(optimized, boundary_live_start)
+        self._diag_sys("after-11.5-boundary", optimized)
         # Step 11.7 mutations above may have changed the token count; refresh the
         # local so the Step 11.8 gate below reads the post-filter size.
         current_tokens = self.token_counter.count_messages(optimized)
@@ -1405,7 +1502,13 @@ class AgentContextOptimizer:
         # This is the preferred method for context management with MTP state preservation
         # Skipped in drift-safe mode (review P1.3) for the same reason as Step 11:
         # it is a prefix-shifting mutation we avoid while reuse is collapsed.
-        if total_tokens > int(max_tokens * 0.8) and not self._prefix_drift:
+        # Also skipped while the batch fold is armed and able (see the
+        # skip_front_eviction rationale at Step 11).
+        if (
+            total_tokens > int(max_tokens * 0.8)
+            and not self._prefix_drift
+            and not skip_front_eviction
+        ):
             try:
                 optimized = self._sliding_window_trim(
                     optimized, use_tokens=True, shrink_floor=self._effective_shrink_floor()
@@ -1598,6 +1701,7 @@ class AgentContextOptimizer:
                 optimized = self._append_volatile_context(
                     optimized, anchor, rag_context, warning_lines, proactive_threshold_tokens
                 )
+            self._diag_sys("after-14.12-volatile", optimized)
         except Exception as e:
             logger.warning("Volatile context append failed: %s", e)
             self._record_degradation("volatile_context_append", e)
@@ -1605,10 +1709,9 @@ class AgentContextOptimizer:
         # Record the final optimized prompt (with the trailing volatile turn) so
         # the app layer's cache-outcome and token-calibration signals match what
         # was actually sent to the backend (#6, review §1/§9).
-        self._last_optimized = optimized
-
         # Live-zone compression (P3): update the stable prefix boundary so the
         # next turn can skip re-optimizing unchanged content.
+        optimized = self._finalize_optimized(optimized, messages)
         if self._config.agentic.live_zone_compression_enabled:
             try:
                 self._update_stable_prefix(optimized, live_zone_start, raw_messages=messages)
@@ -1622,7 +1725,7 @@ class AgentContextOptimizer:
 
         Preserves the message structure and content while stripping:
         - _archived: compactor marker
-        - Section markers (<!-- STATIC/CONTEXT/DYNAMIC_LAYER -->)
+        - Section markers (<!-- STATIC/CONTENT/DYNAMIC_LAYER -->)
         - Proxy-only fields such as chunk_index
         - Any other _prefixed keys (future-proof)
         """
@@ -1630,7 +1733,7 @@ class AgentContextOptimizer:
         internal_prefix = "_"
         # Pre-compiled pattern for performance
         marker_pattern = re.compile(
-            r"<!-- (STATIC|CONTEXT|DYNAMIC)_LAYER -->\n?",
+            r"<!-- (STATIC|CONTENT|DYNAMIC)_LAYER -->\n?",
         )
 
         for msg in messages:
@@ -2229,7 +2332,7 @@ class AgentContextOptimizer:
             i += 1
 
         summary_messages: list[dict[str, Any]] = []
-        while i < len(messages) and messages[i].get("_summary_id"):
+        while i < len(messages) and self._is_summary_block(messages[i]):
             summary_messages.append(messages[i])
             i += 1
 
@@ -2248,12 +2351,6 @@ class AgentContextOptimizer:
             if frozen_end > i:
                 system_anchor.extend(messages[i:frozen_end])
                 i = frozen_end
-            # Keep a rolling summary block (placed right after the frozen prefix)
-            # in the immutable anchor so front-eviction never drops or moves it
-            # (review §1/§3/§5, #7). Its _summary_id marker identifies it.
-            while i < len(messages) and messages[i].get("_summary_id"):
-                system_anchor.append(messages[i])
-                i += 1
 
         # Group remaining messages into turns.
         # Each turn starts with a user message and includes following assistant/tool messages.
@@ -2301,6 +2398,15 @@ class AgentContextOptimizer:
         for turn in pending_turns:
             protected.extend(turn)
         protected.extend(summary_messages)
+
+        # Summary blocks that fell into the evictable body (because they appeared
+        # after the frozen prefix) are moved to protected so they survive
+        # front-eviction. They are identified by content marker, not by position.
+        if evictable:
+            remaining_summaries = [m for m in evictable if self._is_summary_block(m)]
+            if remaining_summaries:
+                evictable = [m for m in evictable if not self._is_summary_block(m)]
+                protected.extend(remaining_summaries)
 
         return system_anchor, evictable, protected
 
@@ -2450,10 +2556,12 @@ class AgentContextOptimizer:
         invalidated the backend's cached KV for the entire body).
 
         To keep the per-turn shrink rate bounded, we transform messages
-        **front-to-back** (oldest first) and stop as soon as transforming the next
-        message would bring the total below ``shrink_floor`` (``prev_size -
-        shrink_cap``). The remaining (recent) messages are left verbatim for later
-        turns to compress gradually, so the cached body head stays valid.
+        **back-to-front** (newest first) and stop as soon as transforming the
+        next message would bring the total below ``shrink_floor`` (``prev_size -
+        shrink_cap``). The remaining (older) messages are left verbatim for later
+        turns to compress gradually.  Back-to-front order keeps the LEADING
+        prefix byte-identical so the backend's prefix cache is reused; only the
+        trailing messages change between turns.
 
         Args:
             messages: Message list to transform.
@@ -2471,8 +2579,10 @@ class AgentContextOptimizer:
             # Already at/under the floor: do not shrink further this turn.
             return list(messages)
 
+        # Iterate back-to-front (newest first) so the leading prefix stays
+        # byte-identical for backend prefix-cache reuse.
         result: list[dict[str, Any]] = []
-        for msg in messages:
+        for msg in reversed(messages):
             transformed = transform(msg)
             candidate = [*result, transformed]
             candidate_tokens = self.token_counter.count_messages(candidate)
@@ -2482,7 +2592,28 @@ class AgentContextOptimizer:
             else:
                 result.append(transformed)
                 total = candidate_tokens
+        result.reverse()
         return result
+
+    def _diag_sys(self, tag: str, msgs: list[dict[str, Any]]) -> None:
+        import hashlib
+        import os
+        import sys
+
+        if not os.environ.get("MOEPT_DIAG_STAGE"):
+            return
+        fps = []
+        for m in msgs:
+            c = m.get("content") or ""
+            h = hashlib.md5(c.encode("utf-8", "ignore")).hexdigest()[:6]
+            fps.append(f"{m.get('role')[:4]}:{h}")
+        sys.stderr.write(f"[DIAG] {tag}: n={len(msgs)} " + " ".join(fps[:22]) + "\n")
+        sys.stderr.flush()
+        if os.environ.get("MOEPT_DIAG_DUMP"):
+            import json
+
+            with open(f"/tmp/diag_{tag.replace(' ', '_')}.json", "w") as _f:
+                json.dump(msgs, _f)
 
     def _apply_boundary_transforms(
         self,
@@ -2743,6 +2874,23 @@ class AgentContextOptimizer:
 
         return messages
 
+    def _stabilize_summary_position(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Move any rolling-summary blocks to the stable-prefix boundary.
+
+        The summary must sit immediately after ``system_anchor`` so its position
+        in the serialized prompt is fixed across turns.  Without this, the
+        summary drifts to the tail as new turns are appended and the leading
+        bytes change on every turn, defeating the backend's prefix cache.
+        """
+        system_anchor, evictable_body, protected_tail = self._partition_for_budget(
+            messages
+        )
+        summary_blocks = [m for m in protected_tail if self._is_summary_block(m)]
+        non_summary_protected = [m for m in protected_tail if not self._is_summary_block(m)]
+        return [*system_anchor, *summary_blocks, *evictable_body, *non_summary_protected]
+
     def _proactive_trim(
         self,
         messages: list[dict[str, Any]],
@@ -2796,7 +2944,8 @@ class AgentContextOptimizer:
         evictable_body = self._evict_for_budget(
             evictable_body, evictable_budget, use_tokens, shrink_floor=shrink_floor
         )
-        return system_anchor + evictable_body + protected_tail
+        result = [*system_anchor, *evictable_body, *protected_tail]
+        return self._stabilize_summary_position(result)
 
     def _sliding_window_trim(
         self,
@@ -2839,8 +2988,12 @@ class AgentContextOptimizer:
                 static_end = frozen_end
         # Keep a rolling summary block (placed right after the frozen prefix) in
         # the static region so sliding-window eviction never drops it
-        # (review §1/§3/§5, #7). Its _summary_id marker identifies it.
-        while static_end < len(messages) and messages[static_end].get("_summary_id"):
+        # (review §1/§3/§5, #7). Use _is_summary_block to detect summary blocks
+        # by both _summary_id marker AND content marker (ROLLING_SUMMARY_MARKER),
+        # because _strip_internal_flags removes _summary_id before the prompt is
+        # sent to the backend, so the summary blocks must be recognized by their
+        # content marker to survive stripping (the turn-16 cliff fix).
+        while static_end < len(messages) and self._is_summary_block(messages[static_end]):
             static_end += 1
         static_messages = messages[:static_end]
         dynamic_messages = messages[static_end:]

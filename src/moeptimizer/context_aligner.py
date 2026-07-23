@@ -87,14 +87,14 @@ class ContextAligner:
         else:
             return i
 
+        # Skip assistant/tool responses from the first user message before
+        # counting frozen turns so we don't accidentally consume the first
+        # complete turn as part of the anchor.
+        while i < n and messages[i].get("role") != "user":
+            i += 1
+
         turns = 0
         while turns < frozen_prefix_turns and i < n:
-            # Skip any assistant/tool continuation left over from the previous
-            # turn before locating the next user-led turn.
-            while i < n and messages[i].get("role") != "user":
-                i += 1
-            if i >= n:
-                break
             # Include this user message and everything until the next user
             # (its assistant/tool responses), which completes one turn.
             i += 1
