@@ -54,6 +54,13 @@ class _ProxyMetrics:
         self.total_prompt_tokens = 0
         self.total_saved_tokens = 0
         self.total_latency_ms = 0.0
+        # Real time-to-first-token (review §4.12.1): wall time from request start to
+        # the first streamed CONTENT chunk. Distinct from total_latency_ms (the full
+        # end-to-end turn time, which the dashboard previously mislabeled as TTFT).
+        # ttft_samples counts turns that actually measured a TTFT (streaming only),
+        # so avg_ttft_ms averages over those, not over non-streaming turns.
+        self.total_ttft_ms = 0.0
+        self.ttft_samples = 0
         # Count of turns where the backend returned an error (e.g. HTTP 500 for a
         # truncated tool call) while streaming/serving. Surfaced in /v1/metrics so
         # operators can distinguish "proxy not helping" from "backend failing".
@@ -78,6 +85,8 @@ class _ProxyMetrics:
                         "total_prompt_tokens": 0,
                         "total_saved_tokens": 0,
                         "total_latency_ms": 0.0,
+                        "total_ttft_ms": 0.0,
+                        "ttft_samples": 0,
                         "backend_errors": 0,
                     }
                     self._per_session[session_id] = entry
@@ -94,6 +103,7 @@ class _ProxyMetrics:
         prompt_tokens: int | None = None,
         saved_tokens: int | None = None,
         latency_ms: float | None = None,
+        ttft_ms: float | None = None,
     ) -> None:
         with self._lock:
             self.requests += 1
@@ -109,6 +119,9 @@ class _ProxyMetrics:
                 self.total_saved_tokens += max(0, saved_tokens)
             if latency_ms is not None:
                 self.total_latency_ms += max(0.0, latency_ms)
+            if ttft_ms is not None:
+                self.total_ttft_ms += max(0.0, ttft_ms)
+                self.ttft_samples += 1
             if session_id:
                 self._record_session_locked(
                     session_id,
@@ -116,6 +129,7 @@ class _ProxyMetrics:
                     prompt_tokens=prompt_tokens,
                     saved_tokens=saved_tokens,
                     latency_ms=latency_ms,
+                    ttft_ms=ttft_ms,
                 )
 
     def _record_session_locked(
@@ -126,6 +140,7 @@ class _ProxyMetrics:
         prompt_tokens: int | None,
         saved_tokens: int | None,
         latency_ms: float | None,
+        ttft_ms: float | None = None,
     ) -> None:
         """Update the per-session counters. Caller must hold ``self._lock``."""
         entry = self._per_session.get(session_id)
@@ -138,6 +153,8 @@ class _ProxyMetrics:
                 "total_prompt_tokens": 0,
                 "total_saved_tokens": 0,
                 "total_latency_ms": 0.0,
+                "total_ttft_ms": 0.0,
+                "ttft_samples": 0,
                 "backend_errors": 0,
             }
         entry["requests"] += 1
@@ -153,6 +170,9 @@ class _ProxyMetrics:
             entry["total_saved_tokens"] += max(0, saved_tokens)
         if latency_ms is not None:
             entry["total_latency_ms"] += max(0.0, latency_ms)
+        if ttft_ms is not None:
+            entry["total_ttft_ms"] = entry.get("total_ttft_ms", 0.0) + max(0.0, ttft_ms)
+            entry["ttft_samples"] = entry.get("ttft_samples", 0) + 1
         # Move-to-end keeps most-recently-active sessions; evict the oldest.
         self._per_session[session_id] = entry
         self._per_session.move_to_end(session_id)
@@ -170,6 +190,7 @@ class _ProxyMetrics:
                 s_req = e["requests"]
                 s_cached = e["total_cached_tokens"]
                 s_prompt = e["total_prompt_tokens"]
+                s_ttft_samples = e.get("ttft_samples", 0)
                 sessions[sid] = {
                     "requests": s_req,
                     "cache_hits": e["cache_hits"],
@@ -182,6 +203,9 @@ class _ProxyMetrics:
                     ),
                     "total_saved_tokens": e["total_saved_tokens"],
                     "avg_latency_ms": round(e["total_latency_ms"] / max(1, s_req), 1),
+                    "avg_ttft_ms": round(
+                        e.get("total_ttft_ms", 0.0) / max(1, s_ttft_samples), 1
+                    ),
                     "backend_errors": e.get("backend_errors", 0),
                 }
             return {
@@ -195,6 +219,11 @@ class _ProxyMetrics:
                 "total_saved_tokens": self.total_saved_tokens,
                 "total_latency_ms": round(self.total_latency_ms, 1),
                 "avg_latency_ms": round(self.total_latency_ms / max(1, requests), 1),
+                # Real time-to-first-token averaged over streaming turns that
+                # measured it (review §4.12.1); avg_latency_ms is the full turn time.
+                "avg_ttft_ms": round(
+                    self.total_ttft_ms / max(1, self.ttft_samples), 1
+                ),
                 "backend_errors": self.backend_errors,
                 "sessions": sessions,
             }
@@ -260,6 +289,7 @@ _METRICS_DASHBOARD_HTML = """<!doctype html>
   <div class="stat info"><div class="v" id="s-saved">—</div><div class="k">Tokens saved (total)</div></div>
   <div class="stat"><div class="v" id="s-hitrate">—</div><div class="k">Cache hit rate</div></div>
   <div class="stat warn"><div class="v" id="s-ttft">—</div><div class="k">Avg TTFT (ms)</div></div>
+  <div class="stat"><div class="v" id="s-latency">—</div><div class="k">Avg latency (ms)</div></div>
   <div class="stat"><div class="v" id="s-err">—</div><div class="k">Backend errors</div></div>
   <div class="panel">
     <h2>Per-session token savings</h2>
@@ -277,7 +307,8 @@ async function refresh() {
   document.getElementById("s-reuse").textContent = pct(d.prefix_cache_reuse_ratio);
   document.getElementById("s-saved").textContent = fmt(d.total_saved_tokens);
   document.getElementById("s-hitrate").textContent = pct(d.cache_hit_rate);
-  document.getElementById("s-ttft").textContent = fmt(d.avg_latency_ms);
+  document.getElementById("s-ttft").textContent = fmt(d.avg_ttft_ms);
+  document.getElementById("s-latency").textContent = fmt(d.avg_latency_ms);
   document.getElementById("s-err").textContent = fmt(d.backend_errors);
   const sess = d.sessions || {};
   const ids = Object.keys(sess);
@@ -293,7 +324,7 @@ async function refresh() {
           + '<td>' + fmt(s.requests) + '</td>'
           + '<td>' + pct(s.prefix_cache_reuse_ratio) + '</td>'
           + '<td>' + fmt(s.total_saved_tokens) + '</td>'
-          + '<td>' + fmt(s.avg_latency_ms) + '</td>'
+          + '<td>' + fmt(s.avg_ttft_ms) + '</td>'
           + '<td><div class="barwrap"><div class="bar" style="width:' + w + '%"></div></div></td></tr>';
   }
   rows += '</tbody></table>';
@@ -737,6 +768,9 @@ def _make_streaming_generator(
             # on the next turn if the client stripped it (see optimizer.capture_thinking).
             _acc_content: list[str] = []
             _acc_reasoning: list[str] = []
+            # Wall time of the first streamed CONTENT chunk, for a real TTFT
+            # (review §4.12.1). reasoning/role-only chunks don't count.
+            first_content_time: float | None = None
 
             async for chunk in backend_client.chat_completions_stream(
                 messages=messages,
@@ -758,6 +792,8 @@ def _make_streaming_generator(
                         if hasattr(d, "content") and d.content is not None:
                             delta["content"] = d.content
                             _acc_content.append(d.content)
+                            if first_content_time is None:
+                                first_content_time = time.time()
                         if hasattr(d, "reasoning_content") and d.reasoning_content is not None:
                             delta["reasoning_content"] = d.reasoning_content
                             _acc_reasoning.append(d.reasoning_content)
@@ -886,12 +922,18 @@ def _make_streaming_generator(
                     logger.debug("Failed to capture thinking block", exc_info=True)
 
             # Aggregate process-wide metrics from the authoritative backend signal.
+            # TTFT = first CONTENT chunk time minus request start (review §4.12.1);
+            # latency_ms remains the full end-to-end turn time.
+            _ttft_ms: float | None = None
+            if turn_start is not None and first_content_time is not None:
+                _ttft_ms = (first_content_time - turn_start) * 1000.0
             PROXY_METRICS.record_turn(
                 session_id=session_id,
                 cached_tokens=cached_tokens,
                 prompt_tokens=(optimizer.last_optimized_token_count if optimizer is not None else None),
                 saved_tokens=(optimizer.last_saved_token_count if optimizer is not None else None),
                 latency_ms=((time.time() - turn_start) * 1000.0 if turn_start is not None else None),
+                ttft_ms=_ttft_ms,
             )
 
             # Calibrate the proxy's token estimates against the backend's real
@@ -1282,6 +1324,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         yield
         await embedding_service.close()
         await embed_client.close()
+        await capability_probe.aclose()
         # C9: deregister the SIGUSR2 handler so a later process reusing this PID
         # does not inherit a dangling callback.
         if _sigusr2_handler is not None and hasattr(signal, "SIGUSR2"):
@@ -1531,15 +1574,24 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         # can measure how much of the original context survived compaction.
         # Gated to a sane size: full prompts can be huge, and the header is
         # only consumed by local benchmarking, not production clients.
-        _opt_text = _serialize_messages_text(optimized_messages)
-        if _opt_text and len(_opt_text) <= 32000:
-            # HTTP headers must be latin-1-encodable. Optimized prompt text can
-            # contain unicode (em-dash, smart quotes, non-latin scripts from code
-            # comments / fixture content); an un-sanitized value makes Starlette's
-            # StreamingResponse header encoding raise UnicodeEncodeError -> HTTP
-            # 500 for that turn. Fold non-latin-1 chars to safe ASCII substitutes
-            # so the header (consumed only by local benchmarking) stays valid.
-            response_headers["X-MOEPT-Optimized-Prompt-Text"] = _header_safe(_opt_text)
+        # Cheap pre-check before serializing (review §4.9.4): the rendered text is
+        # never shorter than the raw string content, so if that alone exceeds the
+        # header cap, skip the (potentially 100s-of-KB) build-then-discard entirely.
+        _content_len = 0
+        for _m in optimized_messages:
+            _c = _m.get("content")
+            if isinstance(_c, str):
+                _content_len += len(_c)
+        if _content_len <= 32000:
+            _opt_text = _serialize_messages_text(optimized_messages)
+            if _opt_text and len(_opt_text) <= 32000:
+                # HTTP headers must be latin-1-encodable. Optimized prompt text can
+                # contain unicode (em-dash, smart quotes, non-latin scripts from code
+                # comments / fixture content); an un-sanitized value makes Starlette's
+                # StreamingResponse header encoding raise UnicodeEncodeError -> HTTP
+                # 500 for that turn. Fold non-latin-1 chars to safe ASCII substitutes
+                # so the header (consumed only by local benchmarking) stays valid.
+                response_headers["X-MOEPT-Optimized-Prompt-Text"] = _header_safe(_opt_text)
 
         # Dry-run / explain mode (review03.md §10): expose the exact optimized
         # prompt the proxy would send to the backend so operators can inspect
@@ -1554,7 +1606,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 optimized_messages
             )
 
-        session_state = optimizer.get_session_state()
+        # Serialize session state off the event loop (review §4.9.4): for long
+        # agentic sessions get_session_state() json.dumps the whole store + runs
+        # goal decomposition, which blocked concurrent requests when run inline.
+        session_state = await asyncio.get_running_loop().run_in_executor(
+            _OPTIMIZER_EXECUTOR, optimizer.get_session_state
+        )
         existing_extra_body = body.get("extra_body")
         if existing_extra_body is not None and not isinstance(existing_extra_body, dict):
             logger.warning("Ignoring invalid extra_body value: %s", type(existing_extra_body).__name__)

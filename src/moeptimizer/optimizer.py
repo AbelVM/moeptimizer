@@ -2671,18 +2671,26 @@ class AgentContextOptimizer:
             return list(messages)
 
         # Iterate back-to-front (newest first) so the leading prefix stays
-        # byte-identical for backend prefix-cache reuse.
+        # byte-identical for backend prefix-cache reuse. Maintain a RUNNING suffix
+        # token total (counting each message once) instead of re-tokenizing the
+        # growing ``[*result, transformed]`` candidate every step — O(n) instead of
+        # O(n²) (review §4.4.2). The per-message overhead is additive, so the
+        # running sum tracks the whole-list count closely enough for this bounded-
+        # shrinkage heuristic.
         result: list[dict[str, Any]] = []
+        suffix_tokens = 0
         for msg in reversed(messages):
             transformed = transform(msg)
-            candidate = [*result, transformed]
-            candidate_tokens = self.token_counter.count_messages(candidate)
+            candidate_tokens = suffix_tokens + self.token_counter.count_messages(
+                [transformed]
+            )
             if candidate_tokens < shrink_floor and result:
                 # Transforming this message would breach the floor; keep original.
                 result.append(msg)
+                suffix_tokens += self.token_counter.count_messages([msg])
             else:
                 result.append(transformed)
-                total = candidate_tokens
+                suffix_tokens = candidate_tokens
         result.reverse()
         return result
 

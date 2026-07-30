@@ -16,12 +16,13 @@ local, hardware-limited infrastructure. Mission: improve **TTFT and TPS** while
 
 ---
 
-## Implementation status (Phase 1 — done, validated)
+## Implementation status (Phase 1 + Phase 2 — done, validated)
 
-The following Phase 1 items (§5) are **implemented in the working tree and
-validated** (pytest 432 passed / 11 pre-existing failures — zero new; ruff 1
-pre-existing; mypy 64→59, zero new; `--check-config` exit 0; dry-run
-cache-stability preserved/improved):
+The following items (§5) are **implemented and validated** (pytest 434 passed / 11
+pre-existing failures — zero new; ruff 1 pre-existing; mypy 59, zero new;
+`--check-config` exit 0; dry-run cache-stability preserved/improved):
+
+**Phase 1 — correctness, leaks, adaptive budget, cleanup** (commit `4b79eb5`):
 
 | Item | Status | Evidence |
 |---|---|---|
@@ -32,14 +33,33 @@ cache-stability preserved/improved):
 | §4.8.1 embedding deadlock + dead RAG | ✅ fixed | genuinely-async fetch on a dedicated loop; `CircuitBreaker.call_async`; one initialized service shared per optimizer; degradation marker |
 | §4.8.2 cross-session summarizer/delta | ✅ fixed | per-optimizer `HierarchicalSummarizer` + `CodeDeltaEncoder`; isolation regression test |
 | §4.9.1 construction on the event loop | ✅ fixed | `get_or_create` offloaded to the optimizer executor |
-| §3.1/§4.2.2 **adaptive budget** | ✅ implemented | `AdaptiveBudgetGovernor` (horizon-growing, window-capped, monotonic floor); dry-run breaks **10 → 7**; 4 new tests |
+| §3.1/§4.2.2 **adaptive budget** (skeleton) | ✅ implemented | horizon-growing, window-capped, monotonic-floor budget; dry-run breaks **10 → 7**; 4 new tests |
 | §7 dead/phantom modules | ✅ deleted | 9 modules + 2 config flags removed; docs synced; dry-run breaks **unchanged** (no-op stages had zero effect) |
 | §4.12.2 CI cache gate | ✅ added | `diag_dryrun_opencode.py --max-breaks` + backend-conditional `dev.sh` step |
 
-**Deferred:** §4.8.4 quality-profile-vs-env precedence — a config-semantics change
-that conflicts with existing tests and the cliff-fix `.env`; handle together with a
-follow-up budget-config redesign. **Not started:** Phase 2–4 (TTFT/TPS throughput,
-error-aware/reversible compression, god-object decomposition).
+**Phase 2 — TTFT/TPS throughput**:
+
+| Item | Status | Evidence |
+|---|---|---|
+| §4.9.2/§4.9.3/§4.9.5 probing | ✅ fixed | sub-probes parallelized within dependency pairs; single-flight on TTL expiry (no thundering herd); long-lived httpx client closed in lifespan |
+| §4.12.1 real TTFT metric | ✅ fixed | first CONTENT chunk timestamped; `avg_ttft_ms` (global + per-session) distinct from `avg_latency_ms`; dashboard relabeled |
+| §4.4.2 O(n²) floor pass | ✅ fixed | running suffix total instead of re-tokenizing the growing candidate; dry-run avg turn time **443 → 201 ms**, breaks unchanged |
+| §4.4.3 per-text token memo | ✅ fixed | local `count()` caches per-text so unchanged prefix messages aren't re-tokenized on a list miss |
+| §4.9.4 CPU on the event loop | ✅ fixed | `_serialize_messages_text` length pre-check (no build-then-discard); `get_session_state()` offloaded to the executor |
+| §4.12.7 `context_window_wall` artifact | ✅ fixed | requires `min_turn=5` + `sustained=2` consecutive breaches; 3 new tests |
+
+**Deferred to a benchmark-validated follow-up:**
+- §4.8.4 quality-profile-vs-env precedence — config-semantics change conflicting with
+  existing tests and the cliff-fix `.env`; handle with a budget-config redesign.
+- §3.1 adaptive budget **full policy** (code-density/codebase signals + cache-break
+  amortization trigger) — cache-sensitive; needs a benchmark to validate the
+  fold-timing change. The skeleton (above) already captures the main win.
+- §4.4.1 zero-copy SSE passthrough — a rewrite of the working streaming path; the
+  proxy must inspect every chunk (usage / thinking / content), so the "minimal"
+  benefit is limited. Needs careful design.
+
+**Not started:** Phase 3–4 (error-aware/reversible tool-output compression,
+god-object decomposition).
 
 ---
 

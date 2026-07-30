@@ -89,19 +89,47 @@ class _FakeTurn:
 
 
 def test_wall_finds_first_collapse():
+    # The wall is the first turn of a SUSTAINED collapse (2+ consecutive breaching
+    # turns) at or after min_turn=5 (review §4.12.7).
     turns = [
-        _FakeTurn(1, {"code_block_ratio": 1.0, "semantic_similarity": 0.8}),
-        _FakeTurn(2, {"code_block_ratio": 0.3, "semantic_similarity": 0.5}),
+        _FakeTurn(4, {"code_block_ratio": 1.0, "semantic_similarity": 0.8}),
+        _FakeTurn(5, {"code_block_ratio": 0.3, "semantic_similarity": 0.5}),
+        _FakeTurn(6, {"code_block_ratio": 0.2, "semantic_similarity": 0.4}),
     ]
     wall = bm._context_window_wall(turns)
-    assert wall["proxy"] == 2
-    assert wall["direct"] == 2
+    assert wall["proxy"] == 5  # first of the sustained breach
+    assert wall["direct"] == 5
+
+
+def test_wall_ignores_single_breach():
+    # One breaching turn surrounded by healthy turns is noise, not a wall.
+    turns = [
+        _FakeTurn(5, {"code_block_ratio": 0.3, "semantic_similarity": 0.5}),
+        _FakeTurn(6, {"code_block_ratio": 0.9, "semantic_similarity": 0.7}),
+        _FakeTurn(7, {"code_block_ratio": 0.3, "semantic_similarity": 0.5}),
+    ]
+    wall = bm._context_window_wall(turns)
+    assert wall["proxy"] is None
+    assert wall["direct"] is None
+
+
+def test_wall_ignores_breaches_before_min_turn():
+    # Early turns are short / non-code answers that trip the raw thresholds for
+    # both sides; breaches before min_turn=5 never count.
+    turns = [
+        _FakeTurn(1, {"code_block_ratio": 0.0, "semantic_similarity": 0.0}),
+        _FakeTurn(2, {"code_block_ratio": 0.0, "semantic_similarity": 0.0}),
+        _FakeTurn(3, {"code_block_ratio": 0.0, "semantic_similarity": 0.0}),
+    ]
+    wall = bm._context_window_wall(turns)
+    assert wall["proxy"] is None
+    assert wall["direct"] is None
 
 
 def test_wall_none_when_no_collapse():
     turns = [
-        _FakeTurn(1, {"code_block_ratio": 1.0, "semantic_similarity": 0.8}),
-        _FakeTurn(2, {"code_block_ratio": 0.9, "semantic_similarity": 0.7}),
+        _FakeTurn(5, {"code_block_ratio": 1.0, "semantic_similarity": 0.8}),
+        _FakeTurn(6, {"code_block_ratio": 0.9, "semantic_similarity": 0.7}),
     ]
     wall = bm._context_window_wall(turns)
     assert wall["proxy"] is None

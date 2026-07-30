@@ -2968,27 +2968,51 @@ def _count_contradictions(contents: list[str]) -> int:
     return contradictions
 
 
-def _context_window_wall(turns: list["TurnComparison"]) -> dict[str, int | None]:
+def _context_window_wall(
+    turns: list["TurnComparison"],
+    min_turn: int = 5,
+    sustained: int = 2,
+) -> dict[str, int | None]:
     """Find the first turn where quality collapses due to budget exhaustion.
 
     Derived purely from existing per-turn quality (no new requests). A "wall" is
-    the first turn where the proxy's code preservation breaks down
-    (code_block_ratio < 0.5) OR semantic fidelity collapses
-    (semantic_similarity < 0.3). Returns the first such turn index per side, or
-    None when no wall is reached within the run.
+    the first turn where code preservation breaks down (code_block_ratio < 0.5) OR
+    semantic fidelity collapses (semantic_similarity < 0.3).
+
+    Two guards avoid false positives (review §4.12.7):
+    - ``min_turn``: early turns are short / non-code answers that trip the raw
+      thresholds for both sides on turn 1, which conveyed nothing. Ignore turns
+      before ``min_turn``.
+    - ``sustained``: a single low-quality turn is noise (a hard sub-question, a
+      one-off code-free reply). Require ``sustained`` consecutive breaching turns;
+      the wall is the FIRST turn of that run.
+
+    Returns the wall turn index per side, or None when no sustained wall is reached
+    within the run.
     """
     out: dict[str, int | None] = {"proxy": None, "direct": None}
     for side in ("proxy", "direct"):
+        consecutive = 0
+        wall_start: int | None = None
         for t in turns:
             q = t.quality
-            if not q:
+            if not q or t.turn_index < min_turn:
+                consecutive = 0
+                wall_start = None
                 continue
             ratio = q.get("code_block_ratio")
             sim = q.get("semantic_similarity")
             hit = (ratio is not None and ratio < 0.5) or (sim is not None and sim < 0.3)
             if hit:
-                out[side] = t.turn_index
-                break
+                if consecutive == 0:
+                    wall_start = t.turn_index
+                consecutive += 1
+                if consecutive >= sustained:
+                    out[side] = wall_start
+                    break
+            else:
+                consecutive = 0
+                wall_start = None
     return out
 
 

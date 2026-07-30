@@ -29,6 +29,7 @@ Signals (verified against a live Lemonade backend):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -108,52 +109,93 @@ class BackendCapabilityProbe:
         self._probe_timeout = probe_timeout
         self._lock = threading.Lock()
         self._cache: BackendCapabilities | None = None
+        # Long-lived HTTP client reused across probes (review §4.9.5): creating a
+        # fresh AsyncClient per probe paid connection-setup cost each time. Created
+        # lazily on the app's event loop and closed via aclose() in the lifespan.
+        self._client: httpx.AsyncClient | None = None
+        # Single-flight gate for probes (review §4.9.3): on TTL expiry every
+        # concurrent request used to fire its own full probe (thundering herd). The
+        # asyncio.Lock serializes probing; waiters re-check the cache the winner
+        # just populated instead of probing again.
+        self._probe_lock = asyncio.Lock()
 
     async def get(self, force: bool = False) -> BackendCapabilities:
-        """Return cached capabilities, re-probing when stale or forced."""
-        now = time.time()
-        with self._lock:
-            cached = self._cache
+        """Return cached capabilities, re-probing when stale or forced.
+
+        Single-flight (review §4.9.3): the fast path returns the fresh cache
+        without locking; on a miss the asyncio.Lock serializes probing and waiters
+        re-check the cache the winner just populated, so a TTL expiry triggers ONE
+        probe, not one per concurrent request.
+        """
+        cached = self.cached()
         if (
             not force
             and cached is not None
-            and (now - cached.probed_at) < self._ttl
+            and (time.time() - cached.probed_at) < self._ttl
         ):
             return cached
 
-        caps = await self._probe()
-        with self._lock:
-            # If the device changed since the last snapshot, log it: capabilities
-            # (slot pinning, remote tokenize) flip with the runtime.
-            if cached is not None and cached.device != caps.device:
-                logger.info(
-                    "Backend device changed %s -> %s; capabilities updated (%s)",
-                    cached.device,
-                    caps.device,
-                    caps.summary(),
-                )
-            self._cache = caps
-        return caps
+        async with self._probe_lock:
+            cached = self.cached()
+            if (
+                not force
+                and cached is not None
+                and (time.time() - cached.probed_at) < self._ttl
+            ):
+                return cached
+
+            caps = await self._probe()
+            with self._lock:
+                # If the device changed since the last snapshot, log it: capabilities
+                # (slot pinning, remote tokenize) flip with the runtime.
+                prev = self._cache
+                if prev is not None and prev.device != caps.device:
+                    logger.info(
+                        "Backend device changed %s -> %s; capabilities updated (%s)",
+                        prev.device,
+                        caps.device,
+                        caps.summary(),
+                    )
+                self._cache = caps
+            return caps
 
     def cached(self) -> BackendCapabilities | None:
         """Return the last snapshot without probing (may be None/stale)."""
         with self._lock:
             return self._cache
 
+    def _get_client(self) -> httpx.AsyncClient:
+        """Lazily create and return the long-lived probe HTTP client (§4.9.5)."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self._probe_timeout)
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the long-lived HTTP client (call from the app lifespan)."""
+        client = self._client
+        self._client = None
+        if client is not None and not client.is_closed:
+            await client.aclose()
+
     async def _probe(self) -> BackendCapabilities:
         caps = BackendCapabilities(probed_at=time.time())
+        client = self._get_client()
         try:
-            async with httpx.AsyncClient(timeout=self._probe_timeout) as client:
-                # Order matters: /health yields the LLM's own backend_url + device,
-                # and the per-model backend is where /slots + /tokenize actually
-                # work. The AGGREGATED /api/v1/slots and /api/v1/tokenize route to
-                # the default (often NPU embedding) backend and wrongly report
-                # "not supported by npu" even when the LLM is on GPU — verified
-                # live. So we always prefer the per-model backend_url.
-                await self._probe_models(client, caps)
-                await self._probe_health(client, caps)
-                await self._probe_slots(client, caps)
-                await self._probe_tokenize(client, caps)
+            # /health + /models yield the LLM's per-model backend_url + device, and
+            # the per-model backend is where /slots + /tokenize actually work (the
+            # AGGREGATED endpoints route to the default — often NPU — backend and
+            # misreport support; verified live). So run identity/health first, THEN
+            # slots/tokenize which depend on caps.llm_backend_url. Each pair runs
+            # concurrently (review §4.9.2), halving probe latency vs. 4 sequential
+            # calls.
+            await asyncio.gather(
+                self._probe_models(client, caps),
+                self._probe_health(client, caps),
+            )
+            await asyncio.gather(
+                self._probe_slots(client, caps),
+                self._probe_tokenize(client, caps),
+            )
         except Exception as exc:
             logger.debug("Capability probe failed: %s", exc)
         logger.debug("Backend capabilities: %s", caps.summary())

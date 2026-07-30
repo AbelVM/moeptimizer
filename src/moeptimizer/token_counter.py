@@ -165,6 +165,16 @@ class TokenCounter:
         # to 0 (no correction) so behavior is unchanged until calibrated.
         self._calibration_delta: int = 0
 
+        # Per-TEXT local-tokenization cache (review §4.4.3). The whole-list
+        # fingerprint cache only hits on an IDENTICAL message list; when the list
+        # changes (new live-zone turn, in-place compression) every message — even
+        # the byte-stable prefix — was re-tokenized. Caching the local encode by
+        # content means unchanged messages are counted O(1) on a list miss. The
+        # remote path already caches per-text via _remote_cache. Bounded LRU.
+        self._text_cache: dict[str, int] = {}
+        self._text_cache_order: list[str] = []
+        self._max_text_cache = self._max_cache * 4
+
         # 1) Explicit HF tokenizer id/path (or "auto" -> try common Qwen ids).
         #    "auto" is restricted to LOCAL files only so it never triggers a
         #    surprise network download on a local/offline box; an explicitly
@@ -270,13 +280,27 @@ class TokenCounter:
             if remote is not None:
                 return remote
 
-        # Use actual tokenizer
+        # Use actual tokenizer, cached per-text (review §4.4.3) so unchanged
+        # messages are not re-tokenized on a whole-list cache miss.
+        cached_count = self._text_cache.get(text)
+        if cached_count is not None:
+            if self._text_cache_order and self._text_cache_order[-1] != text:
+                with contextlib.suppress(ValueError):
+                    self._text_cache_order.remove(text)
+                self._text_cache_order.append(text)
+            return cached_count
         try:
-            return len(self._encode(text))  # type: ignore[misc]
+            n = len(self._encode(text))  # type: ignore[misc]
         except Exception:
-            # Fallback to character-based estimation
+            # Fallback to character-based estimation (lang-dependent; not cached).
             cpt = self.CHARS_PER_TOKEN.get(lang, 3.5)
             return max(1, int(len(text) / cpt))
+        self._text_cache[text] = n
+        self._text_cache_order.append(text)
+        if len(self._text_cache_order) > self._max_text_cache:
+            old = self._text_cache_order.pop(0)
+            self._text_cache.pop(old, None)
+        return n
 
     def _remote_count(self, text: str) -> int | None:
         """Return exact token count from the backend's /tokenize, or None.
