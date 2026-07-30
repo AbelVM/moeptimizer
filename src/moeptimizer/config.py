@@ -114,6 +114,33 @@ class AgenticConfig(BaseModel):
                     "break the backend's prefix-cache reuse (the v0.7.18 turn-13 regression). The "
                     "growth ceiling (max_context_growth_per_turn) bounds per-turn expansion further.",
     )
+    adaptive_budget_enabled: bool = Field(
+        default=True,
+        description="Replace the FIXED optimized-context cap with an adaptive ceiling (review "
+                    "§3.1/§4.2.2). The budget grows with the conversation horizon and is capped at a "
+                    "sane fraction of the live backend window (adaptive_window_fraction), instead of "
+                    "being pinned to max_optimized_tokens. Because the budget is a GROWING ceiling "
+                    "(never shrinks below the current optimized size), the immutable zones always fit "
+                    "inside it (reserved < budget), so the eviction governors stop fighting an "
+                    "unreachable target and the rolling-summary fold fires far less often — raising "
+                    "prefix-cache reuse and retaining more verbatim context. The fixed "
+                    "max_optimized_tokens / max_optimized_chars remain as last-resort safety valves "
+                    "near the real window. Disable to restore the legacy fixed-cap behavior.",
+    )
+    adaptive_horizon_growth_tokens: int = Field(
+        default=800,
+        description="Tokens added to the adaptive budget per conversation turn (the horizon term). A "
+                    "longer session carries a proportionally larger cached working set; a short "
+                    "session stays near the base budget. Only used when adaptive_budget_enabled.",
+    )
+    adaptive_window_fraction: float = Field(
+        default=0.15,
+        description="Ceiling on the adaptive budget as a fraction of the live backend context window. "
+                    "The old fixed cap was effectively 2.5% of the window (budget_window_fraction) "
+                    "pinned to max_optimized_tokens, which over-compacted against an idle window "
+                    "(7% utilization on 262K). 0.15 lets a long session grow toward ~15% of the "
+                    "window before the fold engages. Only used when adaptive_budget_enabled.",
+    )
     max_context_growth_per_turn: int = Field(
         default=1500,
         description="Hard ceiling on how much the OPTIMIZED context may GROW in a single turn "
@@ -249,10 +276,6 @@ class AgenticConfig(BaseModel):
             "risk changing it (cache guide DONT #4). Only enable for non-agentic, "
             "template-friendly scenarios. Still gated behind the proactive threshold."
         ),
-    )
-    attention_sinks_enabled: bool = Field(
-        default=False,
-        description="Inject model-visible attention-sink markers. Disabled by default to preserve exact prompts.",
     )
     delta_encode_inject: bool = Field(
         default=True,
@@ -563,11 +586,6 @@ class V050Config(BaseModel):
         description="Max code snapshots to keep",
     )
 
-    enable_experimental_backend_hints: bool = Field(
-        default=False,
-        description="Send optional llama.cpp/MTP cache-control hints to the backend. Disabled by default because unsupported backends may ignore or hang on unknown extra_body fields.",
-    )
-
     # Session -> backend slot pinning (review §1, priority fix #1)
     slot_pinning_enabled: bool = Field(
         default=False,
@@ -680,7 +698,6 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         "rag_enabled": False,
         "reasoning_preseed_enabled": False,
         "code_skeleton_enabled": False,
-        "attention_sinks_enabled": False,
         "cache_stable_summary_enabled": False,
         "keep_full_steps": 8,
         "max_optimized_tokens": 16000,
@@ -702,7 +719,6 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         "rag_enabled": True,
         "reasoning_preseed_enabled": False,
         "code_skeleton_enabled": False,
-        "attention_sinks_enabled": False,
         "cache_stable_summary_enabled": True,
         # keep_full_steps raised 6 -> 8 (review: deep-context turns 19-30 were
         # over-compressed 15-29x because the protected tail + summary floor
@@ -726,7 +742,6 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         "rag_enabled": True,
         "reasoning_preseed_enabled": False,
         "code_skeleton_enabled": True,
-        "attention_sinks_enabled": False,
         "cache_stable_summary_enabled": True,
         "keep_full_steps": 2,
         "max_optimized_tokens": 4000,

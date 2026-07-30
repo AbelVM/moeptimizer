@@ -37,7 +37,6 @@ from typing import Any
 import numpy as np
 
 from moeptimizer.async_io_stage import get_async_io_stage
-from moeptimizer.attention_sink import apply_attention_sinks
 from moeptimizer.cache import (
     get_block_aligned_cache_key,
     get_block_size,
@@ -60,23 +59,16 @@ from moeptimizer.config import AppConfig
 from moeptimizer.context_aligner import get_context_aligner
 from moeptimizer.context_canonicalizer import get_context_canonicalizer
 from moeptimizer.context_compressor import get_context_compressor
-from moeptimizer.context_template_matcher import get_context_template_matcher
-from moeptimizer.delta_encoder import get_delta_encoder
-from moeptimizer.dependency_orderer import get_dependency_orderer
+from moeptimizer.delta_encoder import CodeDeltaEncoder
 from moeptimizer.embedding import EmbeddingService
 from moeptimizer.goal_decomposer import GoalDecomposer
-from moeptimizer.hierarchical_index import get_hierarchical_index
 from moeptimizer.hierarchical_summarizer import (
     ROLLING_SUMMARY_MARKER,
-    get_hierarchical_summarizer,
+    HierarchicalSummarizer,
 )
 from moeptimizer.hit_prediction_model import get_hit_prediction_model
-from moeptimizer.incremental_updater import get_incremental_updater
-from moeptimizer.kv_slot_tracker import get_kv_slot_tracker
 from moeptimizer.loop_detector import LoopDetector
 from moeptimizer.models import AgentStep, LoopWarning
-from moeptimizer.mtp_state import get_mtp_state_manager
-from moeptimizer.pattern_injector import get_pattern_injector
 from moeptimizer.progress_tracker import ProgressTracker
 from moeptimizer.prompt_templates import classify_and_template
 from moeptimizer.selective_truncator import get_selective_truncator
@@ -118,14 +110,25 @@ class AgentContextOptimizer:
         self,
         config: AppConfig | None = None,
         capability_probe: Any = None,
+        embedding_service: Any = None,
     ) -> None:
         self._config = config or AppConfig()
         self._lock = threading.RLock()
         self._capability_probe = capability_probe
+        # Shared, initialized EmbeddingService injected by the app (review §4.8.1).
+        # A per-session ``EmbeddingService()`` was never ``initialize()``d, so every
+        # embedding was a zero vector and RAG ranking silently did nothing. When the
+        # app injects its initialized instance, ranking works; the fallback keeps
+        # direct construction (tests) behaving as before.
+        self._injected_embedding_service = embedding_service
         # Token-count calibration (review §1/§9, priority fix #6). Initialized
         # early so _budget_tokens() can be called during __init__ (e.g. to seed
         # the adaptive summary-cap ceiling) before the later detailed setup.
         self._token_calibration: float = 1.0
+        # Conversation horizon (turns optimized by this per-session optimizer).
+        # Drives the adaptive budget's horizon term (review §3.1): a longer session
+        # gets a larger cached working set. Incremented once per top-level optimize.
+        self._turns_seen: int = 0
         self.store = AgentStateStore()
         self.context_aligner = get_context_aligner()
 
@@ -133,8 +136,14 @@ class AgentContextOptimizer:
         # because the compactor may reference self.hierarchical_summarizer).
         v050 = self._config.v050
         self._cache_stable_summary = v050.cache_stable_summary_enabled or v050.hierarchical_summary_enabled
+        # Per-session instance (review §4.8.2): the old ``get_hierarchical_summarizer``
+        # returned a module-global singleton, so concurrent sessions contaminated each
+        # other's rolling-summary text, summarized-turn count, and pinned original-request
+        # facts. The live cache-stable rolling-summary state is purely in-memory (the
+        # disk persistence only covers the dead non-cache-stable path), so a fresh
+        # per-optimizer instance gives correct isolation with no persistence loss.
         self.hierarchical_summarizer = (
-            get_hierarchical_summarizer(max_full_turns=v050.hierarchical_summary_max_full_turns)
+            HierarchicalSummarizer(max_full_turns=v050.hierarchical_summary_max_full_turns)
             if self._cache_stable_summary
             else None
         )
@@ -152,7 +161,11 @@ class AgentContextOptimizer:
         )
         self.chunk_fingerprint = get_chunk_fingerprint_cache(max_entries=v050.chunk_fingerprint_max_entries) if v050.chunk_fingerprint_enabled else None
         self.hit_prediction = get_hit_prediction_model(retrain_threshold=v050.hit_prediction_retrain_threshold) if v050.hit_prediction_enabled else None
-        self.delta_encoder = get_delta_encoder() if v050.delta_encoding_enabled else None
+        # Per-session instance (review §4.8.2): the global ``get_delta_encoder`` keyed
+        # snapshots by ``inline:{lang}`` across all sessions, so code deltas could be
+        # computed against another session's file version. A per-optimizer encoder
+        # keeps snapshots isolated to this conversation.
+        self.delta_encoder = CodeDeltaEncoder() if v050.delta_encoding_enabled else None
         self.async_io = get_async_io_stage(max_thread_workers=v050.async_io_max_thread_workers, max_async_concurrency=v050.async_io_max_concurrency) if v050.async_io_enabled else None
 
         self.thinking_preserver = ThinkingPreserver()
@@ -182,27 +195,22 @@ class AgentContextOptimizer:
                 int(self._budget_tokens() * self._config.agentic.rolling_summary_budget_fraction)
             )
         self.goal_decomposer = GoalDecomposer()
-        self.embedding_service = EmbeddingService()
+        self.embedding_service = (
+            embedding_service if embedding_service is not None else EmbeddingService()
+        )
         self.symbol_index = SymbolIndex()
         self.cache_registry = get_cache_registry()
         self.cache_registry.load_from_disk()
         self.context_canonicalizer = get_context_canonicalizer()
         self.context_compressor = get_context_compressor()
-        self.context_template_matcher = get_context_template_matcher()
-        self.dependency_orderer = get_dependency_orderer()  # no-op: instantiated but never called in the pipeline; import ordering not applied
-        self.incremental_updater = get_incremental_updater()
-        self.pattern_injector = get_pattern_injector()
         self.selective_truncator = get_selective_truncator()  # limited: only remove_duplicates is called (deduplicate code blocks in newest user message)
         self.cache_aware_chunker = get_cache_aware_chunker(block_size=get_block_size())
-        self.hierarchical_index = get_hierarchical_index()
-        self.mtp_state_manager = get_mtp_state_manager()  # NON-FUNCTIONAL placeholder: cannot capture real MTP state (review03.md §2.1/§10)
         self.tool_streamer = get_tool_streamer()
         self.tool_output_compressor = ToolOutputCompressor(
             max_chars=self._dynamic_tool_output_max_chars()
         )
         self.tool_output_filter = ToolOutputFilter()
         self._task_type: str = "default"
-        self._last_mtp_state_key: str | None = None
         self._last_backend_extra_body: dict[str, Any] = {}
         # Throttled cache_registry disk-write counter (review §10).
         self._register_save_counter: int = 0
@@ -321,6 +329,19 @@ class AgentContextOptimizer:
         window is unknown or dynamic budgeting is disabled.
         """
         cfg = self._config.agentic
+        base = self._static_budget_tokens()
+        if not cfg.adaptive_budget_enabled:
+            return base
+        return self._adaptive_budget_tokens(base)
+
+    def _static_budget_tokens(self) -> int:
+        """The legacy fixed budget: ``max(window * budget_window_fraction,
+        max_optimized_tokens, char_budget)`` scaled by calibration.
+
+        Used as the base/floor of the adaptive budget and as the full budget when
+        ``adaptive_budget_enabled`` is off (review §4.2.2).
+        """
+        cfg = self._config.agentic
         char_budget = max(1, cfg.max_optimized_chars // 4)
         static = char_budget if cfg.max_optimized_tokens <= 0 else min(char_budget, cfg.max_optimized_tokens)
 
@@ -336,6 +357,41 @@ class AgentContextOptimizer:
         budget = max(derived, cfg.max_optimized_tokens, char_budget)
         # Scale by the learned backend-tokenizer ratio so the cap is enforced
         # against true backend tokens (clamped to [0.5, 2.0] upstream).
+        return max(1, round(budget * self._token_calibration))
+
+    def _adaptive_budget_tokens(self, base: int) -> int:
+        """Adaptive, horizon-growing budget (review §3.1 / §4.2.2).
+
+        The fixed cap was pinned to ``max_optimized_tokens`` (12K) while the
+        immutable zones need ~16K, so ``evictable_budget`` was 0, the cap was
+        ignored (context ran 16-18K), and the fold fired every 2-3 turns against a
+        93%-idle window. This replaces the constant with a GROWING ceiling:
+
+        - **horizon**: ``base + adaptive_horizon_growth_tokens * turns_seen`` — a
+          longer session carries a larger cached working set;
+        - **window ceiling**: capped at ``window * adaptive_window_fraction`` so a
+          long session grows toward a sane fraction of the real window, not a guess;
+        - **monotonic floor**: never below the previous turn's optimized size, so the
+          budget is a ceiling the context grows into — never a target to evict down
+          to. This keeps ``reserved < budget`` (the governors stop fighting) and the
+          prefix cache stable (no forced mid-body shrinkage).
+
+        The result is scaled by the learned calibration like the static budget.
+        """
+        cfg = self._config.agentic
+        budget = base + cfg.adaptive_horizon_growth_tokens * self._turns_seen
+
+        window = self._backend_context_window()
+        if window is not None and window > 0:
+            ceiling = int(window * cfg.adaptive_window_fraction)
+            budget = min(budget, ceiling)
+
+        # getattr: _budget_tokens() is also called during __init__ (to seed the
+        # summary ceiling) before this attribute exists.
+        last = getattr(self, "_last_optimized_token_count", None)
+        if last:
+            budget = max(budget, last)
+
         return max(1, round(budget * self._token_calibration))
 
     def _effective_budget_tokens(self) -> int:
@@ -891,6 +947,10 @@ class AgentContextOptimizer:
     ) -> list[dict[str, Any]]:
         """Run the full optimization pipeline with per-session locking."""
         with self._lock:
+            # Advance the conversation horizon once per top-level request (not for
+            # incremental sub-runs, which reuse this same call). Drives the adaptive
+            # budget's horizon term (review §3.1).
+            self._turns_seen += 1
             return self._optimize_messages_locked(messages, original_prompt)
 
     def _optimize_messages_locked(
@@ -1097,22 +1157,11 @@ class AgentContextOptimizer:
             self._update_stable_prefix(optimized, live_zone_start, raw_messages=messages)
             return self._finalize_optimized(optimized, messages)
 
-        # Static layer end is recomputed after compaction/RAG because those stages
-        # can change the message list.
-        total_chars = sum(len(m.get("content") or "") for m in optimized)
         # NOTE: the quality anchor is no longer injected here. Volatile context
         # (anchor + RAG + loop warnings) is appended as a single trailing user
         # turn at the very end of the pipeline (Step 14.12) so that no historical
         # turn is mutated and the leading prefix stays byte-stable for the
         # backend's prefix cache (review §1/§9, priority fix #1).
-
-        # Step 5.2: Build KV slot map for cache control. This output is only
-        # useful when the backend actually receives cache-control hints, so skip
-        # the work unless experimental backend hints are enabled (the hints are
-        # otherwise stripped before the request is sent).
-        if self._config.v050.enable_experimental_backend_hints:
-            slot_tracker = get_kv_slot_tracker()
-            slot_tracker.build_slot_map(optimized)
 
         # Step 5.5: Apply context canonicalization only when context pressure
         # justifies normalization. Lean contexts preserve exact user/system text.
@@ -1187,23 +1236,6 @@ class AgentContextOptimizer:
                 )
         except Exception as e:
             logger.warning("Prompt template versioning failed: %s", e)
-
-        # Step 6.5: Apply context template matching only for over-budget
-        # contexts where a task template can preserve quality with fewer tokens.
-        # Also gated by prompt_template_enabled (review §4.7).
-        if (
-            self._config.agentic.prompt_template_enabled
-            and current_tokens > proactive_threshold_tokens
-        ):
-            try:
-                if not (optimized and optimized[0].get("role") == "system"):
-                    template_name = self.context_template_matcher.match_template(optimized)
-                    if template_name:
-                        optimized = self.context_template_matcher.apply_template(optimized)
-                        current_tokens = self.token_counter.count_messages(optimized)
-                        self._diag_sys("after-6.5-template", optimized)
-            except Exception as e:
-                logger.warning("Context template matching failed: %s", e)
 
         # Step 7 (pre-compaction): Cache-stable tiered rolling-summary compaction
         # (review §1/§3/§5, #7). MUST run BEFORE the scratchpad compactor (Step 7
@@ -1304,18 +1336,8 @@ class AgentContextOptimizer:
         # Recalculate after compaction so later stages use the actual context size.
         try:
             total_tokens = current_tokens
-            total_chars = sum(len(m.get("content") or "") for m in optimized)
         except Exception as e:
             logger.warning("Post-compaction recount failed: %s", e)
-
-        # Step 7.25: Apply attention sink management only when explicitly
-        # enabled and the context is long enough to benefit from it.
-        if self._config.agentic.attention_sinks_enabled and total_chars > 4000:
-            try:
-                optimized = apply_attention_sinks(optimized, self._find_static_layer_end(optimized))
-                self._diag_sys("after-7.25-sinks", optimized)
-            except Exception as e:
-                logger.warning("Attention sink management failed: %s", e)
 
         # Step 7.5: Apply selective truncation (remove duplicate code blocks)
         try:
@@ -1328,20 +1350,8 @@ class AgentContextOptimizer:
         # Removing messages from the middle of history changes the serialized
         # prompt prefix even when the remaining text is semantically similar.
 
-        # Step 7.7: Dependency ordering is skipped — dependency_orderer is a
-        # no-op (returns messages unchanged). Retained as inert scaffolding.
-
-        # Step 7.8: Apply incremental update for cache preservation
-        try:
-            optimized = self.incremental_updater.update_context(optimized, "")
-            current_tokens = self.token_counter.count_messages(optimized)
-            self._diag_sys("after-7.8-incremental", optimized)
-        except Exception as e:
-            logger.warning("Incremental update failed: %s", e)
-
         try:
             total_tokens = current_tokens
-            total_chars = sum(len(m.get("content") or "") for m in optimized)
         except Exception as e:
             logger.warning("Pre-RAG recount failed: %s", e)
 
@@ -1383,7 +1393,6 @@ class AgentContextOptimizer:
 
         try:
             total_tokens = current_tokens
-            total_chars = sum(len(m.get("content") or "") for m in optimized)
         except Exception as e:
             logger.warning("Post-RAG recount failed: %s", e)
 
@@ -1540,8 +1549,8 @@ class AgentContextOptimizer:
         boundary_live_start = self._stable_prefix_end(optimized)
         optimized = self._apply_boundary_transforms(optimized, boundary_live_start)
         self._diag_sys("after-11.5-boundary", optimized)
-        # Step 11.7 mutations above may have changed the token count; refresh the
-        # local so the Step 11.8 gate below reads the post-filter size.
+        # The boundary transforms above may have changed the token count; refresh
+        # the local so the Step 11.8 gate below reads the post-filter size.
         current_tokens = self.token_counter.count_messages(optimized)
 
         # Recalculate total_tokens after entropy trim (calibrated to the backend
@@ -1550,10 +1559,6 @@ class AgentContextOptimizer:
             total_tokens = self.calibrated_token_count(optimized)
         except Exception as e:
             logger.warning("Token recount failed: %s", e)
-
-        # Step 11.7: MTP state bookkeeping is skipped — mtp_state is a
-        # NON-FUNCTIONAL placeholder (review03.md §2.1/§10). MTP hidden states
-        # cannot be captured/restored by an OpenAI client proxy.
 
         # Step 11.8: Apply sliding window for long contexts
         # This is the preferred method for context management with MTP state preservation
@@ -2293,6 +2298,13 @@ class AgentContextOptimizer:
         matrix = np.vstack(chunk_vecs)
         norm_q = np.linalg.norm(query_vec)
         if norm_q == 0:
+            # Embedding unavailable (server down / breaker open / uninitialized
+            # service): ranking is a no-op. Surface it so operators can tell RAG is
+            # degraded instead of failing silently (review §4.8.1 / §7.2).
+            self._record_degradation(
+                "embed_rank",
+                RuntimeError("zero query embedding; chunks returned unranked"),
+            )
             return chunks[: self._config.code_chunking.top_k_chunks]
 
         norms = np.linalg.norm(matrix, axis=1)
@@ -3352,7 +3364,6 @@ class AgentContextOptimizer:
             "goal_subtasks": self.goal_decomposer.decompose(
                 goal.original_prompt if goal else ""
             ),
-            "mtp_state_key": self._last_mtp_state_key,
         })
 
     def get_debug_info(self) -> dict[str, Any]:
@@ -3405,9 +3416,6 @@ class AgentContextOptimizer:
                 self.progress_tracker._tracked_subtasks[st] = "completed"
             for st in pdata.get("active_subtasks", []):
                 self.progress_tracker._tracked_subtasks[st] = "active"
-
-        # Restore MTP state key for potential state restoration
-        self._last_mtp_state_key = data.get("mtp_state_key")
 
         if "goal_subtasks" in data:
             self.progress_tracker.set_subtasks(data["goal_subtasks"])

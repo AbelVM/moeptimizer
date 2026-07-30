@@ -24,9 +24,14 @@ class SessionManager:
         session_timeout: int | None = None,
         config: AppConfig | None = None,
         capability_probe: Any = None,
+        embedding_service: Any = None,
     ) -> None:
         self._config = config or get_config()
         self._capability_probe = capability_probe
+        # Shared, initialized EmbeddingService handed to every per-session
+        # optimizer so RAG ranking actually works (review §4.8.1). Without this
+        # each optimizer built its own never-initialized service → zero vectors.
+        self._embedding_service = embedding_service
         agentic = self._config.agentic
         self._sessions: dict[str, AgentContextOptimizer] = {}
         self._session_timestamps: dict[str, float] = {}
@@ -35,7 +40,11 @@ class SessionManager:
         self._lock = threading.RLock()
 
     def _make_optimizer(self) -> AgentContextOptimizer:
-        return AgentContextOptimizer(self._config, self._capability_probe)
+        return AgentContextOptimizer(
+            self._config,
+            self._capability_probe,
+            embedding_service=self._embedding_service,
+        )
 
     def reload_config(self) -> AppConfig:
         """Hot-reload configuration from the environment without a process restart.
@@ -155,23 +164,3 @@ class SessionManager:
         for sid, _ in ordered[:over]:
             self._sessions.pop(sid, None)
             self._session_timestamps.pop(sid, None)
-
-    def get_mtp_state_key(self, session_id: str) -> str | None:
-        """Get the MTP state key for a session."""
-        with self._lock:
-            optimizer = self._sessions.get(session_id)
-            if optimizer:
-                return getattr(optimizer, "_last_mtp_state_key", None)
-            return None
-
-    def restore_mtp_state(self, session_id: str) -> Any | None:
-        """Restore MTP state for a session if available."""
-        with self._lock:
-            optimizer = self._sessions.get(session_id)
-            if optimizer:
-                state_key = getattr(optimizer, "_last_mtp_state_key", None)
-                if state_key:
-                    from moeptimizer.mtp_state import get_mtp_state_manager
-                    mtp_manager = get_mtp_state_manager()
-                    return mtp_manager.load_state(state_key)
-            return None

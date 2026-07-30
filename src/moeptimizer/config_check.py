@@ -78,15 +78,6 @@ def check_config(config: AppConfig) -> list[ConfigIssue]:
                 "with cache_stable_mode on.",
             )
         )
-    if a.attention_sinks_enabled:
-        issues.append(
-            ConfigIssue(
-                "WARN",
-                "sinks_break_prefix",
-                "attention_sinks_enabled injects model-visible markers into the prefix "
-                "and breaks byte-stable cache reuse.",
-            )
-        )
     if a.reasoning_preseed_enabled:
         issues.append(
             ConfigIssue(
@@ -113,15 +104,6 @@ def check_config(config: AppConfig) -> list[ConfigIssue]:
         )
 
     # ── Backend-compatibility flags ────────────────────────────────────────
-    if v.enable_experimental_backend_hints:
-        issues.append(
-            ConfigIssue(
-                "WARN",
-                "experimental_hints",
-                "v050.enable_experimental_backend_hints sends extra_body fields that "
-                "unsupported backends may ignore or hang on.",
-            )
-        )
     if v.native_mtp_passthrough:
         issues.append(
             ConfigIssue(

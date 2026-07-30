@@ -436,6 +436,22 @@ def _ensure_content(messages: list[dict[str, Any]]) -> None:
             msg["content"] = ""
 
 
+def _scrub_internal_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return messages with proxy-internal ``_*`` keys removed.
+
+    Last-line scrub at the backend boundary (review §4.8.3). The optimizer strips
+    internal markers at Step 13, but the volatile trailing turn is appended AFTER
+    that (Step 14.12) tagged ``_volatile_turn``, so its marker would otherwise leak
+    to the backend — violating the OpenAI-transparent contract and the
+    "no model-visible markers" constraint. Returns new dicts so the optimizer's
+    stored ``_last_optimized`` (which the incremental path reuses) is untouched.
+    """
+    return [
+        {k: v for k, v in msg.items() if not k.startswith("_")}
+        for msg in messages
+    ]
+
+
 def _fallback_optimized_messages(messages: list[dict[str, Any]], keep_full_steps: int) -> list[dict[str, Any]]:
     """Return a safe compact fallback when the full optimizer fails.
 
@@ -534,8 +550,12 @@ def _pop_custom_session_fields(body: dict[str, Any]) -> tuple[Any, Any]:
 
 
 # Session -> stable backend slot mapping for prefix-cache reuse (review §1).
-# A process-wide map; slots are assigned lazily and kept for the proxy's lifetime.
-_SLOT_MAP: dict[str, int] = {}
+# A process-wide LRU map: slots are assigned lazily, and the least-recently-used
+# entry is evicted past ``_SLOT_MAP_MAX`` so a long-running proxy serving many
+# conversations does not grow this map without bound (review §4.10.1). Evicting an
+# idle session's mapping is harmless — it is reassigned a slot on its next request.
+_SLOT_MAP: OrderedDict[str, int] = OrderedDict()
+_SLOT_MAP_MAX = 512
 _SLOT_LOCK = threading.Lock()
 _NEXT_SLOT = 0
 
@@ -576,6 +596,10 @@ def _slot_for_session(
             slot = _NEXT_SLOT % total_slots
             _SLOT_MAP[session_id] = slot
             _NEXT_SLOT += 1
+            while len(_SLOT_MAP) > _SLOT_MAP_MAX:
+                _SLOT_MAP.popitem(last=False)
+        else:
+            _SLOT_MAP.move_to_end(session_id)
         return slot
 
 
@@ -1119,20 +1143,32 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         model=cfg.server.llm_model,
         ttl_seconds=cfg.v050.capability_probe_ttl_seconds,
     )
+    # Created before the SessionManager so the one initialized instance can be
+    # injected into every per-session optimizer (review §4.8.1). It is initialized
+    # in ``lifespan`` below; optimizers are built lazily on first request, after
+    # initialization, so the shared instance is ready by the time ranking runs.
+    embedding_service = EmbeddingService()
     session_manager = SessionManager(
         config=cfg,
         capability_probe=capability_probe,
+        embedding_service=embedding_service,
     )
-    embedding_service = EmbeddingService()
     backend_client = LemonadeClient(
         base_url=cfg.server.url,
         api_key="lemonade",
         timeout=cfg.server.timeout,
         native_mtp_passthrough=cfg.v050.native_mtp_passthrough,
     )
-    output_shaper = OutputShaper(
-        enabled=cfg.agentic.tool_output_compression_enabled,
-    )
+    # DISABLED (review §4.2.5): OutputShaper clamps max_tokens / reasoning_effort
+    # and injects a "be terse" system instruction — i.e. it tunes RESPONSE
+    # verbosity, which violates the project's hard constraint ("the proxy compacts
+    # ONLY the input context; the backend/model fully controls response size") and
+    # cache_preservation_guide DONT #2 (varying generation params mid-session). It
+    # also biased the direct-vs-proxy benchmark. The proxy must stay input-only;
+    # response verbosity is addressed by better context fidelity, not output
+    # clamping. Kept constructed (enabled=False) so shape_request is a no-op and the
+    # wiring stays reversible behind an explicit, knowingly-constraint-violating edit.
+    output_shaper = OutputShaper(enabled=False)
     embed_client = AsyncOpenAI(
         base_url=cfg.server.embed_url,
         api_key="lemonade",
@@ -1340,12 +1376,27 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         legacy_session_id, session_state = _pop_custom_session_fields(body)
         session_id = _resolve_session_id(body, messages, legacy_session_id)
 
-        optimizer = session_manager.get_or_create(session_id)
+        # Construct/fetch the optimizer OFF the event loop (review §4.9.1). On a new
+        # session ``get_or_create`` builds ~25 components incl. disk I/O and a
+        # (lru-cached) tokenizer load; running that inline stalled the whole loop and
+        # blocked every concurrent request. The dedicated optimizer executor keeps it
+        # off the loop and off the async-IO/embedding pools.
+        loop = asyncio.get_running_loop()
+        optimizer = await loop.run_in_executor(
+            _OPTIMIZER_EXECUTOR, session_manager.get_or_create, session_id
+        )
 
         if session_state:
             if session_id:
-                session_manager.load_state(session_id, session_state)
-                optimizer = session_manager.get_or_create(session_id)
+                await loop.run_in_executor(
+                    _OPTIMIZER_EXECUTOR,
+                    session_manager.load_state,
+                    session_id,
+                    session_state,
+                )
+                optimizer = await loop.run_in_executor(
+                    _OPTIMIZER_EXECUTOR, session_manager.get_or_create, session_id
+                )
             else:
                 with suppress(Exception):
                     optimizer.load_session_state(session_state)
@@ -1527,7 +1578,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             response_headers["X-MOEPT-Optimization-Degraded"] = _header_safe("; ".join(degradation))
 
         body["model"] = cfg.server.llm_model
-        body["messages"] = optimized_messages
+        # Scrub proxy-internal ``_*`` keys (e.g. the late-appended ``_volatile_turn``)
+        # at the backend boundary so nothing internal reaches the model.
+        body["messages"] = _scrub_internal_keys(optimized_messages)
         body.setdefault("temperature", 0.1)
         body.setdefault("stream", True)
 

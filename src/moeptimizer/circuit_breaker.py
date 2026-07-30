@@ -12,6 +12,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,37 @@ class CircuitBreaker:
 
         try:
             result = func(*args, **kwargs)
+        except Exception as e:
+            self._on_failure()
+            logger.warning("[%s] Call failed, using fallback: %s", self._name, e)
+            return fallback
+
+        self._on_success()
+        return result
+
+    async def call_async(
+        self,
+        coro_func: Callable[..., Awaitable[Any]],
+        *args: Any,
+        fallback: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Async variant of ``call``: await ``coro_func(*args, **kwargs)`` under
+        circuit-breaker protection (review §4.8.1).
+
+        The lock is released before the await, so it is never held across the
+        coroutine. Like ``call``, this protects against a dependency that *raises*
+        (fast exception); it does NOT protect against a dependency that *hangs* —
+        callers that need hang protection should wrap the await in a timeout.
+        """
+        with self._lock:
+            self._maybe_transition_to_half_open()
+            if self._state == "OPEN":
+                logger.debug("[%s] Circuit open: fast-fail with fallback", self._name)
+                return fallback
+
+        try:
+            result = await coro_func(*args, **kwargs)
         except Exception as e:
             self._on_failure()
             logger.warning("[%s] Call failed, using fallback: %s", self._name, e)

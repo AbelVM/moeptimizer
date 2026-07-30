@@ -294,15 +294,25 @@ class BackendCapabilityProbe:
         """Sync wrapper around ``tokenize_count`` for use from sync code.
 
         Tries ``asyncio.run()``; if we are already inside a running event loop
-        (e.g. called from async app code via a sync optimizer), falls back to
-        ``None`` so the caller uses local counting instead.
+        (e.g. ``count_messages`` called inline on the loop), returns ``None`` so
+        the caller uses local counting instead. The running-loop check happens
+        BEFORE the coroutine is created — constructing
+        ``self.tokenize_count(text)`` as the ``asyncio.run`` argument and then
+        failing would leave it un-awaited (RuntimeWarning) and, worse, the caller
+        would treat that as a remote failure. Async callers should ``await
+        tokenize_count()`` directly.
         """
-        try:
-            import asyncio
+        import asyncio
 
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # no running loop here — safe to asyncio.run below
+        else:
+            return None  # running loop: cannot block; caller falls back to local
+        try:
             return asyncio.run(self.tokenize_count(text))
         except RuntimeError:
-            # Already in an async context — cannot start a new event loop.
             return None
 
     async def tokenize_count(self, text: str) -> int | None:

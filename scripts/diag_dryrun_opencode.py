@@ -247,6 +247,13 @@ def main() -> int:
                              "trailing anchor differs every turn by design but does not break "
                              "backend prefix reuse, so reuse ratio — not strict append-only — "
                              "is the cache metric (default: 0.8)")
+    parser.add_argument("--max-breaks", type=int, default=None,
+                        help="CI gate: exit 0 when the number of BREAK turns is <= this value, "
+                             "instead of requiring zero breaks. The rolling-summary fold breaks "
+                             "the prefix cache by design on fold turns, so a zero-break gate is "
+                             "unreachable; set this to the expected fold-break count (plus a little "
+                             "headroom) to catch regressions like the every-turn eviction cliff "
+                             "(which broke ~18 turns). Default: strict (any break exits 2).")
     parser.add_argument("--json", action="store_true", dest="json_output",
                         help="Output machine-readable JSON summary (to stdout)")
     args = parser.parse_args()
@@ -503,7 +510,13 @@ def main() -> int:
                 }, f, indent=2, default=str)
             print(f"  report written to {out_path}")
 
-        return 0 if not breaks else 2
+        # CI gate (review §4.12.2): with --max-breaks, pass when the break count is
+        # within the expected fold-break budget; otherwise require zero breaks.
+        allowed = args.max_breaks if args.max_breaks is not None else 0
+        if len(breaks) <= allowed:
+            return 0
+        print(f"  GATE FAIL: {len(breaks)} breaks > allowed {allowed}")
+        return 2
     finally:
         _stop_proxy()
 

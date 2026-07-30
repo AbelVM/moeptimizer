@@ -19,6 +19,7 @@ instead of guessing locally. This is both more accurate (eliminates the Qwen/BPE
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import logging
@@ -313,10 +314,18 @@ class TokenCounter:
                 self._remote_cache.pop(old, None)
             return exact
 
-        # Remote call failed — disable remote for this instance to avoid
-        # repeated failing calls on the hot path.
-        self._use_remote = False
-        logger.debug("Remote tokenize disabled after failure; falling back to local")
+        # A None from a running event loop is NOT a remote failure — the sync
+        # wrapper simply cannot block there. Fall back for this call only, so a
+        # later count on a loop-free executor thread can still use the backend.
+        # Only a genuine failure on a loop-free thread disables remote counting
+        # (to avoid repeated failing calls on the hot path).
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._use_remote = False
+            logger.debug(
+                "Remote tokenize disabled after failure; falling back to local"
+            )
         return None
 
     def count_messages(self, messages: list[dict[str, Any]]) -> int:

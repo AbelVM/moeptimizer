@@ -351,9 +351,13 @@ class TestChatCompletionsStreaming:
 
 
 class TestOutputShaperIntegration:
-    """OutputShaper is applied to the request body before sending to backend."""
+    """Hard-constraint guard (review §4.2.5): the proxy compacts ONLY the input
+    context and must NOT tune response verbosity. OutputShaper is disabled by
+    default, so the proxy must forward the client's generation params unchanged and
+    inject no "be terse" instruction. These tests fail if response shaping is
+    re-enabled."""
 
-    def test_output_shaper_injects_terse_instruction(
+    def test_proxy_does_not_inject_terse_instruction(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import moeptimizer.app as app_module
@@ -383,12 +387,11 @@ class TestOutputShaperIntegration:
         assert len(captured_bodies) == 1
         body = captured_bodies[0]
         messages = body.get("messages", [])
-        # The terse instruction should be appended to the system prompt
-        system_msg = next((m for m in messages if m.get("role") == "system"), None)
-        if system_msg:
-            assert "Be concise" in (system_msg.get("content") or "")
+        # No proxy-injected verbosity instruction may reach the backend.
+        for msg in messages:
+            assert "Be concise" not in (msg.get("content") or "")
 
-    def test_output_shaper_clamps_max_tokens(
+    def test_proxy_does_not_clamp_max_tokens(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import moeptimizer.app as app_module
@@ -418,8 +421,9 @@ class TestOutputShaperIntegration:
 
         assert len(captured_bodies) == 1
         body = captured_bodies[0]
-        # max_tokens should be clamped by OutputShaper for a new_question turn
-        assert body.get("max_tokens", 8192) <= 4096
+        # The client's max_tokens passes through untouched: the backend/model
+        # controls response size, not the proxy.
+        assert body.get("max_tokens") == 8192
 
 
 class TestMetricsSmoke:

@@ -297,7 +297,6 @@ class TestV050Integration:
 
         assert "store" in data
         assert "progress" in data
-        assert "mtp_state_key" in data
 
     def test_multi_turn_with_summarization(self) -> None:
         """Multi-turn conversation triggers hierarchical summarization."""
@@ -351,22 +350,34 @@ class TestV050Integration:
         assert "[Recall:" not in content
 
     def test_code_delta_encoding_in_pipeline(self) -> None:
-        """Delta encoding stores code snapshots during optimization."""
+        """Delta encoding stores code snapshots during optimization.
+
+        Uses a code block large enough to run the full (non-fast) pipeline so the
+        Step-14.8 snapshot scan executes. With the per-session delta encoder
+        (review §4.8.2) the count reflects THIS optimization only — it no longer
+        leaks in from other tests via the old module-global singleton, which is
+        what previously made a tiny (fast-path) context pass this assertion.
+        """
         encoder = self.optimizer.delta_encoder
         assert encoder is not None
 
+        code = "\n".join(
+            f"def func_{i}(x):\n    y = x * {i}\n    return y + {i}" for i in range(200)
+        )
         messages = _build_messages(
             ("system", "System"),
-            ("user", "Write code:\n```python\ndef foo():\n    x = 1\n    return x\n```"),
-            ("assistant", "Here is the code."),
-            ("user", "Update it:\n```python\ndef foo():\n    x = 2\n    y = 3\n    return x + y\n```"),
-            ("assistant", "Updated."),
+            ("user", f"Refactor this module:\n```python\n{code}\n```"),
+            (
+                "assistant",
+                "Here is the refactored version.\n```python\n"
+                f"{code.replace('def func_', 'def refactored_func_')}\n```",
+            ),
         )
 
         result = self.optimizer.optimize_messages(messages)
         assert len(result) >= 2
 
-        # Delta encoder should have stored snapshots
+        # Delta encoder should have stored snapshots from this optimization.
         stats = encoder.get_stats()
         assert stats["total_snapshots"] >= 1
 

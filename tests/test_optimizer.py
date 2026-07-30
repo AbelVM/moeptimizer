@@ -13,6 +13,10 @@ class TestAgentContextOptimizer:
     def setup_method(self) -> None:
         config = AppConfig()
         config.agentic.max_optimized_chars = 500  # Small budget for testing
+        # These tests exercise the fixed-budget eviction machinery; disable the
+        # adaptive budget (review §4.2.2) so the small cap above is actually
+        # enforced rather than grown past. Adaptive behavior has its own tests.
+        config.agentic.adaptive_budget_enabled = False
         self.optimizer = AgentContextOptimizer(config)
 
     def test_optimize_basic_messages(self) -> None:
@@ -330,22 +334,6 @@ class TestAgentContextOptimizer:
         new_optimizer.load_session_state(state)
         assert len(new_optimizer.store.steps) == len(self.optimizer.store.steps)
 
-    def test_attention_sink_markers_are_not_injected(self) -> None:
-        """Attention sink markers are not model-visible in cache-stable mode."""
-        config = AppConfig()
-        config.agentic.max_optimized_chars = 20000
-        config.agentic.attention_sinks_enabled = True
-        optimizer = AgentContextOptimizer(config)
-        long_unique_words = " ".join(f"unique_token_{i}" for i in range(900))
-
-        result = optimizer.optimize_messages([
-            {"role": "system", "content": "System rules"},
-            {"role": "user", "content": long_unique_words},
-        ])
-
-        system_content = result[0].get("content", "")
-        assert "STATIC_LAYER_END" not in system_content
-
     def test_fast_path_preserves_lean_context_and_strips_proxy_fields(self) -> None:
         """Lean contexts should bypass transformations while removing proxy-only fields."""
         config = AppConfig()
@@ -438,6 +426,9 @@ class TestAgentContextOptimizer:
         config.agentic.proactive_trim_ratio = 0.4
         config.agentic.compaction_trigger_ratio = 0.9
         config.agentic.fast_path_enabled = False
+        # Fixed-budget plumbing test: disable the adaptive budget (review §4.2.2)
+        # so the 1000-token cap is the enforced threshold, not a growing ceiling.
+        config.agentic.adaptive_budget_enabled = False
         # Disable the cache-stable rolling summary: while it is armed, the
         # front-evicting proactive trim is skipped below the compaction
         # threshold (the batch fold is the size mechanism then), so this
@@ -1515,6 +1506,10 @@ class TestCacheStabilityAcrossTurns:
         """
         config = AppConfig()
         config.agentic.dynamic_budget_enabled = False  # static budget, no probe
+        # Fixed-budget cliff regression: disable the adaptive budget (review §4.2.2)
+        # so the 3000-token cap stays smaller than the immutable zones — the exact
+        # ``evictable_budget == 0`` condition this test reproduces.
+        config.agentic.adaptive_budget_enabled = False
         config.agentic.max_optimized_tokens = 3000
         config.agentic.max_optimized_chars = 12000
         config.agentic.keep_full_steps = 6
@@ -1639,3 +1634,91 @@ class TestCacheStabilityAcrossTurns:
             f"counts={post_summary_counts}) — the live zone was front-evicted every "
             f"turn (the turn-12 cliff regressed); it must append within a fold cycle"
         )
+
+
+class TestPerSessionIsolation:
+    """Regression: per-conversation optimizer state must not be shared (review §4.8.2).
+
+    The HierarchicalSummarizer and CodeDeltaEncoder were module-global singletons,
+    so concurrent sessions contaminated each other's rolling-summary facts and code
+    snapshots. Each optimizer must own its own instances.
+    """
+
+    def _opt(self) -> AgentContextOptimizer:
+        config = AppConfig()
+        config.v050.cache_stable_summary_enabled = True
+        config.v050.delta_encoding_enabled = True
+        return AgentContextOptimizer(config)
+
+    def test_summarizer_and_delta_encoder_are_per_session(self) -> None:
+        a = self._opt()
+        b = self._opt()
+        assert a.hierarchical_summarizer is not None
+        assert b.hierarchical_summarizer is not None
+        assert a.hierarchical_summarizer is not b.hierarchical_summarizer
+        assert a.delta_encoder is not b.delta_encoder
+
+    def test_original_request_facts_do_not_leak_across_sessions(self) -> None:
+        a = self._opt()
+        b = self._opt()
+        assert a.hierarchical_summarizer is not None
+        assert b.hierarchical_summarizer is not None
+        a.hierarchical_summarizer.seed_original_request(
+            "migrate the auth service to OAuth"
+        )
+        assert a.hierarchical_summarizer._original_request_facts
+        # Session B must NOT inherit session A's pinned facts (the singleton bug).
+        assert b.hierarchical_summarizer._original_request_facts == ""
+
+
+class TestAdaptiveBudget:
+    """The adaptive budget is a growing ceiling, not a fixed cap (review §3.1/§4.2.2).
+
+    It grows with the conversation horizon, is capped at a fraction of the live
+    backend window, and never shrinks below the current optimized size (so the
+    immutable zones always fit and the eviction governors stop fighting).
+    """
+
+    WINDOW = 262144
+
+    def _opt(self) -> AgentContextOptimizer:
+        config = AppConfig()
+        config.agentic.adaptive_budget_enabled = True
+        config.agentic.dynamic_budget_enabled = True
+        opt = AgentContextOptimizer(config)
+        opt._backend_context_window = lambda: self.WINDOW
+        opt._token_calibration = 1.0
+        return opt
+
+    def test_budget_grows_with_horizon(self) -> None:
+        opt = self._opt()
+        opt._last_optimized_token_count = None
+        opt._turns_seen = 0
+        base = opt._budget_tokens()
+        opt._turns_seen = 10
+        grown = opt._budget_tokens()
+        assert grown > base
+        assert grown - base == 10 * opt._config.agentic.adaptive_horizon_growth_tokens
+
+    def test_budget_capped_at_window_fraction(self) -> None:
+        opt = self._opt()
+        opt._last_optimized_token_count = None
+        opt._turns_seen = 100000  # absurd horizon -> hits the ceiling
+        ceiling = int(self.WINDOW * opt._config.agentic.adaptive_window_fraction)
+        assert opt._budget_tokens() == ceiling
+
+    def test_budget_never_shrinks_below_last_optimized_size(self) -> None:
+        opt = self._opt()
+        opt._turns_seen = 0
+        opt._last_optimized_token_count = 50000  # already larger than base+horizon
+        assert opt._budget_tokens() >= 50000
+
+    def test_adaptive_disabled_uses_fixed_budget(self) -> None:
+        opt = self._opt()
+        opt._config.agentic.adaptive_budget_enabled = False
+        opt._last_optimized_token_count = None
+        opt._turns_seen = 0
+        fixed_at_0 = opt._budget_tokens()
+        opt._turns_seen = 30
+        # Horizon must not move the budget once adaptive is off.
+        assert opt._budget_tokens() == fixed_at_0
