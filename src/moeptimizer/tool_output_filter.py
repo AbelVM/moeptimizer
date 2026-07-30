@@ -20,6 +20,8 @@ import logging
 import re
 from typing import Any
 
+from moeptimizer.tool_output_compressor import has_failure_signal
+
 logger = logging.getLogger(__name__)
 
 # Default filter rules: (name, compiled_pattern, replacement).
@@ -161,8 +163,18 @@ class ToolOutputFilter:
 
         Idempotent on already-filtered content: if the content already contains
         a filter marker, it is returned unchanged.
+
+        Failure outputs are passed through UNCHANGED (review §4.1.1): collapsing a
+        failing test/build/lint log into a bare marker (e.g. ``[build error]``)
+        would discard the diagnostics the model needs. Those are left for the
+        error-aware ``ToolOutputCompressor``, which keeps the error/stack/summary
+        lines and drops the passing-test noise. The marker rules below therefore
+        only ever fire on success/noise output.
         """
         if not content or not self.should_filter(content):
+            return content
+
+        if has_failure_signal(content):
             return content
 
         for name, pattern, replacement in self._rules:

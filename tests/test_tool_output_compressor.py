@@ -82,3 +82,76 @@ def test_idempotent_on_compressed_output() -> None:
     once = c.compress(big)
     twice = c.compress(once)
     assert twice == once
+
+
+# ---------------------------------------------------------------------------
+# Error-aware extraction (review §4.1.1)
+# ---------------------------------------------------------------------------
+
+
+def _failing_log(n_passing: int = 40) -> str:
+    passing = "\n".join(f"tests/test_ok_{i}.py::test_case PASSED" for i in range(n_passing))
+    return (
+        "============================= test session starts ==============================\n"
+        "collected 42 items\n"
+        f"{passing}\n"
+        "tests/test_auth.py::test_login FAILED\n"
+        "    def test_login():\n"
+        ">       assert client.login('x') == 200\n"
+        "E       AssertionError: assert 401 == 200\n"
+        "tests/test_auth.py:18: AssertionError\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_auth.py::test_login - AssertionError: assert 401 == 200\n"
+        "========================= 1 failed, 41 passed in 2.34s =========================\n"
+    )
+
+
+def test_error_aware_keeps_failure_diagnostics() -> None:
+    c = ToolOutputCompressor(max_chars=800)
+    log = _failing_log()
+    out = c.compress(log)
+    # The diagnostic signal survives...
+    assert "AssertionError: assert 401 == 200" in out
+    assert "FAILED tests/test_auth.py::test_login" in out
+    assert "1 failed, 41 passed" in out
+    # ...while the bulk of the passing-test noise is dropped.
+    assert len(out) < len(log)
+    assert out.count("PASSED") < 40
+
+
+def test_error_aware_collapses_pure_success() -> None:
+    c = ToolOutputCompressor(max_chars=400)
+    log = (
+        "\n".join(f"tests/test_ok_{i}.py::test_case PASSED" for i in range(60))
+        + "\n========================= 60 passed in 1.23s =========================\n"
+    )
+    out = c.compress(log)
+    assert "60 passed in 1.23s" in out
+    # Collapsed to the verdict: passing lines are gone.
+    assert "PASSED" not in out
+
+
+def test_error_aware_skips_raw_stack_trace_without_summary() -> None:
+    # No verdict/summary line -> not a structured result -> falls through to the
+    # head/tail truncator (no error-aware marker), preserving prior behavior.
+    c = ToolOutputCompressor(max_chars=200)
+    trace = "\n".join(f'  File "app.py", line {n}, in f{n}' for n in range(30))
+    out = c.compress(trace)
+    assert "error-aware compressed" not in out
+
+
+def test_error_aware_idempotent() -> None:
+    c = ToolOutputCompressor(max_chars=800)
+    once = c.compress(_failing_log())
+    twice = c.compress(once)
+    assert twice == once
+
+
+def test_has_failure_signal() -> None:
+    from moeptimizer.tool_output_compressor import has_failure_signal
+
+    assert has_failure_signal("E   AssertionError: assert 1 == 2")
+    assert has_failure_signal('  File "x.py", line 3, in foo')
+    assert has_failure_signal("error: could not compile `crate`")
+    assert not has_failure_signal("60 passed in 1.23s")
+    assert not has_failure_signal("Build succeeded")

@@ -536,6 +536,28 @@ class TestAgentContextOptimizer:
         assert volatile[0]["content"] == "# Conversation Quality Anchor\nanchor text"
         assert "Old volatile context" not in [m["content"] for m in result]
 
+    def test_volatile_anchor_gated_by_config(self) -> None:
+        """The redundant quality anchor is appended only when its flag is on (review §4.2.6)."""
+
+        def _optimized_text(enabled: bool) -> str:
+            config = AppConfig()
+            config.agentic.max_optimized_chars = 2000
+            config.agentic.max_optimized_tokens = 500
+            config.agentic.volatile_quality_anchor_enabled = enabled
+            config.v050.cache_stable_summary_enabled = False
+            opt = AgentContextOptimizer(config)
+            msgs: list[dict] = [{"role": "system", "content": "System"}]
+            for i in range(8):
+                msgs.append({"role": "user", "content": f"Task {i} " + "word " * 60})
+                msgs.append({"role": "assistant", "content": f"Done {i} " + "word " * 60})
+            result = opt.optimize_messages(msgs, original_prompt="Build the thing")
+            return "\n".join(
+                m.get("content") or "" for m in result if isinstance(m.get("content"), str)
+            )
+
+        assert "# Conversation Quality Anchor" in _optimized_text(True)
+        assert "# Conversation Quality Anchor" not in _optimized_text(False)
+
 
 class TestToolOutputCompressionPipeline:
     """Step 11.6: large tool outputs must be boundary-compressed by the pipeline."""

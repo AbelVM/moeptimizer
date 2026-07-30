@@ -223,6 +223,17 @@ class AgenticConfig(BaseModel):
                     "accumulated quality-anchor constraints. Grows the anchor with the window so more "
                     "constraints survive, but stays tiny; the static floor is 5 constraints.",
     )
+    volatile_quality_anchor_enabled: bool = Field(
+        default=True,
+        description="Append the quality anchor (original request + accumulated constraints) to the "
+                    "trailing volatile turn on over-budget turns. The anchor is a THIRD copy of the "
+                    "original request (also in the frozen prefix and the rolling-summary head) and its "
+                    "monotonic stability is wasted because the RAG context in the same trailing turn "
+                    "churns every turn (review §4.2.6), so it costs ~900 chars/over-budget-turn of "
+                    "uncached prefill. Default True preserves current behavior; set False to drop the "
+                    "redundant anchor (keep only RAG + loop warnings) once benchmark quality confirms "
+                    "no regression.",
+    )
     proactive_trim_ratio: float = Field(
         default=0.45,
         description="Ratio of max_optimized_tokens at which proactive top-only trimming starts.",

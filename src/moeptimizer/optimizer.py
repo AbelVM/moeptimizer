@@ -1763,7 +1763,15 @@ class AgentContextOptimizer:
         # then reuses its KV for the whole stable leading prefix and avoids an
         # expensive MoE re-prefill. This is the core KV-cache preservation change.
         try:
-            anchor = self._build_quality_anchor(optimized)
+            # The anchor is a redundant 3rd copy of the original request (also in
+            # the frozen prefix + rolling-summary head); gate it so the savings can
+            # be realized once benchmark quality confirms no regression (review
+            # §4.2.6). RAG + loop warnings are still appended when the anchor is off.
+            anchor = (
+                self._build_quality_anchor(optimized)
+                if self._config.agentic.volatile_quality_anchor_enabled
+                else ""
+            )
             # Drift-safe mode (review P1.3): when real prefix-cache reuse has
             # collapsed we stop appending the volatile trailing turn, because
             # even that append shifts the prefix the backend would otherwise

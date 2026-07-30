@@ -31,6 +31,59 @@ _CR_RE = re.compile(r"\r\n|\r")
 # A repeated stack frame line, e.g. '  File "x.py", line 12, in foo'
 _STACK_FRAME_RE = re.compile(r'^\s*File\s+"[^"]+",\s*line\s+\d+,\s*in\s+\S+')
 
+# --- Error-aware extraction (review §4.1.1, snip/rtk pattern) ---------------
+# Blind head/tail truncation drops the diagnostic signal that lives in the MIDDLE
+# of a failing test/build/lint log (the compiler error, the failing assertion, the
+# stack frame). These patterns let the compressor KEEP that signal and drop the
+# passing-test / progress noise instead — ~90% reduction with zero loss of the
+# information the model actually needs to fix the problem.
+
+# A line that carries diagnostic signal worth keeping on a failure.
+_FAIL_KEYWORDS_RE = re.compile(
+    r"(?i)\b(errors?|failed|failures?|panic|fatal|traceback|exceptions?|"
+    r"assert(?:ion)?error|unresolved|cannot|could not|no such|not found|"
+    r"permission denied|segfault|aborted|expected\b.*\bgot\b)\b"
+    r"|^[✗✘❌]|^(FAIL|ERROR|PANIC|FATAL)\b"
+)
+# Stack frames / file:line references (Python, JS/TS, Rust/Go, gcc/clang).
+_FRAME_RE = re.compile(
+    r'^\s*File\s+"[^"]+",\s*line\s+\d+'        # Python traceback frame
+    r"|\bat\s+\S+\s+\(?[\w./\\-]+:\d+[:\d]*\)?"  # JS/TS / Node "at fn (file:line:col)"
+    r"|^\s*[\w./\\-]+\.\w+:\d+(:\d+)?\b"        # generic file:line[:col]
+    r"|^\s*[\w./\\-]+:\d+:\d+:"                 # gcc/clang file:line:col:
+)
+# A test/build/lint outcome summary line (always keep — it is the verdict).
+_SUMMARY_RE = re.compile(
+    r"(?i)\d+\s+(passed|failed|errors?|skipped|ignored|warnings?)"
+    r"|test result:"
+    r"|build (succeeded|failed|complete)"
+    r"|found \d+ (errors?|warnings?)"
+    r"|=+\s.*(pass|fail|error|summary).*\s=+"
+)
+# Noise to drop when extracting failure diagnostics (passing tests, progress bars,
+# percentage ticks, separator rules, blank lines).
+_NOISE_RE = re.compile(
+    r"^\s*(?:\.{2,}|\[?\s*\d+%\]?|ok\b.*\d+(?:\.\d+)?s|running\b.*|collecting\b.*"
+    r"|[-_=]{3,}|)\s*$",
+    re.IGNORECASE,
+)
+# Marker so re-compressing already error-aware-compressed output is a no-op.
+_ERROR_AWARE_MARKER = "... [error-aware compressed:"
+
+
+def has_failure_signal(text: str) -> bool:
+    """True if ``text`` carries error / stack-frame diagnostic signal.
+
+    Shared with ``ToolOutputFilter`` so it does NOT collapse a failing
+    test/build/lint log into a bare marker (which would discard the very
+    diagnostics the model needs); failures are passed through to the error-aware
+    compressor instead (review §4.1.1).
+    """
+    return any(
+        _FAIL_KEYWORDS_RE.search(ln) or _FRAME_RE.search(ln)
+        for ln in text.split("\n")
+    )
+
 
 class ToolOutputCompressor:
     """Boundary-compress large tool/assistant outputs with cheap transforms."""
@@ -55,8 +108,98 @@ class ToolOutputCompressor:
         # This order is also what makes compress() idempotent.
         text = self._collapse_repeated_stack_frames(text)
         text = self._collapse_repeated_lines(text)
+        # Error-aware extraction (review §4.1.1): for a recognizable test/build/lint
+        # result, keep the diagnostic signal (errors/frames/summary) and drop the
+        # passing/progress noise instead of blindly cutting the middle. Returns None
+        # for general output, which falls through to head/tail truncation.
+        error_aware = self._compress_error_aware(text)
+        if error_aware is not None:
+            return error_aware
         text = self._truncate(text)
         return text
+
+    def _compress_error_aware(self, text: str) -> str | None:
+        """Compress a recognizable test/build/lint result, preserving diagnostics.
+
+        Returns the compressed text, or ``None`` when the output is not a
+        recognizable result (so the caller falls back to head/tail truncation).
+
+        - Pure success (no failures): collapse to a one-line verdict.
+        - Failure: keep the head (what ran), every diagnostic line (error / stack
+          frame / file:line / summary) with a little trailing context, and the tail
+          (final verdict); drop passing-test and progress noise. Capped to
+          ``max_chars``.
+        """
+        if _ERROR_AWARE_MARKER in text:
+            return text  # idempotent
+
+        lines = text.split("\n")
+        has_failure = any(
+            _FAIL_KEYWORDS_RE.search(ln) or _FRAME_RE.search(ln) for ln in lines
+        )
+        has_summary = any(_SUMMARY_RE.search(ln) for ln in lines)
+
+        # Error-aware extraction only applies to a structured RESULT (a verdict /
+        # summary line is present). Raw stack traces and general errors fall through
+        # to head/tail truncation, which already preserves the traceback head + the
+        # final-error tail and collapses repeated frames.
+        if not has_summary:
+            return None
+
+        # Pure success (a verdict but no failure signal anywhere): collapse to the
+        # one-line verdict — the passing-test verbosity carries no information.
+        if not has_failure:
+            verdict = next(
+                (ln.strip() for ln in lines if _SUMMARY_RE.search(ln)), "success"
+            )
+            return f"{verdict}\n{_ERROR_AWARE_MARKER} success collapsed {len(text)} -> ~{len(verdict)} chars] ..."
+
+        # Failure path: extract diagnostic lines + limited context.
+        keep_idx: set[int] = set()
+        n = len(lines)
+        head_ctx = 4
+        for i in range(min(head_ctx, n)):
+            keep_idx.add(i)  # what ran (command / test file header)
+        for i, ln in enumerate(lines):
+            if _FAIL_KEYWORDS_RE.search(ln) or _FRAME_RE.search(ln) or _SUMMARY_RE.search(ln):
+                keep_idx.add(i)
+                # Keep a little context after a diagnostic line (the message that
+                # follows a frame / the assertion detail), and the line before a
+                # frame (often the failing test name).
+                if i + 1 < n:
+                    keep_idx.add(i + 1)
+                if i + 2 < n and _FRAME_RE.search(ln):
+                    keep_idx.add(i + 2)
+                if i - 1 >= 0:
+                    keep_idx.add(i - 1)
+        for i in range(max(0, n - head_ctx), n):
+            keep_idx.add(i)  # tail (final verdict / summary)
+
+        kept: list[str] = []
+        prev = -2
+        dropped = 0
+        for i in sorted(keep_idx):
+            ln = lines[i]
+            if _NOISE_RE.match(ln) and not (
+                _FAIL_KEYWORDS_RE.search(ln) or _SUMMARY_RE.search(ln)
+            ):
+                continue
+            if i != prev + 1 and kept:
+                if dropped:
+                    kept.append(f"... [{dropped} noise lines omitted] ...")
+                dropped = 0
+                kept.append("...")
+            kept.append(ln)
+            prev = i
+        if dropped:
+            kept.append(f"... [{dropped} noise lines omitted] ...")
+
+        result = "\n".join(kept)
+        if len(result) > self.max_chars:
+            result = result[: self.max_chars] + f"\n{_ERROR_AWARE_MARKER} capped at {self.max_chars} chars] ..."
+        elif len(result) < len(text):
+            result = result + f"\n{_ERROR_AWARE_MARKER} {len(text)} -> {len(result)} chars] ..."
+        return result
 
     # --- internals ---------------------------------------------------------
 

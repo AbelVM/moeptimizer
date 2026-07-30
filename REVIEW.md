@@ -16,11 +16,11 @@ local, hardware-limited infrastructure. Mission: improve **TTFT and TPS** while
 
 ---
 
-## Implementation status (Phase 1 + Phase 2 — done, validated)
+## Implementation status (Phase 1 + 2 + 3 — done, validated)
 
-The following items (§5) are **implemented and validated** (pytest 434 passed / 11
+The following items (§5) are **implemented and validated** (pytest 440 passed / 11
 pre-existing failures — zero new; ruff 1 pre-existing; mypy 59, zero new;
-`--check-config` exit 0; dry-run cache-stability preserved/improved):
+`--check-config` exit 0; dry-run cache-stability preserved — breaks steady at 7):
 
 **Phase 1 — correctness, leaks, adaptive budget, cleanup** (commit `4b79eb5`):
 
@@ -48,6 +48,14 @@ pre-existing failures — zero new; ruff 1 pre-existing; mypy 59, zero new;
 | §4.9.4 CPU on the event loop | ✅ fixed | `_serialize_messages_text` length pre-check (no build-then-discard); `get_session_state()` offloaded to the executor |
 | §4.12.7 `context_window_wall` artifact | ✅ fixed | requires `min_turn=5` + `sustained=2` consecutive breaches; 3 new tests |
 
+**Phase 3 — context efficiency & quality**:
+
+| Item | Status | Evidence |
+|---|---|---|
+| §4.1.1 **error-aware tool-output compression** | ✅ implemented | `ToolOutputCompressor` now keeps error/stack-frame/file:line/summary lines and drops passing-test/progress noise (failure log 2.1K→0.65K with diagnostics intact); pure-success logs collapse to the one-line verdict; `ToolOutputFilter` no longer destroys failure detail; 6 new tests; dry-run breaks unchanged |
+| §4.2.6 redundant volatile anchor | ✅ gated | `volatile_quality_anchor_enabled` (default `true` = current behavior); the anchor is a 3rd copy of the original request (also in frozen prefix + summary head) — set `false` to drop ~900 chars/over-budget-turn once benchmark quality confirms; test added |
+| §4.3.3 evicted-code skeleton index | ✅ already present | the `code_ledger` (`CODE_LEDGER_MAX_SIGS`) already accumulates evicted-turn code signatures into a compact index |
+
 **Deferred to a benchmark-validated follow-up:**
 - §4.8.4 quality-profile-vs-env precedence — config-semantics change conflicting with
   existing tests and the cliff-fix `.env`; handle with a budget-config redesign.
@@ -57,9 +65,13 @@ pre-existing failures — zero new; ruff 1 pre-existing; mypy 59, zero new;
 - §4.4.1 zero-copy SSE passthrough — a rewrite of the working streaming path; the
   proxy must inspect every chunk (usage / thinking / content), so the "minimal"
   benefit is limited. Needs careful design.
+- §4.1.2 reversible compression + retrieval handles — a content-addressed store +
+  `expand(id)` tool (MCP-style); a substantial new feature changing the interaction
+  model. Needs dedicated design.
+- §4.5.3 syntactic code slicing (keep only the query-referenced function, stub
+  siblings) — needs relevance detection; builds on the tree-sitter plumbing.
 
-**Not started:** Phase 3–4 (error-aware/reversible tool-output compression,
-god-object decomposition).
+**Not started:** Phase 4 (god-object decomposition of the 3.4K-line `optimizer.py`).
 
 ---
 
