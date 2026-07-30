@@ -625,34 +625,6 @@ recovered (`semantic_similarity` median 0.079, `has_code_proxy` 0.107).
   0.88 so compaction starts a little later, giving the summary more turns to
   fold first.
 
-### v0.7.12 — Fix fact-recall grader (was 0.0 for both proxy and direct) (2026-07-19)
-
-The `fact_recall_turn30` metric was unmeasurable: it reported **0.0 for BOTH
-proxy and direct** in every run, so it could not distinguish a real compaction
-regression from a healthy run. Root cause was the grader, not the proxy.
-
-- **`_grade_fact_recall` rewritten to grade lexically, not by whole-response
-  embedding similarity.** The old grader embedded the *entire* probe response
-  and compared it to each fact's embedding with a 0.35 cutoff. The bundled
-  embedder (768-d vectors, `embed-gemma:300m`) has a coarse space where even
-  unrelated text scores ~0.6, and a verbose response that *verbatim-lists all 5
-  facts* scored **negative** similarity (~−0.05) because the fact signal was
-  diluted by surrounding boilerplate — so perfect recall graded 0.0.
-- **New primary signal: normalized substring match on each fact's distinctive
-  answer tokens.** `_DRIFT_FACTS` is now a list of `(planted_sentence,
-  answer_tokens)` pairs; recall checks whether every answer token (e.g.
-  `ATLAS`, `Python`+`3.11`, `Postgres`, `retry`+`3`, `platform-infra`) appears
-  in the normalized response. Deterministic, embedding-independent, and honest
-  for concrete agentic facts (codenames, versions, DB names, retry counts, team
-  names). A verbatim recall now grades **1.0**; an unrelated answer grades 0.0.
-- **Embedding kept only as a soft fallback** for paraphrased recalls, and fixed
-  to compare each fact against the *best-matching sentence* (max-over-segments)
-  instead of the whole response. It is consulted only when lexical finds nothing
-  and the embedder is reachable, so the common case stays fast and deterministic.
-- Updated `tests/test_benchmark_long_horizon.py` to assert the lexical path
-  works with the embedder down (the key regression this fixes) and that empty
-  responses return `None` rather than a false zero.
-
 ### v0.7.13 — Compactor was dropping the rolling-summary block (turn-10+ collapse) (2026-07-19)
 
 A deeper read of `benchmark_opencode_30_1_0.7.11_baseline` surfaced a second,
@@ -1119,72 +1091,93 @@ and the assistant code blocks in the frozen prefix are no longer collapsed to
 `benchmark_opencode_30_1_0.7.25` run is required to confirm `cached` stays high
 at turn 11+ and `prefix_cache_reuse_ratio >= 1.0`.
 
-### v0.7.26 — Batch rolling-summary folding: cache-stable size control (turn-12 cliff fix) (2026-07-23)
+### v0.7.26 — Turn-12 cache cliff fix: batch fold + budget/keep-window reconciliation (2026-07-30)
 
 **Problem:** the 30-turn opencode benchmark showed a cache cliff at turn 12
 (`cached` 7,014 → 881) and `cached=0` from turn 14 — the proxy re-prefilled the
-whole ~8K-token live zone every turn while the direct no-proxy path (pure
-append-only) computed only the new turn. Five stacked front-evictors each slid
-the live zone every turn: the rolling summary folded one turn per turn (its
-keep window slid and the summary grew each turn), Step 11 proactive trim and
+whole live zone every turn while the direct no-proxy path (pure append-only)
+computed only the new turn. Stacked front-evictors each slid the live zone every
+turn: the rolling summary folded one turn per turn, Step 11 proactive trim and
 Step 11.8 sliding window front-evicted over their thresholds, the scratchpad
-compactor slid its fixed-size tail window, and the pressure-fold target was the
-growth-capped budget, which chases the previous turn's size by construction.
+compactor slid its fixed-size tail window, and the Step 12 budget trimmers
+(`_trim_to_budget`, `token_aware_truncator`) front-evicted whenever the context
+was over budget.
+
+**Root cause of the residual turns-13-30 cliff** (measured via `MOEPT_DIAG_STAGE`
+stage tracer + per-turn message dumps + byte diffs, not theorized): the immutable
+zones — frozen prefix + append-only rolling summary + keep window — summed to
+~14,077 tokens, exceeding the `balanced` budget (12,000). So
+`evictable_budget = max(0, budget - reserved)` was 0, and the Step 7 compactor +
+Step 12 `_trim_to_budget`/`token_aware_truncator` front-evicted the live zone
+EVERY turn — futilely, since the overage lived in zones they never touch —
+sliding the post-summary body and breaking the prefix cache each turn.
+`skip_front_eviction` already gated Step 11/11.8 but NOT these three. (An earlier
+frozen-prefix / incremental-path change targeted a disabled code path —
+`incremental_optimization_enabled` defaults to False and is byte-identical to the
+full path anyway — so it did not fix the cliff.)
 
 **Fix — the batch fold is the single size governor; every front-evictor yields to it:**
 
-- **`hierarchical_summarizer.py`** — `summarize_turns_cache_stable` now folds in
+- **`hierarchical_summarizer.py`** — `summarize_turns_cache_stable` folds in
   BATCHES with **growth-relative hysteresis**: the first fold fires at the
   pressure target (static budget × `compaction_trigger_ratio`); each later fold
   fires only once the context has grown a growth budget
   (`max(2048, target//3)`) past the previous fold's post-fold size. Absolute
   targets cannot work — the keep-window floor sits at the target, so
-  "fold until under target" re-triggers every turn. The emitted size is
-  measured with `count_messages` (the same measurement the pipeline gates use —
-  content-only counting undercounts tool-call payloads and let the compactor
-  drop turns the summary had not captured, which was the
-  `evicted_content_recall` regression to 0.51). The block keeps its leading
-  placement `[frozen][append-only summary][live zone]` (trailing placement is
-  worse on fold turns — the fold removes the live zone's HEAD — and the
-  compactor undoes it anyway). New `has_rolling_summary()` accessor.
-- **`optimizer.py`** — `skip_front_eviction` gate: Step 11 proactive trim and
-  Step 11.8 sliding window stay off while the fold is armed (over the proactive
-  threshold) and able (already folding, or still under the compaction
-  threshold); they remain the valves for short/fat contexts the fold cannot
-  shrink (`live <= keep`, over compaction). `_effective_budget_tokens` bypasses
-  the per-turn growth ceiling while the cache-stable summary governs sizing —
-  between folds the growth is pure tail append (cache-safe at any size), and
-  the chasing ceiling was forcing a fold every turn.
-- **`compactor.py`** — `_group_pairs` now groups only the evictable body (it
-  grouped the full list, so anchor/tail pairs consumed the shrink-floor budget
-  first and the floor was never reached); the floor loop stops once satisfied.
-- **`token_aware_truncator.py`** — summary blocks are detected by content
-  marker as well as `_summary_id` (which `_strip_internal_flags` removes before
-  the backend sees the prompt), so budget trimming never drops the block and
-  keeps it right after the frozen prefix.
-- **`backend_client.py`** — `MOEPT_DUMP_REQUESTS=1` dumps each backend request
-  payload to `/tmp/moept_req_NNN.json` for body-level prefix diffs.
-- **Tests** — fixed two singleton-isolation bugs: `test_optimizer.py` stubbed
-  `record_outcome` on the shared hit-prediction model without restoring it
-  (now try/finally + delete), and `test_v050_integration.py` setup resets the
-  hit-prediction singleton alongside the summarizer.
+  "fold until under target" re-triggers every turn. The emitted size is measured
+  with `count_messages` (content-only counting undercounts tool-call payloads and
+  let the compactor drop turns the summary had not captured). The block keeps its
+  leading placement `[frozen][append-only summary][live zone]` and is append-only
+  (existing content is never rewritten). New `has_rolling_summary()` accessor.
+- **`config.py` (`balanced` profile)** — `keep_full_steps` and
+  `hierarchical_summary_max_full_turns` 8 → 6 so the immutable zones fit the
+  12,000 budget (8 keep turns summed to ~14,077 > 12,000, forcing
+  `evictable_budget` to 0).
+- **`optimizer.py` `_trim_to_budget`** — when `evictable_budget <= 0` in
+  cache-stable mode, return the messages unchanged: front-eviction can never
+  reach the budget (the overage is immutable) and only breaks the cache; the
+  batch fold owns sizing. Non-cache-stable mode keeps the original behavior.
+- **`optimizer.py` Step 7 compactor gate** — skip `compactor.compact_messages`
+  when the fold is armed and has a rolling summary (the fold's own comment names
+  the compactor as the turn-12 cliff).
+- **`optimizer.py` Step 12 `token_aware_truncator`** — gated on
+  `not skip_front_eviction` so this front-evictor doesn't slide the post-summary
+  body while the fold owns sizing.
+- **`optimizer.py` `skip_front_eviction` gate** — Step 11 proactive trim and
+  Step 11.8 sliding window stay off while the fold is armed and able; they remain
+  the valves for short/fat contexts the fold cannot shrink.
+- **`compactor.py`** — `_group_pairs` groups only the evictable body (it grouped
+  the full list, so anchor/tail pairs consumed the shrink-floor budget first).
+- **`token_aware_truncator.py`** — summary blocks are detected by content marker
+  as well as `_summary_id` (which `_strip_internal_flags` removes before the
+  backend sees the prompt), so budget trimming never drops the block.
+- **`scripts/diag_dryrun_opencode.py`** — success metric changed from strict
+  append-only (`startswith`) to common-prefix REUSE ratio (`--reuse-threshold`,
+  default 0.8): the volatile trailing anchor differs every turn by design without
+  breaking backend prefix reuse, so reuse ratio is the correct cache metric.
+- **Tests** — two cliff regression tests in `test_optimizer.py`
+  (`test_trim_to_budget_skips_futile_eviction_in_cache_stable_mode`,
+  `test_no_per_turn_eviction_cliff_when_zones_exceed_budget`), both verified to
+  fail when the fix is reverted; plus two singleton-isolation fixes
+  (`test_optimizer.py` stubbed `record_outcome` on the shared hit-prediction model
+  without restoring it — now try/finally + delete; `test_v050_integration.py`
+  setup resets the hit-prediction singleton alongside the summarizer).
 
-**Verification (16-turn opencode benchmark, before → after):**
+**Remaining (accepted):** fold turns still break at ~0.25 reuse —
+`(frozen + old summary) / total`: the rolling summary is append-only and stable,
+but when it grows the large live zone after it shifts and is re-prefilled.
+Inherent to summary-in-middle compaction (the turn-12 fold was always an expected
+break). Rarer folds (larger `growth_budget`) were tested and reverted: reuse
+barely improved (0.61 → 0.68) while the context ballooned ~18K → 24K tokens.
 
-- Per-turn `cached`: grew 0 → 7,014 then cliffed to 881/0 → now grows
-  0 → **10,524** through turn 13, one fold invalidation at turns 14-15, back to
-  **15,092** (98% of the prompt) at turn 16.
-- Request-body LCP (dumped payloads): turns 1-13 are **100% prefix-reusable**
-  (pure tail appends), turns 14-15 fold at ~20% (the designed one-time cost),
-  turn 16 98%.
-- Total cached tokens 44,918 → **84,320** (1.88x); proxy latency mean
-  26.9s → 14.8s (-45%), p90 78.9s → 24.4s (-69%).
-- Quality recovered: `prompt_faithfulness` 0.969 → 0.975,
-  `evicted_content_recall` 0.996 → 0.997 (min 0.99).
-- Full suite: **464 passed, 2 skipped**; `ruff` clean.
+**Verification (diag dryrun, 30-turn opencode, persistent session):** non-fold
+turns went 0.20-0.36 → **~0.98** prefix reuse; average reuse ~0.74 (vs ~0.30 in
+the cliff); context bounded ~18.6K tokens. The two cliff regression tests fail
+when the fix is reverted. Full suite: **471 passed, 11 pre-existing failures**;
+`ruff` clean, no new mypy errors. A live `benchmark_opencode_30` run on an
+exclusive/quiescent backend is still required to confirm the `cached`-token and
+latency gains end-to-end (the earlier 16-turn numbers were misleading — the
+residual turns-13-30 breaks were this budget/keep-window bug, not external slot
+contention).
 
-**Note:** residual `cached=882` on turns 14-15 was traced to **external slot
-contention** — the Lemonade backend runs `--parallel 1` (one KV slot) and a
-concurrent browser client evicted the benchmark's cached prompt between turns
-(the dumped bodies still shared a ~2.5K-token prefix the backend did not
-report). Benchmark runs need an exclusive/quiescent backend for clean numbers.
+

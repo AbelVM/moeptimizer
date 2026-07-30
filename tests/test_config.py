@@ -50,10 +50,12 @@ class TestQualityProfile:
     def test_balanced_is_default(self) -> None:
         config = AppConfig()
         apply_quality_profile(config)
-        # keep_full_steps raised 6 -> 8 and max_optimized_tokens 8000 -> 12000
-        # (review: deep-context turns were over-compressed 15-29x; the backend
-        # window has <1% utilization so more recent context can be retained).
-        assert config.agentic.keep_full_steps == 8
+        # keep_full_steps lowered 8 -> 6 (cache-cliff fix): the immutable zones
+        # (frozen prefix + append-only summary + keep window) must fit the token
+        # budget, otherwise evictable_budget hits 0 and the budget trimmers
+        # front-evict the live zone every turn, breaking backend prefix-cache
+        # reuse (the turn-12 cliff). 6 keep turns + summary fit the 12000 budget.
+        assert config.agentic.keep_full_steps == 6
         assert config.agentic.max_optimized_tokens == 12000
         # Re-tuned (review P0.1): balanced no longer skeletonizes all code.
         assert config.agentic.code_skeleton_enabled is False

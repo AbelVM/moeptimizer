@@ -613,21 +613,34 @@ class AgentContextOptimizer:
         content = msg.get("content")
         return isinstance(content, str) and content.startswith(ROLLING_SUMMARY_MARKER)
 
+    def _frozen_prefix_end(self, messages: list[dict[str, Any]]) -> int:
+        """Return the index just past the frozen prefix (before the summary).
+
+        The frozen prefix is the byte-stable prefix that the backend
+        caches: system messages, the first user message, and the next
+        ``frozen_prefix_turns`` complete turns. The rolling summary
+        block is NOT part of the frozen prefix because its content
+        grows each turn (append-only), and including it in the
+        comparison would cause the stable-prefix check to always fail
+        after the first fold.
+        """
+        return self.context_aligner.frozen_prefix_end(
+            messages, self._config.v050.frozen_prefix_turns
+        )
+
     def _stable_prefix_end(self, messages: list[dict[str, Any]]) -> int:
         """Return the index just past the byte-stable prefix (frozen + summary).
 
         The stable prefix is the frozen prefix (system + first user +
-        ``frozen_prefix_turns``) PLUS the append-only rolling-summary block, when
-        present. The summary block is recognized by its ``_summary_id`` marker OR
-        its content marker (see :meth:`_is_summary_block`), not by byte-equality,
-        because it grows by appending each turn — its LEADING bytes stay
-        byte-identical, which is exactly what the backend prefix cache reuses.
-        Everything at/after this index is the live zone and may be re-optimized
-        without breaking cache reuse (REVIEW.md P0.5).
+        ``frozen_prefix_turns``) PLUS the append-only rolling-summary block,
+        when present. The summary block is recognized by its ``_summary_id``
+        marker OR its content marker (see :meth:`_is_summary_block`), not by
+        byte-equality, because it grows by appending each turn — its LEADING
+        bytes stay byte-identical, which is exactly what the backend prefix
+        cache reuses. Everything at/after this index is the live zone and may
+        be re-optimized without breaking cache reuse (REVIEW.md P0.5).
         """
-        frozen_end = self.context_aligner.frozen_prefix_end(
-            messages, self._config.v050.frozen_prefix_turns
-        )
+        frozen_end = self._frozen_prefix_end(messages)
         # The summary blocks sit immediately after the frozen prefix (P0.5 fix).
         # Include them in the stable prefix so optimizer stages never mutate them.
         i = frozen_end
@@ -639,14 +652,29 @@ class AgentContextOptimizer:
         """Return the index where the live zone begins.
 
         The stable prefix is the leading block of messages that is byte-identical
-        to the previous turn's optimized prefix. When it matches, everything after
-        it is the live zone and can be re-optimized without breaking cache reuse.
-        When it does not match (e.g. context reset, first turn), the entire list
-        is treated as live.
+        to the previous turn's incoming raw frozen prefix. When it matches,
+        everything after it is the live zone and can be re-optimized without
+        breaking cache reuse. When it does not match (e.g. context reset, first
+        turn), the entire list is treated as live.
 
-        The comparison is against the *raw* (incoming) stable prefix stored from the
-        previous turn, because the client sends raw messages every turn and the
-        stored optimized prefix would never equal the raw incoming prefix.
+        The comparison is against the *raw* (incoming) frozen prefix stored from
+        the previous turn (excluding the rolling summary block), because the
+        client sends raw messages every turn and the stored optimized prefix
+        would never equal the raw incoming prefix. The rolling summary block is
+        excluded from the comparison because its content grows each turn
+        (append-only), so it would always cause a mismatch after the first fold.
+
+        Returns ``len(self._last_raw_prefix)`` (the frozen-prefix boundary in
+        *raw* incoming messages, which excludes the summary block) rather than
+        ``self._live_zone_start`` (the stable-prefix boundary in the previous
+        turn's *optimized* output, which includes the summary block). The raw
+        messages have the summary block at a different position than the
+        optimized output (the optimizer stabilizes it right after the frozen
+        prefix), so using the optimized-output index as a split point for raw
+        messages splits at the wrong position — putting new live messages into
+        the stable zone or the summary block into the live zone, both of which
+        break backend prefix-cache reuse (the root cause of the turn-13+
+        cache cliff).
         """
         if not self._last_raw_prefix:
             return 0
@@ -657,7 +685,7 @@ class AgentContextOptimizer:
 
         current_prefix = _norm(messages[: len(self._last_raw_prefix)])
         if current_prefix == _norm(self._last_raw_prefix):
-            return self._last_raw_stable_end
+            return len(self._last_raw_prefix)
 
         # Prefix changed (new session, reset, or different history). Treat all
         # as live and reset the stored prefix.
@@ -690,23 +718,28 @@ class AgentContextOptimizer:
             {k: v for k, v in m.items() if k in ("role", "content")}
             for m in optimized[: self._live_zone_start]
         ]
-        # Store the RAW (incoming) stable prefix so the next turn's
-        # _compute_live_zone_start can compare like-for-like. The client sends raw
-        # messages every turn; comparing the incoming raw prefix against the stored
-        # *optimized* prefix would never match, forcing a full re-optimization (and
-        # re-mutation) of the frozen prefix + summary every turn and breaking
-        # prefix-cache reuse. We key on the *computed* stable boundary
-        # (self._live_zone_start), not the incoming live_zone_start, so the raw
-        # prefix is established on the very first turn that has a stable prefix
-        # (turn 1 here) and the next turn can reuse it.
-        # P0.5: use _stable_prefix_end (not just frozen_end) to include the
-        # rolling-summary block in the raw prefix, matching the optimized boundary.
+        # Store the RAW (incoming) frozen prefix so the next turn's
+        # _compute_live_zone_start can compare like-for-like. The client
+        # sends raw messages every turn; comparing the incoming raw prefix
+        # against the stored *optimized* prefix would never match, forcing
+        # a full re-optimization (and re-mutation) of the frozen prefix +
+        # summary every turn and breaking prefix-cache reuse. We key on the
+        # *computed* stable boundary (self._live_zone_start), not the
+        # incoming live_zone_start, so the raw prefix is established on the
+        # very first turn that has a stable prefix (turn 1 here) and the
+        # next turn can reuse it.
+        # The rolling summary block is EXCLUDED from the raw prefix
+        # comparison because its content grows each turn (append-only),
+        # so it would always cause a mismatch after the first fold. The
+        # summary is always part of the stable prefix and is never
+        # re-optimized, so the live zone starts right after the frozen
+        # prefix.
         if raw_messages is not None and self._live_zone_start > 0:
-            raw_stable_end = self._stable_prefix_end(raw_messages)
-            self._last_raw_stable_end = raw_stable_end
+            frozen_end = self._frozen_prefix_end(raw_messages)
+            self._last_raw_stable_end = frozen_end
             self._last_raw_prefix = [
                 {k: v for k, v in m.items() if k in ("role", "content")}
-                for m in raw_messages[:raw_stable_end]
+                for m in raw_messages[:frozen_end]
             ]
         else:
             self._last_raw_prefix = []
@@ -730,14 +763,21 @@ class AgentContextOptimizer:
                 # otherwise raw never equals optimized, the hash never matches, and
                 # the incremental path is never taken (the full pipeline re-runs
                 # every turn, re-applying the tool-output filter inconsistently and
-                # breaking prefix-cache reuse). This is the same raw-vs-optimized
-                # mismatch class as _compute_live_zone_start (root cause #3).
+                # breaking prefix-cache reuse). The _compute_live_zone_start
+                # raw-vs-optimized mismatch (root cause #3) has been fixed:
+                # it now returns len(self._last_raw_prefix) so the split point
+                # is based on the raw frozen-prefix length, not the previous
+                # turn's optimized-output index.
                 incoming_prefix_hash = self._content_hash(self._last_raw_prefix)
-                # Cache the FULL optimized stable prefix (frozen prefix + append-only
-                # rolling-summary block), bounded by self._live_zone_start — NOT just
-                # frozen_end. The summary block is part of the stable prefix and must
-                # be reused verbatim; otherwise the next turn regenerates it and the
-                # leading bytes change.
+                # Cache the FULL optimized stable prefix (frozen prefix +
+                # append-only rolling-summary block), bounded by
+                # self._live_zone_start — NOT just frozen_end. The summary
+                # block is part of the stable prefix and must be reused
+                # verbatim; otherwise the next turn regenerates it and the
+                # leading bytes change. The hash is computed from the frozen
+                # prefix only (self._last_raw_prefix excludes the rolling
+                # summary because its content grows each turn and would
+                # always cause a mismatch after the first fold).
                 self._stable_prefix_optimized = [
                     dict(m) for m in optimized[: self._live_zone_start]
                 ]
@@ -902,9 +942,9 @@ class AgentContextOptimizer:
             and self._stable_prefix_optimized is not None
             and self._stable_prefix_hash is not None
         ):
-            incoming_prefix_hash = self._content_hash(messages[:live_zone_start])
+            incoming_prefix_hash = self._content_hash(messages[: len(self._last_raw_prefix)])
             if incoming_prefix_hash == self._stable_prefix_hash:
-                live_zone = messages[live_zone_start:]
+                live_zone = messages[len(self._last_raw_prefix):]
                 # The cached optimized prefix already carries its trailing volatile
                 # turn from the previous turn; strip it so the live-zone sub-run
                 # appends exactly one fresh volatile turn to the merged list.
@@ -1222,8 +1262,25 @@ class AgentContextOptimizer:
         # rolling summary (Step 7 pre-compaction) has already folded the evicted
         # turns into the protected _summary_id block, so this only drops what the
         # summary has already captured.
+        # The batch fold (Step 7 pre-compaction) is the cache-stable compaction
+        # path: it sheds oldest turns into the append-only summary in batches,
+        # leaving the turns between folds as pure tail appends. When it is armed
+        # and has a rolling summary, the scratchpad compactor must NOT run: it
+        # keeps a fixed-size tail window (smaller than the fold's keep window)
+        # and front-evicts one more turn every turn it fires, sliding the whole
+        # post-compact body and breaking the backend prefix cache every turn (the
+        # turn-12 cliff). This is the same skip_front_eviction policy applied to
+        # the proactive trim / sliding window below (Step 11/11.8); the compactor
+        # was the one front-evictor missing that gate. Step 12's hard cap remains
+        # the size safety valve.
+        _skip_compactor = (
+            self._cache_stable_summary
+            and self.hierarchical_summarizer is not None
+            and current_tokens > proactive_threshold_tokens
+            and self.hierarchical_summarizer.has_rolling_summary()
+        )
         try:
-            if current_tokens > compaction_threshold_tokens:
+            if current_tokens > compaction_threshold_tokens and not _skip_compactor:
                 # P0.6: bound the per-turn shrink so the compactor never collapses
                 # the body below prev_size - shrink_cap in one call (which would
                 # invalidate the backend's cached KV for the whole body). The
@@ -1516,13 +1573,22 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Sliding window trim failed: %s", e)
 
-        # Step 12: Enforce hard token cap (calibrated token counts, #6)
+        # Step 12: Enforce hard token cap (calibrated token counts, #6).
+        # _trim_to_budget reconciles budget <-> keep window internally (it is a
+        # no-op when the immutable zones already exceed the budget in cache-stable
+        # mode). The token_aware_truncator is a second front-evictor; gate it on
+        # skip_front_eviction so it does not slide the post-summary body every turn
+        # while the batch fold is armed and owning cache-stable sizing.
         try:
             total_tokens = self.calibrated_token_count(optimized)
             if total_tokens > max_tokens:
                 optimized = self._trim_to_budget(optimized, use_tokens=True)
                 total_tokens = self.calibrated_token_count(optimized)
-                if total_tokens > max_tokens and self.token_aware_truncator is not None:
+                if (
+                    total_tokens > max_tokens
+                    and self.token_aware_truncator is not None
+                    and not skip_front_eviction
+                ):
                     optimized = self.token_aware_truncator.trim_messages_to_budget(
                         optimized,
                         max_tokens,
@@ -2291,6 +2357,19 @@ class AgentContextOptimizer:
             reserved = (sum(len(m.get("content") or "") for m in system_anchor)
                         + sum(len(m.get("content") or "") for m in protected_tail))
             evictable_budget = max(0, max_chars - reserved)
+
+        # Cache-stable reconciliation of budget <-> keep window: when the
+        # immutable zones (system anchor + frozen prefix + append-only summary +
+        # keep window) already meet or exceed the budget, evictable_budget is 0
+        # and front-evicting the (tiny) evictable body can NEVER bring the context
+        # under budget — the overage lives in zones this stage never touches.
+        # Evicting anyway only slides the post-summary body forward every turn and
+        # breaks the backend prefix cache (the turn-12 cliff) for zero budget gain.
+        # In cache-stable mode the batch fold (Step 7) owns sizing, so leave the
+        # body intact for prefix reuse. (Non-cache-stable mode keeps the original
+        # evict-to-budget behavior.)
+        if evictable_budget <= 0 and self._config.v050.cache_stable_mode:
+            return messages
 
         # P0.6: bound the per-turn shrink. The evictable body may not drop below
         # the shrink floor (prev_size - shrink_cap). Compute the floor in the same

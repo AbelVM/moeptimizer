@@ -712,10 +712,10 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         # 262K window the effective cap is ~6.5K rather than a fixed 12K. The 12000
         # here is the floor, not the effective cap. hierarchical_summary_max_full_turns
         # tracks keep_full_steps so the rolling summary protects the same window.
-        "keep_full_steps": 8,
+        "keep_full_steps": 6,
         "max_optimized_tokens": 12000,
         "max_optimized_chars": 48000,
-        "hierarchical_summary_max_full_turns": 8,
+        "hierarchical_summary_max_full_turns": 6,
         "proactive_trim_ratio": 0.6,
         "compaction_trigger_ratio": 0.88,
     },

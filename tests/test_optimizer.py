@@ -1504,3 +1504,138 @@ class TestCacheStabilityAcrossTurns:
         # Everything after the summary must still be present (not dropped).
         assert result[-1]["role"] == "assistant"
         assert result[-2]["role"] == "user"
+
+    def _opt_cliff(self) -> AgentContextOptimizer:
+        """Optimizer configured so the immutable zones exceed the budget.
+
+        Code-block turns (below) make the frozen prefix + rolling summary + keep
+        window sum to MORE than the small static token budget once the summary
+        appears, so ``evictable_budget`` is 0 — the exact condition that drove the
+        turn-12 cliff (the budget trimmers front-evicted the live zone every turn).
+        """
+        config = AppConfig()
+        config.agentic.dynamic_budget_enabled = False  # static budget, no probe
+        config.agentic.max_optimized_tokens = 3000
+        config.agentic.max_optimized_chars = 12000
+        config.agentic.keep_full_steps = 6
+        config.agentic.quality_profile = "balanced"
+        config.v050.cache_stable_mode = True
+        config.v050.frozen_prefix_turns = 2
+        config.v050.cache_stable_summary_enabled = True
+        config.v050.hierarchical_summary_max_full_turns = 6
+        return AgentContextOptimizer(config)
+
+    def _build_large_turn(self, n: int) -> list[dict[str, Any]]:
+        """A heavy agentic turn carrying an extractable code block.
+
+        The code block gives the rolling summarizer constraints to fold (so the
+        summary actually appears), and the size pushes the keep window past the
+        small budget — mirroring the opencode benchmark's verbose code turns.
+        """
+        code = "\n".join(
+            f"    value_{i} = compute_{i}(data_{i})  # turn {n} padding padding"
+            for i in range(25)
+        )
+        return [
+            {
+                "role": "user",
+                "content": f"Turn {n}: refactor module_{n} to add feature_{n} with care.",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    f"Change for turn {n}:\n```python\ndef feature_{n}():\n{code}\n```\n"
+                    f"Added feature_{n}."
+                ),
+            },
+        ]
+
+    def test_trim_to_budget_skips_futile_eviction_in_cache_stable_mode(self) -> None:
+        """Regression (turn-12 cliff): when the immutable zones already meet or
+        exceed the budget (``evictable_budget <= 0``), front-evicting the live
+        zone is futile — it can never bring the context under budget (the overage
+        is in zones this stage never touches) and only slides the post-summary
+        body, breaking the backend prefix cache every turn. In cache-stable mode
+        ``_trim_to_budget`` must leave the messages intact so the batch fold owns
+        sizing. Non-cache-stable mode keeps the original evict-to-budget behavior.
+        """
+        opt = self._opt()
+        opt._config.agentic.dynamic_budget_enabled = False
+        opt._config.agentic.max_optimized_tokens = 50  # tiny: zones always exceed it
+        opt._config.agentic.max_optimized_chars = 200
+        opt._config.agentic.keep_full_steps = 1
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "First task " + "x" * 300},
+            {"role": "assistant", "content": "resp " + "y" * 300},
+        ]
+        for i in range(4):
+            messages.append({"role": "user", "content": f"task {i} " + "x" * 300})
+            messages.append({"role": "assistant", "content": f"resp {i} " + "y" * 300})
+
+        # Cache-stable mode: futile eviction is skipped -> no messages dropped.
+        opt._config.v050.cache_stable_mode = True
+        stable = opt._trim_to_budget(messages, use_tokens=True)
+        assert len(stable) == len(messages), (
+            f"cache-stable _trim_to_budget front-evicted {len(messages) - len(stable)} "
+            "messages despite evictable_budget <= 0 (the turn-12 cliff)"
+        )
+
+        # Non-cache-stable mode: the original evict-to-budget behavior is preserved
+        # (the futile-skip is gated on cache_stable_mode), so turns ARE dropped.
+        opt._config.v050.cache_stable_mode = False
+        evicted = opt._trim_to_budget(messages, use_tokens=True)
+        assert len(evicted) < len(messages), (
+            "non-cache-stable _trim_to_budget should still evict toward the budget"
+        )
+
+    def test_no_per_turn_eviction_cliff_when_zones_exceed_budget(self) -> None:
+        """Regression (turn-12 cliff): with heavy code turns the immutable zones
+        (frozen prefix + rolling summary + keep window) exceed the small budget
+        once the summary appears, so ``evictable_budget`` is 0. Before the fix the
+        budget trimmers front-evicted the live zone EVERY turn: each turn appended
+        a new turn and immediately evicted it, so the optimized message count stayed
+        FLAT (the cached prefix collapsed each turn). After the fix,
+        ``_trim_to_budget`` skips the futile eviction and the batch fold owns
+        sizing, so within a fold cycle the live zone is a pure tail append — the
+        optimized count GROWS turn-over-turn until the next fold resets it.
+
+        Counts messages (not bytes) so the assertion is immune to the boundary
+        transforms' in-place content compression and to the volatile trailing
+        anchor (stripped). It compares the spread of the optimized count across
+        post-summary turns: a growing live zone (fix) has a wide spread; the
+        every-turn eviction cliff kept it flat.
+        """
+        opt = self._opt_cliff()
+        conversation: list[dict[str, Any]] = [
+            {"role": "system", "content": "You are a coding agent. Keep APIs stable."},
+            {"role": "user", "content": "Initial task: build the pipeline."},
+            {"role": "assistant", "content": "I will build the pipeline step by step."},
+        ]
+        summary_seen = False
+        post_summary_counts: list[int] = []
+        total_turns = 16
+        for n in range(1, total_turns + 1):
+            conversation.extend(self._build_large_turn(n))
+            optimized = opt.optimize_messages(list(conversation))
+            optimized = AgentContextOptimizer._strip_volatile_turn(optimized)
+            if any(
+                (m.get("content") or "").startswith(ROLLING_SUMMARY_MARKER) for m in optimized
+            ):
+                summary_seen = True
+            if summary_seen:
+                post_summary_counts.append(len(optimized))
+
+        assert len(post_summary_counts) >= 4, (
+            f"rolling summary appeared too late ({len(post_summary_counts)} post-summary "
+            f"turns) — test scenario did not exercise the cliff window"
+        )
+        spread = max(post_summary_counts) - min(post_summary_counts)
+        # Within a fold cycle the live zone appends one turn (~2 messages) per turn
+        # for several turns, so the count spreads by several messages. The cliff
+        # evicted the new turn every turn, keeping the count flat (spread ~0-1).
+        assert spread >= 4, (
+            f"optimized message count stayed flat (spread={spread}, "
+            f"counts={post_summary_counts}) — the live zone was front-evicted every "
+            f"turn (the turn-12 cliff regressed); it must append within a fold cycle"
+        )
