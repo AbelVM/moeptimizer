@@ -16,6 +16,21 @@ local, hardware-limited infrastructure. Mission: improve **TTFT and TPS** while
 
 ---
 
+## Status legend
+
+Every item in §4 (findings), §5 (implementation plan) and §6 (borrowable
+techniques) carries a status icon:
+
+| Icon | Meaning |
+|---|---|
+| ✅ | **Done** — implemented & validated (tests / lint / types / benchmark as noted) |
+| 🟡 | **Partial** — started, gated off by default, or done-but-not-yet-wired |
+| ⬜ | **Not started / deferred** to a benchmark-validated follow-up |
+| ➖ | **Resolved by deletion** — dead/phantom code or a constraint-violating feature removed |
+| 🆕 | **New finding** added this revision |
+
+---
+
 ## Implementation status (Phase 1 + 2 + 3 — done, validated)
 
 The following items (§5) are **implemented and validated** (pytest 440 passed / 11
@@ -181,9 +196,112 @@ content changed` + `byte_diff first_diff_at_char`:
   outputs on *first appearance* (so the compressed form is what gets cached), which
   removes this class of break entirely. This is a concrete, safe win worth doing.
 
-**Still deferred:** §4.1.2 reversible compression + retrieval handles, §4.4.1
-zero-copy SSE, and the compaction-geometry redesign (summary placement) that would
-remove the fold-turn breaks.
+**Still deferred:** see the **Forward plan** immediately below — a phased, gated
+schedule for everything marked 🟡 / ⬜ / 🆕 above (reversible compression, zero-copy
+SSE, the compaction-geometry redesign, and the rest).
+
+---
+
+## Forward plan — tackling the pending items (post-Phase-1/2/3)
+
+Phases 1–3 are done and validated (status section above). This is the plan for what
+remains: the **23 🟡 partial**, **24 ⬜ deferred**, and **2 🆕 new** items,
+**deduplicated** across §1 / §4 / §5 / §6 (many appear in several lists) and re-ordered
+by mission impact — **TTFT + quality**, with **prefix-cache reuse as the governing
+constraint**. Each phase ends with a gate; phases run in order unless a dependency is
+noted.
+
+- **Icons** show an item's *current* state (🟡 started/gated, ⬜ not started, 🆕 new
+  this revision); the phase gate is the definition of done.
+- **Effort:** **[S]** ≤ ~half day · **[M]** ~1–3 days · **[L]** > 3 days / needs design.
+- **⚠ cache** = touches prefix-reuse / context-mutation logic (AGENTS.md caution):
+  always run the dry-run (`diag_dryrun_opencode.py --max-breaks`) **and** a benchmark
+  round after it.
+
+### Phase A — Recover TTFT: make folds rare and the budget honest *(mission-critical)*
+
+The reuse/TTFT regression (0.81 → 0.48) is the open mission item. The context sits at
+**4 % of a 262 K window**, so folds buy nothing in space terms — stop folding every
+few turns. Highest-ROI remaining work; unblocks append-only (F3).
+
+| # | Item | Refs | Effort |
+|---|---|---|---|
+| A1 | 🟡 **Adaptive budget — full policy + cache-break amortization trigger.** Add task-complexity / code-density / codebase-size signals to the ceiling; fold only when `marginal_per_turn_prefill × remaining_turns > re_prefill_cost`. *The headline lever.* | §3.1, §4.2.2, §4.7.2 | **[L]** |
+| A2 | 🟡 **Single size governor.** Collapse the 6 governors into `BudgetGovernor` + `PrefixLayout`; delete `_proactive_trim` & `_sliding_window_trim`; add `evictable_budget ≤ 0 → return` to the truncator + compactor. | §4.2.1, §4.7.1 | **[M]** |
+| A3 | ⬜ **Compaction-geometry redesign.** Relocate the rolling summary so a fold does not shift the live zone — removes the fold-turn breaks (14/20/23/26) from the per-turn attribution. | break attribution | **[L]** ⚠ cache |
+| A4 | ⬜ **Compress tool outputs on first appearance** so the cached form *is* the compressed form — removes the turn-19 late-compression break class. | break attribution | **[S]** ⚠ cache |
+| A5 | 🟡 **Calibrated-token consistency** across the partition/evict boundary (one count throughout the governor). | §4.8.6 | **[S]** |
+
+*Gate:* dry-run breaks **≤ 3** (fold turns only); backend prefix-cache reuse **≥ 0.8**;
+proxy **TTFT mean ≤ direct**; benchmark vs `fix2` shows reuse recovered **without**
+quality loss.
+
+### Phase B — Context efficiency & quality *(the missing optimizations)*
+
+| # | Item | Refs | Effort |
+|---|---|---|---|
+| B1 | ⬜ **Reversible compression + retrieval handles** — content-addressed store + MCP-style `expand(id)`; ends irreversible information loss (the low semantic-similarity / `code_block_loss` driver). | §4.1.2 | **[L]** |
+| B2 | ⬜ **Cached re-read collapse + global code dedup** — `[file X unchanged since turn N]` reference + SHA-256 whole-file registry across turns. | §4.1.3, §4.5.2 | **[M]** |
+| B3 | ⬜ **Volatile-field relocation** — move dates / UUIDs / SHAs / timestamps out of the cacheable prefix. | §4.1.4, §4.7.4 | **[M]** ⚠ cache |
+| B4 | 🟡 **Wire syntactic code slicing into the pipeline** behind a config gate (default OFF), compressing on first appearance (depends on A4). | §4.5.3 | **[M]** ⚠ cache |
+| B5 | ✅ **Fix AST chunk-0 duplicate imports** — body loop skips the header node indices so imports appear only via the per-chunk prefix (done, regression-tested). | §4.5 #5 | **[S]** |
+| B6 | ⬜ **Per-tool compression budgets + `full_output` escape hatch + savings analytics.** | §4.11.4, §4.11.5 | **[M]** |
+
+*Gate:* token savings **up** AND headline quality (`code_block_ratio`, `rouge_l_f1`)
+**up** vs the Phase-A baseline; dry-run shows **no new prefix breaks** from slicing.
+
+### Phase C — Throughput ceiling *(TTFT / TPS)*
+
+| # | Item | Refs | Effort |
+|---|---|---|---|
+| C1 | ⬜ **Zero-copy SSE passthrough** — raw-byte fast path for turns needing no delta inspection; tap only the final usage chunk. | §4.4.1 | **[M]** |
+| C2 | 🟡 **Token-counting overhaul** — per-message memo + count-once-per-stage + running totals (per-text memo + the O(n²) floor pass are already done). | §4.4.3 | **[M]** |
+
+*Gate:* per-turn proxy overhead down / TPS up; dry-run avg turn time down; reuse unchanged.
+
+### Phase D — Observability & benchmark hygiene
+
+| # | Item | Refs | Effort |
+|---|---|---|---|
+| D1 | 🟡 **Real TTFT + fresh-prefill telemetry** — per-turn `(prompt − cached)` series + live/frozen/summary breakdown in the session-debug endpoint. | §4.11.2 | **[M]** |
+| D2 | 🟡 **cache → TTFT correlation metric** (+ plot) to prove the mechanism and guard it. | §4.12.3 | **[S]** |
+| D3 | 🟡 **Quality regression-gate hardening** + ⬜ drop the weak code embedder from the headline gate (gate on the robust headline block). | §4.12.6, §4.12.4 | **[S]** |
+| D4 | 🟡 **Make degradation visible** — embedding-breaker state + consistently-failing stages in `/v1/metrics` + `X-MOEPT-Optimization-Degraded`. | §4.11.3, §4.8.5 | **[M]** |
+| D5 | 🆕 **Fix `print_report` faith-dict crash** — read `faith["mean"]` (guard `isinstance(dict)`); benchmark-only. | §4.12 #10 | **[S]** |
+| D6 | ⬜ **Multi-file agentic replay fixtures** (real test / lint / compiler failures). | §4.12.9 | **[M]** |
+
+*Gate:* `/v1/metrics` exposes true TTFT + fresh-prefill + degradation; the regression
+gate uses the headline block; `print_report` runs clean (non-`--json` path no longer crashes).
+
+### Phase E — Maintainability & robustness *(finish Phase 4)*
+
+| # | Item | Refs | Effort |
+|---|---|---|---|
+| E1 | 🟡 **Decompose the god object** — extract `PrefixLayout` + `StageRunner` (`BudgetGovernor` already out); `optimizer.py` < ~1500 lines. | §4.2.3 | **[L]** |
+| E2 | ⬜ **Typed summary region** replacing the scattered content-marker guards. | §4.7.3 | **[M]** |
+| E3 | ⬜ **Surface persistent stage failures + route mutators through the optimizer lock** (same-session race). | §4.8.5, §4.8.7 | **[M]** |
+| E4 | ⬜ **Session reaper + prune `AgentStateStore.goals`.** | §4.10.3, §4.10.4 | **[S]** |
+| E5 | 🟡 **Executor scaling + real cancellation** (the 2-worker + 300 s-timeout hazard). | §4.9.6 | **[M]** |
+
+*Gate:* `optimizer.py` < ~1500 lines; no stage with two gate predicates; a stage that
+fails N× surfaces in `/v1/metrics`; `dev.sh` green.
+
+### Phase F — MTP / format hardening & append-only *(lower priority)*
+
+| # | Item | Refs | Effort |
+|---|---|---|---|
+| F1 | ⬜ **ChatML / tool-schema / code-fence byte-stability hardening** (MTP draft acceptance). | §4.6.2 | **[M]** ⚠ cache |
+| F2 | 🟡 **Verbatim `<think>` round-trip verification** (byte-for-byte `reasoning_content`). | §4.6.3 | **[S]** |
+| F3 | ⬜ **Append-only default for cache-stable mode** — lossless compression of new content only; `--context-shift` bounds the window. Depends on Phase-A geometry; the big win for *very long* sessions. | §4.3.1 | **[L]** ⚠ cache |
+
+*Gate:* injected messages are well-formed ChatML and never split a code fence;
+append-only validated on a genuinely window-bound session (near-100 % reuse, TTFT collapses).
+
+**Dependencies & ordering.** **A is the critical path** — everything else benefits from
+a hot cache. A3/A4 enable B4 (slice-on-first-appearance) and F3 (append-only). B1
+(reversible handles) is the largest single *quality* lever but is self-contained and can
+start in parallel with A. C / D / E are largely independent and can interleave with A–B.
+Every ⚠-cache item must be followed by the dry-run gate and a benchmark round.
 
 ---
 
@@ -232,6 +350,55 @@ context is at 4% of the window — folds are buying nothing in space terms), whi
 should recover reuse/TTFT *while keeping* the quality gains. The contradictions
 uptick (proxy 40 vs direct 19) also argues for folding less (less lossy
 summarization).
+
+---
+
+## Follow-up benchmark — `0.7.27_chunkfix` (tree-sitter AST chunking re-enabled)
+
+Single-round opencode run (30 turns, `balanced`, 262K window, stale `MOEPT_*` shell
+exports unset so `.env` governs) after re-enabling the tree-sitter AST chunking path
+(the `code_chunking.py` API fix), diffed against `fix2` via `--baseline`.
+`scripts/benchmark_opencode_30_1_0.7.27_chunkfix.json` + `chunkfix_run.log`.
+
+**Regression gate: ✅ PASSED** (tolerance 0.05, exit 0).
+
+| Metric | `fix2` | `chunkfix` | Direction |
+|---|---|---|---|
+| Token savings | 66.20% | **66.31%** | ✅ flat (+0.11pp) |
+| `code_block_ratio` (mean) | 0.722 | **0.794** | ✅ +0.072 |
+| `code_syntax_validity` | 0.967 | **1.000** | ✅ no broken code (fix2 broke turns 8,16) |
+| `length_ratio` (mean) | 0.888 | 1.063 | ✅ toward 1.0 |
+| ROUGE-L F1 (mean) | 0.247 | **0.204** | ❌ −0.043 |
+| token-Jaccard (mean) | 0.237 | **0.200** | ❌ −0.037 |
+| `prompt_faithfulness` | 0.942 | 0.923 | 🟡 −0.019 (within tol) |
+| `evicted_content_recall` | 0.996 | 0.967 | 🟡 −0.029 (within tol) |
+| `semantic_similarity` | 0.116 | 0.020 | ❌ −0.096 (weak embedder — noise, §4.12.4) |
+| per-turn `cached` (mean) | 4,098 | **3,490** | ❌ reuse slightly worse |
+| TTFT mean (proxy) | 26.6 s | **35.6 s** | ❌ +9.0 s |
+| Latency mean (proxy) | 44.0 s | 52.3 s | ❌ +8.3 s |
+
+**Verdict — safe, code-quality-positive, but NOT a TTFT win.** The gate passed: token
+savings held and the code-structure metrics improved (`code_block_ratio` +0.072,
+`code_syntax_validity` 0.967 → 1.0) — the AST path preserves code structure better
+than line-chunking, a real gain. Lexical quality (ROUGE-L/Jaccard) slipped modestly
+and TTFT/latency were **worse** this round. Two reasons, neither surprising: (1) the
+AST path prepends the imports header to *every* chunk (and duplicates it in chunk 0 —
+the §4.5 #5 wart), so code blocks carry more tokens → more prefill; (2) the structural
+fold-driven reuse problem is **unchanged** (per-turn `cache=863/0.07` on most turns,
+same as `fix2`) because this fix doesn't touch folds. Caveats: **single round**
+(rounds=1) so the +9 s TTFT carries system-load variance — a ≥3-round run is needed to
+separate signal from noise; and `semantic_similarity` is the known-weak
+`embed-gemma-300m-FLM` (noise on code). Note the `--baseline` diff table reads
+ROUGE/Jaccard from `quality.*` while both reports store them under `secondary_quality`,
+so those two rows were silently skipped by the diff (the gate still passed on the
+metrics it did compare) — a benchmark-script path mismatch worth fixing alongside the
+`print_report` bug (§4.12 #10).
+
+**Implication for the plan:** keep the fix (it is the correct behavior, previously
+silently broken, and improves code fidelity), but (a) fix the **chunk-0 duplicate
+imports** wart (Forward plan **B5**) to claw back the extra tokens, and (b) treat the
+real TTFT lever as **Phase A** (rare folds / amortization), not chunking. Re-benchmark
+with ≥3 rounds after B5 + Phase A.
 
 ---
 
@@ -318,7 +485,7 @@ over-compaction, quality regression, unenforced cap). The next gains come from
 
 **Root causes, in priority order:**
 
-1. **The budget is a fixed hard cap that is neither enforced nor appropriate
+1. 🟡 **The budget is a fixed hard cap that is neither enforced nor appropriate
    (the headline issue).** A static `max_optimized_tokens=12000` /
    `max_optimized_chars=12000` governs the pipeline, but the context actually runs
    16–18.5 K (the cap is ignored — §4.2.2) while the backend window is 93 % idle
@@ -328,31 +495,31 @@ over-compaction, quality regression, unenforced cap). The next gains come from
    last-resort ceiling near the real window — with **cache reuse**, not a token
    count, as the governing constraint (§4.2.2). This single change subsumes much of
    the eviction churn below.
-2. **Six independent mechanisms delete/fold old turns** (1 rolling-summary fold +
+2. 🟡 **Six independent mechanisms delete/fold old turns** (1 rolling-summary fold +
    5 front-evictors), each gated by a *different* predicate. When the immutable
    zones (frozen prefix + summary + keep-window) exceed the budget — which they do
    by default — they fight and slide the post-summary body, breaking the prefix
    cache. This is the bug the project has chased across 6+ point releases; a dynamic
    budget that keeps `reserved < budget` removes the condition that makes them fight
    (§4.2 / §4.7).
-3. **The embedding/RAG subsystem is silently dead.** The per-session
+3. ✅ **The embedding/RAG subsystem is silently dead.** The per-session
    `EmbeddingService` is never initialized, so every embedding call hits an
    `assert`, the circuit breaker returns a **zero vector**, and semantic code-chunk
    ranking returns chunks **unranked**. `RAG_ENABLED=true` does nothing today, and
    the same code is a **latent event-loop deadlock** one refactor away (§4.8 / §4.10).
-4. **Heavy per-session optimizer construction (incl. a possible HuggingFace
+4. ✅ **Heavy per-session optimizer construction (incl. a possible HuggingFace
    tokenizer download) runs on the event loop under a global lock.** The first
    request of every new session stalls *all* concurrent requests (§4.9).
-5. **Cross-session shared state:** the `HierarchicalSummarizer` (and `DeltaEncoder`
+5. ✅ **Cross-session shared state:** the `HierarchicalSummarizer` (and `DeltaEncoder`
    snapshots) are module-global singletons, so concurrent sessions contaminate each
    other's rolling summary and code deltas (§4.8).
-6. **`OutputShaper` violates the project's own hard constraint** ("proxy must NOT
+6. ✅ **`OutputShaper` violates the project's own hard constraint** ("proxy must NOT
    tune response verbosity") by clamping `max_tokens`/`reasoning_effort` and
    injecting a "be terse" system instruction — and varying those params turn-to-turn
    violates `cache_preservation_guide.md` DONT #2. The fresh benchmark shows the
    verbosity it was meant to fix got **worse** (`length_ratio` 2.02, max 12.3)
    (§4.2.5).
-7. **~Half of the advertised "optimization stages" are dead weight** — 11 of 23
+7. ✅ **~Half of the advertised "optimization stages" are dead weight** — 11 of 23
    audited modules are no-ops, phantoms (fabricate KV/MTP/slot data a client proxy
    cannot deliver), or never called (§4.2 / §7).
 
@@ -485,7 +652,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
 
 ### 4.1 Missing optimizations
 
-1. **Error-aware tool-output compression (HIGH).** `ToolOutputCompressor`
+1. ✅ **Error-aware tool-output compression (HIGH).** `ToolOutputCompressor`
    (`tool_output_compressor.py`) does ANSI-strip + repeated-line/stack-frame
    collapse + **head/tail truncation** ("never drop the head"). It is **not
    error-aware**: a compiler error, failing-test name, or `file:line` in the
@@ -495,7 +662,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    count, group lint by file/rule, dedup repeated lines with counts. This is the
    single highest-value missing optimization and directly improves quality (the
    model keeps the diagnostic signal) *and* token count. → Phase 2.
-2. **Reversible compression with retrieval handles (HIGH).** headroom/lean-ctx
+2. ⬜ **Reversible compression with retrieval handles (HIGH).** headroom/lean-ctx
    replace large payloads with a compact placeholder + a handle, store the original
    locally, and let the model request it via a tool (`headroom_compress`/
    `headroom_retrieve`; lean-ctx cached re-reads ≈ 13 tokens). The proxy currently
@@ -504,24 +671,24 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    similarity and `code_block_loss`. A content-addressed store + an MCP-style
    `expand(id)` tool would let the proxy keep the context lean *without* permanent
    information loss. → Phase 3 (larger).
-3. **Cached re-read collapse (MED).** lean-ctx collapses a repeated file read to a
+3. ⬜ **Cached re-read collapse (MED).** lean-ctx collapses a repeated file read to a
    ~13-token reference. `delta_encoder.py` already diffs a re-read against the prior
    snapshot, but only when the prior version is still in context; it could go
    further and emit a stable `[file X unchanged since turn N]` reference when the
    content hash matches, regardless of eviction. → Phase 3.
-4. **Volatile-field relocation (MED).** lean-ctx/headroom move dates, UUIDs, commit
+4. ⬜ **Volatile-field relocation (MED).** lean-ctx/headroom move dates, UUIDs, commit
    SHAs, and timestamps **out of the cacheable prefix**. The proxy has a "volatile
    anchor" but it is a *quality* anchor (a 3rd copy of the original request — see
    §4.2.6), not a volatile-field scrubber. Detecting and neutralizing
    high-entropy/changing tokens in otherwise-stable messages would raise reuse. → Phase 3.
-5. **Effort routing — already present but mis-scoped (see §4.2.5).** headroom's
+5. ✅ **Effort routing — already present but mis-scoped (see §4.2.5).** headroom's
    "lower reasoning_effort on routine tool-result turns" is the *right* idea but the
    proxy's implementation (`OutputShaper`) violates the hard constraint; do it via
    client-side defaults or not at all.
 
 ### 4.2 Design weaknesses
 
-1. **Six size governors with four different predicates (CRIT, the core bug).**
+1. 🟡 **Six size governors with four different predicates (CRIT, the core bug).**
    There is **1 fold + 5 front-evictors**, each gated differently:
    | Mechanism | Call site | Gate |
    |---|---|---|
@@ -549,7 +716,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    *same* predicate. Add the `evictable_budget <= 0 → return unchanged` guard to
    `token_aware_truncator._evict_for_budget` (`token_aware_truncator.py:298`) and
    the compactor (`compactor.py:131`) — today only `_trim_to_budget` has it. → Phase 1.
-2. **The budget is a fixed hard cap that is neither enforced nor appropriate
+2. 🟡 **The budget is a fixed hard cap that is neither enforced nor appropriate
    (CRIT, the headline design change).** Two facts from the fresh benchmark:
    (a) the context settles at **16–18.5 K** (dry-run turn 30 = 18,607; benchmark
    final 18,577) vs `max_optimized_tokens=12000` — because the immutable zones
@@ -571,7 +738,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    reuse + lower TTFT p90, more verbatim context → quality recovers, and the
    "budget" becomes a measured outcome rather than an ignored constant. → Phase 1
    (governor skeleton) + Phase 2 (adaptive policy + amortization trigger).
-3. **God object (HIGH, maintainability).** `optimizer.py` is 3,416 lines, one class
+3. 🟡 **God object (HIGH, maintainability).** `optimizer.py` is 3,416 lines, one class
    with ~50 instance attributes and a ~210-line constructor; `_optimize_messages_locked`
    is ~700 lines; step numbering is non-sequential with fractional sub-steps
    (5.1.5, 7.25, 11.7, 14.12…), **Step 7 and Step 11.7 each appear twice**, and the
@@ -579,12 +746,12 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    "v0.7.18/19/21/22") where each fix added a new gate instead of consolidating —
    which is *why* there are six governors. **Fix:** extract `BudgetGovernor`,
    `PrefixLayout`, and a `StageRunner` (ordered, uniformly-guarded stages). → Phase 4.
-4. **Dead/phantom stages wired into the hot path (HIGH).** See §7 — 11 of 23 audited
+4. ✅ **Dead/phantom stages wired into the hot path (HIGH).** See §7 — 11 of 23 audited
    modules are dead/no-op/phantom, several still constructed per session and "called"
    (e.g. `thinking_preserver.process_messages` is a pure copy at `optimizer.py:1013`;
    `incremental_updater.update_context(optimized, "")` is always a no-op at
    `optimizer.py:1336` but still triggers a token recount at `:1337`). → Phase 1/4.
-5. **`OutputShaper` violates the project's hard constraint (HIGH).** AGENTS.md:
+5. ✅ **`OutputShaper` violates the project's hard constraint (HIGH).** AGENTS.md:
    *"the proxy must NOT try to tune/compress response verbosity."* Yet
    `output_shaper.py` appends a "Be concise…" system instruction and clamps
    `max_tokens` and `reasoning_effort` per turn-class, and its own docstring admits
@@ -606,7 +773,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    no-op default behind an explicit opt-in flagged as constraint-violating); fix the
    *cause* — better context fidelity via the adaptive budget (§4.2.2) and
    error-aware/reversible compression (§4.1) — instead of clamping the output. → Phase 1.
-6. **The volatile quality anchor is redundant churn (MED).** `_append_volatile_context`
+6. ✅ **The volatile quality anchor is redundant churn (MED).** `_append_volatile_context`
    (`optimizer.py:1821`) appends a trailing user turn with the "Original request"
    text — which is **already** present verbatim in the frozen first user turn *and*
    pinned into the rolling-summary head (`seed_original_request`,
@@ -621,18 +788,18 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
 
 ### 4.3 Better alternatives
 
-1. **Default to append-only + native context-shift (HIGH).** For cache-stable mode
+1. ⬜ **Default to append-only + native context-shift (HIGH).** For cache-stable mode
    on a large window (262K here), stop deleting history entirely; do only lossless
    boundary compression of *new* content and let `llama.cpp --context-shift` bound
    the window. Every turn becomes a pure tail append → near-100 % reuse → TTFT
    collapses. Reserve compaction for genuinely window-bound sessions. This is the
    biggest lever for the mission (§3, option A). → Phase 2 (after Phase 1 cleanup).
-2. **Native slot pinning is already done well — keep it (positive).**
+2. ✅ **Native slot pinning is already done well — keep it (positive).**
    `backend_capabilities.py` device-aware auto-detection of `/slots`, native MTP
    passthrough, and exact tokenizer is sound and NPU/GPU hot-swap aware
    (`backend_capabilities.py:128-135`, `app.py:560-577`). The `id_slot` pinning is
    the correct mechanism for whole-prefix reuse; just fix the probing issues (§4.9).
-3. **Symbol/skeleton index for evicted code (MED).** When a code-bearing turn is
+3. ✅ **Symbol/skeleton index for evicted code (MED).** When a code-bearing turn is
    evicted, accumulate a compact signature index (the `code_ledger` at
    `optimizer.py:2585` is a start). Extend to a scope-graph skeleton (class/method
    signatures + line spans, lean-ctx `signatures` mode) so the model keeps API
@@ -640,7 +807,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
 
 ### 4.4 Additional throughput improvements
 
-1. **Zero-copy SSE passthrough (HIGH).** `app.py:723-776` parses every backend SSE
+1. ⬜ **Zero-copy SSE passthrough (HIGH).** `app.py:723-776` parses every backend SSE
    chunk into pydantic objects and re-emits a fresh `json.dumps(...)` per chunk —
    the hot decode path, capping TPS on a high-TPS MTP backend. The only reasons it
    can't passthrough are minting its own `id`/`created`/`model`, usage capture, and
@@ -648,14 +815,14 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    `aiter_bytes`/`aiter_raw`) for turns needing no delta inspection; tap only the
    final usage chunk. At minimum, forward the SDK's raw line for deltas that need no
    rewrite. → Phase 2.
-2. **O(n²) token counting in the floor-bounded transform (HIGH).**
+2. ✅ **O(n²) token counting in the floor-bounded transform (HIGH).**
    `_apply_transform_with_floor` (`optimizer.py:2622`) builds `candidate =
    [*result, transformed]` and calls `count_messages(candidate)` **per message**
    (each a distinct fingerprint → cache miss, each O(n)) → O(n²) per transform;
    `_apply_boundary_transforms` runs **three** such transforms on essentially every
    request (incl. fast path). **Fix:** maintain a running token total (count each
    message once, subtract back-to-front, stop at the floor) → O(n). → Phase 2.
-3. **~15–18 full re-tokenizations per turn (HIGH).** `TokenCounter.count_messages`
+3. 🟡 **~15–18 full re-tokenizations per turn (HIGH).** `TokenCounter.count_messages`
    memoizes by a SHA-1 of the *whole list* (`token_counter.py:404-419`), but the
    fingerprint is recomputed O(n) on every call and any mutation misses; the full
    prompt is recounted at ~18 sites in one pass (`optimizer.py:1024,1122,1154,…,1846`),
@@ -663,23 +830,23 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    each miss is a **synchronous HTTP round-trip**. **Fix:** count once per stage
    boundary and thread an integer through the gates; key the memo **per-message**
    (not per-whole-list) so unchanged messages are never re-tokenized. → Phase 2.
-4. **Post-stream CPU on the event loop (MED).** After the stream ends the generator
+4. ✅ **Post-stream CPU on the event loop (MED).** After the stream ends the generator
    runs `record_cache_outcome`, `capture_thinking`, `count_messages`,
    `set_token_calibration`, `calibrate_remote_overhead` on the loop thread
    (`app.py:838-885`). **Fix:** offload to the optimizer executor. → Phase 2.
-5. **Ad-hoc executors / nested pools (MED).** `embedding.py:149,157` create a fresh
+5. ✅ **Ad-hoc executors / nested pools (MED).** `embedding.py:149,157` create a fresh
    `ThreadPoolExecutor` per call/batch, each task doing `asyncio.run(...)` (a new
    event loop per embedding). **Fix:** reuse the single bounded `AsyncIOStage`
    executor; make embedding fetch genuinely async (§4.8.1). → Phase 1.
 
 ### 4.5 Additional context-efficiency improvements
 
-1. **Error-aware tool-output compression** — see §4.1.1 (the biggest win).
-2. **Global content-addressed code dedup (MED).** A SHA-256 registry across turns so
+1. ✅ **Error-aware tool-output compression** — see §4.1.1 (the biggest win).
+2. ⬜ **Global content-addressed code dedup (MED).** A SHA-256 registry across turns so
    a file printed twice (`cat` in turn 2, `read_file` in turn 5) collapses the second
    to a reference. `chunk_fingerprint.py` exists but is per-chunk; extend to
    whole-file identity. → Phase 3.
-3. **Syntactic code slicing (MED) — primitive done, wiring pending.** For a
+3. 🟡 **Syntactic code slicing (MED) — primitive done, wiring pending.** For a
    multi-hundred-line read, keep only the target function/class referenced by the
    user query and stub siblings with `# ... [N definitions collapsed]`.
    `slice_code_to_query` (`code_block_optimizer.py`) implements this against the
@@ -688,29 +855,37 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    broken (silent line-fallback — see the tree-sitter finding in the status section);
    the slicer does not depend on it beyond the parser cache. Remaining: wire into the
    pipeline behind a config gate, compressing on first appearance. → Phase 3.
-4. **Stop double/triple-copying the original request** (§4.2.6) — ~900 chars/turn.
+4. ✅ **Stop double/triple-copying the original request** (§4.2.6) — ~900 chars/turn.
+5. ✅ **AST chunk 0 duplicates the imports (LOW) — fixed.** Now that
+   `chunk_code_with_treesitter` actually runs its tree-sitter path (tree-sitter
+   finding, status section), chunk 0 emitted the file's imports **twice** — once via
+   the `header_prefix` it prepends to every chunk, and once as the file's leading
+   top-level import nodes in the chunk body. **Fixed:** the body loop now skips the
+   header node indices (tracked during header collection) so imports appear only via
+   the prefix; verified chunk 0 carries `import os` exactly once with no code lost
+   (`test_chunk_zero_does_not_duplicate_imports`).
 
 ### 4.6 Additional MTP-preservation techniques
 
-1. **Native MTP passthrough is the only real lever — already implemented (positive).**
+1. ✅ **Native MTP passthrough is the only real lever — already implemented (positive).**
    Client-proxy speculative decoding is impossible (the proxy can't run the draft
    heads); the correct path is forwarding MTP `extra_body` to a backend with native
    MTP (`v050.native_mtp_passthrough`, auto-detected). Keep this; **delete the dead
    client-side MTP scaffolding** (`mtp_state.py`, `mtp_speculative` refs — §7).
-2. **Preserve exact ChatML/tool-schema/code-fence structure (MED).** MTP draft
+2. ⬜ **Preserve exact ChatML/tool-schema/code-fence structure (MED).** MTP draft
    acceptance drops when formatting deviates. The proxy mostly preserves this, but
    the boundary transforms and the `_volatile_turn`/`_code_ledger` injections are
    places where structure can shift; ensure injected messages are well-formed
    ChatML and never split a code fence. → Phase 3 (hardening).
-3. **Verbatim `<think>` preservation (positive).** `thinking_preserver` is a no-op
+3. 🟡 **Verbatim `<think>` preservation (positive).** `thinking_preserver` is a no-op
    *because* thinking is already echoed back by the client; this is correct — but
    `capture_thinking`/re-injection in `app.py` should be verified to round-trip
    `reasoning_content` byte-for-byte (any normalization invalidates the cache). → Phase 3.
 
 ### 4.7 Additional model KV-cache preservation techniques
 
-1. **Single size governor + append-only default** (§4.2.1, §4.3.1) — the dominant lever.
-2. **Drive folds by cache-break amortization, not a token threshold (HIGH).** The
+1. 🟡 **Single size governor + append-only default** (§4.2.1, §4.3.1) — the dominant lever.
+2. ⬜ **Drive folds by cache-break amortization, not a token threshold (HIGH).** The
    fresh `.log` shows the cost directly: on fold turns (14, 17, 20, 22, 25) `cached`
    collapses to **882** (frozen prefix only) and the whole ~16 K body is re-prefilled
    — those are exactly the p90 TTFT outliers (proxy TTFT p90 89 s vs direct 24 s).
@@ -722,20 +897,20 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    observed max single-turn growth as an interim step. `CLIF_RESEARCH.md` #28 found
    "rarer folds" negative only because it also raised context size; with an adaptive
    ceiling (§4.2.2) the tradeoff disappears. → Phase 1 (hysteresis) + Phase 2 (amortization).
-3. **Make the summary a first-class typed region (MED).** Today the summary is
+3. ⬜ **Make the summary a first-class typed region (MED).** Today the summary is
    re-recognized each turn by a **content marker** (`ROLLING_SUMMARY_MARKER`) because
    `_strip_internal_flags` removes `_summary_id`; there are many scattered
    `if self._is_summary_block(msg): continue` guards (`optimizer.py:1424,1664,3338,
    3356,3375`), each a place the invariant can break (the documented "turn-11 cliff").
    Return the summary as a typed region from the partition so stages skip it
    structurally. → Phase 4.
-4. **Volatile-field relocation** (§4.1.4) and **byte-stable tools array** (the
+4. ⬜ **Volatile-field relocation** (§4.1.4) and **byte-stable tools array** (the
    benchmark forwards the OpenAI `tools` schema; ensure the proxy never reorders or
    re-serializes it — `pin_tools` exists; verify it is byte-stable). → Phase 3.
 
 ### 4.8 Potential bugs
 
-1. **CRIT — embedding subsystem: latent deadlock + silently dead RAG.**
+1. ✅ **CRIT — embedding subsystem: latent deadlock + silently dead RAG.**
    `embedding.py:108-124` `_fetch` does `asyncio.run_coroutine_threadsafe(post,
    _get_sync_loop()).result()`, but `_get_sync_loop()` (`embedding.py:24-35`) creates
    a loop and **never runs it** → `.result()` blocks forever. On the async path this
@@ -752,7 +927,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    `CircuitBreaker` an `async call_async`; inject **one initialized** `EmbeddingService`
    shared across optimizers; add an explicit degradation marker when the breaker is
    open so operators can see ranking is disabled. → Phase 1.
-2. **CRIT — cross-session shared state.** `SessionManager` promises per-session
+2. ✅ **CRIT — cross-session shared state.** `SessionManager` promises per-session
    isolation and builds a fresh optimizer per session, but the optimizer obtains the
    summarizer via `get_hierarchical_summarizer()` (`optimizer.py:137`) — a
    **module-global singleton** (`hierarchical_summarizer.py:943-951`). All sessions
@@ -765,7 +940,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    intermittent, invisible in single-session tests. **Fix:** construct
    `HierarchicalSummarizer` and `DeltaEncoder` per optimizer (drop the `get_*` global
    cache) or key their state by session id. → Phase 1.
-3. **HIGH — `_volatile_turn` flag leaks to the backend.** The volatile turn is
+3. ✅ **HIGH — `_volatile_turn` flag leaks to the backend.** The volatile turn is
    appended at Step 14.12 (`optimizer.py:1875`) as `{..., "_volatile_turn": True}`,
    **after** `_strip_internal_flags` (Step 13, `optimizer.py:1605`); nothing strips it
    afterward and `app.py` assigns the optimizer output straight into the request
@@ -773,7 +948,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    turn — violates the transparent contract and the "no model-visible markers"
    constraint; a strict backend/SDK could reject the message. **Fix:** append before
    the strip, or strip `_`-prefixed keys in `_finalize_optimized`. → Phase 1.
-4. **HIGH — quality profile silently clobbers explicit env overrides.**
+4. ✅ **HIGH — quality profile silently clobbers explicit env overrides.**
    `apply_quality_profile` (`config.py:740-770`) unconditionally `setattr`s the
    profile's values, so `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS=24000` is overwritten
    back to 12000 by the default `balanced` profile (`CLIF_RESEARCH.md` #26 confirmed
@@ -781,7 +956,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    the opposite. **Fix:** apply the profile as *defaults* and let explicit env/field
    values win (track which fields were set explicitly), or apply the profile before
    env parsing. → Phase 1.
-5. **MED — silently swallowed exceptions.** Almost every stage is
+5. 🟡 **MED — silently swallowed exceptions.** Almost every stage is
    `try/except Exception → logger.warning` (`optimizer.py:1146,1175,…,1834`) and
    uvicorn runs at `log_level="warning"`; a stage that consistently fails (e.g.
    tree-sitter parser missing) degrades quality with no test-visible signal. The
@@ -789,20 +964,20 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    budget-enforcement crash can leave an over-window context the backend hard-rejects.
    **Fix:** surface persistent degradation via the `/v1/metrics` `backend_errors`/
    degradation counters and a test assertion. → Phase 4.
-6. **MED — calibrated vs uncalibrated token-count drift in eviction.**
+6. 🟡 **MED — calibrated vs uncalibrated token-count drift in eviction.**
    `_evict_for_budget` sums per-pair `count_messages(pair)` (`optimizer.py:2532`)
    while the outer loop compares calibrated whole-list counts (`calibrated_token_count`,
    `optimizer.py:537`); mixing the two across the partition/evict boundary can leave
    the result off by up to the calibration factor (~2×, `optimizer.py:533`). The
    "trim to budget" guarantee is fuzzy. **Fix:** use one consistent (calibrated)
    count throughout the governor. → Phase 1 (with the governor).
-7. **MED — same-session concurrent requests race shared optimizer state.** The
+7. ⬜ **MED — same-session concurrent requests race shared optimizer state.** The
    endpoint/generator call `get_session_state`, `record_cache_outcome`,
    `capture_thinking`, `set_token_calibration` (`app.py:838-885,1530`) without
    obviously holding the optimizer lock that `optimize_messages` uses
    (`optimizer.py:892`). Low impact (agentic turns are sequential) but calibration/
    thinking state can tear. **Fix:** route mutators through the lock. → Phase 4.
-8. **HIGH — remote `/tokenize` is silently dead in the async app (observed in the
+8. ✅ **HIGH — remote `/tokenize` is silently dead in the async app (observed in the
    fresh benchmark log).** `tokenize_count_sync` (`backend_capabilities.py:293-306`)
    does `asyncio.run(self.tokenize_count(text))`; called from a running event loop
    that raises `RuntimeError` and `return None`, but the coroutine argument was
@@ -820,7 +995,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
 
 ### 4.9 Performance bottlenecks
 
-1. **CRIT — optimizer construction on the event loop under a global lock.**
+1. ✅ **CRIT — optimizer construction on the event loop under a global lock.**
    `app.py:1352` `session_manager.get_or_create(session_id)` is a synchronous call in
    the `async` handler; `get_or_create` (`session_manager.py:64-77`) holds a global
    `RLock` and, on a new session, builds ~25 components incl. `cache_registry.load_from_disk()`
@@ -831,20 +1006,20 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    TTFT cliff. **Fix:** construct optimizers via `run_in_executor`; load the
    tokenizer **once process-wide** and share it; narrow the session-manager lock to
    map mutation only (build outside the lock, insert under it with a double-check). → Phase 1.
-2. **HIGH — sequential startup capability probes block `yield`.** In `lifespan`
+2. ✅ **HIGH — sequential startup capability probes block `yield`.** In `lifespan`
    (`app.py:1185-1235`), `capability_probe.get(force=True)` awaits four sub-probes
    **sequentially** (`backend_capabilities.py:148-152`), each `probe_timeout=4.0`s →
    ~16 s against a degraded backend, + a 5 s MTP chat probe, all **before `yield`**
    (server accepts no connections). The docstring claims probes "never block startup."
    **Fix:** `asyncio.gather` the sub-probes; wrap startup probing in a bounded
    `asyncio.wait_for`; or serve with cached defaults and probe lazily after `yield`. → Phase 2.
-3. **HIGH — thundering herd on probe TTL expiry.** `BackendCapabilityProbe.get`
+3. ✅ **HIGH — thundering herd on probe TTL expiry.** `BackendCapabilityProbe.get`
    (`backend_capabilities.py:116-141`) releases the lock before `await self._probe()`;
    when the 30 s TTL lapses, every concurrent request fires its own full probe (no
    single-flight). Every 30 s → N×(4 HTTP probes) at the backend + N×TTFT inflation.
    **Fix:** single-flight via a shared in-flight `asyncio.Task` (use `asyncio.Lock`,
    not `threading.Lock`, across `await`s). → Phase 2.
-4. **HIGH — per-request inline CPU on the loop.** After offloading the optimize step,
+4. ✅ **HIGH — per-request inline CPU on the loop.** After offloading the optimize step,
    the endpoint still runs on the loop: `_serialize_messages_text` (`app.py:1490`)
    renders the *entire* prompt to a string and `.replace("\n","\\n")` then checks
    `len <= 32000` — building a 200 KB string just to discard it; `get_session_state()`
@@ -852,10 +1027,10 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    fallback `count_messages` for the token header (`app.py:1466-1470`). **Fix:** gate
    `_serialize_messages_text` behind a length pre-check; move session-state/header
    serialization into the offloaded step. → Phase 2.
-5. **MED — fresh `httpx.AsyncClient` per probe / per `tokenize_count`**
+5. ✅ **MED — fresh `httpx.AsyncClient` per probe / per `tokenize_count`**
    (`backend_capabilities.py:147,~305`). **Fix:** one long-lived client on the probe
    object, opened/closed with the lifespan. → Phase 2.
-6. **MED — only 2 optimizer-executor workers + 300 s backend timeout.** A wedged
+6. 🟡 **MED — only 2 optimizer-executor workers + 300 s backend timeout.** A wedged
    backend holds one of 2 workers (`config.py:389`) for up to 300 s; two stuck
    sessions queue every subsequent request indefinitely (`app.py:1362`), and a hung
    embedding thread can permanently drain the 4-thread async_io pool (`config.py:633`).
@@ -864,7 +1039,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
 
 ### 4.10 Memory leaks
 
-1. **CRIT — `_SLOT_MAP` grows without bound.** `app.py:538` `_SLOT_MAP: dict[str,int]`
+1. ✅ **CRIT — `_SLOT_MAP` grows without bound.** `app.py:538` `_SLOT_MAP: dict[str,int]`
    is only ever inserted into (`app.py:577`), never `pop`/`clear`/evicted. Session ids
    derive from client-controlled conversation fingerprints, so every distinct
    conversation creates a permanent process-lifetime entry — a slow memory-exhaustion
@@ -872,49 +1047,49 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    (`app.py:64,151-153`), so this is an oversight. **Fix:** bound it identically
    (`OrderedDict` + `move_to_end` + `popitem(last=False)`), and evict on
    `delete_session`/expiry. Trivial. → Phase 1.
-2. **HIGH — per-session `EmbeddingService` (cache + breaker), never cleaned.**
+2. ✅ **HIGH — per-session `EmbeddingService` (cache + breaker), never cleaned.**
    `optimizer.py:194` builds a private `EmbeddingService` per session (each an
    `OrderedDict` cache cap 512 + a `CircuitBreaker`); with `max_sessions=256` → up to
    ~200 MB of embedding cache worst-case, and the app *also* builds a separate
    initialized service (`app.py:1133`) and a separate embed client (`app.py:1136`) —
    three independent stacks. **Fix:** share one initialized `EmbeddingService`
    (also fixes §4.8.1). → Phase 1.
-3. **MED — lazy session expiry; no reaper.** `_cleanup_expired` runs only inside
+3. ⬜ **MED — lazy session expiry; no reaper.** `_cleanup_expired` runs only inside
    `get_or_create` (`session_manager.py:138-146`); idle expired optimizers linger
    until the next create, so the memory high-water mark tracks peak concurrent
    sessions forever (`session_timeout=3600`). **Fix:** a lightweight background reaper
    started in `lifespan`. → Phase 2.
-4. **MED — `AgentStateStore.goals` never pruned** (`state_store.py:156-160`); old
+4. ⬜ **MED — `AgentStateStore.goals` never pruned** (`state_store.py:156-160`); old
    `GoalNode`s accumulate and are re-serialized into every `get_session_state`.
    **Fix:** keep only the current goal. → Phase 4.
-5. **Positive:** `cache_registry.py` (cap 1000/map), `cache.py` LRU, and
+5. ✅ **Positive:** `cache_registry.py` (cap 1000/map), `cache.py` LRU, and
    `_ProxyMetrics._per_session` are correctly bounded.
 
 ### 4.11 New UX features
 
-1. **Fix the config-override contract (HIGH).** Make explicit env/field values win
+1. ✅ **Fix the config-override contract (HIGH).** Make explicit env/field values win
    over the quality profile (§4.8.4); document the precedence clearly. Today an
    operator cannot tune the budget without also setting the profile, which is a
    foot-gun discovered the hard way in `CLIF_RESEARCH.md`.
-2. **Real TTFT + cache-reuse telemetry (HIGH).** The proxy's `/v1/metrics` "TTFT" is
+2. 🟡 **Real TTFT + cache-reuse telemetry (HIGH).** The proxy's `/v1/metrics` "TTFT" is
    mislabeled (it is end-to-end latency, §4.12); expose a *true* first-token time and
    a per-turn `(prompt_tokens − cached_tokens)` "fresh prefill" series so operators
    can see the cache→TTFT link directly. The `/v1/agent/sessions/{id}/debug` endpoint
    exists — add the live-zone/frozen/summary token breakdown there (Gemini §2.11 had
    this right).
-3. **Make degradation visible (MED).** Surface the embedding-breaker state and any
+3. 🟡 **Make degradation visible (MED).** Surface the embedding-breaker state and any
    consistently-failing stage in `/v1/metrics` and the `X-MOEPT-Optimization-Degraded`
    header (today the dead RAG never records degradation). → Phase 1.
-4. **Per-tool compression budgets + escape hatch (MED).** Borrow snip/rtk: per-tool
+4. ⬜ **Per-tool compression budgets + escape hatch (MED).** Borrow snip/rtk: per-tool
    result token budgets and a `full_output` passthrough flag so the agent can request
    the uncompressed original when a compressed result is insufficient (pairs with
    reversible compression, §4.1.2). → Phase 3.
-5. **Savings analytics by tool/command (LOW).** Track which tool outputs waste the
+5. ⬜ **Savings analytics by tool/command (LOW).** Track which tool outputs waste the
    most tokens (snip/rtk `gain` reports) to guide filter tuning. → Phase 3.
 
 ### 4.12 Benchmark improvements
 
-1. **The "TTFT" metric is mislabeled (HIGH).** In `app.py` the `latency_ms` recorded
+1. ✅ **The "TTFT" metric is mislabeled (HIGH).** In `app.py` the `latency_ms` recorded
    per turn is `(time.time() − turn_start)` measured **after the stream completes**
    (`app.py:866-872` streaming, `:1015` non-streaming), yet the dashboard renders it
    as "Avg TTFT (ms)". It is total request duration (dominated by full generation),
@@ -922,26 +1097,26 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    barely correlates with it. **Fix:** timestamp the first yielded content chunk and
    report that as TTFT; keep total latency separate. (The *benchmark script* measures
    TTFT itself via streaming and is fine; this is the proxy's own metric.) → Phase 2.
-2. **Greenlight + CI-gate the dry-run (HIGH).** Integrate
+2. ✅ **Greenlight + CI-gate the dry-run (HIGH).** Integrate
    `diag_dryrun_opencode.py` into `dev.sh`/CI as a prefix-reuse gate (fail if
    non-fold turns drop below a reuse threshold, e.g. 0.8). Today it is not gated and
    not greenlit (fold turns break). Use the **common-prefix reuse ratio** (the real
    backend metric) not strict `startswith` (the volatile tail differs by design). → Phase 1.
-3. **Add a cache→TTFT correlation metric (HIGH).** Report per-turn
+3. 🟡 **Add a cache→TTFT correlation metric (HIGH).** Report per-turn
    `fresh_prefill_tokens = prompt_tokens − cached_tokens` alongside TTFT, and a
    correlation/plot, to *prove* the cache-instability→TTFT mechanism quantitatively
    and prevent regressions. → Phase 2.
-4. **Drop the weak code embedder from the headline gate (MED).** README admits
+4. ⬜ **Drop the weak code embedder from the headline gate (MED).** README admits
    `embed-gemma-300m-FLM` is weak on code; `semantic_similarity` median 0.037 is
    noise. The regression gate (`--min-similarity`) should lean on the robust headline
    (`rouge_l_f1`, `token_jaccard`, `code_block_ratio`, `edit_similarity`,
    `code_syntax_validity`), which the README already separates — make the *gate* use
    the headline block, not semantic similarity. → Phase 2.
-5. **Make the direct-vs-proxy comparison fair (MED).** If any output-shaping
+5. ✅ **Make the direct-vs-proxy comparison fair (MED).** If any output-shaping
    instruction is injected into the proxy path only (§4.2.5), the quality comparison
    is biased. Remove `OutputShaper` from the proxy path (recommended) or apply the
    same instruction to the direct baseline. → Phase 1.
-6. **The quality regression is now the gate concern (HIGH).** The fresh post-fix
+6. 🟡 **The quality regression is now the gate concern (HIGH).** The fresh post-fix
    benchmark traded quality for cache reuse: ROUGE-L F1 0.27 → **0.14**, token-Jaccard
    0.25 → **0.14**, `length_ratio` 0.87 → **2.02** (max 12.3), and
    `code_syntax_invalid_turns: [8,16]` (proxy emitted broken code). Add an explicit
@@ -950,20 +1125,30 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    round, and flag `length_ratio` outside [0.5, 2.0]. The adaptive budget (§4.2.2)
    and error-aware/reversible compression (§4.1) are what should move these back up;
    the benchmark must measure that they do. → Phase 2 gate.
-7. **`context_window_wall` at turn 1 for both sides is a metric bug, not a result
+7. ✅ **`context_window_wall` at turn 1 for both sides is a metric bug, not a result
    (MED).** The wall triggers on `code_block_ratio < 0.5 OR semantic_similarity <
    0.3`; turn 1 (a short non-code answer) trips it immediately for *both* direct and
    proxy, so it reports "wall=1" and conveys nothing. Require a minimum turn index
    (e.g. ≥ 5) and a sustained (2+ consecutive turns) breach before declaring a wall. → Phase 2.
-8. **Re-benchmark after the adaptive budget (process).** With the fresh
+8. 🟡 **Re-benchmark after the adaptive budget (process).** With the fresh
    `0.7.26_fix` baseline in hand (reuse 0.81, TTFT median 8.6 s, ROUGE-L 0.14),
    re-run `--scenario opencode --turns 30 --rounds 3` after Phase 1–2 and confirm:
    reuse stays ≥ 0.8, TTFT **mean** (not just median) drops below direct as fold
    spikes disappear, token savings recover toward 65 %+ *and* ROUGE-L/Jaccard climb
    back above the 0.7.26_fix baseline. Use ≥3 rounds (this run was 1) so variance is
    visible. → Phase 2 gate.
-9. **Multi-file agentic replay (LOW).** Expand `scripts/fixtures` to multi-file
+9. ⬜ **Multi-file agentic replay (LOW).** Expand `scripts/fixtures` to multi-file
    edits + real test/lint/compiler failures (exercises error-aware compression). → Phase 3.
+10. 🆕 **`print_report` crashes on the faithfulness dict (MED).** `benchmark.py:4728`
+    does `if faith is not None and faith < 0.5`, but `prompt_faithfulness` in the
+    summary is a **dict** (mean/median/min/max), not a float — so the *human-readable*
+    report path raises `TypeError: '<' not supported between instances of 'dict' and
+    'float'` and exits non-zero *after* the run completes. The `--json` path
+    (`json.dump(report.summary())`) does not call `print_report`, so JSON + the
+    `--baseline` regression gate are unaffected. **Fix:** read `faith["mean"]` (guard
+    `isinstance(faith, dict)`), mirroring the `isinstance(..., float)` guards already
+    used in the `--dump-responses` block below it. Trivial; benchmark-only (no proxy
+    behavior). → Phase 2 (benchmark hygiene).
 
 ---
 
@@ -975,12 +1160,12 @@ full benchmark until the dry-run is greenlit** (per `CLIF_RESEARCH.md`).
 ### Phase 1 — Correctness, leaks, and the cache-break root cause (highest ROI)
 *Goal: stop the silent corruption and leaks; unify eviction; greenlight the dry-run.*
 
-1. **Single size governor** (§4.2.1, §4.7.2): introduce `BudgetGovernor` +
+1. 🟡 **Single size governor** (§4.2.1, §4.7.2): introduce `BudgetGovernor` +
    `PrefixLayout`; delete `_proactive_trim` and `_sliding_window_trim` from the
    pipeline; fold owns sizing in cache-stable mode; `_trim_to_budget` is the only
    hard-cap safety valve; add `evictable_budget <= 0 → return` to
    `token_aware_truncator` + compactor; widen fold hysteresis ≥ max single-turn growth.
-2. **Adaptive budget — skeleton** (§4.2.2, §3.1): introduce the
+2. ✅ **Adaptive budget — skeleton** (§4.2.2, §3.1): introduce the
    `AdaptiveBudgetGovernor` interface; first make the ceiling **window-relative and
    horizon-growing** instead of the fixed 12 K (raise `budget_window_fraction` from
    0.025 to a sane value, grow with turn index), **floored at `reserved`** so
@@ -989,29 +1174,29 @@ full benchmark until the dry-run is greenlit** (per `CLIF_RESEARCH.md`).
    `_chars` only as last-resort valves. *Gate: dry-run non-fold turns ≥ 0.9 reuse;
    fold turns are the only breaks; the realized context size is a deliberate,
    logged outcome of the governor (not an ignored constant).*
-3. **Fix the embedding subsystem** (§4.8.1, §4.10.2): make `get_embedding` truly
+3. ✅ **Fix the embedding subsystem** (§4.8.1, §4.10.2): make `get_embedding` truly
    async (delete `_get_sync_loop`/`run_coroutine_threadsafe`), inject **one
    initialized** shared `EmbeddingService`, add `CircuitBreaker.call_async`, record a
    degradation marker when the breaker opens. *Gate: a unit test asserts ranking is
    non-trivial (non-zero query norm) when the embedder is up, and a test asserts no
    event-loop hang.*
-4. **Per-session summarizer/delta-encoder** (§4.8.2): construct
+4. ✅ **Per-session summarizer/delta-encoder** (§4.8.2): construct
    `HierarchicalSummarizer` + `DeltaEncoder` per optimizer (drop `get_*` globals) or
    key state by session id. *Gate: concurrency test — two sessions don't share
    rolling-summary text.*
-5. **Strip `_volatile_turn`** (§4.8.3); **fix profile-vs-env precedence** (§4.8.4);
+5. ✅ **Strip `_volatile_turn`** (§4.8.3); **fix profile-vs-env precedence** (§4.8.4);
    **fix `tokenize_count_sync` never-awaited** so remote `/tokenize` actually works
    in the async app (§4.8.8) — needed before the budget is enforced in calibrated tokens.
-6. **Bound `_SLOT_MAP`** (§4.10.1); **offload optimizer construction** + share one
+6. ✅ **Bound `_SLOT_MAP`** (§4.10.1); **offload optimizer construction** + share one
    tokenizer + narrow the session lock (§4.9.1).
-7. **Remove `OutputShaper` from the proxy path** (§4.2.5) — restores the hard
+7. ✅ **Remove `OutputShaper` from the proxy path** (§4.2.5) — restores the hard
    constraint and a fair benchmark.
-8. **Delete the dead/phantom modules** (§7): `kv_slot_tracker`, `mtp_state`,
+8. ✅ **Delete the dead/phantom modules** (§7): `kv_slot_tracker`, `mtp_state`,
    `attention_sink`, `pattern_injector`, `dependency_orderer`, `hierarchical_index`,
    `goal_relevance_scorer`, `incremental_updater`, `context_template_matcher`; strip
    dead branches from `state_rag`, `thinking_preserver`, `prompt_templates`,
    `selective_truncator`, `context_canonicalizer`; remove their config flags.
-9. **CI-gate the dry-run** (§4.12.2).
+9. ✅ **CI-gate the dry-run** (§4.12.2).
    *Phase gate: `bash scripts/dev.sh` green; dry-run greenlit; new regression tests
    for governor/embedding/session-isolation pass.*
 
@@ -1019,22 +1204,22 @@ full benchmark until the dry-run is greenlit** (per `CLIF_RESEARCH.md`).
 *Goal: make the proxy faster than direct on TTFT mean (not just median), and recover
 the quality the cliff fix traded away.*
 
-1. **Adaptive budget — full policy** (§4.2.2, §3.1): add the task-complexity /
+1. ⬜ **Adaptive budget — full policy** (§4.2.2, §3.1): add the task-complexity /
    code-density and codebase-size signals to the ceiling, and switch compaction to
    the **cache-break amortization trigger** (`marginal_per_turn_prefill ×
    remaining_turns > re_prefill_cost`). This is what removes the fold-turn TTFT
    spikes (cached→882 re-prefills) and stops the quality regression (more verbatim
    context retained).
-2. **Append-only default for cache-stable mode** (§4.3.1): lossless compression of
+2. ⬜ **Append-only default for cache-stable mode** (§4.3.1): lossless compression of
    new content only; let `--context-shift` bound the window; reserve compaction for
    genuinely window-bound sessions.
-3. **Zero-copy SSE passthrough** (§4.4.1).
-4. **Token-counting overhaul** (§4.4.2, §4.4.3): per-message memo + running totals +
+3. ⬜ **Zero-copy SSE passthrough** (§4.4.1).
+4. 🟡 **Token-counting overhaul** (§4.4.2, §4.4.3): per-message memo + running totals +
    count-once-per-stage; remove the O(n²) floor pass.
-5. **Probing fixes** (§4.9.2, §4.9.3, §4.9.5): gather sub-probes, bound startup,
+5. ✅ **Probing fixes** (§4.9.2, §4.9.3, §4.9.5): gather sub-probes, bound startup,
    single-flight on TTL expiry, one long-lived httpx client.
-6. **Move post-stream + per-request CPU off the loop** (§4.4.4, §4.9.4).
-7. **Real TTFT metric + cache→TTFT correlation + quality gate** (§4.12.1, §4.12.3,
+6. ✅ **Move post-stream + per-request CPU off the loop** (§4.4.4, §4.9.4).
+7. 🟡 **Real TTFT metric + cache→TTFT correlation + quality gate** (§4.12.1, §4.12.3,
    §4.12.6); fix the `context_window_wall` turn-1 artifact (§4.12.7).
    *Phase gate: re-run `--scenario opencode --turns 30 --rounds 3` (≥3 rounds);
    prefix-cache reuse stays ≥ 0.8; proxy TTFT **mean** ≤ direct (fold spikes gone);
@@ -1043,22 +1228,22 @@ the quality the cliff fix traded away.*
    / 0.95) with `length_ratio` back inside [0.5, 2.0].*
 
 ### Phase 3 — Context efficiency & quality (the missing optimizations)
-1. **Error-aware tool-output compression** (§4.1.1): failures-only for tests/builds/
+1. ✅ **Error-aware tool-output compression** (§4.1.1): failures-only for tests/builds/
    lint, keep error/stack/`file:line`, group by file/rule, dedup-with-counts,
    per-tool budgets + `full_output` escape hatch.
-2. **Reversible compression + retrieval handles** (§4.1.2): content-addressed store +
+2. ⬜ **Reversible compression + retrieval handles** (§4.1.2): content-addressed store +
    `expand(id)` tool (MCP-style); pair with cached re-read collapse (§4.1.3) and
    global code dedup (§4.5.2).
-3. **Syntactic code slicing + evicted-code skeleton index** (§4.5.3, §4.3.3).
-4. **Volatile-field relocation** (§4.1.4); drop the redundant anchor (§4.2.6).
-5. **MTP/ChatML hardening** (§4.6.2, §4.6.3); multi-file fixtures (§4.12.7).
+3. 🟡 **Syntactic code slicing + evicted-code skeleton index** (§4.5.3, §4.3.3).
+4. 🟡 **Volatile-field relocation** (§4.1.4); drop the redundant anchor (§4.2.6).
+5. ⬜ **MTP/ChatML hardening** (§4.6.2, §4.6.3); multi-file fixtures (§4.12.7).
    *Phase gate: token savings up AND headline quality (esp. `code_block_ratio`,
    `rouge_l_f1`) up vs Phase 2 baseline.*
 
 ### Phase 4 — Maintainability (reduce the chance of regressions)
-1. **Decompose the god object** (§4.2.3): `BudgetGovernor`/`PrefixLayout`/`StageRunner`.
-2. **Typed summary region** (§4.7.3) replacing scattered content-marker guards.
-3. **Surface persistent stage failures** (§4.8.5, §4.8.7); prune `AgentStateStore.goals`
+1. 🟡 **Decompose the god object** (§4.2.3): `BudgetGovernor`/`PrefixLayout`/`StageRunner`.
+2. ⬜ **Typed summary region** (§4.7.3) replacing scattered content-marker guards.
+3. ⬜ **Surface persistent stage failures** (§4.8.5, §4.8.7); prune `AgentStateStore.goals`
    (§4.10.4); session reaper (§4.10.3).
    *Phase gate: `optimizer.py` < ~1500 lines; no stage with two gate predicates;
    `dev.sh` green.*
@@ -1067,15 +1252,15 @@ the quality the cliff fix traded away.*
 
 ## 6. Borrowable techniques from reference projects (ranked)
 
-| # | Technique | Source | Where it fits |
-|---|---|---|---|
-| 1 | **Error-aware, failures-only tool-output compression** (keep error/stack/file:line; collapse passing tests to counts; group by file/rule; dedup-with-counts; deterministic, no LLM) | snip, rtk | §4.1.1 / Phase 3 — biggest win |
-| 2 | **Reversible compression + retrieval handles** (placeholder + store original + `expand` tool; cached re-read ≈ 13 tokens) | headroom, lean-ctx | §4.1.2 / Phase 3 |
-| 3 | **Cache-safe live-zone compression + volatile-field relocation** (move dates/UUIDs/SHAs out of the prefix; CacheAligner warns on cache-busting volatile content) | headroom, lean-ctx | §4.1.4, §4.7 / Phase 3 |
-| 4 | **Outline/signatures-first code views** with targeted line-range expansion | lean-ctx, rtk, swe-pruner | §4.3.3, §4.5.3 / Phase 3 |
-| 5 | **Task-aware code pruning** (infer the current goal; keep task-relevant lines; stub the rest) — heuristic or tiny local skimmer | swe-pruner | §4.5.3 / Phase 3 (optional) |
-| 6 | **Per-tool token budgets + savings analytics + passthrough escape hatch** | snip, rtk | §4.11.4 / Phase 3 |
-| 7 | **Effort routing** (lower reasoning_effort on routine tool-result turns) — *client-side or not at all; the proxy must not own response verbosity* | headroom | §4.2.5 (caution) |
+| # | Technique | Source | Where it fits | Status |
+|---|---|---|---|---|
+| 1 | **Error-aware, failures-only tool-output compression** (keep error/stack/file:line; collapse passing tests to counts; group by file/rule; dedup-with-counts; deterministic, no LLM) | snip, rtk | §4.1.1 / Phase 3 — biggest win | ✅ done |
+| 2 | **Reversible compression + retrieval handles** (placeholder + store original + `expand` tool; cached re-read ≈ 13 tokens) | headroom, lean-ctx | §4.1.2 / Phase 3 | ⬜ deferred |
+| 3 | **Cache-safe live-zone compression + volatile-field relocation** (move dates/UUIDs/SHAs out of the prefix; CacheAligner warns on cache-busting volatile content) | headroom, lean-ctx | §4.1.4, §4.7 / Phase 3 | ⬜ not started |
+| 4 | **Outline/signatures-first code views** with targeted line-range expansion | lean-ctx, rtk, swe-pruner | §4.3.3, §4.5.3 / Phase 3 | 🟡 slicer primitive done (`slice_code_to_query`); wiring pending |
+| 5 | **Task-aware code pruning** (infer the current goal; keep task-relevant lines; stub the rest) — heuristic or tiny local skimmer | swe-pruner | §4.5.3 / Phase 3 (optional) | 🟡 query-name slicing done; goal-inference not started |
+| 6 | **Per-tool token budgets + savings analytics + passthrough escape hatch** | snip, rtk | §4.11.4 / Phase 3 | ⬜ not started |
+| 7 | **Effort routing** (lower reasoning_effort on routine tool-result turns) — *client-side or not at all; the proxy must not own response verbosity* | headroom | §4.2.5 (caution) | ➖ rejected for the proxy (hard constraint); `OutputShaper` removed |
 
 Central lesson across all five: **treat tool output as a first-class, deterministic,
 command-aware compression layer** (60–90 % savings, no extra model call, no added
