@@ -56,3 +56,20 @@ class TestCodeChunking:
         assert "import sys" in chunks[1]
         # And the result must not be identical to the line-based fallback.
         assert chunks != chunk_text_fallback(code, 80)
+
+    def test_chunk_zero_does_not_duplicate_imports(self) -> None:
+        """Regression (REVIEW.md §4.5 #5): the header nodes are re-emitted via the
+        per-chunk header prefix, so the body loop must skip them — otherwise chunk 0
+        carries the imports twice (once in the prefix, once as leading body nodes).
+        """
+        lines = ["import os", "import sys", ""]
+        for i in range(20):
+            lines += [f"def func_{i}():", f"    return {i}", ""]
+        code = "\n".join(lines)
+
+        chunks = chunk_code_with_treesitter(code, "python", 80)
+        assert chunks[0].count("import os") == 1
+        assert chunks[0].count("import sys") == 1
+        # No code is lost by skipping the header nodes in the body.
+        joined = "\n".join(chunks)
+        assert all(f"def func_{i}()" in joined for i in range(20))

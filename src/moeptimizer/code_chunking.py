@@ -257,6 +257,7 @@ def chunk_code_with_treesitter(
     current_length = 0
 
     file_headers = []
+    header_indices: set[int] = set()
     header_types = {
         "import_statement",
         "import_declaration",
@@ -271,6 +272,9 @@ def chunk_code_with_treesitter(
         child = root_node.child(i)
         if _get_kind(child) in header_types:
             file_headers.append(_get_text(child))
+            header_indices.add(i)
+    # Header nodes are re-emitted via header_prefix on every chunk, so skip them in
+    # the body loop — otherwise chunk 0 carries the imports twice (REVIEW.md §4.5 #5).
     header_prefix = "\n".join(file_headers) + "\n" if file_headers else ""
 
     def _add(text: str) -> None:
@@ -286,6 +290,8 @@ def chunk_code_with_treesitter(
             current_length = 0
 
     for i in range(root_node.child_count):
+        if i in header_indices:
+            continue
         child = root_node.child(i)
         node_text = _get_text(child)
         node_len = len(node_text)
