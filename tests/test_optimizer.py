@@ -248,6 +248,9 @@ class TestAgentContextOptimizer:
         # does not bypass compaction of the dynamic layer, independent of the
         # frozen early-turn prefix.
         self.optimizer._config.v050.cache_stable_mode = False
+        # Turn-count path under test: disable space-based folding (default 0.25) so
+        # the front-evictors are not skipped (review §4.7 / A1-lite).
+        self.optimizer._config.v050.fold_window_fraction = 0.0
 
         first_messages = [
             {"role": "system", "content": "You are helpful"},
@@ -436,6 +439,9 @@ class TestAgentContextOptimizer:
         # threshold-plumbing test exercises the classic path.
         config.v050.cache_stable_summary_enabled = False
         config.v050.hierarchical_summary_enabled = False
+        # Turn-count path under test: disable space-based folding (default 0.25) so
+        # the front-evicting proactive trim is not skipped (review §4.7 / A1-lite).
+        config.v050.fold_window_fraction = 0.0
         optimizer = AgentContextOptimizer(config)
         messages = [
             {"role": "system", "content": "System"},
@@ -1726,6 +1732,9 @@ class TestAdaptiveBudget:
 
     def test_budget_capped_at_window_fraction(self) -> None:
         opt = self._opt()
+        # Isolate the adaptive_window_fraction ceiling: disable space-based folding
+        # (default 0.25), which otherwise raises the ceiling to fold_window_fraction.
+        opt._config.v050.fold_window_fraction = 0.0
         opt.budget._last_optimized_token_count = None
         opt.budget._turns_seen = 100000  # absurd horizon -> hits the ceiling
         ceiling = int(self.WINDOW * opt._config.agentic.adaptive_window_fraction)
