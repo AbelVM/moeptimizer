@@ -10,6 +10,7 @@ from typing import Any
 
 from moeptimizer.code_chunking import (
     LANG_MAP,
+    _get_cached_parser,
     chunk_code_with_treesitter,
     deduplicate_chunks,
     detect_language_and_id,
@@ -17,6 +18,18 @@ from moeptimizer.code_chunking import (
 
 # Pre-compiled regex for fallback (kept for performance)
 _CODE_BLOCK_PATTERN = re.compile(r"(```[\w]*\n.*?```)", re.DOTALL)
+
+# Top-level node kinds treated as file header (kept verbatim when slicing).
+_HEADER_KINDS = {
+    "import_statement",
+    "import_declaration",
+    "import_from_statement",
+    "package_clause",
+    "use_declaration",
+    "namespace_declaration",
+    "module_declaration",
+    "require_statement",
+}
 
 
 def has_code_blocks(text: str) -> bool:
@@ -120,3 +133,94 @@ def optimize_code_in_text(
             offset += len(replacement) - (end - start)
 
     return result
+
+
+def _node_text(code_bytes: bytes, node: Any) -> str:
+    """Extract the source text of a tree-sitter node via its byte range.
+
+    ``node.byte_range`` is a ``(start, end)`` tuple of byte offsets, so slicing
+    must happen on the encoded bytes (not the str, whose indices are code points)
+    to stay correct for non-ASCII source.
+    """
+    start, end = node.byte_range
+    return code_bytes[start:end].decode(errors="replace")
+
+
+def _definition_name(code_bytes: bytes, node: Any) -> str | None:
+    """Return the name of a top-level definition node, or None if it has none."""
+    try:
+        name_node = node.child_by_field_name("name")
+        if name_node is not None:
+            return _node_text(code_bytes, name_node)
+    except Exception:
+        pass
+    # Fallback: first identifier-like child (covers grammars without a name field).
+    for i in range(node.child_count):
+        child = node.child(i)
+        if child.type in ("identifier", "type_identifier", "name"):
+            return _node_text(code_bytes, child)
+    return None
+
+
+def slice_code_to_query(code: str, lang_id: str, query: str) -> str:
+    """Slice a code block down to the top-level definitions referenced by ``query``.
+
+    Review §4.5.3: for a multi-hundred-line file read, keep the imports header plus
+    every top-level function/class whose name appears in the query, and collapse the
+    unrelated siblings to a marker. This keeps the code the model actually needs to
+    edit/extend while dropping the rest.
+
+    Strictly fail-open: returns the original ``code`` unchanged when the language is
+    unknown, parsing fails, there are no named top-level definitions, nothing matches
+    the query, or everything matches (nothing to drop). Only ever shrinks — never
+    expands — so it cannot bloat the context.
+
+    Uses the tree-sitter 0.25 property API (``tree.root_node``, ``node.type``,
+    ``node.child_count``, ``node.byte_range`` are properties; ``node.child(i)`` and
+    ``node.child_by_field_name(name)`` are methods).
+    """
+    if not code or not query or lang_id == "generic":
+        return code
+    parser = _get_cached_parser(lang_id)
+    if parser is None:
+        return code
+    code_bytes = code.encode()
+    try:
+        tree = parser.parse(code_bytes)
+        root = tree.root_node
+    except Exception:
+        return code
+
+    header_parts: list[str] = []
+    defs: list[tuple[str, int, int]] = []  # (name, byte_start, byte_end)
+    for i in range(root.child_count):
+        child = root.child(i)
+        if child.type in _HEADER_KINDS:
+            header_parts.append(_node_text(code_bytes, child))
+            continue
+        name = _definition_name(code_bytes, child)
+        if name:
+            start, end = child.byte_range
+            defs.append((name, start, end))
+
+    if not defs:
+        return code
+
+    query_tokens = {t.lower() for t in re.findall(r"\w+", query)}
+    matched = [(name, s, e) for name, s, e in defs if name.lower() in query_tokens]
+    # Nothing to drop: no match (fail-open, keep everything the model might need)
+    # or every definition is referenced (slicing would remove nothing).
+    if not matched or len(matched) == len(defs):
+        return code
+
+    matched.sort(key=lambda t: t[1])
+    kept: list[str] = []
+    if header_parts:
+        kept.append("\n".join(header_parts))
+    for _name, s, e in matched:
+        kept.append(code_bytes[s:e].decode(errors="replace"))
+    collapsed = len(defs) - len(matched)
+    kept.append(f"# ... [{collapsed} other top-level definition(s) collapsed] ...")
+    sliced = "\n".join(kept)
+    # Never expand the context.
+    return sliced if len(sliced) < len(code) else code
