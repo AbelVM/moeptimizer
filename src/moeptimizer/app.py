@@ -61,6 +61,12 @@ class _ProxyMetrics:
         # so avg_ttft_ms averages over those, not over non-streaming turns.
         self.total_ttft_ms = 0.0
         self.ttft_samples = 0
+        # Fresh prefill (review §4.11.2 / Forward plan D1): prompt_tokens -
+        # cached_tokens, the tokens the backend re-prefilled this turn. Averaged
+        # alongside TTFT so operators see the cache -> TTFT link directly (a rising
+        # avg_fresh_prefill_tokens means the prefix is being invalidated more).
+        self.total_fresh_prefill_tokens = 0
+        self.fresh_prefill_samples = 0
         # Count of turns where the backend returned an error (e.g. HTTP 500 for a
         # truncated tool call) while streaming/serving. Surfaced in /v1/metrics so
         # operators can distinguish "proxy not helping" from "backend failing".
@@ -122,6 +128,9 @@ class _ProxyMetrics:
             if ttft_ms is not None:
                 self.total_ttft_ms += max(0.0, ttft_ms)
                 self.ttft_samples += 1
+            if prompt_tokens is not None and cached_tokens is not None:
+                self.total_fresh_prefill_tokens += max(0, prompt_tokens - cached_tokens)
+                self.fresh_prefill_samples += 1
             if session_id:
                 self._record_session_locked(
                     session_id,
@@ -155,6 +164,8 @@ class _ProxyMetrics:
                 "total_latency_ms": 0.0,
                 "total_ttft_ms": 0.0,
                 "ttft_samples": 0,
+                "total_fresh_prefill_tokens": 0,
+                "fresh_prefill_samples": 0,
                 "backend_errors": 0,
             }
         entry["requests"] += 1
@@ -173,6 +184,11 @@ class _ProxyMetrics:
         if ttft_ms is not None:
             entry["total_ttft_ms"] = entry.get("total_ttft_ms", 0.0) + max(0.0, ttft_ms)
             entry["ttft_samples"] = entry.get("ttft_samples", 0) + 1
+        if prompt_tokens is not None and cached_tokens is not None:
+            entry["total_fresh_prefill_tokens"] = entry.get("total_fresh_prefill_tokens", 0) + max(
+                0, prompt_tokens - cached_tokens
+            )
+            entry["fresh_prefill_samples"] = entry.get("fresh_prefill_samples", 0) + 1
         # Move-to-end keeps most-recently-active sessions; evict the oldest.
         self._per_session[session_id] = entry
         self._per_session.move_to_end(session_id)
@@ -206,6 +222,11 @@ class _ProxyMetrics:
                     "avg_ttft_ms": round(
                         e.get("total_ttft_ms", 0.0) / max(1, s_ttft_samples), 1
                     ),
+                    "avg_fresh_prefill_tokens": round(
+                        e.get("total_fresh_prefill_tokens", 0)
+                        / max(1, e.get("fresh_prefill_samples", 0)),
+                        1,
+                    ),
                     "backend_errors": e.get("backend_errors", 0),
                 }
             return {
@@ -223,6 +244,11 @@ class _ProxyMetrics:
                 # measured it (review §4.12.1); avg_latency_ms is the full turn time.
                 "avg_ttft_ms": round(
                     self.total_ttft_ms / max(1, self.ttft_samples), 1
+                ),
+                # Fresh prefill (prompt - cached) averaged over turns that reported
+                # both; read next to avg_ttft_ms to see the cache -> TTFT link.
+                "avg_fresh_prefill_tokens": round(
+                    self.total_fresh_prefill_tokens / max(1, self.fresh_prefill_samples), 1
                 ),
                 "backend_errors": self.backend_errors,
                 "sessions": sessions,
