@@ -2653,14 +2653,22 @@ class AgentContextOptimizer:
         the live zone WITH the floor (gradual compression).
         """
         optimized = messages
-        shrink_floor = self._effective_shrink_floor()
+        # A4 (Forward plan): compress on FIRST appearance, monotonically. The transforms
+        # are idempotent (content-hash cached) and the stable/live split keeps the leading
+        # prefix byte-stable, so the per-turn shrink floor is redundant for cache safety
+        # here. Worse, the floor held live tool outputs back uncompressed and collapsed
+        # them only once they reached the stable prefix — a late 4998→15 rewrite
+        # mid-context that broke the backend prefix (the turn-19 break class). Passing
+        # shrink_floor=None compresses each output fully the first time it appears
+        # (trailing new content), freezing its form into the prefix so it never changes —
+        # matching the documented intent of tool_output_compression_enabled.
         if self._config.agentic.tool_output_compression_enabled:
             try:
                 optimized = self._transform_stable_then_live(
                     optimized,
                     live_zone_start,
                     lambda m: self._filter_tool_message(m),
-                    shrink_floor=shrink_floor,
+                    shrink_floor=None,
                 )
             except Exception as e:
                 logger.warning("Tool output filtering failed: %s", e)
@@ -2672,7 +2680,7 @@ class AgentContextOptimizer:
                     optimized,
                     live_zone_start,
                     lambda m: self._compress_tool_output_message(m),
-                    shrink_floor=shrink_floor,
+                    shrink_floor=None,
                 )
             except Exception as e:
                 logger.warning("Tool output compression failed: %s", e)
@@ -2684,7 +2692,7 @@ class AgentContextOptimizer:
                     optimized,
                     live_zone_start,
                     lambda m: self._compress_user_paste_message(m),
-                    shrink_floor=shrink_floor,
+                    shrink_floor=None,
                 )
             except Exception as e:
                 logger.warning("User paste compression failed: %s", e)
