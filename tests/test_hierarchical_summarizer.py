@@ -191,6 +191,36 @@ class TestHierarchicalSummarizer:
         assert result == messages
         assert not [m for m in result if m.get("_rolling_summary")]
 
+    def test_disable_drift_suppresses_turn_count_fold(self) -> None:
+        """Space-based folding (review §4.7): disable_drift=True turns off the
+        turn-count DRIFT trigger, so a live zone far past keep + margin is NOT
+        folded (folding happens only on the size-pressure trigger instead)."""
+        def conv() -> list[dict]:
+            msgs = [
+                {"role": "system", "content": "System"},
+                {"role": "user", "content": "First user"},
+                {"role": "assistant", "content": "Resp 0"},
+            ]
+            # 8 substantive dynamic turns: live (8) > keep (2) + margin (2).
+            for i in range(1, 9):
+                msgs.append({"role": "user", "content": f"Turn {i} implements feature {i} with validation"})
+                msgs.append({"role": "assistant", "content": f"Resp {i} done"})
+            return msgs
+
+        # Without disable_drift: a DRIFT fold fires (a summary block appears).
+        summarizer = HierarchicalSummarizer(max_full_turns=2)  # keep=2, margin=2
+        folded = summarizer.summarize_turns_cache_stable(conv(), frozen_prefix_end=3)
+        assert [m for m in folded if m.get("_rolling_summary")]
+
+        # With disable_drift (and no pressure target): no fold, messages unchanged.
+        summarizer2 = HierarchicalSummarizer(max_full_turns=2)
+        messages = conv()
+        not_folded = summarizer2.summarize_turns_cache_stable(
+            messages, frozen_prefix_end=3, disable_drift=True
+        )
+        assert not [m for m in not_folded if m.get("_rolling_summary")]
+        assert not_folded == messages
+
     def test_summarize_cache_stable_retains_constraints(self) -> None:
         """The rolling summary retains the task's 'don't' constraints."""
         summarizer = HierarchicalSummarizer(max_full_turns=2)

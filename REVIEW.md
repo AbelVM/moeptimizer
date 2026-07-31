@@ -67,22 +67,48 @@ trigger** (`live_count > keep + fold_margin` in `hierarchical_summarizer.py`), w
 a budget term cannot influence. The code-density term only matters when the budget
 is binding (a smaller window or a much larger working set).
 
-**The reuse regression needs fold-geometry work, not budget tuning.** The binding
-constraint on context size is the fold (it keeps the context at ~15–22K), not the
-budget. To reduce fold frequency (and recover reuse/TTFT) the options are: (a) widen
-the DRIFT `fold_margin` / keep window — but `CLIF_RESEARCH.md` #28 measured that
-rarer folds *increased* breaks (10→12) and ballooned the context (18K→24K) with the
-old fixed budget, so this is risky and needs re-validation under the adaptive budget;
-or (b) a compaction-geometry change (e.g. summary at the tail, or append-only with
-backend `--context-shift`) — the durable fix, but a major architectural change
-(Phase 4 territory, needs maintainer design discussion).
+**Fold-geometry experiments (implemented + swept, dry-run opencode/30):** the binding
+constraint on context size is the fold, not the budget, so two fold controls were
+added and swept (both default OFF = current behavior; both cache-stable, tested):
+
+- `fold_margin_turns` (DRIFT margin) and `fold_window_fraction` (space-based
+  folding: disables the turn-count DRIFT trigger and folds only when the context
+  exceeds a fraction of the live window; the budget ceiling rises to match and the
+  scratchpad compactor + front-evictors are skipped so the cliff is not re-created).
+
+| Config | Breaks | turn-30 context |
+|---|---|---|
+| baseline (margin=keep=6) | 7 `[16,17,20,21,24,27,28]` | 22.3K |
+| `fold_margin_turns=18` (3×) | **6** `[18,22,23,25,27,28]` | 23.0K |
+| `fold_margin_turns=30` (5×) | 6 (same) | 23.0K |
+| `fold_window_fraction=0.1` | 7 `[20,21,23,24,26,27,29]` | 23.0K |
+| `fold_window_fraction=0.25` | 7 `[22,23,26,27,28,29,30]` | 31.8K |
+| `fold_window_fraction=0.5` | 7 (same) | 31.8K |
+
+**Findings:** (1) widening the DRIFT margin gives only a **marginal** improvement
+(7→6 breaks). (2) Space-based folding does **not** reduce the break *count* for a
+30-turn session — it still breaks 7 times, just later, and grows the context
+(31.8K vs 22.3K, worse for savings). The first space-based attempt re-created the
+every-turn cliff (11 consecutive breaks) because disabling DRIFT left no rolling
+summary to gate the scratchpad compactor; that is now fixed (compactor +
+front-evictors skipped under space-based folding). (3) **The ~7 breaks are
+structural** — they persist regardless of fold trigger, so they are not purely
+fold-driven; the remaining breaks likely come from the boundary transforms /
+volatile tail interacting with the backend's cache, and need per-turn backend-cache
+instrumentation to pin down. Space-based folding is still the right design for
+**very long** sessions (folds only near the window) but is not a win at 30 turns.
+
+**Conclusion:** neither fold knob meaningfully recovers reuse at 30 turns. The
+reuse regression vs the pre-Phase-1 baseline (0.81→0.48) is partly single-round
+variance and partly the leaner context; recovering it further needs per-turn
+backend-cache instrumentation to attribute the residual ~7 breaks, then a targeted
+fix. Both fold controls are committed as tunable, validated options.
 
 **Deferred to a benchmark-validated follow-up:**
 - §4.8.4 quality-profile-vs-env precedence — config-semantics change conflicting with
   existing tests and the cliff-fix `.env`; handle with a budget-config redesign.
-- §3.1 adaptive budget **amortization trigger** — fold only when amortized prefill
-  savings exceed the re-prefill cost. Now confirmed to require fold-geometry work
-  (above), not a budget knob; risky per CLIF #28.
+- §3.1 adaptive budget **amortization trigger** — sweep confirmed fold knobs don't
+  recover reuse at 30 turns; needs per-turn backend-cache instrumentation first.
 - §4.4.1 zero-copy SSE passthrough — a rewrite of the working streaming path; the
   proxy must inspect every chunk (usage / thinking / content), so the "minimal"
   benefit is limited. Needs careful design.

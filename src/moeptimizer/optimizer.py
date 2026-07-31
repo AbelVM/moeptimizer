@@ -146,7 +146,12 @@ class AgentContextOptimizer:
         # disk persistence only covers the dead non-cache-stable path), so a fresh
         # per-optimizer instance gives correct isolation with no persistence loss.
         self.hierarchical_summarizer = (
-            HierarchicalSummarizer(max_full_turns=v050.hierarchical_summary_max_full_turns)
+            HierarchicalSummarizer(
+                max_full_turns=v050.hierarchical_summary_max_full_turns,
+                # fold_margin_turns=0 -> None -> the summarizer defaults the DRIFT
+                # margin to the keep window (current behavior).
+                fold_margin=v050.fold_margin_turns or None,
+            )
             if self._cache_stable_summary
             else None
         )
@@ -394,7 +399,15 @@ class AgentContextOptimizer:
 
         window = self._backend_context_window()
         if window is not None and window > 0:
-            ceiling = int(window * cfg.adaptive_window_fraction)
+            ceiling_frac = cfg.adaptive_window_fraction
+            # Space-based folding (review §4.7): the budget ceiling must reach the
+            # fold pressure target (fold_window_fraction) so the budget gates
+            # (_trim_to_budget & co.) don't front-evict — and break the prefix
+            # cache — before the fold fires on real space pressure near the window.
+            fold_frac = self._config.v050.fold_window_fraction
+            if fold_frac > 0:
+                ceiling_frac = max(ceiling_frac, fold_frac)
+            ceiling = int(window * ceiling_frac)
             budget = min(budget, ceiling)
 
         # getattr: _budget_tokens() is also called during __init__ (to seed the
@@ -1308,12 +1321,27 @@ class AgentContextOptimizer:
                 # cached) until the live zone grows back over the target.
                 # (Targeting the growth-chasing ceiling instead folded EVERY
                 # turn — its slack is one turn's growth by construction.)
+                #
+                # Space-based folding (review §4.7): when fold_window_fraction > 0
+                # the pressure target becomes a fraction of the LIVE WINDOW (not the
+                # small budget) and the turn-count DRIFT trigger is disabled, so the
+                # conversation is near append-only and folds — which break the prefix
+                # cache — fire only on real space pressure near the window.
+                fold_window_fraction = self._config.v050.fold_window_fraction
+                window = self._backend_context_window()
+                if fold_window_fraction > 0 and window and window > 0:
+                    pressure_target = int(window * fold_window_fraction)
+                    disable_drift = True
+                else:
+                    pressure_target = int(
+                        max_tokens * self._config.agentic.compaction_trigger_ratio
+                    )
+                    disable_drift = False
                 optimized = self.hierarchical_summarizer.summarize_turns_cache_stable(
                     optimized,
                     frozen_end,
-                    pressure_target_tokens=int(
-                        max_tokens * self._config.agentic.compaction_trigger_ratio
-                    ),
+                    pressure_target_tokens=pressure_target,
+                    disable_drift=disable_drift,
                 )
                 current_tokens = self.token_counter.count_messages(optimized)
                 self._diag_sys("after-7-summary", optimized)
@@ -1337,7 +1365,12 @@ class AgentContextOptimizer:
         # the proactive trim / sliding window below (Step 11/11.8); the compactor
         # was the one front-evictor missing that gate. Step 12's hard cap remains
         # the size safety valve.
-        _skip_compactor = (
+        # Space-based folding (review §4.7): the space-based fold is the ONLY
+        # compaction path, so the scratchpad compactor (a fixed-tail-window
+        # front-evictor) must stay off — otherwise it front-evicts every turn and
+        # re-creates the turn-12 cliff (no rolling summary exists to gate it).
+        _space_based_folding = self._config.v050.fold_window_fraction > 0
+        _skip_compactor = _space_based_folding or (
             self._cache_stable_summary
             and self.hierarchical_summarizer is not None
             and current_tokens > proactive_threshold_tokens
@@ -1532,9 +1565,15 @@ class AgentContextOptimizer:
             and self.hierarchical_summarizer is not None
             and current_tokens > proactive_threshold_tokens
         )
-        skip_front_eviction = summary_armed and (
-            self.hierarchical_summarizer.has_rolling_summary()
-            or current_tokens <= compaction_threshold_tokens
+        # Space-based folding (review §4.7): front-eviction is off — the space-based
+        # fold is the only compaction path (see _skip_compactor above). Step 12's
+        # hard cap (also gated below) still bounds the context at the window.
+        skip_front_eviction = _space_based_folding or (
+            summary_armed
+            and (
+                self.hierarchical_summarizer.has_rolling_summary()
+                or current_tokens <= compaction_threshold_tokens
+            )
         )
         # Drift-safe mode (review P1.3): when real prefix-cache reuse has
         # collapsed, skip the aggressive proactive trim — it is the mutation most

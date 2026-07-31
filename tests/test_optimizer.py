@@ -1777,3 +1777,13 @@ class TestAdaptiveBudget:
         opt._recent_code_tokens = 8000
         # Zero factor: code volume must not move the budget.
         assert opt._budget_tokens() == base
+
+    def test_budget_ceiling_rises_with_fold_window_fraction(self) -> None:
+        # Space-based folding (review §4.7): the budget ceiling rises to the fold
+        # window fraction so the budget gates don't front-evict before the fold.
+        opt = self._opt()
+        opt._last_optimized_token_count = None
+        opt._turns_seen = 100000  # absurd horizon -> hits the ceiling
+        opt._config.v050.fold_window_fraction = 0.5
+        # max(adaptive_window_fraction=0.15, fold_window_fraction=0.5) = 0.5.
+        assert opt._budget_tokens() == int(self.WINDOW * 0.5)

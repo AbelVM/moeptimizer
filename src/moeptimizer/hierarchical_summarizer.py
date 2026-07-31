@@ -256,6 +256,7 @@ class HierarchicalSummarizer:
         messages: list[dict[str, Any]],
         frozen_prefix_end: int,
         pressure_target_tokens: int | None = None,
+        disable_drift: bool = False,
     ) -> list[dict[str, Any]]:
         """Cache-stable BATCH rolling-summary compaction (review §1/§3/§5, #7).
 
@@ -355,7 +356,11 @@ class HierarchicalSummarizer:
         # batch extracts across all folded turns at once so the high-value
         # sections (Files/Code) are ordered before prose — the append-time
         # truncation keeps the front, so code survives budget pressure.
-        if live_count > keep + self._fold_margin:
+        # Disabled for space-based folding (review §4.7): when the optimizer
+        # folds on a window-fraction pressure target instead, the turn-count
+        # DRIFT trigger is what breaks the prefix cache every few turns, so it
+        # is turned off and folding happens only on real space pressure.
+        if not disable_drift and live_count > keep + self._fold_margin:
             end = total_turns - keep
             new_turns = turns[self._summarized_turn_count:end]
             extracted = self._extract_constraints(new_turns) if new_turns else ""

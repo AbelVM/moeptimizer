@@ -585,6 +585,24 @@ class V050Config(BaseModel):
         default=6,
         description="Max recent turns to keep in full. Tracks agentic.keep_full_steps so the rolling summary and the compactor protect the same recent window (review: soften post-cliff floor).",
     )
+    fold_margin_turns: int = Field(
+        default=0,
+        description="DRIFT fold margin: the live zone may drift this many turns past the keep "
+                    "window before a batch fold pulls it back down to the keep window. 0 (default) "
+                    "uses the keep window (hierarchical_summary_max_full_turns). Larger => rarer "
+                    "folds (better prefix-cache reuse) but a larger context between folds. Only "
+                    "used when fold_window_fraction is 0 (turn-count folding).",
+    )
+    fold_window_fraction: float = Field(
+        default=0.0,
+        description="Space-based folding (compaction-geometry redesign, review §4.7). When > 0, the "
+                    "turn-count DRIFT trigger is DISABLED and the rolling summary folds only once the "
+                    "emitted context exceeds this fraction of the live backend window. On a huge "
+                    "window the context stays well under the fraction, so folds (which break the "
+                    "prefix cache) become rare/absent and the conversation is near append-only. 0 "
+                    "(default) keeps the turn-count DRIFT + budget-pressure folding. Start around "
+                    "0.25-0.5 and benchmark the reuse/TTFT/quality/savings tradeoff.",
+    )
     persist_state_to_disk: bool = Field(
         default=False,
         description=(
