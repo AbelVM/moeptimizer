@@ -48,6 +48,7 @@ from moeptimizer.chunk_fingerprint import get_chunk_fingerprint_cache
 from moeptimizer.code_block_optimizer import (
     extract_code_blocks,
     optimize_code_in_text,
+    slice_code_to_query,
 )
 from moeptimizer.code_chunking import (
     LANG_MAP,
@@ -2720,6 +2721,25 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("Tool output dedup failed: %s", e)
                 self._record_degradation("tool_output_dedup", e)
+
+        # B4 (review §4.5.3): slice fenced code to the definitions named in the
+        # session's original request. The query is the stable original request, so
+        # slicing is deterministic; the transform is idempotent (re-slicing a
+        # collapsed block fails open), hence cache-stable as a boundary transform.
+        if self._config.agentic.code_slicing_enabled:
+            goal = self.store.get_goal()
+            query = goal.original_prompt if goal is not None else ""
+            if query:
+                try:
+                    optimized = self._transform_stable_then_live(
+                        optimized,
+                        live_zone_start,
+                        lambda m: self._slice_message_code_to_query(m, query),
+                        shrink_floor=None,
+                    )
+                except Exception as e:
+                    logger.warning("Code slicing failed: %s", e)
+                    self._record_degradation("code_slicing", e)
         return optimized
 
     def _extract_code_signatures(self, pair: list[dict[str, Any]]) -> list[str]:
@@ -3310,6 +3330,45 @@ class AgentContextOptimizer:
                 seen[digest] = self.content_store.put(content)
                 out.append(msg)
         return out
+
+    @staticmethod
+    def _slice_code_in_text(text: str, query: str) -> str:
+        """Slice each fenced code block in ``text`` to the query-referenced defs (B4).
+
+        Replaces each block with ``slice_code_to_query(code, lang, query)`` — strictly
+        fail-open (unknown language / no match returns the block unchanged) and never
+        expands. Blocks are processed back-to-front so earlier offsets stay valid.
+        Idempotent: re-slicing a collapsed block sees only the kept definitions (all
+        matching the query) and fails open, returning it unchanged — so the transform
+        is cache-stable when applied on every turn.
+        """
+        blocks = extract_code_blocks(text)
+        if not blocks:
+            return text
+        result = text
+        for lang, code, start, end in reversed(blocks):
+            lang_id = LANG_MAP.get(lang, lang) if lang else detect_language_and_id(code)
+            sliced = slice_code_to_query(code, lang_id or "generic", query)
+            if sliced != code:
+                result = result[:start] + f"```{lang}\n{sliced}\n```" + result[end:]
+        return result
+
+    def _slice_message_code_to_query(self, msg: dict[str, Any], query: str) -> dict[str, Any]:
+        """Per-message wrapper: slice code blocks in the content to ``query`` (B4)."""
+        if msg.get("role") not in ("tool", "assistant", "user"):
+            return msg
+        # Never rewrite the append-only rolling-summary block.
+        if self._is_summary_block(msg):
+            return msg
+        content = msg.get("content") or ""
+        if not isinstance(content, str) or "```" not in content:
+            return msg
+        sliced = self._slice_code_in_text(content, query)
+        if sliced == content:
+            return msg
+        new_msg = dict(msg)
+        new_msg["content"] = sliced
+        return new_msg
 
     def _compress_user_paste_message(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Per-message wrapper around user-paste compression for the floor-bound transform."""

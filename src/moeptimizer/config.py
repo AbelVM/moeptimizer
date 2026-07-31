@@ -369,6 +369,19 @@ class AgenticConfig(BaseModel):
         description="Only dedup tool outputs at least this many chars (for smaller "
                     "outputs the reference marker would outweigh the saving).",
     )
+    code_slicing_enabled: bool = Field(
+        default=False,
+        description=(
+            "Query-aware syntactic code slicing (review §4.5.3 / Forward plan B4). For "
+            "a message containing fenced code, keep the imports header plus the "
+            "top-level definitions whose names appear in the session's original "
+            "request, collapsing the rest (slice_code_to_query, tree-sitter). Strictly "
+            "fail-open (unknown language / no match / never-expands). The query is the "
+            "stable original request, so slicing is deterministic and cache-stable when "
+            "applied as a boundary transform. OFF by default: it is context-dependent "
+            "and should be benchmarked before enabling."
+        ),
+    )
     user_paste_compression_enabled: bool = Field(
         default=True,
         description=(

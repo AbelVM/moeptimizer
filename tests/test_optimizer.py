@@ -134,6 +134,40 @@ class TestAgentContextOptimizer:
         out = self.optimizer._dedup_repeated_tool_outputs(msgs)
         assert out[1]["content"] == small  # not collapsed (below min_chars)
 
+    def test_slice_code_in_text_slices_to_query(self) -> None:
+        """B4 (review §4.5.3): a fenced block is sliced to the query-referenced defs,
+        keeping the imports header and collapsing the unrelated siblings."""
+        text = (
+            "Here is the file:\n"
+            "```python\n"
+            "import os\n\n"
+            "def alpha():\n    return 1\n\n"
+            "def beta():\n    return 2\n\n"
+            "def gamma():\n    return 3\n"
+            "```\n"
+        )
+        sliced = AgentContextOptimizer._slice_code_in_text(text, "refactor the beta function")
+        assert "def beta():" in sliced
+        assert "import os" in sliced
+        assert "def alpha" not in sliced
+        assert "def gamma" not in sliced
+        assert "collapsed" in sliced
+        assert "Here is the file:" in sliced  # surrounding prose preserved
+
+    def test_slice_code_in_text_is_idempotent(self) -> None:
+        """Re-slicing a collapsed block fails open (all kept defs match) => stable."""
+        text = "```python\ndef alpha():\n    return 1\n\ndef beta():\n    return 2\n```"
+        once = AgentContextOptimizer._slice_code_in_text(text, "beta")
+        twice = AgentContextOptimizer._slice_code_in_text(once, "beta")
+        assert twice == once
+
+    def test_slice_code_in_text_no_match_unchanged(self) -> None:
+        text = "```python\ndef alpha():\n    return 1\n```"
+        assert AgentContextOptimizer._slice_code_in_text(text, "zzz") == text
+
+    def test_code_slicing_off_by_default(self) -> None:
+        assert self.optimizer._config.agentic.code_slicing_enabled is False
+
     def test_set_token_calibration_clamps_and_scales(self) -> None:
         # ratio clamped to [0.5, 2.0]
         self.optimizer.set_token_calibration(10.0)
