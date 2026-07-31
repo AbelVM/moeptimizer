@@ -56,12 +56,33 @@ pre-existing failures — zero new; ruff 1 pre-existing; mypy 59, zero new;
 | §4.2.6 redundant volatile anchor | ✅ gated | `volatile_quality_anchor_enabled` (default `true` = current behavior); the anchor is a 3rd copy of the original request (also in frozen prefix + summary head) — set `false` to drop ~900 chars/over-budget-turn once benchmark quality confirms; test added |
 | §4.3.3 evicted-code skeleton index | ✅ already present | the `code_ledger` (`CODE_LEDGER_MAX_SIGS`) already accumulates evicted-turn code signatures into a compact index |
 
+**Adaptive budget — code-density term (implemented, but see caveat):**
+`adaptive_code_density_factor` (default 0.25) grows the budget by a fraction of the
+request's code tokens (§3.1 task-complexity signal). Implemented + tested +
+cache-stable. **Caveat (measured):** on the 262K-window opencode benchmark it has
+**zero effect** — the budget ceiling (~39K) is already far above the ~22K context
+(4% utilization), so the budget is non-binding and the term changes nothing. The
+folds that drive the reuse regression come from the turn-count-based **DRIFT
+trigger** (`live_count > keep + fold_margin` in `hierarchical_summarizer.py`), which
+a budget term cannot influence. The code-density term only matters when the budget
+is binding (a smaller window or a much larger working set).
+
+**The reuse regression needs fold-geometry work, not budget tuning.** The binding
+constraint on context size is the fold (it keeps the context at ~15–22K), not the
+budget. To reduce fold frequency (and recover reuse/TTFT) the options are: (a) widen
+the DRIFT `fold_margin` / keep window — but `CLIF_RESEARCH.md` #28 measured that
+rarer folds *increased* breaks (10→12) and ballooned the context (18K→24K) with the
+old fixed budget, so this is risky and needs re-validation under the adaptive budget;
+or (b) a compaction-geometry change (e.g. summary at the tail, or append-only with
+backend `--context-shift`) — the durable fix, but a major architectural change
+(Phase 4 territory, needs maintainer design discussion).
+
 **Deferred to a benchmark-validated follow-up:**
 - §4.8.4 quality-profile-vs-env precedence — config-semantics change conflicting with
   existing tests and the cliff-fix `.env`; handle with a budget-config redesign.
-- §3.1 adaptive budget **full policy** (code-density/codebase signals + cache-break
-  amortization trigger) — cache-sensitive; needs a benchmark to validate the
-  fold-timing change. The skeleton (above) already captures the main win.
+- §3.1 adaptive budget **amortization trigger** — fold only when amortized prefill
+  savings exceed the re-prefill cost. Now confirmed to require fold-geometry work
+  (above), not a budget knob; risky per CLIF #28.
 - §4.4.1 zero-copy SSE passthrough — a rewrite of the working streaming path; the
   proxy must inspect every chunk (usage / thinking / content), so the "minimal"
   benefit is limited. Needs careful design.
@@ -72,6 +93,54 @@ pre-existing failures — zero new; ruff 1 pre-existing; mypy 59, zero new;
   siblings) — needs relevance detection; builds on the tree-sitter plumbing.
 
 **Not started:** Phase 4 (god-object decomposition of the 3.4K-line `optimizer.py`).
+
+---
+
+## Latest benchmark — `0.7.26_fix2` (post-Phase-1/2/3)
+
+Single-round opencode run (30 turns, `balanced`, 262K window) after Phases 1–3,
+compared against the pre-Phase-1 `0.7.26_fix` baseline. **The result is a clear
+tradeoff — quality and token savings improved; prefix-cache reuse and TTFT
+regressed.**
+
+| Metric | `fix` (pre-P1) | `fix2` (post-P3) | Direction |
+|---|---|---|---|
+| ROUGE-L F1 (mean) | 0.139 | **0.247** | ✅ +78% |
+| token-Jaccard (mean) | 0.138 | **0.237** | ✅ +72% |
+| `length_ratio` (mean) | 2.02 | **0.888** | ✅ verbosity fixed (proxy was 2× too long) |
+| `code_syntax_validity` | 0.95 | 0.967 | ✅ |
+| Token savings | 58.0% | **66.2%** | ✅ |
+| Final context / utilization | 18.6K / 7.1% | **10.7K / 4.1%** | ✅ leaner |
+| **Prefix-cache reuse ratio** | 0.81 | **0.48** | ❌ −41% |
+| per-turn `cached` (mean) | 8,810 | **4,098** | ❌ |
+| TTFT mean (proxy / direct) | 23.2 / 14.3 s | **26.6 / 13.3 s** | ❌ proxy ~2× direct |
+| TTFT median (proxy / direct) | 8.6 / 16.5 s | 18.8 / 14.2 s | ❌ (median regressed) |
+| Contradictions (proxy / direct) | 33 / 39 | **40 / 19** | ❌ proxy now > direct |
+
+**Root cause of the reuse/TTFT regression (from the per-turn log):** the proxy's
+backend `cached` collapses to **~864 tokens (frozen prefix only)** on ~12 break
+turns, with long consecutive runs (16–18, 21–23, 27–30) where the rolling-summary
+**fold fires every turn**, re-prefilling the whole ~12–15K body each time. The
+dry-run (proxy-side common-prefix) shows only 7 breaks, so the backend is breaking
+cache *more* than the optimized prompt changes — the fold is firing too aggressively
+in the back half of the session. This is precisely what the **deferred
+adaptive-budget amortization trigger** (§3.1) is meant to fix: fold only when the
+cumulative prefill saved over the remaining horizon exceeds the one-time re-prefill
+cost. At 4% window utilization there is no space pressure justifying a fold every
+turn.
+
+**What improved and why:** the error-aware tool-output compression (§4.1.1) collapses
+passing-test/progress noise and keeps diagnostics, so tool outputs are much smaller
+(leaner context, +8pt savings) and the model sees cleaner input (ROUGE-L/Jaccard up,
+verbosity normalized). The quality gains are real and substantial.
+
+**Honest assessment:** the mission is TTFT **+** quality. Phase 1–3 delivered the
+quality half but regressed the TTFT half via over-aggressive folding. The
+highest-value next work is the **amortization trigger** to make folds rare (the
+context is at 4% of the window — folds are buying nothing in space terms), which
+should recover reuse/TTFT *while keeping* the quality gains. The contradictions
+uptick (proxy 40 vs direct 19) also argues for folding less (less lossy
+summarization).
 
 ---
 

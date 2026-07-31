@@ -129,6 +129,9 @@ class AgentContextOptimizer:
         # Drives the adaptive budget's horizon term (review §3.1): a longer session
         # gets a larger cached working set. Incremented once per top-level optimize.
         self._turns_seen: int = 0
+        # Code volume (tokens) in the current request; the adaptive budget's
+        # task-complexity term (review §3.1). Recomputed each optimize.
+        self._recent_code_tokens: int = 0
         self.store = AgentStateStore()
         self.context_aligner = get_context_aligner()
 
@@ -381,6 +384,14 @@ class AgentContextOptimizer:
         cfg = self._config.agentic
         budget = base + cfg.adaptive_horizon_growth_tokens * self._turns_seen
 
+        # Task-complexity term (review §3.1): a code-heavy request grows the budget
+        # so more verbatim code survives (and the fold pressure target rises, so
+        # code-heavy sessions fold less often). getattr: _budget_tokens() is also
+        # called during __init__ before this attribute exists.
+        code_tokens = getattr(self, "_recent_code_tokens", 0)
+        if cfg.adaptive_code_density_factor and code_tokens:
+            budget += int(cfg.adaptive_code_density_factor * code_tokens)
+
         window = self._backend_context_window()
         if window is not None and window > 0:
             ceiling = int(window * cfg.adaptive_window_fraction)
@@ -393,6 +404,23 @@ class AgentContextOptimizer:
             budget = max(budget, last)
 
         return max(1, round(budget * self._token_calibration))
+
+    @staticmethod
+    def _count_code_tokens(messages: list[dict[str, Any]]) -> int:
+        """Estimate tokens inside fenced code blocks across ``messages``.
+
+        Cheap char-based estimate (chars/4) of code-fence content only — used as
+        the adaptive budget's task-complexity signal (review §3.1), not for exact
+        counting. Returns 0 when there is no fenced code.
+        """
+        code_chars = 0
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, str) or "```" not in content:
+                continue
+            for match in re.finditer(r"```[\s\S]*?```", content):
+                code_chars += len(match.group(0))
+        return code_chars // 4
 
     def _effective_budget_tokens(self) -> int:
         """Return the budget actually enforced this turn, with the growth ceiling.
@@ -1078,6 +1106,10 @@ class AgentContextOptimizer:
         # ``current_tokens`` and only recompute it right after a stage mutates
         # ``optimized``. Every gate below reads this variable instead of calling
         # count_messages again.
+        # Task-complexity signal for the adaptive budget (review §3.1): the code
+        # volume in the current request, read by _adaptive_budget_tokens below so a
+        # code-heavy turn keeps a larger budget (more verbatim code, fewer folds).
+        self._recent_code_tokens = self._count_code_tokens(messages)
         max_tokens = self._effective_budget_tokens()
         proactive_threshold_tokens = int(max_tokens * self._config.agentic.proactive_trim_ratio)
         compaction_threshold_tokens = int(max_tokens * self._config.agentic.compaction_trigger_ratio)

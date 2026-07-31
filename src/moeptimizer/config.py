@@ -141,6 +141,16 @@ class AgenticConfig(BaseModel):
                     "(7% utilization on 262K). 0.15 lets a long session grow toward ~15% of the "
                     "window before the fold engages. Only used when adaptive_budget_enabled.",
     )
+    adaptive_code_density_factor: float = Field(
+        default=0.25,
+        description="Task-complexity term of the adaptive budget (review §3.1): the budget grows by "
+                    "this fraction of the code tokens present in the current request, so a code-heavy "
+                    "turn (refactor/debug with large file reads) keeps more verbatim code instead of "
+                    "skeletonizing it, while a prose-only turn keeps a tighter budget. Raising the "
+                    "budget also raises the fold pressure target indirectly, so code-heavy sessions "
+                    "fold less often (better prefix-cache reuse). 0 disables the term. Only used when "
+                    "adaptive_budget_enabled.",
+    )
     max_context_growth_per_turn: int = Field(
         default=1500,
         description="Hard ceiling on how much the OPTIMIZED context may GROW in a single turn "

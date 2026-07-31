@@ -1744,3 +1744,36 @@ class TestAdaptiveBudget:
         opt._turns_seen = 30
         # Horizon must not move the budget once adaptive is off.
         assert opt._budget_tokens() == fixed_at_0
+
+    def test_count_code_tokens_counts_only_fenced_code(self) -> None:
+        msgs = [
+            {"role": "user", "content": "prose only, no code here"},
+            {"role": "assistant", "content": "```python\n" + "x = 1\n" * 40 + "```"},
+        ]
+        # ~200 chars of code / 4 ≈ 50 tokens; prose contributes nothing.
+        assert AgentContextOptimizer._count_code_tokens(msgs) > 0
+        assert AgentContextOptimizer._count_code_tokens([msgs[0]]) == 0
+
+    def test_budget_grows_with_code_density(self) -> None:
+        opt = self._opt()
+        opt._last_optimized_token_count = None
+        opt._turns_seen = 0
+        opt._recent_code_tokens = 0
+        prose_budget = opt._budget_tokens()
+        opt._recent_code_tokens = 8000  # a code-heavy turn
+        code_budget = opt._budget_tokens()
+        assert code_budget > prose_budget
+        assert code_budget - prose_budget == int(
+            opt._config.agentic.adaptive_code_density_factor * 8000
+        )
+
+    def test_code_density_disabled_by_zero_factor(self) -> None:
+        opt = self._opt()
+        opt._config.agentic.adaptive_code_density_factor = 0.0
+        opt._last_optimized_token_count = None
+        opt._turns_seen = 0
+        opt._recent_code_tokens = 0
+        base = opt._budget_tokens()
+        opt._recent_code_tokens = 8000
+        # Zero factor: code volume must not move the budget.
+        assert opt._budget_tokens() == base
