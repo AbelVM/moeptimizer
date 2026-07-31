@@ -240,8 +240,8 @@ quality loss.
 
 | # | Item | Refs | Effort |
 |---|---|---|---|
-| B1 | ⬜ **Reversible compression + retrieval handles** — content-addressed store + MCP-style `expand(id)`; ends irreversible information loss (the low semantic-similarity / `code_block_loss` driver). | §4.1.2 | **[L]** |
-| B2 | ⬜ **Cached re-read collapse + global code dedup** — `[file X unchanged since turn N]` reference + SHA-256 whole-file registry across turns. | §4.1.3, §4.5.2 | **[M]** |
+| B1 | 🟡 **Reversible compression + retrieval handles** — per-session content-addressed `ContentStore` + handle embedded in the compressed placeholder + `GET /v1/agent/sessions/{id}/content/{handle}` retrieval (commit `e21675b`, config-gated OFF). **Pending:** the model-facing `expand(id)` tool that calls the endpoint. | §4.1.2 | **[L]** |
+| B2 | ⬜ **Cached re-read collapse + global code dedup** — `[file X unchanged since turn N]` reference + SHA-256 whole-file registry across turns. Can build on B1's `ContentStore`. Must be monotonic/first-appearance to stay cache-stable. | §4.1.3, §4.5.2 | **[M]** |
 | B3 | ⬜ **Volatile-field relocation** — move dates / UUIDs / SHAs / timestamps out of the cacheable prefix. | §4.1.4, §4.7.4 | **[M]** ⚠ cache |
 | B4 | 🟡 **Wire syntactic code slicing into the pipeline** behind a config gate (default OFF), compressing on first appearance (depends on A4). | §4.5.3 | **[M]** ⚠ cache |
 | B5 | ✅ **Fix AST chunk-0 duplicate imports** — body loop skips the header node indices so imports appear only via the per-chunk prefix (done, regression-tested). | §4.5 #5 | **[S]** |
