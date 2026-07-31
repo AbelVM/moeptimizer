@@ -126,8 +126,39 @@ take effect** — with them cleared, the dry-run shows 5 breaks (no cliff).
 - §4.1.2 reversible compression + retrieval handles — a content-addressed store +
   `expand(id)` tool (MCP-style); a substantial new feature changing the interaction
   model. Needs dedicated design.
-- §4.5.3 syntactic code slicing (keep only the query-referenced function, stub
-  siblings) — needs relevance detection; builds on the tree-sitter plumbing.
+- §4.5.3 syntactic code slicing — **primitive done** (`slice_code_to_query` in
+  `code_block_optimizer.py`, 11 tests): keeps the imports header + every top-level
+  def named in the query, collapses the rest, strictly fail-open / never-expands.
+  **Pipeline wiring still deferred** (needs a config gate + a compression point that
+  has the current query, and must compress on *first appearance* to avoid a new
+  prefix break). Blocked on the tree-sitter finding below.
+
+**New finding — the tree-sitter AST path is, and has been, silently disabled.** The
+installed `tree_sitter` is **0.25.2**, whose API exposes `tree.root_node`,
+`node.type`, `node.child_count`, `node.byte_range` as **properties** (and
+`byte_range` is a plain `(start, end)` tuple). But `code_chunking.py` calls them as
+**methods** (`tree.root_node()`, `node.kind()`, `node.child_count()`,
+`node.byte_range()` — its docstring even asserts this is "the tree-sitter >= 0.25
+API"). Every one of those raises inside the `try/except Exception` guard, so
+`chunk_code_with_treesitter` **always falls back to line-based `chunk_text_fallback`**
+— verified byte-identical output, and the AST path's signature "prepend imports to
+every chunk" behavior is absent. Net: the project's "language-aware AST chunking"
+has been a silent no-op. This is a concrete instance of the "silently swallowed
+exceptions" weakness (§4.5 #5): uvicorn at `log_level=warning` + blanket
+`except Exception` means a permanently-failing stage leaves no test-visible signal.
+**Resolved:** `code_chunking.py` is ported to the correct 0.25.2 property API
+(`parse(bytes)`, `tree.root_node`, `node.type`, `node.child_count`, `node.byte_range`
+as a `(start, end)` tuple, byte-offset slicing on the encoded bytes) and the AST path
+now genuinely runs — verified output diverges from the line fallback and the imports
+header is prepended to every chunk. `test_ast_path_actually_runs`
+(`tests/test_code_chunking.py`) locks this in by asserting the imports land in a
+non-first chunk (which the fallback never does). `slice_code_to_query` uses the same
+correct API. **Observed wart (pre-existing, now visible):** chunk 0 emits the imports
+twice — once via the header prefix and once as the file's leading top-level nodes;
+only chunk 0 is affected. Left as-is to keep the change scoped to the API fix;
+candidate for a small follow-up (skip header-kind nodes in the body loop). **Because
+this changes chunking output, it needs a benchmark round to confirm no regression in
+token savings / quality / prefix-cache reuse.**
 
 **Phase 4 — god-object decomposition (started).** Extracted `BudgetGovernor`
 (`budget_governor.py`) out of the 3.3K-line `optimizer.py` (~250 lines moved): it
@@ -136,9 +167,23 @@ plus all budget/growth/shrink/dynamic-cap math; the optimizer keeps thin delegat
 Behavior-preserving (dry-run break pattern identical). Remaining god-object work:
 extract the eviction/trim machinery and the stage runner.
 
-**Still deferred:** §4.5.3 syntactic code slicing, §4.1.2 reversible compression +
-retrieval handles, §4.4.1 zero-copy SSE, and interpreting the residual ~7 breaks via
-per-turn backend-cache attribution.
+**Per-turn break attribution (done — verbose dry-run, post-fix breaks `[14,19,20,23,26]`):**
+the residual breaks have two distinct causes, visible in the per-turn `msg[i]
+content changed` + `byte_diff first_diff_at_char`:
+- **Fold turns (14, 20, 23, 26):** the first divergent message is the rolling-summary
+  block (`msg[16]` becomes `Context summary (rolling):…` and grows each fold), which
+  shifts the entire live zone after it. This is the summary-in-middle geometry — the
+  durable fix is the compaction-geometry redesign (below), not a knob.
+- **Late tool-output compression (19):** a tool output is compressed *after* first
+  appearance (`msg[26]` pytest output `4998 → 15` chars, `first_diff_at_char=12432`).
+  The output entered the prefix uncompressed, then the boundary filter compressed it
+  a turn later, breaking the prefix at that message. **Fixable:** compress tool
+  outputs on *first appearance* (so the compressed form is what gets cached), which
+  removes this class of break entirely. This is a concrete, safe win worth doing.
+
+**Still deferred:** §4.1.2 reversible compression + retrieval handles, §4.4.1
+zero-copy SSE, and the compaction-geometry redesign (summary placement) that would
+remove the fold-turn breaks.
 
 ---
 
@@ -634,10 +679,15 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    a file printed twice (`cat` in turn 2, `read_file` in turn 5) collapses the second
    to a reference. `chunk_fingerprint.py` exists but is per-chunk; extend to
    whole-file identity. → Phase 3.
-3. **Syntactic code slicing (MED).** For a multi-hundred-line read, keep only the
-   target function/class referenced by the user query and stub siblings with
-   `... # [N lines collapsed]`. `code_block_optimizer.py`/`code_chunking.py` have the
-   tree-sitter plumbing; add a relevance-gated slicer. → Phase 3.
+3. **Syntactic code slicing (MED) — primitive done, wiring pending.** For a
+   multi-hundred-line read, keep only the target function/class referenced by the
+   user query and stub siblings with `# ... [N definitions collapsed]`.
+   `slice_code_to_query` (`code_block_optimizer.py`) implements this against the
+   correct tree-sitter 0.25.2 property API, fail-open + never-expands, 11 tests.
+   Note: the pre-existing "tree-sitter plumbing" in `code_chunking.py` was in fact
+   broken (silent line-fallback — see the tree-sitter finding in the status section);
+   the slicer does not depend on it beyond the parser cache. Remaining: wire into the
+   pipeline behind a config gate, compressing on first appearance. → Phase 3.
 4. **Stop double/triple-copying the original request** (§4.2.6) — ~900 chars/turn.
 
 ### 4.6 Additional MTP-preservation techniques

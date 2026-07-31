@@ -218,12 +218,13 @@ def chunk_code_with_treesitter(
     Preserves file-level imports as a header prefix in each chunk.
     Falls back to line-based chunking for unknown languages or parse failures.
 
-    Uses tree-sitter >= 0.25 API where:
-    - tree.root_node() is callable
-    - node.kind() returns the node type string
-    - node.byte_range() returns ByteRange with .start and .end
-    - node.child_count() is callable
-    - node.child(i) returns the i-th child
+    Uses the tree-sitter 0.25 property API where:
+    - parser.parse() takes a bytestring
+    - tree.root_node is a property
+    - node.type is the node kind string (property)
+    - node.byte_range is a (start, end) byte-offset tuple (property)
+    - node.child_count is a property
+    - node.child(i) returns the i-th child (method)
     """
     config = get_config().code_chunking
     max_chars = max_chars or config.chunk_max_chars
@@ -235,20 +236,21 @@ def chunk_code_with_treesitter(
     if parser is None:
         return chunk_text_fallback(code, max_chars)
 
+    code_bytes = code.encode()
     try:
-        tree = parser.parse(code)
-        root_node = tree.root_node()
+        tree = parser.parse(code_bytes)
+        root_node = tree.root_node
     except Exception:
         return chunk_text_fallback(code, max_chars)
 
     def _get_text(node: Any) -> str:
-        """Extract text from a node using byte_range."""
-        br = node.byte_range()
-        return code[br.start : br.end]
+        """Extract text from a node using its byte_range (byte offsets)."""
+        start, end = node.byte_range
+        return code_bytes[start:end].decode(errors="replace")
 
     def _get_kind(node: Any) -> str:
         """Get the kind (type) of a node."""
-        return node.kind()
+        return node.type
 
     chunks: list[str] = []
     current_chunk: list[str] = []
@@ -265,7 +267,7 @@ def chunk_code_with_treesitter(
         "use_declaration",
         "require_statement",
     }
-    for i in range(min(root_node.child_count(), 5)):
+    for i in range(min(root_node.child_count, 5)):
         child = root_node.child(i)
         if _get_kind(child) in header_types:
             file_headers.append(_get_text(child))
@@ -283,14 +285,14 @@ def chunk_code_with_treesitter(
             current_chunk = []
             current_length = 0
 
-    for i in range(root_node.child_count()):
+    for i in range(root_node.child_count):
         child = root_node.child(i)
         node_text = _get_text(child)
         node_len = len(node_text)
 
         if node_len > max_chars:
-            if child.child_count() > 0:
-                for j in range(child.child_count()):
+            if child.child_count > 0:
+                for j in range(child.child_count):
                     sub = child.child(j)
                     sub_text = _get_text(sub)
                     sub_len = len(sub_text)
