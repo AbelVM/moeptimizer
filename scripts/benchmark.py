@@ -4715,8 +4715,16 @@ def print_report(report: BenchmarkReport) -> None:
     code_loss = qual.get("code_block_loss_turns", 0)
     rouge_gap = qual.get("rouge_precision_recall_gap_mean", 0.0)
     quality_skipped = qual.get("quality_skipped_turns", 0)
+    # prompt_faithfulness / evicted_content_recall are aggregated {mean,median,
+    # min,max} dicts in the summary; unwrap to the mean before the float compares
+    # below (REVIEW.md §4.12 #10 — comparing the dict to a float raised TypeError
+    # and crashed the human-readable report after the run completed).
     faith = qual.get("prompt_faithfulness")
+    if isinstance(faith, dict):
+        faith = faith.get("mean")
     evict_recall = qual.get("evicted_content_recall")
+    if isinstance(evict_recall, dict):
+        evict_recall = evict_recall.get("mean")
 
     degradation_notes: list[str] = []
     if quality_skipped > 0:
