@@ -3477,6 +3477,22 @@ class BenchmarkReport:
         direct_ttft = [t.direct.ttft_ms for t in self.turns if t.direct.ttft_ms is not None]
         proxy_ttft = [t.proxy.ttft_ms for t in self.turns if t.proxy.ttft_ms is not None]
 
+        # ── Cache → TTFT (review §4.12.3 / Forward plan D2) ─────────────
+        # fresh_prefill = prompt_tokens − cached_tokens: the tokens the backend
+        # actually re-prefilled this turn. Correlating it with proxy TTFT quantifies
+        # the cache-instability → TTFT mechanism (a strong positive correlation means
+        # more re-prefill ⇒ slower first token), so a reuse regression is caught even
+        # before the aggregate TTFT mean moves.
+        fresh_prefill = [
+            float(max(0, t.proxy.prompt_tokens - t.proxy.cached_tokens)) for t in self.turns
+        ]
+        fresh_prefill_ttft_pairs = [
+            (float(max(0, t.proxy.prompt_tokens - t.proxy.cached_tokens)), t.proxy.ttft_ms)
+            for t in self.turns
+            if t.proxy.ttft_ms is not None
+        ]
+        cache_ttft_correlation = _pearson(fresh_prefill_ttft_pairs)
+
         # ── Proxy overhead (X-Proxy-Process-Ms, when the proxy emits it) ─
         proxy_process = [t.proxy.proxy_process_ms for t in self.turns if t.proxy.proxy_process_ms is not None]
 
@@ -3509,6 +3525,10 @@ class BenchmarkReport:
             "ttft_ms": {
                 "direct": _stats(direct_ttft),
                 "proxy": _stats(proxy_ttft),
+            },
+            "cache_ttft": {
+                "fresh_prefill_tokens": _stats(fresh_prefill) if fresh_prefill else {},
+                "fresh_prefill_vs_ttft_correlation": cache_ttft_correlation,
             },
             "proxy_overhead_ms": _stats(proxy_process) if proxy_process else {},
             "tokens": {
@@ -3699,6 +3719,24 @@ def _paired_sign_test(diffs: list[float]) -> tuple[int, int]:
     pos = sum(1 for d in diffs if d > 0)
     neg = sum(1 for d in diffs if d < 0)
     return (pos, neg)
+
+
+def _pearson(pairs: list[tuple[float, float]]) -> float | None:
+    """Pearson correlation coefficient for (x, y) pairs, or None when undefined
+    (< 2 pairs or zero variance in either variable)."""
+    n = len(pairs)
+    if n < 2:
+        return None
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    mx = statistics.fmean(xs)
+    my = statistics.fmean(ys)
+    num = sum((x - mx) * (y - my) for x, y in pairs)
+    den_x = sum((x - mx) ** 2 for x in xs) ** 0.5
+    den_y = sum((y - my) ** 2 for y in ys) ** 0.5
+    if den_x == 0 or den_y == 0:
+        return None
+    return round(num / (den_x * den_y), 4)
 
 
 # ---------------------------------------------------------------------------
