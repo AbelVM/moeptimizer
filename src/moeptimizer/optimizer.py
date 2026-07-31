@@ -2457,9 +2457,13 @@ class AgentContextOptimizer:
         if current_pair:
             pairs.append(current_pair)
 
-        # Drop from front until under budget.
+        # Drop from front until under budget. Measure the body in calibrated
+        # (backend-true) tokens so it is comparable to the calibrated budget the
+        # callers pass (review §4.8.6 / Forward plan A5) — summing raw per-pair
+        # counts against a calibrated budget left the result off by up to the
+        # calibration factor.
         if use_tokens:
-            total = sum(self.token_counter.count_messages(pair) for pair in pairs)
+            total = sum(self.calibrated_token_count(pair) for pair in pairs)
         else:
             total = sum(len(m.get("content") or "") for p in pairs for m in p)
 
@@ -2499,7 +2503,7 @@ class AgentContextOptimizer:
             if not pairs:
                 break
             if use_tokens:
-                total -= self.token_counter.count_messages(pairs[0])
+                total -= self.calibrated_token_count(pairs[0])
             else:
                 total -= sum(len(m.get("content") or "") for m in pairs[0])
             ledger_sigs.extend(self._extract_code_signatures(pairs[0]))
@@ -2945,7 +2949,7 @@ class AgentContextOptimizer:
                 size in tokens (P0.6 per-turn shrink cap).
         """
         if use_tokens:
-            total_tokens = self.token_counter.count_messages(messages)
+            total_tokens = self.calibrated_token_count(messages)
             if total_tokens <= target:
                 return messages
         else:
@@ -2956,8 +2960,10 @@ class AgentContextOptimizer:
         system_anchor, evictable_body, protected_tail = self._partition_for_budget(messages)
 
         if use_tokens:
-            reserved = (self.token_counter.count_messages(system_anchor)
-                        + self.token_counter.count_messages(protected_tail))
+            # Calibrated counts throughout so the (calibrated) target is compared
+            # against calibrated reserved/body sizes (review §4.8.6 / Forward plan A5).
+            reserved = (self.calibrated_token_count(system_anchor)
+                        + self.calibrated_token_count(protected_tail))
             evictable_budget = max(0, target - reserved)
             # P0.6: convert the whole-context floor to an evictable-body floor.
             if shrink_floor is not None:
