@@ -227,10 +227,10 @@ few turns. Highest-ROI remaining work; unblocks append-only (F3).
 | # | Item | Refs | Effort |
 |---|---|---|---|
 | A1 | 🟡 **Adaptive budget — full policy + cache-break amortization trigger.** Add task-complexity / code-density / codebase-size signals to the ceiling; fold only when `marginal_per_turn_prefill × remaining_turns > re_prefill_cost`. **A1-lite done:** `fold_window_fraction` default `0.25` (space-based folding) → **zero dry-run breaks**; the full horizon/complexity amortization policy is still pending. | §3.1, §4.2.2, §4.7.2 | **[L]** |
-| A2 | 🟡 **Single size governor.** Collapse the 6 governors into `BudgetGovernor` + `PrefixLayout`; delete `_proactive_trim` & `_sliding_window_trim`; add `evictable_budget ≤ 0 → return` to the truncator + compactor. | §4.2.1, §4.7.1 | **[M]** |
+| A2 | ⬜ **Single size governor.** Collapse the 6 governors into `BudgetGovernor` + `PrefixLayout`; delete `_proactive_trim` & `_sliding_window_trim`; add `evictable_budget ≤ 0 → return` to the truncator + compactor. **Deferred:** maintainability consolidation that is dormant under the space-based-folding default and would remove the still-tested turn-count fallback (AGENTS.md cautions against large pipeline refactors as an early change). | §4.2.1, §4.7.1 | **[M]** |
 | A3 | ⬜ **Compaction-geometry redesign.** Relocate the rolling summary so a fold does not shift the live zone — removes the fold-turn breaks (14/20/23/26) from the per-turn attribution. Only needed for window-bound sessions now that A4 + A1-lite give zero breaks at low utilization. | break attribution | **[L]** ⚠ cache |
 | A4 | ✅ **Compress tool outputs on first appearance** (monotonic) so the cached form *is* the compressed form — removed the turn-19 late-compression break class (commit `1a271a9`; dry-run breaks 5 → 3). | break attribution | **[S]** ⚠ cache |
-| A5 | 🟡 **Calibrated-token consistency** across the partition/evict boundary (one count throughout the governor). | §4.8.6 | **[S]** |
+| A5 | ✅ **Calibrated-token consistency** across the partition/evict boundary — `_evict_for_budget` + `_proactive_trim` now measure the body in calibrated tokens, matching the calibrated budget (commit `240321f`). | §4.8.6 | **[S]** |
 
 *Gate:* dry-run breaks **≤ 3** (fold turns only); backend prefix-cache reuse **≥ 0.8**;
 proxy **TTFT mean ≤ direct**; benchmark vs `fix2` shows reuse recovered **without**
@@ -265,9 +265,9 @@ quality loss.
 |---|---|---|---|
 | D1 | 🟡 **Real TTFT + fresh-prefill telemetry** — per-turn `(prompt − cached)` series + live/frozen/summary breakdown in the session-debug endpoint. | §4.11.2 | **[M]** |
 | D2 | 🟡 **cache → TTFT correlation metric** (+ plot) to prove the mechanism and guard it. | §4.12.3 | **[S]** |
-| D3 | 🟡 **Quality regression-gate hardening** + ⬜ drop the weak code embedder from the headline gate (gate on the robust headline block). | §4.12.6, §4.12.4 | **[S]** |
+| D3 | ✅ **Quality regression-gate hardening** — gate + diff table now read lexical metrics from `secondary_quality` (they were silently zeroed by a wrong path), add `code_syntax_validity`, and flag `length_ratio` outside [0.5, 2.0] (commit `3b4cf94`). The gate already preferred the lexical battery over the weak embedder (§4.12.4 mostly pre-done). | §4.12.6, §4.12.4 | **[S]** |
 | D4 | 🟡 **Make degradation visible** — embedding-breaker state + consistently-failing stages in `/v1/metrics` + `X-MOEPT-Optimization-Degraded`. | §4.11.3, §4.8.5 | **[M]** |
-| D5 | 🆕 **Fix `print_report` faith-dict crash** — read `faith["mean"]` (guard `isinstance(dict)`); benchmark-only. | §4.12 #10 | **[S]** |
+| D5 | ✅ **Fix `print_report` faith-dict crash** — unwrap `prompt_faithfulness`/`evicted_content_recall` to the mean (commit `bba5daa`); benchmark-only. | §4.12 #10 | **[S]** |
 | D6 | ⬜ **Multi-file agentic replay fixtures** (real test / lint / compiler failures). | §4.12.9 | **[M]** |
 
 *Gate:* `/v1/metrics` exposes true TTFT + fresh-prefill + degradation; the regression
@@ -280,7 +280,7 @@ gate uses the headline block; `print_report` runs clean (non-`--json` path no lo
 | E1 | 🟡 **Decompose the god object** — extract `PrefixLayout` + `StageRunner` (`BudgetGovernor` already out); `optimizer.py` < ~1500 lines. | §4.2.3 | **[L]** |
 | E2 | ⬜ **Typed summary region** replacing the scattered content-marker guards. | §4.7.3 | **[M]** |
 | E3 | ⬜ **Surface persistent stage failures + route mutators through the optimizer lock** (same-session race). | §4.8.5, §4.8.7 | **[M]** |
-| E4 | ⬜ **Session reaper + prune `AgentStateStore.goals`.** | §4.10.3, §4.10.4 | **[S]** |
+| E4 | ✅ **Session reaper + prune `AgentStateStore.goals`** — daemon reaper started/stopped in the lifespan + single-goal store (commit `a6dd948`). | §4.10.3, §4.10.4 | **[S]** |
 | E5 | 🟡 **Executor scaling + real cancellation** (the 2-worker + 300 s-timeout hazard). | §4.9.6 | **[M]** |
 
 *Gate:* `optimizer.py` < ~1500 lines; no stage with two gate predicates; a stage that
