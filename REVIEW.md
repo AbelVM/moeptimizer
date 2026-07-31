@@ -754,7 +754,7 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    count, group lint by file/rule, dedup repeated lines with counts. This is the
    single highest-value missing optimization and directly improves quality (the
    model keeps the diagnostic signal) *and* token count. → Phase 2.
-2. ⬜ **Reversible compression with retrieval handles (HIGH).** headroom/lean-ctx
+2. 🟡 **Reversible compression with retrieval handles (HIGH).** headroom/lean-ctx
    replace large payloads with a compact placeholder + a handle, store the original
    locally, and let the model request it via a tool (`headroom_compress`/
    `headroom_retrieve`; lean-ctx cached re-reads ≈ 13 tokens). The proxy currently
@@ -762,7 +762,10 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    into a summary, the detail is gone, which is a driver of the low semantic
    similarity and `code_block_loss`. A content-addressed store + an MCP-style
    `expand(id)` tool would let the proxy keep the context lean *without* permanent
-   information loss. → Phase 3 (larger).
+   information loss. **Done (B1, `e21675b`, config-gated OFF):** per-session
+   content-addressed `ContentStore` + handle in the placeholder + HTTP retrieval
+   (`GET /v1/agent/sessions/{id}/content/{handle}`); the model-facing `expand(id)`
+   tool is the pending half. → Phase 3 (larger).
 3. ⬜ **Cached re-read collapse (MED).** lean-ctx collapses a repeated file read to a
    ~13-token reference. `delta_encoder.py` already diffs a re-read against the prior
    snapshot, but only when the prior version is still in context; it could go
@@ -969,10 +972,11 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    the boundary transforms and the `_volatile_turn`/`_code_ledger` injections are
    places where structure can shift; ensure injected messages are well-formed
    ChatML and never split a code fence. → Phase 3 (hardening).
-3. 🟡 **Verbatim `<think>` preservation (positive).** `thinking_preserver` is a no-op
-   *because* thinking is already echoed back by the client; this is correct — but
-   `capture_thinking`/re-injection in `app.py` should be verified to round-trip
-   `reasoning_content` byte-for-byte (any normalization invalidates the cache). → Phase 3.
+3. ✅ **Verbatim `<think>` preservation (positive).** `thinking_preserver` is a no-op
+   *because* thinking is already echoed back by the client; this is correct — and
+   `capture_thinking`/re-injection in `app.py` is verified to round-trip
+   `reasoning_content` byte-for-byte (F2, `f8b1239`: regression test with awkward
+   whitespace/unicode, no mutation, client-echoed reasoning never overwritten). → Phase 3.
 
 ### 4.7 Additional model KV-cache preservation techniques
 
@@ -1146,14 +1150,15 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    initialized service (`app.py:1133`) and a separate embed client (`app.py:1136`) —
    three independent stacks. **Fix:** share one initialized `EmbeddingService`
    (also fixes §4.8.1). → Phase 1.
-3. ⬜ **MED — lazy session expiry; no reaper.** `_cleanup_expired` runs only inside
-   `get_or_create` (`session_manager.py:138-146`); idle expired optimizers linger
-   until the next create, so the memory high-water mark tracks peak concurrent
-   sessions forever (`session_timeout=3600`). **Fix:** a lightweight background reaper
-   started in `lifespan`. → Phase 2.
-4. ⬜ **MED — `AgentStateStore.goals` never pruned** (`state_store.py:156-160`); old
-   `GoalNode`s accumulate and are re-serialized into every `get_session_state`.
-   **Fix:** keep only the current goal. → Phase 4.
+3. ✅ **MED — lazy session expiry; no reaper.** `_cleanup_expired` ran only inside
+   `get_or_create`; idle expired optimizers lingered until the next create, so the
+   memory high-water mark tracked peak concurrent sessions forever. **Fixed (E4,
+   `a6dd948`):** an idempotent daemon reaper (interval = half the session timeout,
+   capped to [1,60] s) started/stopped in the lifespan. → Phase 2.
+4. ✅ **MED — `AgentStateStore.goals` never pruned**; old `GoalNode`s accumulated and
+   were re-serialized into every `get_session_state`. **Fixed (E4, `a6dd948`):**
+   `set_goal` keeps only the current goal (the optimizer already guards it with
+   `not get_goal()`, so this makes the single-goal invariant explicit). → Phase 4.
 5. ✅ **Positive:** `cache_registry.py` (cap 1000/map), `cache.py` LRU, and
    `_ProxyMetrics._per_session` are correctly bounded.
 
@@ -1163,12 +1168,13 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    over the quality profile (§4.8.4); document the precedence clearly. Today an
    operator cannot tune the budget without also setting the profile, which is a
    foot-gun discovered the hard way in `CLIF_RESEARCH.md`.
-2. 🟡 **Real TTFT + cache-reuse telemetry (HIGH).** The proxy's `/v1/metrics` "TTFT" is
-   mislabeled (it is end-to-end latency, §4.12); expose a *true* first-token time and
-   a per-turn `(prompt_tokens − cached_tokens)` "fresh prefill" series so operators
-   can see the cache→TTFT link directly. The `/v1/agent/sessions/{id}/debug` endpoint
-   exists — add the live-zone/frozen/summary token breakdown there (Gemini §2.11 had
-   this right).
+2. 🟡 **Real TTFT + cache-reuse telemetry (HIGH).** The true first-token time landed
+   in Phase 2 (§4.12.1, `avg_ttft_ms` distinct from latency), and **D1 (`c43b4b6`)**
+   added the per-turn `(prompt_tokens − cached_tokens)` "fresh prefill" series
+   (`avg_fresh_prefill_tokens`, global + per-session) next to TTFT so operators see
+   the cache→TTFT link directly. **Pending:** the live-zone/frozen/summary token
+   breakdown in the `/v1/agent/sessions/{id}/debug` endpoint (needs the optimizer to
+   expose zone sizes).
 3. 🟡 **Make degradation visible (MED).** Surface the embedding-breaker state and any
    consistently-failing stage in `/v1/metrics` and the `X-MOEPT-Optimization-Degraded`
    header (today the dead RAG never records degradation). → Phase 1.
@@ -1194,29 +1200,30 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    non-fold turns drop below a reuse threshold, e.g. 0.8). Today it is not gated and
    not greenlit (fold turns break). Use the **common-prefix reuse ratio** (the real
    backend metric) not strict `startswith` (the volatile tail differs by design). → Phase 1.
-3. 🟡 **Add a cache→TTFT correlation metric (HIGH).** Report per-turn
-   `fresh_prefill_tokens = prompt_tokens − cached_tokens` alongside TTFT, and a
-   correlation/plot, to *prove* the cache-instability→TTFT mechanism quantitatively
-   and prevent regressions. → Phase 2.
-4. ⬜ **Drop the weak code embedder from the headline gate (MED).** README admits
-   `embed-gemma-300m-FLM` is weak on code; `semantic_similarity` median 0.037 is
-   noise. The regression gate (`--min-similarity`) should lean on the robust headline
-   (`rouge_l_f1`, `token_jaccard`, `code_block_ratio`, `edit_similarity`,
-   `code_syntax_validity`), which the README already separates — make the *gate* use
-   the headline block, not semantic similarity. → Phase 2.
+3. ✅ **Add a cache→TTFT correlation metric (HIGH).** Done (D2, `64a87e0`): the
+   benchmark summary reports per-turn `fresh_prefill_tokens = prompt_tokens −
+   cached_tokens` (full stats) plus `fresh_prefill_vs_ttft_correlation` (Pearson),
+   quantifying the cache-instability→TTFT mechanism so a reuse regression is caught
+   before the aggregate TTFT mean moves. → Phase 2.
+4. ✅ **Drop the weak code embedder from the headline gate (MED).** The gate already
+   preferred the composite lexical battery over `semantic_similarity` (last-resort
+   fallback + a hard floor); D3 (`3b4cf94`) fixed the metric paths (the lexical
+   metrics were read from the wrong summary section and silently zeroed) so the
+   lexical checks actually fire, and added `code_syntax_validity` to the battery. → Phase 2.
 5. ✅ **Make the direct-vs-proxy comparison fair (MED).** If any output-shaping
    instruction is injected into the proxy path only (§4.2.5), the quality comparison
    is biased. Remove `OutputShaper` from the proxy path (recommended) or apply the
    same instruction to the direct baseline. → Phase 1.
-6. 🟡 **The quality regression is now the gate concern (HIGH).** The fresh post-fix
+6. ✅ **The quality regression is now the gate concern (HIGH).** The fresh post-fix
    benchmark traded quality for cache reuse: ROUGE-L F1 0.27 → **0.14**, token-Jaccard
    0.25 → **0.14**, `length_ratio` 0.87 → **2.02** (max 12.3), and
-   `code_syntax_invalid_turns: [8,16]` (proxy emitted broken code). Add an explicit
-   **quality regression gate** alongside the reuse gate: fail if headline
-   `rouge_l_f1` / `token_jaccard` / `code_syntax_validity` drop below the previous
-   round, and flag `length_ratio` outside [0.5, 2.0]. The adaptive budget (§4.2.2)
-   and error-aware/reversible compression (§4.1) are what should move these back up;
-   the benchmark must measure that they do. → Phase 2 gate.
+   `code_syntax_invalid_turns: [8,16]` (proxy emitted broken code). **Done (D3,
+   `3b4cf94`):** the baseline gate now checks `prompt_faithfulness` /
+   `evicted_content_recall` / `code_block_ratio` / `code_syntax_validity` /
+   `rouge_l_f1` / `token_jaccard` / `edit_similarity` (read from the correct summary
+   sections) against the previous round and flags `length_ratio` outside [0.5, 2.0]
+   (informational). The adaptive budget (§4.2.2) and error-aware/reversible
+   compression (§4.1) are what should move these back up; the benchmark measures it. → Phase 2 gate.
 7. ✅ **`context_window_wall` at turn 1 for both sides is a metric bug, not a result
    (MED).** The wall triggers on `code_block_ratio < 0.5 OR semantic_similarity <
    0.3`; turn 1 (a short non-code answer) trips it immediately for *both* direct and
@@ -1231,16 +1238,16 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    visible. → Phase 2 gate.
 9. ⬜ **Multi-file agentic replay (LOW).** Expand `scripts/fixtures` to multi-file
    edits + real test/lint/compiler failures (exercises error-aware compression). → Phase 3.
-10. 🆕 **`print_report` crashes on the faithfulness dict (MED).** `benchmark.py:4728`
-    does `if faith is not None and faith < 0.5`, but `prompt_faithfulness` in the
+10. ✅ **`print_report` crashes on the faithfulness dict (MED).** `benchmark.py:4728`
+    did `if faith is not None and faith < 0.5`, but `prompt_faithfulness` in the
     summary is a **dict** (mean/median/min/max), not a float — so the *human-readable*
-    report path raises `TypeError: '<' not supported between instances of 'dict' and
-    'float'` and exits non-zero *after* the run completes. The `--json` path
+    report path raised `TypeError: '<' not supported between instances of 'dict' and
+    'float'` and exited non-zero *after* the run completes. The `--json` path
     (`json.dump(report.summary())`) does not call `print_report`, so JSON + the
-    `--baseline` regression gate are unaffected. **Fix:** read `faith["mean"]` (guard
-    `isinstance(faith, dict)`), mirroring the `isinstance(..., float)` guards already
-    used in the `--dump-responses` block below it. Trivial; benchmark-only (no proxy
-    behavior). → Phase 2 (benchmark hygiene).
+    `--baseline` regression gate were unaffected. **Fixed (D5, `bba5daa`):** unwrap
+    `prompt_faithfulness`/`evicted_content_recall` to the mean (guard
+    `isinstance(..., dict)`), mirroring the `isinstance(..., float)` guards in the
+    `--dump-responses` block. Benchmark-only (no proxy behavior). → Phase 2 (benchmark hygiene).
 
 ---
 
