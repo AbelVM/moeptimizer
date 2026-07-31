@@ -226,10 +226,10 @@ few turns. Highest-ROI remaining work; unblocks append-only (F3).
 
 | # | Item | Refs | Effort |
 |---|---|---|---|
-| A1 | 🟡 **Adaptive budget — full policy + cache-break amortization trigger.** Add task-complexity / code-density / codebase-size signals to the ceiling; fold only when `marginal_per_turn_prefill × remaining_turns > re_prefill_cost`. *The headline lever.* | §3.1, §4.2.2, §4.7.2 | **[L]** |
+| A1 | 🟡 **Adaptive budget — full policy + cache-break amortization trigger.** Add task-complexity / code-density / codebase-size signals to the ceiling; fold only when `marginal_per_turn_prefill × remaining_turns > re_prefill_cost`. **A1-lite done:** `fold_window_fraction` default `0.25` (space-based folding) → **zero dry-run breaks**; the full horizon/complexity amortization policy is still pending. | §3.1, §4.2.2, §4.7.2 | **[L]** |
 | A2 | 🟡 **Single size governor.** Collapse the 6 governors into `BudgetGovernor` + `PrefixLayout`; delete `_proactive_trim` & `_sliding_window_trim`; add `evictable_budget ≤ 0 → return` to the truncator + compactor. | §4.2.1, §4.7.1 | **[M]** |
-| A3 | ⬜ **Compaction-geometry redesign.** Relocate the rolling summary so a fold does not shift the live zone — removes the fold-turn breaks (14/20/23/26) from the per-turn attribution. | break attribution | **[L]** ⚠ cache |
-| A4 | ⬜ **Compress tool outputs on first appearance** so the cached form *is* the compressed form — removes the turn-19 late-compression break class. | break attribution | **[S]** ⚠ cache |
+| A3 | ⬜ **Compaction-geometry redesign.** Relocate the rolling summary so a fold does not shift the live zone — removes the fold-turn breaks (14/20/23/26) from the per-turn attribution. Only needed for window-bound sessions now that A4 + A1-lite give zero breaks at low utilization. | break attribution | **[L]** ⚠ cache |
+| A4 | ✅ **Compress tool outputs on first appearance** (monotonic) so the cached form *is* the compressed form — removed the turn-19 late-compression break class (commit `1a271a9`; dry-run breaks 5 → 3). | break attribution | **[S]** ⚠ cache |
 | A5 | 🟡 **Calibrated-token consistency** across the partition/evict boundary (one count throughout the governor). | §4.8.6 | **[S]** |
 
 *Gate:* dry-run breaks **≤ 3** (fold turns only); backend prefix-cache reuse **≥ 0.8**;
@@ -396,9 +396,101 @@ metrics it did compare) — a benchmark-script path mismatch worth fixing alongs
 
 **Implication for the plan:** keep the fix (it is the correct behavior, previously
 silently broken, and improves code fidelity), but (a) fix the **chunk-0 duplicate
-imports** wart (Forward plan **B5**) to claw back the extra tokens, and (b) treat the
-real TTFT lever as **Phase A** (rare folds / amortization), not chunking. Re-benchmark
-with ≥3 rounds after B5 + Phase A.
+imports** wart (Forward plan **B5**, ✅ done) to claw back the extra tokens, and
+(b) treat the real TTFT lever as **Phase A** (rare folds / amortization), not
+chunking. Re-benchmark with ≥3 rounds after B5 + Phase A.
+
+### Cache-cliff diagnosis (from the live backend log — drives Phase A)
+
+The `chunkfix_run.log` per-turn `cached` makes the cliff concrete and shows it is
+**worse than the dry-run predicted**. Proxy backend-facing `cached` is excellent for
+turns 1–12 (grows 1,375 → 9,372, ratio > 1.0), then collapses to **863 tokens (the
+frozen prefix only)** on **14 of the 18 back-half turns** (13, 15, 16, 18, 19, 21–27,
+29, 30), re-prefilling ~10–13 K tokens each time. The **direct** path never cliffs —
+`cached` grows monotonically (1,375 → 32,088 by turn 20) because it is append-only.
+The proxy-side dry-run on the same committed code still reports only **5 breaks**
+`[14,19,20,23,26]`, so the backend breaks cache on ~10 turns the dry-run calls REUSED
+(15, 16, 18, 21, 22, 24, 25, 27, 29, 30) — the live (large, varied) responses trigger
+far more head-rewriting than the canned dry-run replay.
+
+**Two prefix-breaking mechanisms (from the dry-run `byte_diff`):**
+- **Folds insert the rolling summary mid-context** (turns 14, 20, 23, 26): `msg[16]`
+  becomes `Context summary (rolling):…` and everything after it shifts
+  (`first_diff_at_char≈7540`). This is the summary-in-middle geometry.
+- **Late, non-monotonic tool-output compression** (turn 19): a pytest output is
+  compressed *after* first appearance (`msg[26]` `4998 → 15` chars → `[pytest result]`,
+  `first_diff_at_char≈12432`). The dry-run also shows tool outputs flipping
+  `15 → 4998 → 15` across turns — compression is **context-dependent and
+  non-monotonic**, so the prefix churns as the context grows.
+
+**The decisive comparison — compact-and-break loses to append-and-reuse at low
+utilization.** Direct carries **44 K** tokens but reuses ~all of them (prefills only
+~2 K new/turn); the proxy compacts to **11 K** but breaks cache and re-prefills ~10 K/turn.
+At **4 % window utilization** there is no space pressure justifying any of this — the
+proxy could append, keep the prefix hot, and prefill only the new tokens, exactly like
+direct. The folds/compaction are buying nothing in space terms and costing the cache.
+
+**Phase A response (priority order) — A4 + A1-lite implemented:**
+1. ✅ **A4 — compress tool outputs on first appearance (monotonic)** (commit
+   `1a271a9`). The boundary filter/compression ran with the per-turn shrink floor,
+   which held live tool outputs back uncompressed and collapsed them only at the
+   stable/live boundary (the turn-19 break). The transforms are idempotent and the
+   stable/live split already keeps the leading prefix stable, so the floor was
+   redundant — removed (`shrink_floor=None`), so each output is frozen into the prefix
+   on first appearance. **Dry-run breaks `[14,19,20,23,26] → [14,20,26]`** (the two
+   compression breaks gone; the rest are folds).
+2. ✅ **A1-lite — utilization-gated folding** via `fold_window_fraction` default
+   `0.0 → 0.25` (config/.env/README updated). This *existing* space-based-folding knob
+   disables the turn-count DRIFT trigger and folds only once the context exceeds the
+   window fraction — pre-A4 it looked useless (the sweep) because compression breaks
+   dominated; with A4 in place it removes the remaining fold breaks. **Dry-run breaks
+   `[14,20,26] → none`**: the conversation goes fully append-only (147 msgs / 13.5 K
+   tok at turn 30, ~5 % of the 262 K window), with folds still available near ~65 K for
+   genuinely long sessions. `0.5` behaves identically (context stays under both); `0.25`
+   is the safer default (folds sooner on very long sessions).
+3. ⬜ **A3 — compaction-geometry redesign** (relocate the summary so a fold doesn't
+   shift the live zone) — only needed for window-bound sessions where folds must fire;
+   at low utilization A4 + A1-lite already give zero breaks.
+
+**Benchmark result — A4 + A1-lite vs `fix2` (opencode/30, 1 round,
+`benchmark_opencode_30_1_0.7.27_phaseA.json`):**
+
+| Metric | `fix2` proxy | **phaseA** proxy | direct | Verdict |
+|---|---|---|---|---|
+| per-turn `cached` (mean) | 4,098 | **10,950** | (grows monotonic) | ✅ **cliff fixed** — cache now grows 0 → 24,254 every turn, **zero** collapses to 863 (was 14/18 back-half turns) |
+| **TTFT mean** | 26.6 s | **7.2 s** | 14.0 s | ✅ **proxy now 1.94× faster than direct** (was ~2× slower) |
+| TTFT median | 18.8 s | **5.0 s** | 14.5 s | ✅ proxy 2.87× faster |
+| Latency mean | 44.0 s | 35.9 s | 35.4 s | ✅ parity with direct |
+| `code_block_ratio` | 0.722 | **0.850** | — | ✅ +0.128 |
+| `code_syntax_validity` | 0.967 | **0.989** | — | ✅ |
+| `rouge_l_f1` | 0.247 | **0.155** | — | ❌ −0.092 |
+| `token_jaccard` | 0.237 | **0.160** | — | ❌ −0.077 |
+| `length_ratio` | 0.888 | **2.46** | — | ❌ proxy responses now 2.46× direct |
+| Token savings | 66.2 % | **54.1 %** | — | ❌ −12.1 pp |
+
+**The cache cliff is robustly fixed and the mission TTFT goal is met** — the proxy
+reuses its whole prefix every turn (per-turn `cached` 4,098 → 10,950; the monotonic
+0 → 24,254 growth is the append-only signature direct shows) and **TTFT mean drops
+26.6 → 7.2 s, now 1.94× faster than direct** (2.87× on median). Code-structure quality
+improves (`code_block_ratio` +0.128, `code_syntax_validity` 0.967 → 0.989).
+
+**The cost is a deliberate tradeoff, and the regression gate FAILS on it (exit 2):**
+token savings fall **66.2 → 54.1 %** (−12.1 pp, beyond the 0.05 tolerance) because
+append-only carries more context instead of folding it. Lexical similarity to direct
+also regresses (`rouge_l_f1` 0.247 → 0.155, `token_jaccard` 0.237 → 0.160) and the
+proxy responds **2.46× longer than direct** (`length_ratio` 0.888 → 2.46) — retaining
+more verbatim history makes the model re-reference/re-explain more. **Caveat:** these
+quality/verbosity numbers are **single-round** (the cache/TTFT result is deterministic
+and robust); a ≥ 3-round run is needed to separate signal from sampling variance before
+the verbosity shift is taken as settled.
+
+**Decision point (not yet committed):** `fold_window_fraction=0.25` is staged as the
+default but the gate failure + single-round quality regression mean it should not be
+committed blindly. Options: (a) accept the TTFT-first tradeoff and ship `0.25`;
+(b) tune to a middle fraction (e.g. `0.1` gave 3 dry-run breaks but more compaction ⇒
+likely higher savings / less verbosity shift); (c) validate with ≥ 3 rounds first. The
+mission ("TTFT without KV-cache refills") is achieved; the open question is how much
+token-savings / verbosity the user is willing to trade for it.
 
 ---
 
