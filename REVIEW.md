@@ -248,7 +248,7 @@ quality loss.
 | # | Item | Refs | Effort |
 |---|---|---|---|
 | B1 | 🟡 **Reversible compression + retrieval handles** — per-session content-addressed `ContentStore` + handle embedded in the compressed placeholder + `GET /v1/agent/sessions/{id}/content/{handle}` retrieval (commit `e21675b`, config-gated OFF). **Pending:** the model-facing `expand(id)` tool that calls the endpoint. | §4.1.2 | **[L]** |
-| B2 | ✅ **Cached re-read collapse + global code dedup** — stateless, idempotent boundary transform: first occurrence of a repeated tool output stays full, later identical ones collapse to a handle reference (original retained in B1's `ContentStore`) (commit `39b080e`, config-gated OFF). **Default decision pending:** benchmarking `tool_output_dedup_enabled=true` vs OFF to decide whether to flip it ON (the strongest candidate — see config-default review). | §4.1.3, §4.5.2 | **[M]** |
+| B2 | ✅ **Cached re-read collapse + global code dedup** — stateless, idempotent boundary transform: first occurrence of a repeated tool output stays full, later identical ones collapse to a handle reference (original retained in B1's `ContentStore`) (commit `39b080e`, config-gated OFF). **Keep OFF:** an A/B benchmark (dedup ON vs phaseA OFF) was aborted when the backend crashed, but the partial run showed dedup ON made the **backend** cliff to the frozen prefix at turns 11–12 (then recover) — cliffs absent with dedup OFF — even though the dry-run showed **zero proxy-side breaks**. So dedup is idempotent/proxy-stable but perturbs the backend's prefix cache; do not flip ON until that backend-side interaction is understood. | §4.1.3, §4.5.2 | **[M]** |
 | B3 | ⬜ **Volatile-field relocation** — move dates / UUIDs / SHAs / timestamps out of the cacheable prefix. | §4.1.4, §4.7.4 | **[M]** ⚠ cache |
 | B4 | ✅ **Wire syntactic code slicing into the pipeline** — wired as a config-gated (`code_slicing_enabled`, OFF) boundary transform using the stable original request as the query; idempotent + fail-open + never-expands ⇒ cache-stable (commit `09f9770`). **Kept OFF by default** pending better relevance detection (current sub-task, not the session goal) + a benchmark. | §4.5.3 | **[M]** ⚠ cache |
 | B5 | ✅ **Fix AST chunk-0 duplicate imports** — body loop skips the header node indices so imports appear only via the per-chunk prefix (done, regression-tested). | §4.5 #5 | **[S]** |
@@ -318,15 +318,17 @@ must be benchmarked before changing default behavior. Revisited individually:
 | Flag | Default | Verdict | Why |
 |---|---|---|---|
 | `fold_window_fraction` (A1-lite) | **`0.25` (ON)** | ✅ keep ON | The mission-critical cliff fix: zero prefix breaks, proxy TTFT now beats direct. Already the default. |
-| `tool_output_dedup_enabled` (B2) | `false` | 🟡 **benchmark, lean ON** | Strongest candidate to enable. Monotonic + idempotent (cache-stable), first occurrence stays full, saves tokens on repeated file reads. Low risk; turn ON once a benchmark confirms savings without quality loss. |
+| `tool_output_dedup_enabled` (B2) | `false` | ⬜ **keep OFF (for now)** | Monotonic + idempotent and proxy-side-stable (dry-run: zero breaks), first occurrence stays full. **But** an A/B benchmark (aborted — backend crashed) showed dedup ON made the *backend* cliff to the frozen prefix at turns 11–12 (cliffs absent with dedup OFF). Do not flip ON until that backend-side cache interaction is understood. |
 | `reversible_compression_enabled` (B1) | `false` | ⬜ **stay OFF** | The handle is only retrievable via the operator-facing HTTP endpoint; the model-facing `expand(id)` tool is **not wired yet**, so enabling now only adds placeholder overhead to the context with no in-conversation benefit. Enable once the expand tool lands. |
 | `code_slicing_enabled` (B4) | `false` | ⬜ **stay OFF** | Slices to the *original request's* named definitions — conservative (fails open when none match) but risks dropping code a later sub-task needs (the relevance-detection gap). Needs a better query (the current sub-task, not the session goal) + a benchmark before enabling. |
 
-**Net:** keep B1/B4 OFF (they need follow-up work — the expand tool and better
-relevance detection — to be net-positive), and **benchmark B2 as the next default to
-flip ON**. All three are cache-stable by construction (monotonic / first-appearance /
-idempotent), so enabling them does not threaten prefix reuse — the open question is
-their quality/savings tradeoff, which only a benchmark settles.
+**Net:** keep all three OFF for now. B1/B4 need follow-up work (the expand tool; better
+relevance detection) to be net-positive. B2 looked like the strongest candidate, but the
+aborted A/B benchmark revealed it makes the *backend* drop its prefix cache mid-session
+(turns 11–12) despite being proxy-side-stable — so it stays OFF until that backend-side
+interaction is understood. All three are cache-stable *by construction* (monotonic /
+first-appearance / idempotent) on the proxy side; the open questions are their
+quality/savings tradeoff and, for B2, the backend-cache perturbation.
 
 ---
 
