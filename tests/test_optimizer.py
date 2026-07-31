@@ -41,6 +41,31 @@ class TestAgentContextOptimizer:
         assert goal is not None
         assert "REST API" in goal.original_prompt
 
+    def test_thinking_round_trip_is_verbatim(self) -> None:
+        """F2 (review §4.6.3): a captured reasoning block must re-inject
+        byte-for-byte — any normalization would break the backend's cached prefix —
+        and existing client-echoed reasoning must never be overwritten."""
+        content = "The answer is 42."
+        # Deliberately awkward whitespace + unicode + trailing newlines.
+        reasoning = "  Step 1: café ≠ cafe\t\n  Step 2: π ≈ 3.14  \n\n"
+        self.optimizer.capture_thinking(content, reasoning)
+
+        # Client stripped reasoning_content -> restore re-adds it verbatim.
+        stripped = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": content},
+        ]
+        restored = self.optimizer._restore_thinking(stripped)
+        assert restored[1]["reasoning_content"] == reasoning
+        # The caller's message dict is not mutated (a copy is returned).
+        assert "reasoning_content" not in stripped[1]
+
+        # Client echoed its own reasoning -> restore must NOT overwrite it.
+        echoed = [
+            {"role": "assistant", "content": content, "reasoning_content": "client's own"},
+        ]
+        assert self.optimizer._restore_thinking(echoed)[0]["reasoning_content"] == "client's own"
+
     def test_set_token_calibration_clamps_and_scales(self) -> None:
         # ratio clamped to [0.5, 2.0]
         self.optimizer.set_token_calibration(10.0)
