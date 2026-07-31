@@ -5498,15 +5498,34 @@ def _baseline_get(d: dict[str, Any], *keys) -> float | None:
     return cur if isinstance(cur, (int, float)) else None
 
 
+def _quality_metric(summary: dict[str, Any], name: str) -> float | None:
+    """Read a quality metric's mean from whichever section holds it.
+
+    ``code_block_ratio`` / ``code_syntax_validity`` / ``prompt_faithfulness`` /
+    ``evicted_content_recall`` live under ``quality``; ``rouge_l_f1`` /
+    ``token_jaccard`` / ``edit_similarity`` / ``length_ratio`` live under
+    ``secondary_quality``. REVIEW.md §4.12.6: the gate and diff table previously
+    read all of them from ``quality``, so the lexical metrics silently compared
+    0.0 vs 0.0 and never fired.
+    """
+    for section in ("quality", "secondary_quality"):
+        val = _baseline_get(summary, section, name)
+        if val is not None:
+            return val
+    return None
+
+
 def _print_baseline_diff(current: dict[str, Any], baseline: dict[str, Any]) -> None:
     """Print a concise delta table of key metrics vs the baseline."""
     rows = [
         ("token_savings_pct", "tokens", "token_savings_pct", "{:.2f}pp", 1.0),
         ("cost_savings_pct", "cost_usd", "savings_pct", "{:.2f}pp", 1.0),
-        ("rouge_l_f1", "quality", "rouge_l_f1", "{:.4f}", 1.0),
-        ("token_jaccard", "quality", "token_jaccard", "{:.4f}", 1.0),
+        ("rouge_l_f1", "secondary_quality", "rouge_l_f1", "{:.4f}", 1.0),
+        ("token_jaccard", "secondary_quality", "token_jaccard", "{:.4f}", 1.0),
         ("code_block_ratio", "quality", "code_block_ratio", "{:.4f}", 1.0),
-        ("edit_similarity", "quality", "edit_similarity", "{:.4f}", 1.0),
+        ("code_syntax_validity", "quality", "code_syntax_validity", "{:.4f}", 1.0),
+        ("edit_similarity", "secondary_quality", "edit_similarity", "{:.4f}", 1.0),
+        ("length_ratio", "secondary_quality", "length_ratio", "{:.4f}", 1.0),
         ("prompt_faithfulness", "quality", "prompt_faithfulness", "{:.4f}", 1.0),
         ("evicted_content_recall", "quality", "evicted_content_recall", "{:.4f}", 1.0),
         ("semantic_similarity", "semantic_similarity", "mean", "{:.4f}", 1.0),
@@ -5562,15 +5581,26 @@ def _check_baseline_gate(
 
     # Headline quality metrics (lower is a regression). prompt_faithfulness
     # and evicted_content_recall are the PRIMARY optimizer signals (context
-    # retention); the lexical battery is secondary for this use case.
-    for qm in ("prompt_faithfulness", "evicted_content_recall", "code_block_ratio", "rouge_l_f1", "token_jaccard", "edit_similarity"):
-        cur = _baseline_get(current, "quality", qm) or 0.0
-        base = _baseline_get(baseline, "quality", qm) or 0.0
+    # retention); the lexical battery is secondary for this use case. Read each
+    # metric from whichever section holds it (quality vs secondary_quality —
+    # REVIEW.md §4.12.6; reading all from "quality" silently zeroed the lexical
+    # metrics so those checks never fired).
+    for qm in ("prompt_faithfulness", "evicted_content_recall", "code_block_ratio", "code_syntax_validity", "rouge_l_f1", "token_jaccard", "edit_similarity"):
+        cur = _quality_metric(current, qm) or 0.0
+        base = _quality_metric(baseline, qm) or 0.0
         drop = base - cur
         if drop > tol:
             failures.append(
                 f"{qm} regressed {drop:.4f} (baseline {base:.4f} -> {cur:.4f}, tol {tol:.4f})"
             )
+
+    # length_ratio should stay near 1.0 (proxy response length vs direct). The
+    # proxy cannot control response length (it compacts INPUT only), so an
+    # out-of-band value is flagged as a WARNING, not a hard failure (REVIEW.md
+    # §4.12.6) — it signals a context-fidelity shift worth inspecting.
+    lr_cur = _quality_metric(current, "length_ratio")
+    if lr_cur is not None and not (0.5 <= lr_cur <= 2.0):
+        _status(args, f"\n  ⚠️  length_ratio={lr_cur:.4f} outside [0.5, 2.0] (informational)")
 
     if failures:
         _status(args, "\n  ❌ BASELINE REGRESSION GATE FAILED:")
