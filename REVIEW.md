@@ -104,9 +104,20 @@ variance and partly the leaner context; recovering it further needs per-turn
 backend-cache instrumentation to attribute the residual ~7 breaks, then a targeted
 fix. Both fold controls are committed as tunable, validated options.
 
+**§4.8.4 quality-profile-vs-env precedence — DONE.** `apply_quality_profile` now
+fills only fields the user left at their default (`field not in
+target.model_fields_set`), so an explicit env/`.env`/constructor value wins over the
+preset (e.g. `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS=24000` is no longer reset to
+12000). Tests updated to isolate the preset (clear `MOEPT_*` env); new
+`test_explicit_env_wins_over_profile`. **Environment caveat:** the precedence is
+correct, but a stale exported `MOEPT_*` shell environment overrides the `.env`. The
+shipped `.env` had pre-profile values (`KEEP_FULL_STEPS=3`, `MAX_OPTIMIZED_TOKENS=3000`,
+…) that would now win and re-introduce the turn-12 cliff; those fields are commented
+out in `.env` so the balanced profile applies. **The user must also unset stale
+exported `MOEPT_*` shell vars (or start a fresh shell) for the balanced profile to
+take effect** — with them cleared, the dry-run shows 5 breaks (no cliff).
+
 **Deferred to a benchmark-validated follow-up:**
-- §4.8.4 quality-profile-vs-env precedence — config-semantics change conflicting with
-  existing tests and the cliff-fix `.env`; handle with a budget-config redesign.
 - §3.1 adaptive budget **amortization trigger** — sweep confirmed fold knobs don't
   recover reuse at 30 turns; needs per-turn backend-cache instrumentation first.
 - §4.4.1 zero-copy SSE passthrough — a rewrite of the working streaming path; the

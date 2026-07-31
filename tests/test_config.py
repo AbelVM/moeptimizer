@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from moeptimizer.config import (
     AppConfig,
     apply_quality_profile,
@@ -47,8 +49,21 @@ class TestConfig:
 
 
 class TestQualityProfile:
-    def test_balanced_is_default(self) -> None:
-        config = AppConfig()
+    @staticmethod
+    def _clean_config(monkeypatch: pytest.MonkeyPatch) -> AppConfig:
+        """Config with no env/.env overrides, so a preset applies fully.
+
+        Profile tests must be isolated from the ambient MOEPT_* environment
+        (review §4.8.4): explicit settings win over the profile, so a preset can
+        only be tested in isolation when nothing is set explicitly.
+        """
+        for key in list(os.environ):
+            if key.startswith("MOEPT_"):
+                monkeypatch.delenv(key, raising=False)
+        return AppConfig(_env_file=None)
+
+    def test_balanced_is_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = self._clean_config(monkeypatch)
         apply_quality_profile(config)
         # keep_full_steps lowered 8 -> 6 (cache-cliff fix): the immutable zones
         # (frozen prefix + append-only summary + keep window) must fit the token
@@ -60,8 +75,8 @@ class TestQualityProfile:
         # Re-tuned (review P0.1): balanced no longer skeletonizes all code.
         assert config.agentic.code_skeleton_enabled is False
 
-    def test_quality_profile_maximizes_fidelity(self) -> None:
-        config = AppConfig()
+    def test_quality_profile_maximizes_fidelity(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = self._clean_config(monkeypatch)
         config.agentic.quality_profile = "quality"
         apply_quality_profile(config)
         assert config.v050.hierarchical_summary_enabled is False
@@ -71,20 +86,33 @@ class TestQualityProfile:
         assert config.agentic.keep_full_steps == 8
         assert config.agentic.max_optimized_tokens == 16000
 
-    def test_aggressive_profile_saves_more(self) -> None:
-        config = AppConfig()
+    def test_aggressive_profile_saves_more(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = self._clean_config(monkeypatch)
         config.agentic.quality_profile = "aggressive"
         apply_quality_profile(config)
         assert config.agentic.keep_full_steps == 2
         assert config.agentic.max_optimized_tokens == 4000
         assert config.agentic.proactive_trim_ratio == 0.45
 
-    def test_unknown_profile_falls_back_to_balanced(self) -> None:
-        config = AppConfig()
+    def test_unknown_profile_falls_back_to_balanced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = self._clean_config(monkeypatch)
         config.agentic.quality_profile = "bogus"
         apply_quality_profile(config)
         assert config.agentic.quality_profile == "balanced"
         assert config.agentic.max_optimized_tokens == 12000
+
+    def test_explicit_env_wins_over_profile(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Review §4.8.4: an explicitly-set field is NOT clobbered by the profile."""
+        for key in list(os.environ):
+            if key.startswith("MOEPT_"):
+                monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS", "24000")
+        config = AppConfig(_env_file=None)
+        apply_quality_profile(config)  # balanced would set 12000
+        # The explicit env value (24000) wins over the balanced preset (12000).
+        assert config.agentic.max_optimized_tokens == 24000
+        # A field left at its default still receives the preset value.
+        assert config.agentic.keep_full_steps == 6
 
 
 class TestConfigCheck:

@@ -814,10 +814,18 @@ def apply_quality_profile(config: AppConfig) -> AppConfig:
     # Route each override to the sub-config that owns the field. agentic is
     # checked first so loop-tuning fields land there; v050 owns the remainder
     # (e.g. hierarchical_summary_enabled).
+    #
+    # Precedence (review §4.8.4): the profile is a PRESET of defaults; a field the
+    # user set explicitly (env var, .env, or constructor) wins. pydantic records
+    # explicitly-set fields in ``model_fields_set``, so the profile only fills fields
+    # the user left at their default. Previously the profile clobbered explicit
+    # settings (e.g. MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS=24000 was reset to 12000),
+    # which made env tuning silently ineffective.
     targets = (config.agentic, config.v050)
     for field, value in overrides.items():
         for target in targets:
             if hasattr(target, field):
-                setattr(target, field, value)
+                if field not in target.model_fields_set:
+                    setattr(target, field, value)
                 break
     return config
