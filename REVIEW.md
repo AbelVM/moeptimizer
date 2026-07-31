@@ -303,6 +303,24 @@ a hot cache. A3/A4 enable B4 (slice-on-first-appearance) and F3 (append-only). B
 start in parallel with A. C / D / E are largely independent and can interleave with A–B.
 Every ⚠-cache item must be followed by the dry-run gate and a benchmark round.
 
+### Config default review — should the new gated features be ON?
+
+The B-phase features landed **config-gated OFF** because each rewrites the context and
+must be benchmarked before changing default behavior. Revisited individually:
+
+| Flag | Default | Verdict | Why |
+|---|---|---|---|
+| `fold_window_fraction` (A1-lite) | **`0.25` (ON)** | ✅ keep ON | The mission-critical cliff fix: zero prefix breaks, proxy TTFT now beats direct. Already the default. |
+| `tool_output_dedup_enabled` (B2) | `false` | 🟡 **benchmark, lean ON** | Strongest candidate to enable. Monotonic + idempotent (cache-stable), first occurrence stays full, saves tokens on repeated file reads. Low risk; turn ON once a benchmark confirms savings without quality loss. |
+| `reversible_compression_enabled` (B1) | `false` | ⬜ **stay OFF** | The handle is only retrievable via the operator-facing HTTP endpoint; the model-facing `expand(id)` tool is **not wired yet**, so enabling now only adds placeholder overhead to the context with no in-conversation benefit. Enable once the expand tool lands. |
+| `code_slicing_enabled` (B4) | `false` | ⬜ **stay OFF** | Slices to the *original request's* named definitions — conservative (fails open when none match) but risks dropping code a later sub-task needs (the relevance-detection gap). Needs a better query (the current sub-task, not the session goal) + a benchmark before enabling. |
+
+**Net:** keep B1/B4 OFF (they need follow-up work — the expand tool and better
+relevance detection — to be net-positive), and **benchmark B2 as the next default to
+flip ON**. All three are cache-stable by construction (monotonic / first-appearance /
+idempotent), so enabling them does not threaten prefix reuse — the open question is
+their quality/savings tradeoff, which only a benchmark settles.
+
 ---
 
 ## Latest benchmark — `0.7.26_fix2` (post-Phase-1/2/3)
