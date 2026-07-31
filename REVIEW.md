@@ -129,7 +129,16 @@ take effect** — with them cleared, the dry-run shows 5 breaks (no cliff).
 - §4.5.3 syntactic code slicing (keep only the query-referenced function, stub
   siblings) — needs relevance detection; builds on the tree-sitter plumbing.
 
-**Not started:** Phase 4 (god-object decomposition of the 3.4K-line `optimizer.py`).
+**Phase 4 — god-object decomposition (started).** Extracted `BudgetGovernor`
+(`budget_governor.py`) out of the 3.3K-line `optimizer.py` (~250 lines moved): it
+owns the token-calibration, horizon, code-density, and last-optimized-count state
+plus all budget/growth/shrink/dynamic-cap math; the optimizer keeps thin delegates.
+Behavior-preserving (dry-run break pattern identical). Remaining god-object work:
+extract the eviction/trim machinery and the stage runner.
+
+**Still deferred:** §4.5.3 syntactic code slicing, §4.1.2 reversible compression +
+retrieval handles, §4.4.1 zero-copy SSE, and interpreting the residual ~7 breaks via
+per-turn backend-cache attribution.
 
 ---
 
