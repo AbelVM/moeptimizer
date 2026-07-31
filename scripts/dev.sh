@@ -8,7 +8,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 echo "Installing moeptimizer..."
-pip install -e ".[dev]"
+pip install -e ".[dev]" --break-system-packages
 
 echo "Running tests..."
 pytest tests/ -v --tb=short
