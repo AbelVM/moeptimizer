@@ -255,7 +255,7 @@ quality loss.
 | # | Item | Refs | Effort |
 |---|---|---|---|
 | C1 | ⬜ **Zero-copy SSE passthrough** — raw-byte fast path for turns needing no delta inspection; tap only the final usage chunk. | §4.4.1 | **[M]** |
-| C2 | 🟡 **Token-counting overhaul** — per-message memo + count-once-per-stage + running totals (per-text memo + the O(n²) floor pass are already done). | §4.4.3 | **[M]** |
+| C2 | 🟡 **Token-counting overhaul** — per-text memo + O(n²) floor pass already done (Phase 2); C2 removed a redundant double-count in the budget section. **Deferred:** true count-once-per-stage threading (large, risky hot-path refactor; marginal benefit now that tokenization is per-text cached — needs profiling first). | §4.4.3 | **[M]** |
 
 *Gate:* per-turn proxy overhead down / TPS up; dry-run avg turn time down; reuse unchanged.
 
@@ -919,13 +919,18 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    request (incl. fast path). **Fix:** maintain a running token total (count each
    message once, subtract back-to-front, stop at the floor) → O(n). → Phase 2.
 3. 🟡 **~15–18 full re-tokenizations per turn (HIGH).** `TokenCounter.count_messages`
-   memoizes by a SHA-1 of the *whole list* (`token_counter.py:404-419`), but the
-   fingerprint is recomputed O(n) on every call and any mutation misses; the full
-   prompt is recounted at ~18 sites in one pass (`optimizer.py:1024,1122,1154,…,1846`),
-   most after a stage mutated the list (misses). With the remote `/tokenize` path
-   each miss is a **synchronous HTTP round-trip**. **Fix:** count once per stage
-   boundary and thread an integer through the gates; key the memo **per-message**
-   (not per-whole-list) so unchanged messages are never re-tokenized. → Phase 2.
+   memoizes by a SHA-1 of the *whole list*, but the fingerprint is recomputed O(n) on
+   every call and any mutation misses; the full prompt is recounted at ~16 sites in one
+   pass, most after a stage mutated the list (misses). **Mostly mitigated:** the
+   expensive part — tokenization — is already cached **per-text** (`_text_cache`,
+   §4.4.3, Phase 2), so a whole-list miss re-counts each message via a cheap cache hit
+   (no re-tokenization), and the O(n²) floor pass is a running suffix total (§4.4.2,
+   Phase 2). C2 also removed a redundant double-count in the budget-enforcement section
+   (reuse the raw count for the calibrated total). **Remaining (deferred):** true
+   *count-once-per-stage* — threading one integer through the ~16 gates instead of
+   recounting — is a large, risky hot-path refactor whose benefit is now marginal
+   (the per-text memo + whole-list cache already make repeated counts cheap); it needs
+   profiling to justify before touching the cache-stability-sensitive main loop. → Phase 2.
 4. ✅ **Post-stream CPU on the event loop (MED).** After the stream ends the generator
    runs `record_cache_outcome`, `capture_thinking`, `count_messages`,
    `set_token_calibration`, `calibrate_remote_overhead` on the loop thread

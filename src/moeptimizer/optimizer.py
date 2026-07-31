@@ -1473,9 +1473,11 @@ class AgentContextOptimizer:
         current_tokens = self.token_counter.count_messages(optimized)
 
         # Recalculate total_tokens after entropy trim (calibrated to the backend
-        # tokenizer so the budget is enforced against true token counts, #6).
+        # tokenizer so the budget is enforced against true token counts, #6). Reuse
+        # the raw count just computed instead of re-counting the same (unchanged)
+        # list inside calibrated_token_count (review §4.4.3 / Forward plan C2).
         try:
-            total_tokens = self.calibrated_token_count(optimized)
+            total_tokens = self.budget.calibrated_token_count(current_tokens)
         except Exception as e:
             logger.warning("Token recount failed: %s", e)
 
