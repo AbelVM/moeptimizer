@@ -91,6 +91,49 @@ class TestAgentContextOptimizer:
         assert "handle=" not in compressed["content"]
         assert len(self.optimizer.content_store) == 0
 
+    def test_dedup_collapses_repeated_tool_outputs(self) -> None:
+        """B2 (review §4.1.3/§4.5.2): the first occurrence stays full, a later
+        identical one collapses to a handle reference; the original is retained."""
+        self.optimizer._config.agentic.tool_output_dedup_enabled = True
+        self.optimizer._config.agentic.tool_output_dedup_min_chars = 50
+        big = "def f():\n    return 42\n" * 20  # identical file content, > min_chars
+        msgs = [
+            {"role": "user", "content": "read config.py"},
+            {"role": "tool", "content": big},
+            {"role": "user", "content": "read config.py again"},
+            {"role": "tool", "content": big},
+        ]
+        out = self.optimizer._dedup_repeated_tool_outputs(msgs)
+        assert out[1]["content"] == big  # first occurrence unchanged
+        assert out[3]["content"].startswith("[moept-dedup: ")  # duplicate collapsed
+        handle = out[3]["content"].split("handle=")[1].rstrip("]")
+        assert self.optimizer.content_store.get(handle) == big
+
+    def test_dedup_is_idempotent(self) -> None:
+        """Re-running dedup on its own output reproduces the same bytes (cache-stable)."""
+        self.optimizer._config.agentic.tool_output_dedup_enabled = True
+        self.optimizer._config.agentic.tool_output_dedup_min_chars = 50
+        big = "x = 1\n" * 30
+        msgs = [
+            {"role": "tool", "content": big},
+            {"role": "tool", "content": big},
+        ]
+        once = self.optimizer._dedup_repeated_tool_outputs(msgs)
+        twice = self.optimizer._dedup_repeated_tool_outputs(once)
+        assert [m["content"] for m in twice] == [m["content"] for m in once]
+
+    def test_dedup_off_by_default(self) -> None:
+        assert self.optimizer._config.agentic.tool_output_dedup_enabled is False
+
+    def test_dedup_skips_small_outputs(self) -> None:
+        """Outputs below min_chars are not worth a reference and stay verbatim."""
+        self.optimizer._config.agentic.tool_output_dedup_enabled = True
+        self.optimizer._config.agentic.tool_output_dedup_min_chars = 200
+        small = "ok"
+        msgs = [{"role": "tool", "content": small}, {"role": "tool", "content": small}]
+        out = self.optimizer._dedup_repeated_tool_outputs(msgs)
+        assert out[1]["content"] == small  # not collapsed (below min_chars)
+
     def test_set_token_calibration_clamps_and_scales(self) -> None:
         # ratio clamped to [0.5, 2.0]
         self.optimizer.set_token_calibration(10.0)

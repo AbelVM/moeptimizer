@@ -352,6 +352,23 @@ class AgenticConfig(BaseModel):
         description="Only store originals for compression of tool outputs at least this "
                     "many chars (smaller outputs are not worth a retrieval handle).",
     )
+    tool_output_dedup_enabled: bool = Field(
+        default=False,
+        description=(
+            "Whole-file tool-output dedup (review §4.1.3/§4.5.2 / Forward plan B2). "
+            "When the same tool output (e.g. a file read) appears more than once in the "
+            "context, keep the FIRST occurrence full and collapse later identical "
+            "occurrences to a short handle reference (the original is retained in the "
+            "per-session content store for retrieval). Stateless + idempotent, so it is "
+            "cache-stable as a boundary transform. OFF by default: it rewrites context "
+            "and should be benchmarked before enabling."
+        ),
+    )
+    tool_output_dedup_min_chars: int = Field(
+        default=200,
+        description="Only dedup tool outputs at least this many chars (for smaller "
+                    "outputs the reference marker would outweigh the saving).",
+    )
     user_paste_compression_enabled: bool = Field(
         default=True,
         description=(

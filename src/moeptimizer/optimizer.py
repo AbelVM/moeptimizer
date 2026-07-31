@@ -104,6 +104,11 @@ _OPENAI_MESSAGE_KEYS = {
     "refusal",
 }
 
+# Marker prefix for B2 whole-file dedup references (review §4.1.3/§4.5.2). A tool
+# output whose content starts with this is an already-collapsed duplicate; the
+# boundary dedup skips it so re-running is idempotent (cache-stable).
+_DEDUP_MARKER = "[moept-dedup: "
+
 
 class AgentContextOptimizer:
     """Main orchestrator for agentic context optimization."""
@@ -2705,6 +2710,16 @@ class AgentContextOptimizer:
             except Exception as e:
                 logger.warning("User paste compression failed: %s", e)
                 self._record_degradation("user_paste_compression", e)
+
+        # B2 (review §4.1.3/§4.5.2): collapse repeated tool outputs to a handle
+        # reference. List-level + idempotent (rebuilt from the context each turn), so
+        # it runs on the whole optimized prompt after the per-message compression.
+        if self._config.agentic.tool_output_dedup_enabled:
+            try:
+                optimized = self._dedup_repeated_tool_outputs(optimized)
+            except Exception as e:
+                logger.warning("Tool output dedup failed: %s", e)
+                self._record_degradation("tool_output_dedup", e)
         return optimized
 
     def _extract_code_signatures(self, pair: list[dict[str, Any]]) -> list[str]:
@@ -3254,6 +3269,47 @@ class AgentContextOptimizer:
         if len(self._tool_output_cache) > self._tool_output_cache_max:
             self._tool_output_cache.pop(next(iter(self._tool_output_cache)))
         return compressed_msg
+
+    def _dedup_repeated_tool_outputs(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Collapse repeated tool outputs to a handle reference (review §4.1.3/§4.5.2, B2).
+
+        The same file read / command output often reappears across turns; keeping every
+        copy wastes the context. Leave the FIRST full occurrence of each content
+        unchanged and collapse later identical occurrences to a short reference whose
+        handle retrieves the original from the per-session content store.
+
+        Stateless and idempotent: the seen-set is rebuilt from the context each call,
+        and an already-collapsed reference (content starts with ``_DEDUP_MARKER``) is
+        skipped, so re-running reproduces the same bytes — cache-stable as a boundary
+        transform (the first occurrence stays byte-identical; duplicates collapse
+        deterministically by content hash, and only the trailing live zone changes).
+        """
+        min_chars = self._config.agentic.tool_output_dedup_min_chars
+        seen: dict[str, str] = {}  # content hash -> retrieval handle
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") != "tool":
+                out.append(msg)
+                continue
+            content = msg.get("content") or ""
+            if not isinstance(content, str) or content.startswith(_DEDUP_MARKER):
+                out.append(msg)  # not a tool output / already collapsed -> idempotent
+                continue
+            if len(content) < min_chars:
+                out.append(msg)  # too small to be worth a reference
+                continue
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+            if digest in seen:
+                new_msg = dict(msg)
+                new_msg["content"] = (
+                    f"{_DEDUP_MARKER}identical tool output omitted; "
+                    f"original retained, handle={seen[digest]}]"
+                )
+                out.append(new_msg)
+            else:
+                seen[digest] = self.content_store.put(content)
+                out.append(msg)
+        return out
 
     def _compress_user_paste_message(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Per-message wrapper around user-paste compression for the floor-bound transform."""
