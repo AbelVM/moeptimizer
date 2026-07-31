@@ -71,3 +71,23 @@ class TestSessionManager:
         for i in range(20):
             manager.get_or_create(f"s{i}")
         assert len(manager.list_sessions()) == 20
+
+    def test_reaper_reaps_expired_sessions(self) -> None:
+        """The background reaper collects expired sessions without a get_or_create
+        call (review §4.10.3 — cleanup otherwise only ran inside get_or_create)."""
+        manager = SessionManager(session_timeout=1)
+        manager.get_or_create("test-session")
+        manager.start_reaper(interval=0.1)
+        try:
+            time.sleep(1.4)  # past timeout + several reaper ticks; no get_or_create
+            assert "test-session" not in manager.list_sessions()
+        finally:
+            manager.stop_reaper()
+
+    def test_start_reaper_is_idempotent(self) -> None:
+        manager = SessionManager(session_timeout=3600)
+        manager.start_reaper(interval=60)
+        first = manager._reaper_thread
+        manager.start_reaper(interval=60)
+        assert manager._reaper_thread is first  # no second thread spawned
+        manager.stop_reaper()

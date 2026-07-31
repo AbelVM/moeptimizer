@@ -38,6 +38,8 @@ class SessionManager:
         self._session_timeout = session_timeout or agentic.session_timeout
         self._max_sessions = agentic.max_sessions
         self._lock = threading.RLock()
+        self._reaper_stop: threading.Event | None = None
+        self._reaper_thread: threading.Thread | None = None
 
     def _make_optimizer(self) -> AgentContextOptimizer:
         return AgentContextOptimizer(
@@ -164,3 +166,37 @@ class SessionManager:
         for sid, _ in ordered[:over]:
             self._sessions.pop(sid, None)
             self._session_timestamps.pop(sid, None)
+
+    def start_reaper(self, interval: float | None = None) -> None:
+        """Start a daemon thread that periodically reaps expired sessions.
+
+        ``_cleanup_expired`` otherwise runs only inside ``get_or_create``, so on an
+        idle proxy expired optimizers linger until the next request and the memory
+        high-water mark tracks peak concurrent sessions forever (review §4.10.3).
+        The interval defaults to half the session timeout, capped to [1, 60] s, so
+        expired sessions are collected promptly without busy polling. Idempotent.
+        """
+        with self._lock:
+            if self._reaper_thread is not None and self._reaper_thread.is_alive():
+                return
+            period = interval if interval is not None else self._session_timeout / 2
+            period = max(1.0, min(60.0, float(period)))
+            stop = threading.Event()
+            self._reaper_stop = stop
+
+            def _run() -> None:
+                while not stop.wait(period):
+                    with self._lock:
+                        self._cleanup_expired(time.time())
+
+            self._reaper_thread = threading.Thread(
+                target=_run, name="moept-session-reaper", daemon=True
+            )
+            self._reaper_thread.start()
+
+    def stop_reaper(self) -> None:
+        """Signal the reaper thread to stop (best-effort; it is a daemon thread)."""
+        if self._reaper_stop is not None:
+            self._reaper_stop.set()
+        self._reaper_thread = None
+        self._reaper_stop = None

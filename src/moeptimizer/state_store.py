@@ -111,7 +111,11 @@ class AgentStateStore:
     def set_goal(self, original_prompt: str) -> str:
         """Set the root goal for this agent session."""
         goal = GoalNode(original_prompt=original_prompt)
-        self.goals[goal.goal_id] = goal
+        # Keep only the current goal: _goal_id only ever references the latest, so
+        # any superseded goal is dead weight that would be re-serialized into every
+        # get_session_state (review §4.10.4). (The optimizer already guards set_goal
+        # with `not get_goal()`, so this also makes the single-goal invariant explicit.)
+        self.goals = {goal.goal_id: goal}
         self._goal_id = goal.goal_id
         return goal.goal_id
 

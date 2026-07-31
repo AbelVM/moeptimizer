@@ -34,6 +34,16 @@ class TestAgentStateStore:
         assert goal is not None
         assert goal.original_prompt == "Test goal"
 
+    def test_set_goal_keeps_only_current_goal(self) -> None:
+        """Superseding the goal must not accumulate stale GoalNodes (review §4.10.4)."""
+        store = AgentStateStore()
+        store.set_goal("First goal")
+        store.set_goal("Second goal")
+        assert len(store.goals) == 1
+        goal = store.get_goal()
+        assert goal is not None
+        assert goal.original_prompt == "Second goal"
+
     def test_serialize_deserialize(self) -> None:
         """Serialize and deserialize store."""
         store = AgentStateStore()

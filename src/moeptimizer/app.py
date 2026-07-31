@@ -1321,7 +1321,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             cfg.v050.capability_autodetect,
             cfg.v050.slot_pinning_enabled,
         )
+        # §4.10.3: reap expired sessions in the background so an idle proxy does not
+        # retain optimizers past their timeout until the next request.
+        session_manager.start_reaper()
         yield
+        session_manager.stop_reaper()
         await embedding_service.close()
         await embed_client.close()
         await capability_probe.aclose()
