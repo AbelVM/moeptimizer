@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import patch
 
 from moeptimizer import ROLLING_SUMMARY_MARKER
+from moeptimizer.budget_governor import BudgetGovernor
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer
 
@@ -43,14 +44,14 @@ class TestAgentContextOptimizer:
     def test_set_token_calibration_clamps_and_scales(self) -> None:
         # ratio clamped to [0.5, 2.0]
         self.optimizer.set_token_calibration(10.0)
-        assert self.optimizer._token_calibration == 2.0
+        assert self.optimizer.budget._token_calibration == 2.0
         self.optimizer.set_token_calibration(0.01)
-        assert self.optimizer._token_calibration == 0.5
+        assert self.optimizer.budget._token_calibration == 0.5
         # None / non-positive ignored (keeps last)
         self.optimizer.set_token_calibration(None)
-        assert self.optimizer._token_calibration == 0.5
+        assert self.optimizer.budget._token_calibration == 0.5
         self.optimizer.set_token_calibration(-1.0)
-        assert self.optimizer._token_calibration == 0.5
+        assert self.optimizer.budget._token_calibration == 0.5
 
     def test_record_cache_outcome_skips_weak_label(self) -> None:
         """Review §2 / C7: do not train hit_prediction on a guessed label.
@@ -90,14 +91,14 @@ class TestAgentContextOptimizer:
         # exact backend count = 2x local -> ratio 2.0 (also the clamp ceiling)
         self.optimizer.seed_token_calibration(sample, local * 2)
         assert self.optimizer._calibration_seeded is True
-        assert self.optimizer._token_calibration == 2.0
+        assert self.optimizer.budget._token_calibration == 2.0
 
     def test_seed_token_calibration_ignores_bad_input(self) -> None:
         self.optimizer.seed_token_calibration("", 5)
         assert self.optimizer._calibration_seeded is False
         self.optimizer.seed_token_calibration("text", 0)
         assert self.optimizer._calibration_seeded is False
-        assert self.optimizer._token_calibration == 1.0
+        assert self.optimizer.budget._token_calibration == 1.0
 
     def test_aggressive_defaults_use_top_only_eviction(self) -> None:
         """Default aggressive settings evict old complete turns without mutating history."""
@@ -1359,11 +1360,11 @@ class TestCacheStabilityAcrossTurns:
             {"role": "assistant", "content": "ok"},
         ]
         opt.optimize_messages(msgs)
-        base = opt._last_optimized_token_count or 0
+        base = opt.budget._last_optimized_token_count or 0
         # A much larger second turn would otherwise jump to the full ~6.5K budget.
         big = [*msgs, {"role": "user", "content": "x" * 4000}, {"role": "assistant", "content": "y" * 4000}]
         opt.optimize_messages(big)
-        grown = (opt._last_optimized_token_count or 0) - base
+        grown = (opt.budget._last_optimized_token_count or 0) - base
         assert grown <= opt._config.agentic.max_context_growth_per_turn + 50, (
             f"context grew {grown} tokens in one turn, exceeds growth ceiling"
         )
@@ -1385,7 +1386,7 @@ class TestCacheStabilityAcrossTurns:
             {"role": "assistant", "content": "ok " + "z" * 2000},
         ]
         opt.optimize_messages(big)
-        base = opt._last_optimized_token_count or 0
+        base = opt.budget._last_optimized_token_count or 0
         # A tiny next turn would otherwise let the compactor drop the whole body.
         small = [
             {"role": "system", "content": "sys " + "x" * 2000},
@@ -1395,7 +1396,7 @@ class TestCacheStabilityAcrossTurns:
             {"role": "assistant", "content": "ack"},
         ]
         opt.optimize_messages(small)
-        shrunk = base - (opt._last_optimized_token_count or 0)
+        shrunk = base - (opt.budget._last_optimized_token_count or 0)
         # The shrink must be bounded by the per-turn cap (allow small slack for
         # the protected tail / summary which are never evicted).
         cap = opt._effective_shrink_cap()
@@ -1420,7 +1421,7 @@ class TestCacheStabilityAcrossTurns:
             {"role": "assistant", "content": "Hello!"},
         ]
         opt.optimize_messages(lean)
-        assert opt._last_optimized_token_count is not None, (
+        assert opt.budget._last_optimized_token_count is not None, (
             "fast path left _last_optimized_token_count unset -> shrink floor is None"
         )
         # A subsequent over-budget turn must now see a real floor and stay bounded.
@@ -1430,7 +1431,7 @@ class TestCacheStabilityAcrossTurns:
             {"role": "assistant", "content": "y" * 4000},
         ]
         opt.optimize_messages(big)
-        assert opt._last_optimized_token_count is not None
+        assert opt.budget._last_optimized_token_count is not None
 
     def test_filter_tool_messages_respects_shrink_floor(self) -> None:
         """P0.6 regression: tool-output filtering must not drop the context below
@@ -1461,7 +1462,7 @@ class TestCacheStabilityAcrossTurns:
             {"role": "tool", "tool_call_id": "call_1", "name": "run_command", "content": big_log},
         ]
         opt.optimize_messages(base_msgs)
-        base = opt._last_optimized_token_count or 0
+        base = opt.budget._last_optimized_token_count or 0
         # A tiny follow-up turn would otherwise let the filter collapse the body.
         small = [
             *base_msgs,
@@ -1469,7 +1470,7 @@ class TestCacheStabilityAcrossTurns:
             {"role": "assistant", "content": "ack"},
         ]
         opt.optimize_messages(small)
-        shrunk = base - (opt._last_optimized_token_count or 0)
+        shrunk = base - (opt.budget._last_optimized_token_count or 0)
         floor = opt._effective_shrink_floor()
         # The shrink must be bounded by the per-turn cap (small slack for the
         # protected tail / summary which are never evicted).
@@ -1708,40 +1709,41 @@ class TestAdaptiveBudget:
         config.agentic.adaptive_budget_enabled = True
         config.agentic.dynamic_budget_enabled = True
         opt = AgentContextOptimizer(config)
-        opt._backend_context_window = lambda: self.WINDOW
-        opt._token_calibration = 1.0
+        # The budget state lives on the BudgetGovernor (Phase 4); drive it directly.
+        opt.budget._backend_window = lambda: self.WINDOW
+        opt.budget._token_calibration = 1.0
         return opt
 
     def test_budget_grows_with_horizon(self) -> None:
         opt = self._opt()
-        opt._last_optimized_token_count = None
-        opt._turns_seen = 0
+        opt.budget._last_optimized_token_count = None
+        opt.budget._turns_seen = 0
         base = opt._budget_tokens()
-        opt._turns_seen = 10
+        opt.budget._turns_seen = 10
         grown = opt._budget_tokens()
         assert grown > base
         assert grown - base == 10 * opt._config.agentic.adaptive_horizon_growth_tokens
 
     def test_budget_capped_at_window_fraction(self) -> None:
         opt = self._opt()
-        opt._last_optimized_token_count = None
-        opt._turns_seen = 100000  # absurd horizon -> hits the ceiling
+        opt.budget._last_optimized_token_count = None
+        opt.budget._turns_seen = 100000  # absurd horizon -> hits the ceiling
         ceiling = int(self.WINDOW * opt._config.agentic.adaptive_window_fraction)
         assert opt._budget_tokens() == ceiling
 
     def test_budget_never_shrinks_below_last_optimized_size(self) -> None:
         opt = self._opt()
-        opt._turns_seen = 0
-        opt._last_optimized_token_count = 50000  # already larger than base+horizon
+        opt.budget._turns_seen = 0
+        opt.budget._last_optimized_token_count = 50000  # already larger than base+horizon
         assert opt._budget_tokens() >= 50000
 
     def test_adaptive_disabled_uses_fixed_budget(self) -> None:
         opt = self._opt()
         opt._config.agentic.adaptive_budget_enabled = False
-        opt._last_optimized_token_count = None
-        opt._turns_seen = 0
+        opt.budget._last_optimized_token_count = None
+        opt.budget._turns_seen = 0
         fixed_at_0 = opt._budget_tokens()
-        opt._turns_seen = 30
+        opt.budget._turns_seen = 30
         # Horizon must not move the budget once adaptive is off.
         assert opt._budget_tokens() == fixed_at_0
 
@@ -1751,16 +1753,16 @@ class TestAdaptiveBudget:
             {"role": "assistant", "content": "```python\n" + "x = 1\n" * 40 + "```"},
         ]
         # ~200 chars of code / 4 ≈ 50 tokens; prose contributes nothing.
-        assert AgentContextOptimizer._count_code_tokens(msgs) > 0
-        assert AgentContextOptimizer._count_code_tokens([msgs[0]]) == 0
+        assert BudgetGovernor.count_code_tokens(msgs) > 0
+        assert BudgetGovernor.count_code_tokens([msgs[0]]) == 0
 
     def test_budget_grows_with_code_density(self) -> None:
         opt = self._opt()
-        opt._last_optimized_token_count = None
-        opt._turns_seen = 0
-        opt._recent_code_tokens = 0
+        opt.budget._last_optimized_token_count = None
+        opt.budget._turns_seen = 0
+        opt.budget._recent_code_tokens = 0
         prose_budget = opt._budget_tokens()
-        opt._recent_code_tokens = 8000  # a code-heavy turn
+        opt.budget._recent_code_tokens = 8000  # a code-heavy turn
         code_budget = opt._budget_tokens()
         assert code_budget > prose_budget
         assert code_budget - prose_budget == int(
@@ -1770,11 +1772,11 @@ class TestAdaptiveBudget:
     def test_code_density_disabled_by_zero_factor(self) -> None:
         opt = self._opt()
         opt._config.agentic.adaptive_code_density_factor = 0.0
-        opt._last_optimized_token_count = None
-        opt._turns_seen = 0
-        opt._recent_code_tokens = 0
+        opt.budget._last_optimized_token_count = None
+        opt.budget._turns_seen = 0
+        opt.budget._recent_code_tokens = 0
         base = opt._budget_tokens()
-        opt._recent_code_tokens = 8000
+        opt.budget._recent_code_tokens = 8000
         # Zero factor: code volume must not move the budget.
         assert opt._budget_tokens() == base
 
@@ -1782,8 +1784,8 @@ class TestAdaptiveBudget:
         # Space-based folding (review §4.7): the budget ceiling rises to the fold
         # window fraction so the budget gates don't front-evict before the fold.
         opt = self._opt()
-        opt._last_optimized_token_count = None
-        opt._turns_seen = 100000  # absurd horizon -> hits the ceiling
+        opt.budget._last_optimized_token_count = None
+        opt.budget._turns_seen = 100000  # absurd horizon -> hits the ceiling
         opt._config.v050.fold_window_fraction = 0.5
         # max(adaptive_window_fraction=0.15, fold_window_fraction=0.5) = 0.5.
         assert opt._budget_tokens() == int(self.WINDOW * 0.5)

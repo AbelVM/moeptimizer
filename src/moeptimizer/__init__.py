@@ -22,6 +22,7 @@ from __future__ import annotations
 __version__ = "0.7.26"
 
 from moeptimizer.async_io_stage import AsyncIOStage, get_async_io_stage
+from moeptimizer.budget_governor import BudgetGovernor
 from moeptimizer.cache import (
     CONTEXT_BLOCK_SIZE,
     align_to_block_boundary,
@@ -94,6 +95,7 @@ __all__ = [
     "AgentStep",
     "AppConfig",
     "AsyncIOStage",
+    "BudgetGovernor",
     "CacheAwareChunker",
     "CacheKeyRegistry",
     "ChunkFingerprintCache",

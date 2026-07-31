@@ -37,6 +37,7 @@ from typing import Any
 import numpy as np
 
 from moeptimizer.async_io_stage import get_async_io_stage
+from moeptimizer.budget_governor import BudgetGovernor
 from moeptimizer.cache import (
     get_block_aligned_cache_key,
     get_block_size,
@@ -121,17 +122,15 @@ class AgentContextOptimizer:
         # app injects its initialized instance, ranking works; the fallback keeps
         # direct construction (tests) behaving as before.
         self._injected_embedding_service = embedding_service
-        # Token-count calibration (review §1/§9, priority fix #6). Initialized
-        # early so _budget_tokens() can be called during __init__ (e.g. to seed
-        # the adaptive summary-cap ceiling) before the later detailed setup.
-        self._token_calibration: float = 1.0
-        # Conversation horizon (turns optimized by this per-session optimizer).
-        # Drives the adaptive budget's horizon term (review §3.1): a longer session
-        # gets a larger cached working set. Incremented once per top-level optimize.
-        self._turns_seen: int = 0
-        # Code volume (tokens) in the current request; the adaptive budget's
-        # task-complexity term (review §3.1). Recomputed each optimize.
-        self._recent_code_tokens: int = 0
+        # Context-budget state + computation (Phase 4 god-object decomposition).
+        # The governor owns the token-calibration ratio (review §1/§9, priority
+        # fix #6), the conversation horizon (turns seen), the current request's
+        # code volume, and the last optimized token count that used to live on
+        # this optimizer. Constructed early so _budget_tokens() can be called
+        # during __init__ (e.g. to seed the adaptive summary-cap ceiling) before
+        # the later detailed setup. It reads the live backend window through
+        # ``self._backend_context_window`` (set up just above via the probe).
+        self.budget = BudgetGovernor(self._config, self._backend_context_window)
         self.store = AgentStateStore()
         self.context_aligner = get_context_aligner()
 
@@ -236,7 +235,8 @@ class AgentContextOptimizer:
         self._real_cache_samples: int = 0
         self._prefix_drift: bool = False
         self._last_optimized: list[dict[str, Any]] = []
-        self._last_optimized_token_count: int | None = None
+        # ``_last_optimized_token_count`` is owned by ``self.budget`` (Phase 4);
+        # read/write it via the governor's accessor/mutator.
         self._last_original_token_count: int | None = None
         # Degradation vector (review §11 / P4b). Each pipeline stage swallows
         # failures with a `logger.warning` and falls back to a safe default. To
@@ -326,194 +326,35 @@ class AgentContextOptimizer:
     def _budget_tokens(self) -> int:
         """Return the effective token budget for the optimized context.
 
-        When ``dynamic_budget_enabled`` is on and the live backend window is known,
-        the budget is derived from the REAL context window
-        (``max(window * budget_window_fraction, max_optimized_tokens)``) and scaled
-        by the learned token-calibration ratio, so it is enforced against the
-        backend's true token count rather than a static guess. This adapts the cap
-        to the actual device (e.g. a 262K window yields ~15.7K vs the old fixed
-        12K) and keeps headroom for generation + the cache-stable prefix. Falls back
-        to the static ``max_optimized_tokens`` (floored by the char budget) when the
-        window is unknown or dynamic budgeting is disabled.
+        Thin delegate to :class:`BudgetGovernor` (Phase 4 god-object
+        decomposition); see :meth:`BudgetGovernor.budget_tokens` for the full
+        static/adaptive budget behavior.
         """
-        cfg = self._config.agentic
-        base = self._static_budget_tokens()
-        if not cfg.adaptive_budget_enabled:
-            return base
-        return self._adaptive_budget_tokens(base)
-
-    def _static_budget_tokens(self) -> int:
-        """The legacy fixed budget: ``max(window * budget_window_fraction,
-        max_optimized_tokens, char_budget)`` scaled by calibration.
-
-        Used as the base/floor of the adaptive budget and as the full budget when
-        ``adaptive_budget_enabled`` is off (review §4.2.2).
-        """
-        cfg = self._config.agentic
-        char_budget = max(1, cfg.max_optimized_chars // 4)
-        static = char_budget if cfg.max_optimized_tokens <= 0 else min(char_budget, cfg.max_optimized_tokens)
-
-        if not cfg.dynamic_budget_enabled:
-            return static
-
-        window = self._backend_context_window()
-        if window is None or window <= 0:
-            return static
-
-        derived = int(window * cfg.budget_window_fraction)
-        # Never go below the configured floor, and never below the char budget.
-        budget = max(derived, cfg.max_optimized_tokens, char_budget)
-        # Scale by the learned backend-tokenizer ratio so the cap is enforced
-        # against true backend tokens (clamped to [0.5, 2.0] upstream).
-        return max(1, round(budget * self._token_calibration))
-
-    def _adaptive_budget_tokens(self, base: int) -> int:
-        """Adaptive, horizon-growing budget (review §3.1 / §4.2.2).
-
-        The fixed cap was pinned to ``max_optimized_tokens`` (12K) while the
-        immutable zones need ~16K, so ``evictable_budget`` was 0, the cap was
-        ignored (context ran 16-18K), and the fold fired every 2-3 turns against a
-        93%-idle window. This replaces the constant with a GROWING ceiling:
-
-        - **horizon**: ``base + adaptive_horizon_growth_tokens * turns_seen`` — a
-          longer session carries a larger cached working set;
-        - **window ceiling**: capped at ``window * adaptive_window_fraction`` so a
-          long session grows toward a sane fraction of the real window, not a guess;
-        - **monotonic floor**: never below the previous turn's optimized size, so the
-          budget is a ceiling the context grows into — never a target to evict down
-          to. This keeps ``reserved < budget`` (the governors stop fighting) and the
-          prefix cache stable (no forced mid-body shrinkage).
-
-        The result is scaled by the learned calibration like the static budget.
-        """
-        cfg = self._config.agentic
-        budget = base + cfg.adaptive_horizon_growth_tokens * self._turns_seen
-
-        # Task-complexity term (review §3.1): a code-heavy request grows the budget
-        # so more verbatim code survives (and the fold pressure target rises, so
-        # code-heavy sessions fold less often). getattr: _budget_tokens() is also
-        # called during __init__ before this attribute exists.
-        code_tokens = getattr(self, "_recent_code_tokens", 0)
-        if cfg.adaptive_code_density_factor and code_tokens:
-            budget += int(cfg.adaptive_code_density_factor * code_tokens)
-
-        window = self._backend_context_window()
-        if window is not None and window > 0:
-            ceiling_frac = cfg.adaptive_window_fraction
-            # Space-based folding (review §4.7): the budget ceiling must reach the
-            # fold pressure target (fold_window_fraction) so the budget gates
-            # (_trim_to_budget & co.) don't front-evict — and break the prefix
-            # cache — before the fold fires on real space pressure near the window.
-            fold_frac = self._config.v050.fold_window_fraction
-            if fold_frac > 0:
-                ceiling_frac = max(ceiling_frac, fold_frac)
-            ceiling = int(window * ceiling_frac)
-            budget = min(budget, ceiling)
-
-        # getattr: _budget_tokens() is also called during __init__ (to seed the
-        # summary ceiling) before this attribute exists.
-        last = getattr(self, "_last_optimized_token_count", None)
-        if last:
-            budget = max(budget, last)
-
-        return max(1, round(budget * self._token_calibration))
-
-    @staticmethod
-    def _count_code_tokens(messages: list[dict[str, Any]]) -> int:
-        """Estimate tokens inside fenced code blocks across ``messages``.
-
-        Cheap char-based estimate (chars/4) of code-fence content only — used as
-        the adaptive budget's task-complexity signal (review §3.1), not for exact
-        counting. Returns 0 when there is no fenced code.
-        """
-        code_chars = 0
-        for msg in messages:
-            content = msg.get("content")
-            if not isinstance(content, str) or "```" not in content:
-                continue
-            for match in re.finditer(r"```[\s\S]*?```", content):
-                code_chars += len(match.group(0))
-        return code_chars // 4
+        return self.budget.budget_tokens()
 
     def _effective_budget_tokens(self) -> int:
         """Return the budget actually enforced this turn, with the growth ceiling.
 
-        Wraps :meth:`_budget_tokens` with the per-turn growth cap
-        (``max_context_growth_per_turn``). The dynamic budget can be much larger
-        than the previous turn's optimized context (e.g. ~6.5K on a 262K window);
-        without a growth cap a single turn could jump straight to the cap and force
-        a large mid-body rewrite that breaks the backend's prefix-cache reuse (the
-        v0.7.18 turn-13 regression). The growth ceiling limits expansion to
-        ``prev_size + max_context_growth_per_turn`` so the context grows gradually
-        and the cached prefix stays valid. On the first turn (no previous size) or
-        when the cap is disabled (0), the full dynamic budget applies.
+        Thin delegate to :class:`BudgetGovernor` (Phase 4 god-object
+        decomposition); see :meth:`BudgetGovernor.effective_budget_tokens`.
         """
-        budget = self._budget_tokens()
-        cap = self._config.agentic.max_context_growth_per_turn
-        if cap <= 0 or self._last_optimized_token_count is None:
-            return budget
-        # With the cache-stable rolling summary active, the BATCH FOLD is the
-        # size governor: between folds the context grows by pure tail append
-        # (cache-safe at any size), and the fold sheds tokens the turn the
-        # context crosses its target. The growth ceiling was designed to stop
-        # a single turn from forcing a large MID-BODY rewrite (v0.7.18), but
-        # here it does the opposite: it chases the previous turn's size with
-        # only ``cap`` tokens of slack, so any turn growing more than that
-        # (the fixture's turns vary 230-2300 tokens) trips the pressure fold
-        # EVERY turn, appending to the summary and sliding the live zone —
-        # the per-turn prefix break the fold is supposed to prevent. Let the
-        # full (static) budget apply; the fold target derived from it keeps
-        # the size bounded with rare, batched invalidations.
-        if self._cache_stable_summary and self.hierarchical_summarizer is not None:
-            return budget
-        ceiling = self._last_optimized_token_count + cap
-        return min(budget, ceiling)
+        return self.budget.effective_budget_tokens()
 
     def _effective_shrink_cap(self) -> int:
         """Return the per-turn SHRINK ceiling (max tokens the context may drop).
 
-        Symmetric to :meth:`_effective_budget_tokens`'s growth ceiling (P0.6).
-        Bounds the front-eviction rate so the body never collapses in a single
-        over-budget turn — the v0.7.21 turn-13 break was an 8.5K->2K tok drop that
-        invalidated the backend's cached KV for the whole body. When the next
-        turn's optimized size would fall below ``prev_size - shrink_cap``, the
-        trimmer only drops down to that floor and leaves the rest for later turns,
-        so the cached head stays valid.
-
-        The cap is DYNAMIC (smart default) when ``max_context_shrink_per_turn=0``:
-        it is proportional to the CURRENT lean context size
-        (``current_size * shrink_context_fraction``), not the model's full window.
-        The target is a lean context, so a 12K-tok context may shrink ~1.8K/turn
-        while a 2K-tok context only ~300/turn. The cap is floored by the growth
-        ceiling (a session that grows fast must be allowed to shrink at least as
-        fast) and by ``shrink_min_tokens`` (an absolute floor so tiny contexts
-        still have a bounded, non-trivial shrink rate).
+        Thin delegate to :class:`BudgetGovernor` (Phase 4 god-object
+        decomposition); see :meth:`BudgetGovernor.effective_shrink_cap`.
         """
-        cfg = self._config.agentic
-        if cfg.max_context_shrink_per_turn > 0:
-            return cfg.max_context_shrink_per_turn
-        # Auto: proportional to the current lean context size, floored by the
-        # growth rate and an absolute minimum.
-        growth = cfg.max_context_growth_per_turn
-        current = self._last_optimized_token_count
-        if current is None or current <= 0:
-            # No baseline yet: fall back to the growth ceiling so shrink is at
-            # least as fast as growth.
-            return max(growth, cfg.shrink_min_tokens)
-        derived = int(current * cfg.shrink_context_fraction)
-        return max(derived, growth, cfg.shrink_min_tokens)
+        return self.budget.effective_shrink_cap()
 
     def _effective_shrink_floor(self) -> int | None:
         """Return the minimum optimized size allowed this turn, or None if N/A.
 
-        ``prev_size - shrink_cap``. Returns None on the first turn (no previous
-        size) or when the shrink cap is disabled (<= 0 and no window), so the
-        full budget applies.
+        Thin delegate to :class:`BudgetGovernor` (Phase 4 god-object
+        decomposition); see :meth:`BudgetGovernor.effective_shrink_floor`.
         """
-        cap = self._effective_shrink_cap()
-        if cap <= 0 or self._last_optimized_token_count is None:
-            return None
-        return max(0, self._last_optimized_token_count - cap)
+        return self.budget.effective_shrink_floor()
 
     def _backend_context_window(self) -> int | None:
         """Return the live backend context window in tokens, or None if unknown.
@@ -557,9 +398,9 @@ class AgentContextOptimizer:
         optimized = self._stabilize_summary_position(optimized)
         self._last_optimized = optimized
         try:
-            self._last_optimized_token_count = self.token_counter.count_messages(optimized)
+            self.budget.set_last_optimized_token_count(self.token_counter.count_messages(optimized))
         except Exception:  # pragma: no cover - defensive
-            self._last_optimized_token_count = None
+            self.budget.set_last_optimized_token_count(None)
         try:
             self._last_original_token_count = self.token_counter.count_messages(messages)
         except Exception:  # pragma: no cover - defensive
@@ -569,15 +410,12 @@ class AgentContextOptimizer:
     def _dynamic_cap(self, fraction: float, floor: int) -> int:
         """Return ``max(fraction * dynamic_budget, floor)`` in tokens.
 
-        Used to derive the various sub-caps (tool-output compression threshold,
-        code-chunk size, state-step cap, anchor constraints) from the live
-        backend window so they scale with the device instead of being fixed.
-        Falls back to ``floor`` when the window is unknown or dynamic budgeting
-        is disabled (the floor is the configured static value).
+        Thin delegate to :class:`BudgetGovernor` (Phase 4 god-object
+        decomposition); see :meth:`BudgetGovernor.dynamic_cap`. Used to derive
+        the various sub-caps (tool-output compression threshold, code-chunk
+        size, state-step cap, anchor constraints) from the live backend window.
         """
-        if not self._config.agentic.dynamic_budget_enabled:
-            return floor
-        return max(floor, int(self._budget_tokens() * fraction))
+        return self.budget.dynamic_cap(fraction, floor)
 
     def _dynamic_tool_output_max_chars(self) -> int:
         """Boundary-compression threshold (chars) for tool/assistant output.
@@ -627,14 +465,14 @@ class AgentContextOptimizer:
         if ratio is None or ratio <= 0:
             return
         clamped = max(0.5, min(2.0, float(ratio)))
-        self._token_calibration = clamped
+        self.budget.set_token_calibration(clamped)
         if self.token_aware_truncator is not None:
             self.token_aware_truncator._token_calibration = clamped
 
     def calibrated_token_count(self, messages: list[dict[str, Any]]) -> int:
         """Return the token count scaled by the learned backend ratio (#6)."""
         raw = self.token_counter.count_messages(messages)
-        return round(raw * self._token_calibration)
+        return self.budget.calibrated_token_count(raw)
 
     def _record_degradation(self, stage: str, error: Exception) -> None:
         """Record a swallowed pipeline-stage failure for the degradation header (P4b).
@@ -991,7 +829,7 @@ class AgentContextOptimizer:
             # Advance the conversation horizon once per top-level request (not for
             # incremental sub-runs, which reuse this same call). Drives the adaptive
             # budget's horizon term (review §3.1).
-            self._turns_seen += 1
+            self.budget.advance_turn()
             return self._optimize_messages_locked(messages, original_prompt)
 
     def _optimize_messages_locked(
@@ -1120,9 +958,9 @@ class AgentContextOptimizer:
         # ``optimized``. Every gate below reads this variable instead of calling
         # count_messages again.
         # Task-complexity signal for the adaptive budget (review §3.1): the code
-        # volume in the current request, read by _adaptive_budget_tokens below so a
-        # code-heavy turn keeps a larger budget (more verbatim code, fewer folds).
-        self._recent_code_tokens = self._count_code_tokens(messages)
+        # volume in the current request, read by the governor's adaptive budget so
+        # a code-heavy turn keeps a larger budget (more verbatim code, fewer folds).
+        self.budget.set_recent_code_tokens(messages)
         max_tokens = self._effective_budget_tokens()
         proactive_threshold_tokens = int(max_tokens * self._config.agentic.proactive_trim_ratio)
         compaction_threshold_tokens = int(max_tokens * self._config.agentic.compaction_trigger_ratio)
@@ -1709,9 +1547,9 @@ class AgentContextOptimizer:
         # the X-Optimized-Prompt-Tokens header without re-tokenizing the whole
         # prompt on the event loop (expensive with the real HF Qwen tokenizer).
         try:
-            self._last_optimized_token_count = self.token_counter.count_messages(optimized)
+            self.budget.set_last_optimized_token_count(self.token_counter.count_messages(optimized))
         except Exception:  # pragma: no cover - defensive
-            self._last_optimized_token_count = None
+            self.budget.set_last_optimized_token_count(None)
         if self.hit_prediction is not None:
             try:
                 self.hit_prediction.record_outcome(
@@ -2476,9 +2314,10 @@ class AgentContextOptimizer:
         else:
             # Char mode: derive a floor from the token shrink cap if available.
             cap = self._effective_shrink_cap()
-            if cap > 0 and self._last_optimized_token_count is not None:
+            last_optimized = self.budget.last_optimized_token_count
+            if cap > 0 and last_optimized is not None:
                 # Approximate char floor: prev_chars - cap*4 (4 chars/token).
-                prev_chars = (self._last_optimized_token_count - cap) * 4
+                prev_chars = (last_optimized - cap) * 4
                 shrink_floor = max(0, prev_chars - reserved)
 
         # Evict from front of evictable body until under remaining budget AND
@@ -2884,7 +2723,7 @@ class AgentContextOptimizer:
     @property
     def last_optimized_token_count(self) -> int | None:
         """Token count of the most recent optimized prompt (cached from optimize_messages)."""
-        return self._last_optimized_token_count
+        return self.budget.last_optimized_token_count
 
     @property
     def last_original_token_count(self) -> int | None:
@@ -2894,9 +2733,10 @@ class AgentContextOptimizer:
     @property
     def last_saved_token_count(self) -> int | None:
         """Tokens saved by the last optimization (original - optimized), if known."""
-        if self._last_original_token_count is None or self._last_optimized_token_count is None:
+        optimized = self.budget.last_optimized_token_count
+        if self._last_original_token_count is None or optimized is None:
             return None
-        return max(0, self._last_original_token_count - self._last_optimized_token_count)
+        return max(0, self._last_original_token_count - optimized)
 
     @property
     def last_degradation(self) -> list[str]:
@@ -3477,7 +3317,7 @@ class AgentContextOptimizer:
             },
             "cache": {
                 "last_static_prefix_hit": self._last_static_prefix_hit,
-                "last_optimized_token_count": self._last_optimized_token_count,
+                "last_optimized_token_count": self.budget.last_optimized_token_count,
                 "last_original_token_count": self._last_original_token_count,
                 "last_saved_token_count": self.last_saved_token_count,
                 "registry": cache_stats,
