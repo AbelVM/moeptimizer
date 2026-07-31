@@ -335,6 +335,23 @@ class AgenticConfig(BaseModel):
                     "tool_output_compression_budget_fraction * dynamic budget; this value is the floor "
                     "so a tiny/unknown window never compresses everything.",
     )
+    reversible_compression_enabled: bool = Field(
+        default=False,
+        description=(
+            "Reversible compression (review §4.1.2 / Forward plan B1). When a tool "
+            "output is compressed, keep the original in a per-session content-addressed "
+            "store and embed its handle in the placeholder, so the compression is "
+            "reversible (retrieve the original via GET /v1/content/{handle}; a "
+            "model-facing expand(id) tool is the planned follow-up) instead of losing "
+            "the detail forever. OFF by default: it is a new interaction surface and the "
+            "retrieval tool is not yet wired into the model protocol."
+        ),
+    )
+    reversible_compression_min_chars: int = Field(
+        default=2000,
+        description="Only store originals for compression of tool outputs at least this "
+                    "many chars (smaller outputs are not worth a retrieval handle).",
+    )
     user_paste_compression_enabled: bool = Field(
         default=True,
         description=(

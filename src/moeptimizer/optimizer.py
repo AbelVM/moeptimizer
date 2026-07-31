@@ -57,6 +57,7 @@ from moeptimizer.code_chunking import (
 )
 from moeptimizer.compactor import ScratchpadCompactor
 from moeptimizer.config import AppConfig
+from moeptimizer.content_store import ContentStore
 from moeptimizer.context_aligner import get_context_aligner
 from moeptimizer.context_canonicalizer import get_context_canonicalizer
 from moeptimizer.context_compressor import get_context_compressor
@@ -217,6 +218,9 @@ class AgentContextOptimizer:
             max_chars=self._dynamic_tool_output_max_chars()
         )
         self.tool_output_filter = ToolOutputFilter()
+        # Reversible compression (review §4.1.2 / B1): per-session content-addressed
+        # store holding the originals of compressed tool outputs, keyed by handle.
+        self.content_store = ContentStore()
         self._task_type: str = "default"
         self._last_backend_extra_body: dict[str, Any] = {}
         # Throttled cache_registry disk-write counter (review §10).
@@ -3229,6 +3233,23 @@ class AgentContextOptimizer:
             return self._tool_output_cache[cache_key]
         compressed = compress_tool_messages([msg], compressor)
         compressed_msg = compressed[0] if compressed else msg
+        # Reversible compression (review §4.1.2 / Forward plan B1): keep the original
+        # behind a handle so compression is not lossy. The handle is the content hash,
+        # so the placeholder is deterministic — cache-stable when applied on first
+        # appearance (the same content always yields the same placeholder). Only for
+        # outputs worth a handle (>= min_chars) that were actually compressed.
+        if (
+            self._config.agentic.reversible_compression_enabled
+            and len(content) >= self._config.agentic.reversible_compression_min_chars
+            and (compressed_msg.get("content") or "") != content
+        ):
+            handle = self.content_store.put(content)
+            compressed_msg = dict(compressed_msg)
+            compressed_msg["content"] = (
+                f"[original retained: handle={handle}, {len(content)} chars; "
+                f"retrieve via GET /v1/content/{handle}]\n"
+                f"{compressed_msg.get('content') or ''}"
+            )
         self._tool_output_cache[cache_key] = compressed_msg
         if len(self._tool_output_cache) > self._tool_output_cache_max:
             self._tool_output_cache.pop(next(iter(self._tool_output_cache)))

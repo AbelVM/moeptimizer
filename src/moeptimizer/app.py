@@ -1924,6 +1924,18 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         debug["metrics"] = PROXY_METRICS.snapshot().get("sessions", {}).get(session_id)
         return {"object": "agent.session.debug", **debug}
 
+    @app.get("/v1/agent/sessions/{session_id}/content/{handle}")
+    async def get_retained_content(session_id: str, handle: str) -> dict[str, str]:
+        """Retrieve the original of a reversibly-compressed tool output by handle
+        (review §4.1.2 / Forward plan B1). The handle is embedded in the compressed
+        placeholder; 404 if the content was evicted or never stored. A model-facing
+        expand(id) tool that calls this is the planned follow-up."""
+        optimizer = session_manager.get_or_create(session_id)
+        content = optimizer.content_store.get(handle)
+        if content is None:
+            raise HTTPException(status_code=404, detail="handle not found or evicted")
+        return {"object": "retained_content", "handle": handle, "content": content}
+
     @app.delete("/v1/agent/session/{session_id}")
     async def delete_session(session_id: str):
         """Delete an agent session."""

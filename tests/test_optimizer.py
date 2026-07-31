@@ -66,6 +66,31 @@ class TestAgentContextOptimizer:
         ]
         assert self.optimizer._restore_thinking(echoed)[0]["reasoning_content"] == "client's own"
 
+    def test_reversible_compression_retains_original(self) -> None:
+        """B1 (review §4.1.2): with reversible compression on, a compressed tool
+        output carries a deterministic handle and the original is retrievable."""
+        self.optimizer._config.agentic.reversible_compression_enabled = True
+        self.optimizer._config.agentic.reversible_compression_min_chars = 100
+        original = (
+            "======================== test session starts ========================\n"
+            + "PASSED tests/test_ok.py::test_case\n" * 200
+            + "======================== 200 passed in 1.23s ========================\n"
+        )
+        compressed = self.optimizer._compress_tool_output_message({"role": "tool", "content": original})
+        content = compressed["content"]
+        assert len(content) < len(original)  # actually compressed
+        assert "handle=" in content
+        handle = content.split("handle=")[1].split(",")[0]
+        assert self.optimizer.content_store.get(handle) == original
+
+    def test_reversible_compression_off_by_default(self) -> None:
+        """With the flag off (default), compression is lossy and stores nothing."""
+        assert self.optimizer._config.agentic.reversible_compression_enabled is False
+        original = "PASSED tests/test_ok.py::test_case\n" * 200
+        compressed = self.optimizer._compress_tool_output_message({"role": "tool", "content": original})
+        assert "handle=" not in compressed["content"]
+        assert len(self.optimizer.content_store) == 0
+
     def test_set_token_calibration_clamps_and_scales(self) -> None:
         # ratio clamped to [0.5, 2.0]
         self.optimizer.set_token_calibration(10.0)

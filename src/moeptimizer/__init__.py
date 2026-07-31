@@ -51,6 +51,7 @@ from moeptimizer.code_chunking import (
 )
 from moeptimizer.compactor import ScratchpadCompactor
 from moeptimizer.config import AppConfig, get_config
+from moeptimizer.content_store import ContentStore
 from moeptimizer.context_aligner import ContextAligner, get_context_aligner
 from moeptimizer.context_canonicalizer import ContextCanonicalizer, get_context_canonicalizer
 from moeptimizer.context_compressor import ContextCompressor, get_context_compressor
@@ -101,6 +102,7 @@ __all__ = [
     "ChunkFingerprintCache",
     "CircuitBreaker",
     "CodeDeltaEncoder",
+    "ContentStore",
     "ContextAligner",
     "ContextCanonicalizer",
     "ContextCompressor",
