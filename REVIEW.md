@@ -241,7 +241,7 @@ quality loss.
 | # | Item | Refs | Effort |
 |---|---|---|---|
 | B1 | 🟡 **Reversible compression + retrieval handles** — per-session content-addressed `ContentStore` + handle embedded in the compressed placeholder + `GET /v1/agent/sessions/{id}/content/{handle}` retrieval (commit `e21675b`, config-gated OFF). **Pending:** the model-facing `expand(id)` tool that calls the endpoint. | §4.1.2 | **[L]** |
-| B2 | ⬜ **Cached re-read collapse + global code dedup** — `[file X unchanged since turn N]` reference + SHA-256 whole-file registry across turns. Can build on B1's `ContentStore`. Must be monotonic/first-appearance to stay cache-stable. | §4.1.3, §4.5.2 | **[M]** |
+| B2 | ✅ **Cached re-read collapse + global code dedup** — stateless, idempotent boundary transform: first occurrence of a repeated tool output stays full, later identical ones collapse to a handle reference (original retained in B1's `ContentStore`) (commit `39b080e`, config-gated OFF). | §4.1.3, §4.5.2 | **[M]** |
 | B3 | ⬜ **Volatile-field relocation** — move dates / UUIDs / SHAs / timestamps out of the cacheable prefix. | §4.1.4, §4.7.4 | **[M]** ⚠ cache |
 | B4 | 🟡 **Wire syntactic code slicing into the pipeline** behind a config gate (default OFF), compressing on first appearance (depends on A4). | §4.5.3 | **[M]** ⚠ cache |
 | B5 | ✅ **Fix AST chunk-0 duplicate imports** — body loop skips the header node indices so imports appear only via the per-chunk prefix (done, regression-tested). | §4.5 #5 | **[S]** |
@@ -766,11 +766,12 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    content-addressed `ContentStore` + handle in the placeholder + HTTP retrieval
    (`GET /v1/agent/sessions/{id}/content/{handle}`); the model-facing `expand(id)`
    tool is the pending half. → Phase 3 (larger).
-3. ⬜ **Cached re-read collapse (MED).** lean-ctx collapses a repeated file read to a
-   ~13-token reference. `delta_encoder.py` already diffs a re-read against the prior
-   snapshot, but only when the prior version is still in context; it could go
-   further and emit a stable `[file X unchanged since turn N]` reference when the
-   content hash matches, regardless of eviction. → Phase 3.
+3. ✅ **Cached re-read collapse (MED).** lean-ctx collapses a repeated file read to a
+   ~13-token reference. **Done (B2, `39b080e`, config-gated OFF):** a stateless,
+   idempotent boundary transform keeps the first occurrence of a repeated tool output
+   full and collapses later identical ones (by content hash, regardless of eviction)
+   to a handle reference; the original is retained in the per-session `ContentStore`
+   for retrieval. → Phase 3.
 4. ⬜ **Volatile-field relocation (MED).** lean-ctx/headroom move dates, UUIDs, commit
    SHAs, and timestamps **out of the cacheable prefix**. The proxy has a "volatile
    anchor" but it is a *quality* anchor (a 3rd copy of the original request — see
@@ -937,10 +938,12 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
 ### 4.5 Additional context-efficiency improvements
 
 1. ✅ **Error-aware tool-output compression** — see §4.1.1 (the biggest win).
-2. ⬜ **Global content-addressed code dedup (MED).** A SHA-256 registry across turns so
+2. ✅ **Global content-addressed code dedup (MED).** A SHA-256 registry across turns so
    a file printed twice (`cat` in turn 2, `read_file` in turn 5) collapses the second
-   to a reference. `chunk_fingerprint.py` exists but is per-chunk; extend to
-   whole-file identity. → Phase 3.
+   to a reference. **Done (B2, `39b080e`, config-gated OFF):** whole-file identity via
+   a per-session content-hash registry (built on B1's `ContentStore`); the first
+   occurrence stays full, later identical tool outputs collapse to a handle reference.
+   (`chunk_fingerprint.py` remains the per-chunk cache; this adds whole-file identity.) → Phase 3.
 3. 🟡 **Syntactic code slicing (MED) — primitive done, wiring pending.** For a
    multi-hundred-line read, keep only the target function/class referenced by the
    user query and stub siblings with `# ... [N definitions collapsed]`.
