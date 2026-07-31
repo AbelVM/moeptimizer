@@ -204,15 +204,22 @@ SSE, the compaction-geometry redesign, and the rest).
 
 ## Forward plan — tackling the pending items (post-Phase-1/2/3)
 
-Phases 1–3 are done and validated (status section above). This is the plan for what
-remains: the **23 🟡 partial**, **24 ⬜ deferred**, and **2 🆕 new** items,
-**deduplicated** across §1 / §4 / §5 / §6 (many appear in several lists) and re-ordered
-by mission impact — **TTFT + quality**, with **prefix-cache reuse as the governing
-constraint**. Each phase ends with a gate; phases run in order unless a dependency is
-noted.
+Phases 1–3 are done and validated (status section above). This is the plan for the
+remaining work, **deduplicated** across §1 / §4 / §5 / §6 (many appear in several
+lists) and re-ordered by mission impact — **TTFT + quality**, with **prefix-cache
+reuse as the governing constraint**. Each phase ends with a gate; phases run in order
+unless a dependency is noted.
 
-- **Icons** show an item's *current* state (🟡 started/gated, ⬜ not started, 🆕 new
-  this revision); the phase gate is the definition of done.
+**Progress (this revision): 10 ✅ done · 7 🟡 partial · 10 ⬜ not started.**
+**Phase A (mission-critical) is essentially complete** — the cache cliff is fixed and
+proxy TTFT now beats direct (A4 monotonic compression, A5 calibrated eviction, A1-lite
+space-based folding); A2/A3 are deferred (maintainability consolidation / window-bound
+only). Phase B's context-efficiency features (B1 reversible compression, B2 dedup, B4
+slicing) are implemented config-gated OFF (see the config-default review below). Quick
+wins D2/D3/D5/E4/F2 and the C2 consolidation are done.
+
+- **Icons** show an item's *current* state (✅ done · 🟡 partial/gated · ⬜ not
+  started); the phase gate is the definition of done.
 - **Effort:** **[S]** ≤ ~half day · **[M]** ~1–3 days · **[L]** > 3 days / needs design.
 - **⚠ cache** = touches prefix-reuse / context-mutation logic (AGENTS.md caution):
   always run the dry-run (`diag_dryrun_opencode.py --max-breaks`) **and** a benchmark
@@ -241,9 +248,9 @@ quality loss.
 | # | Item | Refs | Effort |
 |---|---|---|---|
 | B1 | 🟡 **Reversible compression + retrieval handles** — per-session content-addressed `ContentStore` + handle embedded in the compressed placeholder + `GET /v1/agent/sessions/{id}/content/{handle}` retrieval (commit `e21675b`, config-gated OFF). **Pending:** the model-facing `expand(id)` tool that calls the endpoint. | §4.1.2 | **[L]** |
-| B2 | ✅ **Cached re-read collapse + global code dedup** — stateless, idempotent boundary transform: first occurrence of a repeated tool output stays full, later identical ones collapse to a handle reference (original retained in B1's `ContentStore`) (commit `39b080e`, config-gated OFF). | §4.1.3, §4.5.2 | **[M]** |
+| B2 | ✅ **Cached re-read collapse + global code dedup** — stateless, idempotent boundary transform: first occurrence of a repeated tool output stays full, later identical ones collapse to a handle reference (original retained in B1's `ContentStore`) (commit `39b080e`, config-gated OFF). **Default decision pending:** benchmarking `tool_output_dedup_enabled=true` vs OFF to decide whether to flip it ON (the strongest candidate — see config-default review). | §4.1.3, §4.5.2 | **[M]** |
 | B3 | ⬜ **Volatile-field relocation** — move dates / UUIDs / SHAs / timestamps out of the cacheable prefix. | §4.1.4, §4.7.4 | **[M]** ⚠ cache |
-| B4 | 🟡 **Wire syntactic code slicing into the pipeline** behind a config gate (default OFF), compressing on first appearance (depends on A4). | §4.5.3 | **[M]** ⚠ cache |
+| B4 | ✅ **Wire syntactic code slicing into the pipeline** — wired as a config-gated (`code_slicing_enabled`, OFF) boundary transform using the stable original request as the query; idempotent + fail-open + never-expands ⇒ cache-stable (commit `09f9770`). **Kept OFF by default** pending better relevance detection (current sub-task, not the session goal) + a benchmark. | §4.5.3 | **[M]** ⚠ cache |
 | B5 | ✅ **Fix AST chunk-0 duplicate imports** — body loop skips the header node indices so imports appear only via the per-chunk prefix (done, regression-tested). | §4.5 #5 | **[S]** |
 | B6 | ⬜ **Per-tool compression budgets + `full_output` escape hatch + savings analytics.** | §4.11.4, §4.11.5 | **[M]** |
 
@@ -263,8 +270,8 @@ quality loss.
 
 | # | Item | Refs | Effort |
 |---|---|---|---|
-| D1 | 🟡 **Real TTFT + fresh-prefill telemetry** — per-turn `(prompt − cached)` series + live/frozen/summary breakdown in the session-debug endpoint. | §4.11.2 | **[M]** |
-| D2 | 🟡 **cache → TTFT correlation metric** (+ plot) to prove the mechanism and guard it. | §4.12.3 | **[S]** |
+| D1 | 🟡 **Real TTFT + fresh-prefill telemetry** — real TTFT done (Phase 2); `avg_fresh_prefill_tokens` (per-turn `prompt − cached`, global + per-session) added to `/v1/metrics` (commit `c43b4b6`). **Pending:** the live/frozen/summary token breakdown in the session-debug endpoint (needs the optimizer to expose zone sizes). | §4.11.2 | **[M]** |
+| D2 | ✅ **cache → TTFT correlation metric** — `cache_ttft` summary section: per-turn `fresh_prefill_tokens` stats + `fresh_prefill_vs_ttft_correlation` (Pearson) (commit `64a87e0`). A dashboard *plot* of the series is the only remaining nice-to-have. | §4.12.3 | **[S]** |
 | D3 | ✅ **Quality regression-gate hardening** — gate + diff table now read lexical metrics from `secondary_quality` (they were silently zeroed by a wrong path), add `code_syntax_validity`, and flag `length_ratio` outside [0.5, 2.0] (commit `3b4cf94`). The gate already preferred the lexical battery over the weak embedder (§4.12.4 mostly pre-done). | §4.12.6, §4.12.4 | **[S]** |
 | D4 | 🟡 **Make degradation visible** — embedding-breaker state + consistently-failing stages in `/v1/metrics` + `X-MOEPT-Optimization-Degraded`. | §4.11.3, §4.8.5 | **[M]** |
 | D5 | ✅ **Fix `print_report` faith-dict crash** — unwrap `prompt_faithfulness`/`evicted_content_recall` to the mean (commit `bba5daa`); benchmark-only. | §4.12 #10 | **[S]** |
@@ -291,7 +298,7 @@ fails N× surfaces in `/v1/metrics`; `dev.sh` green.
 | # | Item | Refs | Effort |
 |---|---|---|---|
 | F1 | ⬜ **ChatML / tool-schema / code-fence byte-stability hardening** (MTP draft acceptance). | §4.6.2 | **[M]** ⚠ cache |
-| F2 | 🟡 **Verbatim `<think>` round-trip verification** (byte-for-byte `reasoning_content`). | §4.6.3 | **[S]** |
+| F2 | ✅ **Verbatim `<think>` round-trip verification** — confirmed `capture_thinking`/`_restore_thinking` round-trip `reasoning_content` byte-for-byte (no normalization, no mutation, client-echoed reasoning never overwritten); regression test added (commit `f8b1239`). | §4.6.3 | **[S]** |
 | F3 | ⬜ **Append-only default for cache-stable mode** — lossless compression of new content only; `--context-shift` bounds the window. Depends on Phase-A geometry; the big win for *very long* sessions. | §4.3.1 | **[L]** ⚠ cache |
 
 *Gate:* injected messages are well-formed ChatML and never split a code fence;
