@@ -594,14 +594,17 @@ class V050Config(BaseModel):
                     "used when fold_window_fraction is 0 (turn-count folding).",
     )
     fold_window_fraction: float = Field(
-        default=0.0,
-        description="Space-based folding (compaction-geometry redesign, review §4.7). When > 0, the "
-                    "turn-count DRIFT trigger is DISABLED and the rolling summary folds only once the "
-                    "emitted context exceeds this fraction of the live backend window. On a huge "
-                    "window the context stays well under the fraction, so folds (which break the "
-                    "prefix cache) become rare/absent and the conversation is near append-only. 0 "
-                    "(default) keeps the turn-count DRIFT + budget-pressure folding. Start around "
-                    "0.25-0.5 and benchmark the reuse/TTFT/quality/savings tradeoff.",
+        default=0.25,
+        description="Space-based folding (compaction-geometry redesign, review §4.7 / Forward plan "
+                    "A1-lite). When > 0, the turn-count DRIFT trigger is DISABLED and the rolling "
+                    "summary folds only once the emitted context exceeds this fraction of the live "
+                    "backend window. On a huge window the context stays well under the fraction, so "
+                    "folds (which break the prefix cache) become rare/absent and the conversation is "
+                    "near append-only — at low window utilization append-and-reuse beats "
+                    "compact-and-break for TTFT (the backend reuses the whole prefix and prefills only "
+                    "the new tokens). Default 0.25: zero prefix breaks in the opencode/30 dry-run while "
+                    "the context stays ~5% of a 262K window, with folds still kicking in near ~65K for "
+                    "genuinely long sessions. Set 0 to restore turn-count DRIFT + budget-pressure folding.",
     )
     persist_state_to_disk: bool = Field(
         default=False,
