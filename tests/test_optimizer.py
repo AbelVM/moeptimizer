@@ -1,6 +1,7 @@
 """Tests for the full optimizer pipeline — front-loading eviction strategy."""
 
 import json
+import re
 from typing import Any
 from unittest.mock import patch
 
@@ -788,6 +789,49 @@ class TestAgentContextOptimizer:
         assert len(volatile) == 1
         assert volatile[0]["content"] == "# Conversation Quality Anchor\nanchor text"
         assert "Old volatile context" not in [m["content"] for m in result]
+
+    def test_balance_code_fences(self) -> None:
+        """F1 (review §4.6.2): a dangling fence is closed; balanced or absent fences
+        are left untouched. Deterministic, so the volatile turn stays cache-stable."""
+        balance = AgentContextOptimizer._balance_code_fences
+
+        def fence_count(t: str) -> int:
+            return len(re.findall(r"(?m)^[ \t]*```", t))
+
+        # No fences -> unchanged.
+        assert balance("plain text, no fences") == "plain text, no fences"
+        # Balanced pair -> unchanged.
+        balanced = "intro\n```python\ndef f(): pass\n```\noutro"
+        assert balance(balanced) == balanced
+        # Dangling opener -> a closing fence is appended, making the count even.
+        closed = balance("look:\n```python\ndef f(): pass\n")
+        assert closed.endswith("\n```")
+        assert fence_count(closed) % 2 == 0
+        # Indented fence delimiters are counted too.
+        assert fence_count(balance("  ```\ncode\n")) % 2 == 0
+
+    def test_volatile_context_balances_dangling_fence(self) -> None:
+        """F1: injected volatile context never leaves a code fence open. A RAG snippet
+        with a dangling ``` is closed in the appended volatile turn so it cannot bleed
+        'code' into subsequent content (which degrades MTP draft acceptance)."""
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 200_000
+        optimizer = AgentContextOptimizer(config)
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "Task A"},
+            {"role": "assistant", "content": "Done A"},
+        ]
+        # RAG context carries a dangling opener (odd fence count).
+        rag = "retrieved:\n```python\ndef g(): return 1\n"
+        result = optimizer._append_volatile_context(
+            messages, anchor="", rag_context=rag, warning_lines=[], proactive_threshold_tokens=0
+        )
+        volatile = [m for m in result if m.get("_volatile_turn")]
+        assert len(volatile) == 1
+        content = volatile[0]["content"]
+        assert len(re.findall(r"(?m)^[ \t]*```", content)) % 2 == 0
+        assert content.rstrip("\n").endswith("```")
 
     def test_volatile_anchor_gated_by_config(self) -> None:
         """The redundant quality anchor is appended only when its flag is on (review §4.2.6)."""

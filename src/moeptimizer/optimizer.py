@@ -1876,6 +1876,8 @@ class AgentContextOptimizer:
             return messages
 
         content = "\n\n".join(parts)
+        # F1 (review §4.6.2): never let injected context leave a code fence open.
+        content = self._balance_code_fences(content)
         # Stable tag so we can find and REMOVE any prior volatile turn from a
         # previous pass before appending a fresh one. Without this, the prior
         # volatile turn becomes a historical user turn on the next request and a
@@ -1954,6 +1956,25 @@ class AgentContextOptimizer:
     def _placeholder_code_blocks(self, text: str) -> str:
         """Replace large code fences with a compact placeholder for anchors."""
         return re.sub(r"```[\s\S]*?```", "[code block]", text)
+
+    @staticmethod
+    def _balance_code_fences(text: str) -> str:
+        """Ensure ``text`` has balanced ``` code fences (F1, review §4.6.2).
+
+        Injected volatile context (anchor / RAG / loop warnings) is assembled from
+        arbitrary source text that may carry a dangling fence —
+        ``_placeholder_code_blocks`` only strips *balanced* ```` ```...``` ```` pairs,
+        so an odd fence survives. An unterminated fence makes the backend treat
+        everything after it as code, bleeding past the injected message and degrading
+        MTP draft acceptance. Count line-start fence delimiters; an odd count is a
+        dangling opener, closed by appending a fence so the block terminates within this
+        message. Deterministic ⇒ cache-stable, and the volatile turn is trailing so
+        nothing before it shifts.
+        """
+        if len(re.findall(r"(?m)^[ \t]*```", text)) % 2 == 0:
+            return text
+        sep = "" if text.endswith("\n") else "\n"
+        return f"{text}{sep}```"
 
     def _compact_anchor_text(self, text: str, max_chars: int) -> str:
         """Compact whitespace and truncate text for quality anchors."""
