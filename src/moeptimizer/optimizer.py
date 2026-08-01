@@ -32,11 +32,9 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
-
+from moeptimizer.anchor_ops import AnchorOpsMixin
 from moeptimizer.async_io_stage import get_async_io_stage
 from moeptimizer.budget_governor import BudgetGovernor
 from moeptimizer.cache import (
@@ -46,17 +44,7 @@ from moeptimizer.cache import (
 from moeptimizer.cache_aware_chunker import get_cache_aware_chunker
 from moeptimizer.cache_registry import get_cache_registry
 from moeptimizer.chunk_fingerprint import get_chunk_fingerprint_cache
-from moeptimizer.code_block_optimizer import (
-    extract_code_blocks,
-    optimize_code_in_text,
-    slice_code_to_query,
-)
-from moeptimizer.code_chunking import (
-    LANG_MAP,
-    chunk_code_with_treesitter,
-    deduplicate_chunks,
-    detect_language_and_id,
-)
+from moeptimizer.code_opt_ops import CodeOptOpsMixin
 from moeptimizer.compactor import ScratchpadCompactor
 from moeptimizer.config import AppConfig
 from moeptimizer.content_store import ContentStore
@@ -64,6 +52,7 @@ from moeptimizer.context_aligner import get_context_aligner
 from moeptimizer.context_canonicalizer import get_context_canonicalizer
 from moeptimizer.context_compressor import get_context_compressor
 from moeptimizer.delta_encoder import CodeDeltaEncoder
+from moeptimizer.diagnostics_ops import DiagnosticsOpsMixin
 from moeptimizer.embedding import EmbeddingService
 from moeptimizer.goal_decomposer import GoalDecomposer
 from moeptimizer.hierarchical_summarizer import (
@@ -73,6 +62,7 @@ from moeptimizer.hierarchical_summarizer import (
 from moeptimizer.hit_prediction_model import get_hit_prediction_model
 from moeptimizer.loop_detector import LoopDetector
 from moeptimizer.models import AgentStep, LoopWarning
+from moeptimizer.prefix_layout import PrefixLayout
 from moeptimizer.progress_tracker import ProgressTracker
 from moeptimizer.prompt_templates import classify_and_template
 from moeptimizer.selective_truncator import get_selective_truncator
@@ -80,22 +70,13 @@ from moeptimizer.state_rag import StateBasedRAG
 from moeptimizer.state_store import AgentStateStore
 from moeptimizer.static_prefix_kv import get_static_prefix_kv_cache
 from moeptimizer.symbol_index import SymbolIndex
+from moeptimizer.thinking_ops import ThinkingOpsMixin
 from moeptimizer.thinking_preserver import ThinkingPreserver
 from moeptimizer.token_aware_truncator import TokenAwareTruncator
 from moeptimizer.token_counter import TokenCounter
 from moeptimizer.tool_output_compressor import ToolOutputCompressor, compress_tool_messages
 from moeptimizer.tool_output_filter import ToolOutputFilter
 from moeptimizer.tool_streamer import get_tool_streamer
-
-
-@dataclass(frozen=True)
-class PrefixLayout:
-    """The immutable, evictable, and protected prompt regions."""
-
-    system_anchor: list[dict[str, Any]]
-    evictable_body: list[dict[str, Any]]
-    protected_tail: list[dict[str, Any]]
-
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +118,12 @@ _VOLATILE_FIELD_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
-class AgentContextOptimizer:
+class AgentContextOptimizer(
+    ThinkingOpsMixin,
+    AnchorOpsMixin,
+    DiagnosticsOpsMixin,
+    CodeOptOpsMixin,
+):
     """Main orchestrator for agentic context optimization."""
 
     def __init__(
@@ -527,57 +513,6 @@ class AgentContextOptimizer:
         """Return the token count scaled by the learned backend ratio (#6)."""
         raw = self.token_counter.count_messages(messages)
         return self.budget.calibrated_token_count(raw)
-
-    def _record_degradation(
-        self,
-        stage: str,
-        error: Exception | None = None,
-        *,
-        reason: str | None = None,
-    ) -> None:
-        """Record a swallowed pipeline-stage failure for the degradation header (P4b).
-
-        Called from the ``except`` guards of each optimization stage. Kept cheap:
-        a single list append with a short, header-safe string. The list is reset
-        at the start of every ``optimize_messages`` call, so it only ever reflects
-        the current turn. Never raises.
-
-        Two message shapes:
-        - ``reason`` given → ``stage:reason`` — a short, structured reason code for
-          a *fail-open* path that raised no exception (e.g.
-          ``code_slicing:parser_unavailable:lang=diff:size=1234:failed_open``). This
-          is the REVIEW_luna P1 ask: a reason code plus input size / language /
-          failed-open-vs-changed, without a synthesized exception type.
-        - ``error`` given → ``stage:ErrorType:message`` — the swallowed-exception shape.
-        """
-        try:
-            if reason is not None:
-                msg = f"{stage}:{reason[:200]}"
-            elif error is not None:
-                msg = f"{stage}:{type(error).__name__}"
-                if str(error):
-                    msg = f"{msg}:{str(error)[:200]}"
-            else:
-                msg = stage
-            self._last_degradation.append(msg)
-            self._last_degradation_counts[stage] = self._last_degradation_counts.get(stage, 0) + 1
-            # Cumulative per-stage count (never resets) so a consistently-failing
-            # stage is visible in get_debug_info, not just the per-turn header.
-            self._degradation_counts[stage] = self._degradation_counts.get(stage, 0) + 1
-        except Exception:  # pragma: no cover - defensive
-            pass
-
-    @property
-    def degradation_counts(self) -> dict[str, int]:
-        """Cumulative per-stage swallowed-failure counts since session start
-        (review §4.8.5 / D4). A stage with a high count is failing consistently
-        and silently degrading quality — the signal that was previously invisible."""
-        return dict(self._degradation_counts)
-
-    @property
-    def last_degradation_counts(self) -> dict[str, int]:
-        """Return stage failure counts from the most recent optimization turn."""
-        return dict(self._last_degradation_counts)
 
     def calibrate_remote_overhead(
         self, backend_prompt_tokens: int, messages: list[dict[str, Any]]
@@ -1827,154 +1762,6 @@ class AgentContextOptimizer:
 
         return result
 
-    def _append_volatile_context(
-        self,
-        messages: list[dict[str, Any]],
-        anchor: str,
-        rag_context: str,
-        warning_lines: list[str],
-        proactive_threshold_tokens: int,
-    ) -> list[dict[str, Any]]:
-        """Append volatile (derived) context as ONE trailing user turn.
-
-        KV-cache stability (review §1/§9, priority fix #1): the quality anchor,
-        RAG context, and loop warnings are volatile — they change every turn. If
-        they were appended to the active (last) user turn, that turn's content
-        would differ between the turn it was generated and the next turn (when it
-        becomes historical), shifting the token boundary the backend hashes and
-        defeating prefix-cache reuse for everything up to that turn. Appending
-        them as a single trailing user turn keeps every historical turn
-        byte-identical across turns, so the backend reuses its cached KV for the
-        whole stable leading prefix instead of re-prefilling.
-
-        Only injected when the context is already over the proactive threshold
-        (matching the prior behavior): lean contexts stay untouched.
-        """
-        if not messages:
-            return messages
-        if self.token_counter.count_messages(messages) <= proactive_threshold_tokens:
-            return messages
-        if self._budget_tokens() <= 100:
-            return messages
-
-        parts: list[str] = []
-        if anchor:
-            parts.append(f"# Conversation Quality Anchor\n{anchor}")
-        if warning_lines:
-            parts.append("\n\n".join(warning_lines))
-        if rag_context:
-            parts.append(f"# Relevant Context\n{rag_context}")
-        if not parts:
-            return messages
-
-        content = "\n\n".join(parts)
-        # F1 (review §4.6.2): never let injected context leave a code fence open.
-        content = self._balance_code_fences(content)
-        # Stable tag so we can find and REMOVE any prior volatile turn from a
-        # previous pass before appending a fresh one. Without this, the prior
-        # volatile turn becomes a historical user turn on the next request and a
-        # new one is appended after it, so the context accumulates one extra
-        # volatile turn every turn until eviction (review §8).
-        result = [
-            dict(msg)
-            for msg in messages
-            if not msg.get("_volatile_turn")
-        ]
-        # Avoid duplicating an identical trailing volatile turn from a prior pass.
-        if result and result[-1].get("role") == "user" and result[-1].get("content") == content:
-            return messages
-        result.append({"role": "user", "content": content, "_volatile_turn": True})
-        return result
-
-    def _build_quality_anchor(self, messages: list[dict[str, Any]]) -> str:
-        """Build a compact, **monotonic** anchor from the original request and constraints.
-
-        KV-cache stability (review §5, C5): the anchor is appended as the trailing
-        volatile user turn. If its content *churns* turn-to-turn (e.g. the oldest
-        constraints drop off a ``[-5:]`` slice while newer ones shift position), the
-        backend's prefix cache for that turn is invalidated every turn. To keep the
-        trailing turn byte-stable across turns we accumulate constraints **append-only**
-        in ``self._anchor_constraints`` and only ever drop from the FRONT (oldest) when
-        the cap is exceeded — the most-recent tail therefore stays identical between
-        turns. The first request is captured once and never rewritten.
-
-        Only scans real user turns (volatile trailing turns are tagged ``_volatile_turn``
-        and stripped by the caller before this runs), so a prior anchor can never leak
-        into the next anchor's source text.
-        """
-        marker = "# Conversation Quality Anchor\n"
-        user_messages = []
-        for msg in messages:
-            if msg.get("role") == "user" and isinstance(msg.get("content") or "", str):
-                content = msg.get("content") or ""
-                if marker in content:
-                    content = content.split(marker, 1)[0]
-                user_messages.append(content)
-        if not user_messages:
-            return ""
-
-        # First request is captured once and frozen (monotonic anchor head).
-        if not self._anchor_first_request:
-            self._anchor_first_request = self._compact_anchor_text(
-                self._placeholder_code_blocks(user_messages[0]),
-                max_chars=700,
-            )
-        first_request = self._anchor_first_request
-
-        # Append-only constraint accumulation: only NEW constraints are added; the
-        # existing tail is never reordered or rewritten. Dedup against the running
-        # set so repeated user turns don't grow the anchor.
-        seen = {c[len("- "):] if c.startswith("- ") else c for c in self._anchor_constraints}
-        for content in user_messages[1:]:
-            compact = self._compact_anchor_text(self._placeholder_code_blocks(content), max_chars=160)
-            if not compact or compact in seen:
-                continue
-            seen.add(compact)
-            self._anchor_constraints.append(f"- {compact}")
-
-        # Cap by dropping from the FRONT (oldest), keeping the recent tail stable.
-        max_constraints = self._dynamic_max_anchor_constraints()
-        if len(self._anchor_constraints) > max_constraints:
-            self._anchor_constraints = self._anchor_constraints[-max_constraints:]
-
-        lines = [f"Original request:\n{first_request}"]
-        if self._anchor_constraints:
-            lines.append("Accumulated constraints:")
-            lines.extend(self._anchor_constraints)
-
-        anchor = "\n".join(lines)
-        return self._compact_anchor_text(anchor, max_chars=900)
-
-    def _placeholder_code_blocks(self, text: str) -> str:
-        """Replace large code fences with a compact placeholder for anchors."""
-        return re.sub(r"```[\s\S]*?```", "[code block]", text)
-
-    @staticmethod
-    def _balance_code_fences(text: str) -> str:
-        """Ensure ``text`` has balanced ``` code fences (F1, review §4.6.2).
-
-        Injected volatile context (anchor / RAG / loop warnings) is assembled from
-        arbitrary source text that may carry a dangling fence —
-        ``_placeholder_code_blocks`` only strips *balanced* ```` ```...``` ```` pairs,
-        so an odd fence survives. An unterminated fence makes the backend treat
-        everything after it as code, bleeding past the injected message and degrading
-        MTP draft acceptance. Count line-start fence delimiters; an odd count is a
-        dangling opener, closed by appending a fence so the block terminates within this
-        message. Deterministic ⇒ cache-stable, and the volatile turn is trailing so
-        nothing before it shifts.
-        """
-        if len(re.findall(r"(?m)^[ \t]*```", text)) % 2 == 0:
-            return text
-        sep = "" if text.endswith("\n") else "\n"
-        return f"{text}{sep}```"
-
-    def _compact_anchor_text(self, text: str, max_chars: int) -> str:
-        """Compact whitespace and truncate text for quality anchors."""
-        compact = " ".join(text.strip().split())
-        if len(compact) <= max_chars:
-            return compact
-        return f"{compact[: max_chars - 3].rstrip()}..."
-
     def _should_run_hierarchical_summary(
         self,
         messages: list[dict[str, Any]],
@@ -2029,328 +1816,6 @@ class AgentContextOptimizer:
 
             self.store.add_step(step)
             self.progress_tracker.record_step(step)
-
-    @staticmethod
-    def _extract_file_path(msg: dict[str, Any], tool_calls: Any, content: str) -> str | None:
-        """Best-effort extraction of the file path a file-tool acted on."""
-        # Prefer the tool_call arguments on the matching assistant message; we
-        # only have the tool message here, so fall back to scanning the content
-        # for a path-like token and to the tool message's own metadata.
-        meta = msg.get("metadata", {}) or {}
-        for key in ("path", "file_path", "filename"):
-            val = meta.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-        # Scan the first lines of the content for a path-like token.
-        for line in content.splitlines()[:5]:
-            m = re.search(r"(?:[/\\][\w.\-/\\]+){2,}\.\w{1,6}", line)
-            if m:
-                return m.group(0)
-        return None
-
-    def _track_active_file(self, path: str, content: str) -> None:
-        """Record an active file's verbatim content (bounded LRU)."""
-        norm = path.strip()
-        if norm in self._active_files:
-            self._active_file_order.remove(norm)
-        self._active_files[norm] = content
-        self._active_file_order.append(norm)
-        # Keep only the most recent few files.
-        while len(self._active_file_order) > 5:
-            old = self._active_file_order.pop(0)
-            self._active_files.pop(old, None)
-
-    def _is_active_file_content(self, content: str) -> bool:
-        """True if ``content`` is (a prefix of) a tracked active file body."""
-        if not self._active_files:
-            return False
-        for body in self._active_files.values():
-            if body and content and (content == body or content in body or body in content):
-                return True
-        return False
-
-    def _inject_code_deltas(
-        self, optimized: list[dict[str, Any]], scan_from: int
-    ) -> None:
-        """Replace re-read full file bodies with a diff against the prior snapshot.
-
-        P2.2 (review §3.4): when a file is re-read after an edit, the full new
-        file body is redundant if the model already has the prior version in
-        context. For each code block we ask the delta encoder for the diff vs the
-        previously stored version of the same block. The diff is only injected
-        when the prior content is already present somewhere in ``optimized``
-        (verified by substring), so the model can apply the diff to a file it
-        already sees — never on a first read, and never when the prior version is
-        absent (which would make the diff unapplicable).
-        """
-        if self.delta_encoder is None:
-            return
-        # Serialize the whole context once to test prior-content presence.
-        ctx_blob = "\n".join(
-            (m.get("content") or "") if isinstance(m.get("content"), str) else ""
-            for m in optimized
-        )
-        for msg in optimized[scan_from:]:
-            # Never mutate the append-only rolling-summary block: it is part of the
-            # STABLE PREFIX, so rewriting its (verbatim-preserved) code block with a
-            # delta diff changes its leading bytes and invalidates the backend's
-            # cached KV for the whole body (the turn-11 cliff: cached 3192 -> 882).
-            # The summary's code is a folded historical snapshot, not a live file
-            # the model is actively editing, so delta injection does not apply.
-            if self._is_summary_block(msg):
-                continue
-            content = msg.get("content")
-            if not isinstance(content, str) or "```" not in content:
-                continue
-            new_parts: list[str] = []
-            last = 0
-            changed = False
-            for match in re.finditer(r"```(\w*)\n(.*?)```", content, re.DOTALL):
-                lang = match.group(1)
-                code = match.group(2)
-                # Stable per-language block id so re-reads of the same file map to
-                # the same encoder entry and produce a real prior-version delta.
-                file_path = f"inline:{lang}"
-                delta = self.delta_encoder.get_delta_vs_previous(file_path, code)
-                if delta:
-                    # The diff is only applicable if the PRIOR version is already
-                    # present in the context (so the model can apply the diff to a
-                    # file it already has). If the prior version is absent, keep the
-                    # full current code so the model can still see it.
-                    prev = self.delta_encoder.get_previous_content(file_path)
-                    if prev and prev in ctx_blob:
-                        new_parts.append(content[last : match.start()])
-                        new_parts.append(
-                            "```diff\n# file changed since last read; "
-                            "apply this diff to the version you already have:\n"
-                            f"{delta}\n```"
-                        )
-                        changed = True
-                        last = match.end()
-            if changed:
-                new_parts.append(content[last:])
-                msg["content"] = "".join(new_parts)
-
-    # --- Thinking-block reconstruction (review P1.1 / cache guide DO #2) ---
-
-    @staticmethod
-    def _thinking_key(content: str) -> str:
-        """Stable key for an assistant message: hash of its ``content``."""
-        return hashlib.md5((content or "").encode("utf-8", "replace")).hexdigest()[:16]
-
-    def pin_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
-        """Pin and re-emit the `tools` schema verbatim (review P1.2 / DO #5).
-
-        The backend's prefix cache includes the serialized `tools` array. If the
-        client re-sends tools in a different order or with a different dict layout
-        turn-to-turn, the cached prefix no longer matches and the backend must
-        re-prefill. We cache the first-seen schema and return it unchanged on
-        every subsequent turn, ignoring client reordering. Returns ``None`` when
-        no tools were ever seen (the caller should then leave `tools` untouched).
-        """
-        if tools:
-            # Normalize once: stable, sorted-by-name ordering so the serialized
-            # bytes are deterministic regardless of client input order.
-            normalized = sorted(
-                (dict(t) for t in tools if isinstance(t, dict)),
-                key=lambda t: str(t.get("function", {}).get("name", t.get("name", ""))),
-            )
-            if self._pinned_tools is None:
-                self._pinned_tools = normalized
-            return self._pinned_tools
-        return self._pinned_tools
-
-    def capture_thinking(self, content: str, reasoning: str | None) -> None:
-        """Store the thinking block observed for an assistant ``content``.
-
-        Called by the app layer after a streaming response completes, so the
-        proxy remembers the reasoning block the backend cached alongside this
-        assistant message. Bounded LRU.
-        """
-        if not content or not reasoning:
-            return
-        key = self._thinking_key(content)
-        # Route through the optimizer lock (review §4.8.7 / E3): called from the app
-        # layer after the stream, concurrently with optimize_messages (which reads the
-        # store via _restore_thinking); the RLock keeps the LRU from tearing.
-        with self._lock:
-            if key in self._thinking_store:
-                self._thinking_order.remove(key)
-            self._thinking_store[key] = reasoning
-            self._thinking_order.append(key)
-            while len(self._thinking_order) > 32:
-                old = self._thinking_order.pop(0)
-                self._thinking_store.pop(old, None)
-
-    def _restore_thinking(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Re-inject stored thinking blocks into assistant messages (review P1.1).
-
-        If a client stripped ``reasoning_content`` from an assistant message we
-        previously saw WITH thinking, re-add it so the message we send to the
-        backend byte-matches what the backend cached — avoiding a forced re-prefill.
-        Only adds; never removes existing reasoning the client did echo.
-        """
-        if not self._thinking_store:
-            return messages
-        out: list[dict[str, Any]] = []
-        for msg in messages:
-            if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
-                content = msg.get("content") or ""
-                key = self._thinking_key(content)
-                reasoning = self._thinking_store.get(key)
-                if reasoning:
-                    new_msg = dict(msg)
-                    new_msg["reasoning_content"] = reasoning
-                    out.append(new_msg)
-                    continue
-            out.append(msg)
-        return out
-
-    def _has_code_blocks(self, text: str) -> bool:
-        """Check if text contains fenced code blocks."""
-        return bool(re.search(r"```[\s\S]*?```", text))
-
-    def _optimize_code_block_content(self, text: str) -> str:
-        """Optimize code blocks while reusing identical chunk fingerprints."""
-        if self.chunk_fingerprint is None:
-            return optimize_code_in_text(
-                text,
-                self._config,
-                self.embedding_service,
-            )
-
-        cached = self.chunk_fingerprint.get(text)
-        if cached is not None:
-            cached_text = cached.get("optimized_text")
-            if isinstance(cached_text, str):
-                return cached_text
-
-        optimized = optimize_code_in_text(
-            text,
-            self._config,
-            self.embedding_service,
-        )
-        self.chunk_fingerprint.put(text, {"optimized_text": optimized})
-        return optimized
-
-    def _optimize_code_in_text(self, text: str) -> str:
-        """Optimize code blocks within a text string using Tree-Sitter + NPU.
-
-        Returns the original text if optimization would reduce code block count.
-        """
-        regex_pattern = r"(```[\s\S]*?```)"
-        blocks = re.findall(regex_pattern, text)
-        base_text = re.sub(regex_pattern, "", text).strip()
-
-        if not blocks:
-            return text
-
-        detected_langs: set[str] = set()
-        all_chunks: list[str] = []
-        block_langs: list[str] = []  # Track language per block
-
-        for block in blocks:
-            clean = block.replace("```", "").strip()
-            lines = clean.split("\n")
-            first_line = lines[0].strip().lower() if lines else ""
-            lang_id = None
-            code = clean
-
-            if first_line in LANG_MAP:
-                lang_id = LANG_MAP[first_line]
-                code = "\n".join(lines[1:])
-            else:
-                lang_id = detect_language_and_id(clean)
-
-            detected_langs.add(lang_id if lang_id != "generic" else "unknown-text")
-            block_langs.append(first_line if first_line in LANG_MAP else (lang_id if lang_id != "generic" else ""))
-
-            chunks = chunk_code_with_treesitter(code, lang_id or "generic", self._dynamic_chunk_max_chars())
-            all_chunks.extend(chunks)
-
-        if not all_chunks:
-            return text
-
-        all_chunks = deduplicate_chunks(all_chunks)
-
-        # If we have fewer chunks than original blocks, we'd lose code
-        # Return original text to preserve all code blocks
-        if len(all_chunks) < len(blocks):
-            return text
-
-        if len(all_chunks) >= 2 and len(base_text) > 100:
-            try:
-                ranked = self._sync_embed_and_rank(base_text, all_chunks)
-                all_chunks = ranked
-            except Exception:
-                pass
-
-        # Reassemble text with optimized code blocks
-        placeholder = "__CODE_BLOCK_{}__"
-        for i, block in enumerate(blocks):
-            text = text.replace(block, placeholder.format(i))
-
-        for i, chunk in enumerate(all_chunks):
-            placeholder_str = placeholder.format(i) if i < len(blocks) else ""
-            if i < len(blocks):
-                # Preserve original language from the block
-                original_lang = block_langs[i] if i < len(block_langs) else ""
-                replacement = f"```{original_lang}\n{chunk}\n```"
-                text = text.replace(placeholder_str, replacement)
-
-        return text
-
-    def _sync_embed_and_rank(self, base_text: str, chunks: list[str]) -> list[str]:
-        """Synchronous embedding and ranking (optionally offloaded to a thread pool)."""
-        if self.async_io is not None:
-            return self.async_io.run_sync_stage(
-                self._embed_and_rank_impl, base_text, chunks, stage_name="embed_rank"
-            )
-        return self._embed_and_rank_impl(base_text, chunks)
-
-    def _embed_and_rank_impl(self, base_text: str, chunks: list[str]) -> list[str]:
-        """Core embedding + cosine ranking, run on the request or worker thread."""
-        query_vec = self.embedding_service._sync_get_embedding(base_text)
-        vecs = self.embedding_service.embed_batch_sync(chunks)
-        return self._rank_chunks(query_vec, vecs, chunks)
-
-    def _rank_chunks(
-        self,
-        query_vec: np.ndarray[Any, Any],
-        chunk_vecs: list[np.ndarray[Any, Any]],
-        chunks: list[str],
-    ) -> list[str]:
-        """Rank chunks by cosine similarity, return top-K."""
-        if not chunk_vecs:
-            return chunks
-
-        matrix = np.vstack(chunk_vecs)
-        norm_q = np.linalg.norm(query_vec)
-        if norm_q == 0:
-            # Embedding unavailable (server down / breaker open / uninitialized
-            # service): ranking is a no-op. Surface it so operators can tell RAG is
-            # degraded instead of failing silently (review §4.8.1 / §7.2).
-            self._record_degradation(
-                "embed_rank",
-                RuntimeError("zero query embedding; chunks returned unranked"),
-            )
-            return chunks[: self._config.code_chunking.top_k_chunks]
-
-        norms = np.linalg.norm(matrix, axis=1)
-        dots = np.dot(matrix, query_vec)
-        scores = np.where(norms != 0, dots / (norm_q * norms), -1.0)
-
-        valid = scores >= self._config.code_chunking.min_chunk_score
-        if np.any(valid):
-            indices = np.where(valid)[0]
-            local_top = np.argsort(scores[indices])[::-1][
-                : self._config.code_chunking.top_k_chunks
-            ]
-            return [chunks[i] for i in indices[local_top]]
-        return [
-            chunks[i]
-            for i in np.argsort(scores)[::-1][: self._config.code_chunking.top_k_chunks]
-        ]
 
     def _trim_to_budget(
         self,
@@ -2738,26 +2203,6 @@ class AgentContextOptimizer:
         result.reverse()
         return result
 
-    def _diag_sys(self, tag: str, msgs: list[dict[str, Any]]) -> None:
-        import hashlib
-        import os
-        import sys
-
-        if not os.environ.get("MOEPT_DIAG_STAGE"):
-            return
-        fps = []
-        for m in msgs:
-            c = m.get("content") or ""
-            h = hashlib.md5(c.encode("utf-8", "ignore")).hexdigest()[:6]
-            fps.append(f"{m.get('role')[:4]}:{h}")
-        sys.stderr.write(f"[DIAG] {tag}: n={len(msgs)} " + " ".join(fps[:22]) + "\n")
-        sys.stderr.flush()
-        if os.environ.get("MOEPT_DIAG_DUMP"):
-            import json
-
-            with open(f"/tmp/diag_{tag.replace(' ', '_')}.json", "w") as _f:
-                json.dump(msgs, _f)
-
     def _apply_boundary_transforms(
         self,
         messages: list[dict[str, Any]],
@@ -2869,35 +2314,6 @@ class AgentContextOptimizer:
                     self._record_degradation("code_slicing", e)
         return optimized
 
-    def _extract_code_signatures(self, pair: list[dict[str, Any]]) -> list[str]:
-        """Extract compact code signatures from an evicted turn pair.
-
-        Returns a list of short signature strings (function/class defs) so the
-        model keeps awareness of code that lived in a now-evicted turn.
-        """
-        sigs: list[str] = []
-        for msg in pair:
-            content = msg.get("content") or ""
-            if not isinstance(content, str) or "```" not in content:
-                continue
-            for _lang, code, _s, _e in extract_code_blocks(content):
-                for line in code.splitlines():
-                    stripped = line.strip()
-                    if stripped.startswith(("def ", "class ", "function ", "async def ")):
-                        sig = stripped.split(":", 1)[0] if ":" in stripped else stripped
-                        if sig and sig not in sigs:
-                            sigs.append(sig)
-        return sigs
-
-    def _build_code_ledger(self, sigs: list[str]) -> list[dict[str, Any]]:
-        """Build a compact code-ledger message from accumulated signatures."""
-        # Cap the ledger so it cannot itself blow the budget.
-        capped = sigs[: self._config.agentic.code_ledger_max_sigs]
-        if not capped:
-            return []
-        body = "[Evicted-turn code index]\n" + "\n".join(capped)
-        return [{"role": "system", "content": body, "_code_ledger": True}]
-
     @property
     def last_optimized_token_count(self) -> int | None:
         """Token count of the most recent optimized prompt (cached from optimize_messages)."""
@@ -2915,27 +2331,6 @@ class AgentContextOptimizer:
         if self._last_original_token_count is None or optimized is None:
             return None
         return max(0, self._last_original_token_count - optimized)
-
-    @property
-    def last_degradation(self) -> list[str]:
-        """Per-turn degradation vector (review §11 / P4b).
-
-        Each entry is ``stage:ErrorType:message`` for a pipeline stage that
-        swallowed a failure this turn and fell back to a safe default. Empty when
-        the turn ran clean. Surfaced to clients via the X-MOEPT-Optimization-Degraded
-        response header and in ``get_debug_info``.
-        """
-        return list(self._last_degradation)
-
-    @property
-    def last_evicted_turns(self) -> int:
-        """Count of complete user-assistant turns dropped by front-eviction on the
-        most recent ``optimize_messages`` call (review §11.4 / C8).
-
-        Surfaced to streaming clients as an SSE comment so the client knows history
-        was compacted. Reset to 0 at the start of each ``optimize_messages`` call.
-        """
-        return self._last_evicted_turns
 
     def get_cache_key(self, messages: list[dict[str, Any]]) -> str:
         """Generate cache key with canonicalization for static layer."""
@@ -3025,55 +2420,6 @@ class AgentContextOptimizer:
         if static_end == 0:
             return ""
         return "\n".join(m.get("content") or "" for m in messages[:static_end])
-
-    def _preseed_reasoning(
-        self,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Pre-seed reasoning prefix for MTP optimization.
-
-        Adds task-specific reasoning scaffolding to improve MTP convergence.
-        Only applies if there's sufficient budget headroom.
-        """
-        if not messages:
-            return messages
-
-        # Check if we have budget headroom for preseeding
-        total_tokens = self.token_counter.count_messages(messages)
-        max_tokens = self._budget_tokens()
-        if total_tokens > int(max_tokens * 0.9):
-            # Too close to budget, skip preseeding
-            return messages
-
-        # Find the last user message
-        last_user_idx = -1
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-
-        if last_user_idx < 0:
-            return messages
-
-        # Pre-seed reasoning for the last user message
-        user_msg = messages[last_user_idx]
-        content = user_msg.get("content") or ""
-
-        if isinstance(content, str):
-            # Add reasoning pre-seed
-            preseeded = self.thinking_preserver.preseed_reasoning_prefix(
-                content,
-                self._task_type,
-            )
-            # Return a new list with the modified message
-            result = [dict(m) for m in messages]
-            result[last_user_idx] = {
-                **user_msg,
-                "content": preseeded,
-            }
-            return result
-
-        return messages
 
     def _stabilize_summary_position(
         self, messages: list[dict[str, Any]]
@@ -3512,62 +2858,6 @@ class AgentContextOptimizer:
                 out.append(msg)
         return out
 
-    def _slice_code_in_text(self, text: str, query: str) -> str:
-        """Slice each fenced code block in ``text`` to the query-referenced defs (B4).
-
-        Replaces each block with ``slice_code_to_query(code, lang, query)`` — strictly
-        fail-open (unknown language / no match returns the block unchanged) and never
-        expands. Blocks are processed back-to-front so earlier offsets stay valid.
-        Idempotent: re-slicing a collapsed block sees only the kept definitions (all
-        matching the query) and fails open, returning it unchanged — so the transform
-        is cache-stable when applied on every turn.
-
-        A block whose grammar is unavailable fails open (full file retained) and is
-        surfaced as a ``code_slicing``/``parser_unavailable`` degradation carrying the
-        language, retained input size, and ``failed_open`` outcome, so the silent
-        no-delta path is visible in ``/v1/metrics`` (REVIEW_luna P1 reason codes).
-        """
-        blocks = extract_code_blocks(text)
-        if not blocks:
-            return text
-        result = text
-        unavailable: set[str] = set()
-        retained_chars: dict[str, int] = {}
-        for lang, code, start, end in reversed(blocks):
-            lang_id = LANG_MAP.get(lang, lang) if lang else detect_language_and_id(code)
-            resolved = lang_id or "generic"
-            sliced = slice_code_to_query(code, resolved, query, unavailable)
-            if resolved in unavailable:
-                retained_chars[resolved] = retained_chars.get(resolved, 0) + len(code)
-            if sliced != code:
-                result = result[:start] + f"```{lang}\n{sliced}\n```" + result[end:]
-        for lang_id in sorted(unavailable):
-            self._record_degradation(
-                "code_slicing",
-                reason=(
-                    f"parser_unavailable:lang={lang_id}"
-                    f":size={retained_chars.get(lang_id, 0)}:failed_open"
-                ),
-            )
-        return result
-
-    def _slice_message_code_to_query(self, msg: dict[str, Any], query: str) -> dict[str, Any]:
-        """Per-message wrapper: slice code blocks in the content to ``query`` (B4)."""
-        if msg.get("role") not in ("tool", "assistant", "user"):
-            return msg
-        # Never rewrite the append-only rolling-summary block.
-        if self._is_summary_block(msg):
-            return msg
-        content = msg.get("content") or ""
-        if not isinstance(content, str) or "```" not in content:
-            return msg
-        sliced = self._slice_code_in_text(content, query)
-        if sliced == content:
-            return msg
-        new_msg = dict(msg)
-        new_msg["content"] = sliced
-        return new_msg
-
     def _compress_user_paste_message(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Per-message wrapper around user-paste compression for the floor-bound transform."""
         if msg.get("role") != "user":
@@ -3629,109 +2919,3 @@ class AgentContextOptimizer:
         else:
             return 0.6  # Low entropy, deterministic coding
 
-    def get_session_state(self) -> str:
-        """Get serialized state for persistence across requests."""
-        # Route through the optimizer lock (review §4.8.7 / E3): serializes the
-        # store/progress/goal, which optimize_messages mutates; the RLock keeps the
-        # snapshot consistent (reentrant, so safe if already held).
-        with self._lock:
-            progress = self.progress_tracker.get_progress()
-            goal = self.store.get_goal()
-            return json.dumps({
-                "store": self.store.serialize(),
-                "progress": progress.to_dict(),
-                "goal_subtasks": self.goal_decomposer.decompose(
-                    goal.original_prompt if goal else ""
-                ),
-            })
-
-    def _zone_token_breakdown(self) -> dict[str, int]:
-        """Token sizes of the frozen prefix / rolling summary / live zone for the
-        last optimized context (review §4.11.2 / Forward plan D1 debug breakdown).
-
-        Lets operators see how the context is composed — e.g. whether a growing
-        summary or a large live zone is driving prefill. Read-only and defensive
-        (never affects the optimization path); boundaries are re-derived fresh from
-        ``_last_optimized`` so they cannot go stale relative to it.
-        """
-        msgs = self._last_optimized
-        empty = {"frozen_prefix": 0, "rolling_summary": 0, "live_zone": 0, "total": 0}
-        if not msgs:
-            return empty
-        try:
-            frozen_end = self._frozen_prefix_end(msgs)
-            stable_end = self._stable_prefix_end(msgs)
-            frozen = self.token_counter.count_messages(msgs[:frozen_end])
-            stable = self.token_counter.count_messages(msgs[:stable_end])
-            total = self.token_counter.count_messages(msgs)
-            return {
-                "frozen_prefix": frozen,
-                "rolling_summary": max(0, stable - frozen),
-                "live_zone": max(0, total - stable),
-                "total": total,
-            }
-        except Exception:  # pragma: no cover - defensive (debug-only)
-            return empty
-
-    def get_debug_info(self) -> dict[str, Any]:
-        """Return per-session debug snapshot for the operator dashboard (P4).
-
-        Aggregates the live-zone boundary (stable prefix vs. live zone), the
-        real prefix-cache outcome, token savings, and the embedding circuit
-        breaker state. All fields are read-only and cheap; this is purely
-        observational and never affects the optimization path.
-        """
-        goal = self.store.get_goal()
-        cache_stats = {}
-        with suppress(Exception):
-            cache_stats = self.cache_registry.get_cache_stats()
-        breaker_stats: dict[str, Any] = {}
-        with suppress(Exception):
-            breaker_stats = self.embedding_service.breaker_stats()
-        return {
-            "session_id": getattr(self, "_session_id", None),
-            "live_zone": {
-                "live_zone_start": self._live_zone_start,
-                "stable_prefix_len": len(self._last_stable_prefix),
-                "live_zone_compression_enabled": self._config.agentic.live_zone_compression_enabled,
-                "zone_tokens": self._zone_token_breakdown(),
-            },
-            "cache": {
-                "last_static_prefix_hit": self._last_static_prefix_hit,
-                "last_optimized_token_count": self.budget.last_optimized_token_count,
-                "last_original_token_count": self._last_original_token_count,
-                "last_saved_token_count": self.last_saved_token_count,
-                "registry": cache_stats,
-            },
-            "embedding_breaker": breaker_stats,
-            "degradation": self.last_degradation,
-            "degradation_counts": self.degradation_counts,
-            "tool_savings": {
-                name: {"chars_in": io[0], "chars_out": io[1], "saved": io[0] - io[1]}
-                for name, io in self._tool_savings.items()
-            },
-            "evicted_turns": self._last_evicted_turns,
-            "goal": goal.original_prompt if goal is not None else None,
-            "step_count": len(self.store.steps),
-        }
-
-    def load_session_state(self, state_json: str) -> None:
-        """Load state from a previous session."""
-        data = json.loads(state_json)
-        self.store = AgentStateStore.deserialize(data.get("store", "{}"))
-        self.state_rag = StateBasedRAG(self.store)
-
-        if "progress" in data:
-            pdata = data["progress"]
-            self.progress_tracker._step_count = pdata.get("total_steps", 0)
-            self.progress_tracker._tools_used = set(pdata.get("tools_used", []))
-            for st in pdata.get("completed_subtasks", []):
-                self.progress_tracker._tracked_subtasks[st] = "completed"
-            for st in pdata.get("active_subtasks", []):
-                self.progress_tracker._tracked_subtasks[st] = "active"
-
-        if "goal_subtasks" in data:
-            self.progress_tracker.set_subtasks(data["goal_subtasks"])
-
-        # Load cache registry for cross-session persistence
-        self.cache_registry.load_from_disk()

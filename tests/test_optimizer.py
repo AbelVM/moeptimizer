@@ -8,7 +8,8 @@ from unittest.mock import patch
 from moeptimizer import ROLLING_SUMMARY_MARKER
 from moeptimizer.budget_governor import BudgetGovernor
 from moeptimizer.config import AppConfig
-from moeptimizer.optimizer import AgentContextOptimizer, PrefixLayout
+from moeptimizer.optimizer import AgentContextOptimizer
+from moeptimizer.prefix_layout import PrefixLayout
 
 
 class TestAgentContextOptimizer:
