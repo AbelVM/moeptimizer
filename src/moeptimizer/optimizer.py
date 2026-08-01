@@ -528,18 +528,37 @@ class AgentContextOptimizer:
         raw = self.token_counter.count_messages(messages)
         return self.budget.calibrated_token_count(raw)
 
-    def _record_degradation(self, stage: str, error: Exception) -> None:
+    def _record_degradation(
+        self,
+        stage: str,
+        error: Exception | None = None,
+        *,
+        reason: str | None = None,
+    ) -> None:
         """Record a swallowed pipeline-stage failure for the degradation header (P4b).
 
         Called from the ``except`` guards of each optimization stage. Kept cheap:
         a single list append with a short, header-safe string. The list is reset
         at the start of every ``optimize_messages`` call, so it only ever reflects
         the current turn. Never raises.
+
+        Two message shapes:
+        - ``reason`` given → ``stage:reason`` — a short, structured reason code for
+          a *fail-open* path that raised no exception (e.g.
+          ``code_slicing:parser_unavailable:lang=diff:size=1234:failed_open``). This
+          is the REVIEW_luna P1 ask: a reason code plus input size / language /
+          failed-open-vs-changed, without a synthesized exception type.
+        - ``error`` given → ``stage:ErrorType:message`` — the swallowed-exception shape.
         """
         try:
-            msg = f"{stage}:{type(error).__name__}"
-            if str(error):
-                msg = f"{msg}:{str(error)[:200]}"
+            if reason is not None:
+                msg = f"{stage}:{reason[:200]}"
+            elif error is not None:
+                msg = f"{stage}:{type(error).__name__}"
+                if str(error):
+                    msg = f"{msg}:{str(error)[:200]}"
+            else:
+                msg = stage
             self._last_degradation.append(msg)
             self._last_degradation_counts[stage] = self._last_degradation_counts.get(stage, 0) + 1
             # Cumulative per-stage count (never resets) so a consistently-failing
@@ -3491,21 +3510,32 @@ class AgentContextOptimizer:
         is cache-stable when applied on every turn.
 
         A block whose grammar is unavailable fails open (full file retained) and is
-        surfaced as a ``code_slicing``/``parser_unavailable`` degradation, so the
-        silent no-delta path is visible in ``/v1/metrics`` (REVIEW_luna P1).
+        surfaced as a ``code_slicing``/``parser_unavailable`` degradation carrying the
+        language, retained input size, and ``failed_open`` outcome, so the silent
+        no-delta path is visible in ``/v1/metrics`` (REVIEW_luna P1 reason codes).
         """
         blocks = extract_code_blocks(text)
         if not blocks:
             return text
         result = text
         unavailable: set[str] = set()
+        retained_chars: dict[str, int] = {}
         for lang, code, start, end in reversed(blocks):
             lang_id = LANG_MAP.get(lang, lang) if lang else detect_language_and_id(code)
-            sliced = slice_code_to_query(code, lang_id or "generic", query, unavailable)
+            resolved = lang_id or "generic"
+            sliced = slice_code_to_query(code, resolved, query, unavailable)
+            if resolved in unavailable:
+                retained_chars[resolved] = retained_chars.get(resolved, 0) + len(code)
             if sliced != code:
                 result = result[:start] + f"```{lang}\n{sliced}\n```" + result[end:]
         for lang_id in sorted(unavailable):
-            self._record_degradation("code_slicing", RuntimeError(f"parser_unavailable:{lang_id}"))
+            self._record_degradation(
+                "code_slicing",
+                reason=(
+                    f"parser_unavailable:lang={lang_id}"
+                    f":size={retained_chars.get(lang_id, 0)}:failed_open"
+                ),
+            )
         return result
 
     def _slice_message_code_to_query(self, msg: dict[str, Any], query: str) -> dict[str, Any]:

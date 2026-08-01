@@ -168,16 +168,38 @@ class TestAgentContextOptimizer:
     def test_slice_code_in_text_reports_unavailable_grammar(self) -> None:
         """REVIEW_luna P1: a block whose grammar is missing fails open (full file
         retained) and records a ``code_slicing``/``parser_unavailable`` degradation
-        so the silent no-delta path is visible in ``/v1/metrics``."""
+        carrying lang + retained size + failed_open outcome, so the silent no-delta
+        path is visible in ``/v1/metrics``."""
         opt = self.optimizer
         assert opt.degradation_counts == {}
         text = "```not_a_real_language_xyz\ndef beta():\n    return 2\n```"
         out = opt._slice_code_in_text(text, "beta")
         assert out == text  # fail-open: full block retained
         assert opt.degradation_counts.get("code_slicing") == 1
+        # The reason code carries language, retained input size, and outcome.
+        (msg,) = opt._last_degradation
+        assert msg.startswith("code_slicing:parser_unavailable:")
+        assert "lang=not_a_real_language_xyz" in msg
+        assert "size=" in msg
+        assert msg.endswith(":failed_open")
 
     def test_code_slicing_off_by_default(self) -> None:
         assert self.optimizer._config.agentic.code_slicing_enabled is False
+
+    def test_record_degradation_reason_code_shape(self) -> None:
+        """D4 reason fields (REVIEW_luna P1): a fail-open path records a structured
+        ``stage:reason`` code with no synthesized exception type, while the
+        exception path keeps the ``stage:ErrorType:message`` shape."""
+        opt = self.optimizer
+        opt._record_degradation(
+            "code_slicing", reason="parser_unavailable:lang=diff:size=9:failed_open"
+        )
+        assert opt._last_degradation == [
+            "code_slicing:parser_unavailable:lang=diff:size=9:failed_open"
+        ]
+        opt._record_degradation("tool_output_compression", ValueError("boom"))
+        assert opt._last_degradation[-1] == "tool_output_compression:ValueError:boom"
+        assert opt.degradation_counts == {"code_slicing": 1, "tool_output_compression": 1}
 
     def test_degradation_counts_accumulate(self) -> None:
         """D4 (review §4.8.5): a consistently-failing stage accumulates a cumulative
