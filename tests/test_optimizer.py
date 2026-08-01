@@ -860,7 +860,8 @@ class TestToolOutputCompressionPipeline:
             {"role": "user", "content": "Run the first command."},
             {"role": "tool", "tool_call_id": "c1", "content": first_log},
         ]
-        second_turn = first_turn + [
+        second_turn = [
+            *first_turn,
             {"role": "user", "content": "Run the second command."},
             {"role": "tool", "tool_call_id": "c2", "content": second_log},
         ]
@@ -1574,27 +1575,31 @@ class TestCacheStabilityAcrossTurns:
                     # The frozen head never changes — fold turn or not.
                     assert head == frozen_head, f"frozen head mutated at turn {n}"
                 frozen_head = head
-            if prev_blob is not None and n >= 4 and frozen_head is not None:
-                if not blob.startswith(prev_blob):
-                    # A fold turn: the divergence must sit at or after the
-                    # frozen head. The fold appends to the summary and slides
-                    # the live zone; it never touches the frozen prefix. A
-                    # divergence INSIDE the head means a front-evictor slid
-                    # the cached prefix — the v0.7.26 regression.
-                    fold_turns += 1
-                    div = next(
-                        (
-                            i
-                            for i in range(min(len(blob), len(prev_blob)))
-                            if blob[i] != prev_blob[i]
-                        ),
-                        min(len(blob), len(prev_blob)),
-                    )
-                    assert div >= len(frozen_head), (
-                        f"turn {n}: divergence at char {div} is inside the frozen "
-                        f"head ({len(frozen_head)} chars) — a front-evictor slid "
-                        f"the cached prefix"
-                    )
+            if (
+                prev_blob is not None
+                and n >= 4
+                and frozen_head is not None
+                and not blob.startswith(prev_blob)
+            ):
+                # A fold turn: the divergence must sit at or after the
+                # frozen head. The fold appends to the summary and slides
+                # the live zone; it never touches the frozen prefix. A
+                # divergence INSIDE the head means a front-evictor slid
+                # the cached prefix — the v0.7.26 regression.
+                fold_turns += 1
+                div = next(
+                    (
+                        i
+                        for i in range(min(len(blob), len(prev_blob)))
+                        if blob[i] != prev_blob[i]
+                    ),
+                    min(len(blob), len(prev_blob)),
+                )
+                assert div >= len(frozen_head), (
+                    f"turn {n}: divergence at char {div} is inside the frozen "
+                    f"head ({len(frozen_head)} chars) — a front-evictor slid "
+                    f"the cached prefix"
+                )
             prev_blob = blob
 
         # The old code broke EVERY turn once pressure built up (turns 12-30 in
