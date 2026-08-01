@@ -411,7 +411,7 @@ function renderChart(canvas, cfg, hover){
     const ax=ds.axis==='y1'?'y1':'y';
     for(const v of ds.data){
       if(cfg.type==='boxplot' && v){
-        for(const value of [v.min,v.q1,v.median,v.q3,v.max]) if(isNum(value)){ axes[ax].min=Math.min(axes[ax].min,value); axes[ax].max=Math.max(axes[ax].max,value); }
+        for(const value of [v.min,v.q1,v.median,v.q3,v.max,v.mean]) if(isNum(value)){ axes[ax].min=Math.min(axes[ax].min,value); axes[ax].max=Math.max(axes[ax].max,value); }
       } else if(isNum(v)){ axes[ax].min=Math.min(axes[ax].min,v); axes[ax].max=Math.max(axes[ax].max,v); }
     }
   }
@@ -466,6 +466,15 @@ function renderChart(canvas, cfg, hover){
         // Keep the median legible over the translucent box, including when
         // its value is close to q1 or q3.
         ctx.strokeStyle='#ffffff'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(x-boxW/2,yMed); ctx.lineTo(x+boxW/2,yMed); ctx.stroke();
+        // Mean marker (a small ✕), distinct from the median line (#8). Drawn only
+        // when the stats carry a mean; white outline keeps it legible over the box.
+        if(isNum(s.mean)){
+          const yMean=yAt(s.mean,'y'), r=3.5;
+          ctx.strokeStyle='#ffffff'; ctx.lineWidth=3;
+          ctx.beginPath(); ctx.moveTo(x-r,yMean-r); ctx.lineTo(x+r,yMean+r); ctx.moveTo(x-r,yMean+r); ctx.lineTo(x+r,yMean-r); ctx.stroke();
+          ctx.strokeStyle=color; ctx.lineWidth=1.4;
+          ctx.beginPath(); ctx.moveTo(x-r,yMean-r); ctx.lineTo(x+r,yMean+r); ctx.moveTo(x-r,yMean+r); ctx.lineTo(x+r,yMean-r); ctx.stroke();
+        }
       }
     }
   }
@@ -929,15 +938,15 @@ function renderJSONView(root,J,L,ri){
   const chartLabel = text => Object.assign(el('div','chart-label'),{textContent:text});
   grid.appendChild(chartLabel('Latency & generation'));
 
-  // Latency percentiles (direct vs proxy)
+  // Latency distribution (direct vs proxy) — boxplot of per-turn latency (#1),
+  // matching the other summary-statistics charts.
   if(lat.direct&&lat.proxy){
-    const keys=['mean','median','p90','p95','p99'];
-    const labels=keys.map(k=>k.toUpperCase());
-    grid.appendChild(panel('Latency percentiles (direct vs proxy)','ms',
-      lineBarCfg(labels,[
-        {label:'Direct',color:PALETTE.direct,type:'bar',data:keys.map(k=>lat.direct[k])},
-        {label:'Proxy',color:PALETTE.proxy,type:'bar',data:keys.map(k=>lat.proxy[k])}
-      ], fmtSec), 'Grouped by percentile. Proxy is slower on average but with heavy tail variance.'));
+    grid.appendChild(panel('Latency (direct vs proxy)','ms',
+      {type:'boxplot',labels:['Direct','Proxy'],datasets:[
+        {label:'Direct',color:PALETTE.direct,data:[lat.direct,null]},
+        {label:'Proxy',color:PALETTE.proxy,data:[null,lat.proxy]}
+      ],yFmt:fmtSec},
+      'Per-turn total request latency distribution: box = q1..q3, center line = median, ✕ = mean, whiskers = min..max.'));
   }
 
   // TTFT growth curve (latency compounding) — per-turn TTFT from the log.
@@ -984,7 +993,7 @@ function renderJSONView(root,J,L,ri){
       {type:'boxplot',labels:['Direct','Proxy'],datasets:[
         {label:'Direct',color:PALETTE.direct,data:[pd,null]},
         {label:'Proxy',color:PALETTE.proxy,data:[null,pp]}
-      ],yFmt:fmt}, 'Per-turn distribution: box = q1..q3, center line = median, whiskers = min..max. Proxy keeps each turn small.'));
+      ],yFmt:fmt}, 'Per-turn distribution: box = q1..q3, center line = median, ✕ = mean, whiskers = min..max. Proxy keeps each turn small.'));
   }
 
   if(perf.fresh_prefill_tokens && (perf.fresh_prefill_tokens.direct||perf.fresh_prefill_tokens.proxy)){
@@ -994,11 +1003,16 @@ function renderJSONView(root,J,L,ri){
       {type:'boxplot',labels:['Direct','Proxy'],datasets:[
         {label:'Direct',color:PALETTE.direct,data:[d,null]},
         {label:'Proxy',color:PALETTE.proxy,data:[null,p]}
-      ],yFmt:fmt}, 'Fresh prefill distribution: box = q1..q3, center line = median, whiskers = min..max. Lower values indicate more prefix reuse.'));
+      ],yFmt:fmt}, 'Fresh prefill distribution: box = q1..q3, center line = median, ✕ = mean, whiskers = min..max. Lower values indicate more prefix reuse.'));
   }
 
   if(perf.cache_reuse_pct && (perf.cache_reuse_pct.direct||perf.cache_reuse_pct.proxy)){
-    const measuredTurns=(perf.per_turn||[]).filter(r=>Number(r.turn)>0);
+    // Exclude the cold first turn (always 0% reuse — nothing cached yet) so it
+    // does not contaminate the min/whisker of the distribution (#2). Turns are
+    // 1-indexed, so drop the minimum turn number rather than filtering on > 0.
+    const reuseTurns=(perf.per_turn||[]);
+    const minTurn=reuseTurns.length?Math.min(...reuseTurns.map(r=>Number(r.turn))):0;
+    const measuredTurns=reuseTurns.filter(r=>Number(r.turn)>minTurn);
     const d=statsFromValues(measuredTurns.map(r=>isNum(r.direct_cache_reuse_pct)?Math.min(100,Math.max(0,r.direct_cache_reuse_pct)):NaN));
     const p=statsFromValues(measuredTurns.map(r=>isNum(r.proxy_cache_reuse_pct)?Math.min(100,Math.max(0,r.proxy_cache_reuse_pct)):NaN));
     const summaryD=boundedPctStats(perf.cache_reuse_pct.direct), summaryP=boundedPctStats(perf.cache_reuse_pct.proxy);
@@ -1009,7 +1023,7 @@ function renderJSONView(root,J,L,ri){
         {label:'Direct',color:PALETTE.direct,data:[d,null]},
         {label:'Proxy',color:PALETTE.proxy,data:[null,p]}
       ],yFmt:v=>isNum(v)?v.toFixed(1)+'%':'—',yMin:0,yMax:100},
-      'Cached prompt tokens divided by total prompt tokens. Box = q1..q3, center line = median, whiskers = min..max.'));
+      'Cached prompt tokens divided by total prompt tokens. Box = q1..q3, center line = median, ✕ = mean, whiskers = min..max.'));
   }
 
   const hasTpsRows=(perf.per_turn||[]).some(r=>isNum(r.direct_approx_decode_tps)||isNum(r.proxy_approx_decode_tps));
@@ -1022,7 +1036,7 @@ function renderJSONView(root,J,L,ri){
         {label:'Direct',color:PALETTE.direct,data:[d,null]},
         {label:'Proxy',color:PALETTE.proxy,data:[null,p]}
       ],yFmt:v=>isNum(v)?v.toFixed(1):'—'},
-      'Approximation only: completion tokens / (request latency − TTFT). Box = q1..q3, center line = median, whiskers = min..max; it is not backend instrumentation.'));
+      'Approximation only: completion tokens / (request latency − TTFT). Box = q1..q3, center line = median, ✕ = mean, whiskers = min..max; it is not backend instrumentation.'));
   }
 
   if(perf.per_turn && perf.per_turn.length){
@@ -1072,20 +1086,31 @@ function renderJSONView(root,J,L,ri){
   // Secondary / informational quality metrics — radar (0–1).
   // These compare responses, so they stay with the quality guidance rather
   // than getting their own response-comparison section.
-  if(sec.trigram_overlap||sec.markdown_structure_similarity||sec.rouge_l_precision||sec.rouge_l_recall||sec.response_stability||q.rouge_l_f1||q.token_jaccard||q.edit_similarity){
+  // ROUGE-L F1 / token Jaccard / edit similarity live in secondary_quality (sec),
+  // NOT quality (q) — reading them from q yielded NaN and dropped the axes (#4).
+  // Fall back to q for older reports that filed them there.
+  const rougeF1=sec.rouge_l_f1||q.rouge_l_f1;
+  const tokenJaccard=sec.token_jaccard||q.token_jaccard;
+  const editSim=sec.edit_similarity||q.edit_similarity;
+  if(rougeF1||tokenJaccard||editSim||sec.trigram_overlap||sec.markdown_structure_similarity){
     const labels=['ROUGE-L F1','Token Jaccard','Edit sim','Trigram overlap','Markdown struct'];
     const mk=(o)=>o&&o.mean!=null?o.mean:NaN;
     grid.appendChild(panel('Secondary quality metrics (mean, 0–1, informational)','score',
       {type:'radar', labels,
         datasets:[
-          {label:'Secondary quality (proxy vs direct)',color:PALETTE.rouge,data:[mk(q.rouge_l_f1),mk(q.token_jaccard),mk(q.edit_similarity),mk(sec.trigram_overlap),mk(sec.markdown_structure_similarity)]}
+          {label:'Secondary quality (proxy vs direct)',color:PALETTE.rouge,data:[mk(rougeF1),mk(tokenJaccard),mk(editSim),mk(sec.trigram_overlap),mk(sec.markdown_structure_similarity)]}
         ], yFmt:fmt2, yMin:0, yMax:1},
       'Informational only — response-vs-response overlap. Low absolute values are expected (LLM phrasing variance), NOT optimizer failure. Semantic similarity is shown separately because its cosine scale is signed.'));
   }
   if(sem && sem.mean!=null){
+    // The report aggregate carries mean/median/min/max but NO quartiles, which
+    // collapses the box to q1=q3=median (#5). Recompute proper quartiles (and
+    // mean) from the per-turn cosine values when the log provides them.
+    const semVals=(L.turnList||[]).map(t=>t.sem).filter(isNum);
+    const semStats=semVals.length>=2?statsFromValues(semVals):sem;
     grid.appendChild(panel('Semantic similarity (signed, informational)','score',
-      {type:'boxplot', labels:['Proxy vs direct'], datasets:[{label:'Cosine similarity',color:PALETTE.sem,data:[sem]}], yFmt:fmt2, yMin:-1, yMax:1},
-      'Cosine similarity distribution: box = q1..q3, center line = median, whiskers = min..max. Negative values are valid; this is informational and weak on code-heavy traffic.'));
+      {type:'boxplot', labels:['Proxy vs direct'], datasets:[{label:'Cosine similarity',color:PALETTE.sem,data:[semStats]}], yFmt:fmt2, yMin:-1, yMax:1},
+      'Cosine similarity distribution: box = q1..q3, center line = median, ✕ = mean, whiskers = min..max. Negative values are valid; this is informational and weak on code-heavy traffic.'));
   }
 
   grid.appendChild(chartLabel('Cache & MTP telemetry'));
@@ -1134,7 +1159,7 @@ function renderJSONView(root,J,L,ri){
     for(const r of (mtp.per_turn||[])){const a=byRound.get(Number(r.round))||[];if(isNum(r.acceptance_rate))a.push(r.acceptance_rate*100);byRound.set(Number(r.round),a);}
     grid.appendChild(panel('MTP acceptance per round','%',
       {type:'boxplot',labels,datasets:[{label:'Accepted / drafted',color:PALETTE.sem,data:mtp.per_round.map(r=>boxStats(byRound.get(Number(r.round))||[]))}],yFmt:v=>isNum(v)?v.toFixed(0)+'%':'—',yMin:0,yMax:100},
-      'Backend-reported per-turn acceptance distribution by round: box = q1..q3, center line = median, whiskers = min..max. Acceptance does not by itself prove faster generation.'));
+      'Backend-reported per-turn acceptance distribution by round: box = q1..q3, center line = median, ✕ = mean, whiskers = min..max. Acceptance does not by itself prove faster generation.'));
   }
 
   if(mtp && mtp.per_turn && mtp.per_turn.length){
@@ -1156,14 +1181,15 @@ function renderJSONView(root,J,L,ri){
         const row=match&&perfByTurn.get(`${match.round}:${match.turn}`);
         return row&&isNum(row[`${phase}_approx_decode_tps`]) ? row[`${phase}_approx_decode_tps`] : NaN;
       });
-      grid.appendChild(panel('MTP acceptance and throughput estimate per turn','%',
-        {dual:true, labels:turns, datasets:[
-          {label:'Direct acceptance',color:PALETTE.direct,type:'line',data:values('direct')},
-          {label:'Proxy acceptance',color:PALETTE.proxy,type:'line',data:values('proxy')},
-          {label:'Direct request TPS',color:PALETTE.direct,axis:'y1',data:throughput('direct')},
-          {label:'Proxy request TPS',color:PALETTE.proxy,axis:'y1',data:throughput('proxy')}
-        ], yFmt:v=>isNum(v)?v.toFixed(0)+'%':'—', yFmt1:v=>isNum(v)?v.toFixed(1):'—', yMin:0, yMax:100},
-        'Acceptance uses the left axis; request-level throughput estimate uses the right axis. Correlation is descriptive, not proof that MTP caused a speed change.'));
+      // Acceptance is already shown in "MTP acceptance per turn"; keep this chart
+      // throughput-only so its 2 series get 2 distinct colors instead of a
+      // confusing 4-series / 2-color dual-axis mix (#6).
+      grid.appendChild(panel('Approximate decode throughput per turn','tok/s',
+        lineBarCfg(turns,[
+          {label:'Direct request TPS',color:PALETTE.direct,type:'line',data:throughput('direct')},
+          {label:'Proxy request TPS',color:PALETTE.proxy,type:'line',data:throughput('proxy')}
+        ], v=>isNum(v)?v.toFixed(1):'—'),
+        'Request-level decode throughput estimate per turn (completion tokens / (latency − TTFT)). Draft acceptance is shown in the MTP acceptance per turn chart. Correlation is descriptive, not proof that MTP caused a speed change.'));
     }
   }
 
