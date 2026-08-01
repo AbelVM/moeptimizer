@@ -30,8 +30,13 @@ prefix cache is reused.
   integration-level tests.
 - `scripts/` — `run.sh` (start proxy), `dev.sh` (install + test + lint + type-check),
   `benchmark.py` (direct-vs-proxy benchmark), `benchmark_dashboard.html` (report UI),
-  `benchmark_all.sh`, `fixtures/` (real project replayed by the `opencode`/`fixtures`
-  benchmark scenario).
+  `diag_dryrun_opencode.py` (local prefix-stability dry-run gate), `benchmark_all.sh`,
+  `fixtures/` (real project replayed by the `opencode`/`fixtures` benchmark scenario).
+- **Observability endpoints** (in `app.py`): `GET /v1/metrics` (process-wide aggregate),
+  `GET /v1/debug/requests` (bounded per-request trace: prompt hash, slot, prompt/cache/
+  fresh-prefill tokens, TTFT — no prompt contents by default), `POST /v1/metrics/reset`,
+  `GET /v1/metrics/ui`. Per-stage swallowed-failure counts carry structured reason codes
+  (e.g. `code_slicing:parser_unavailable:lang=…:size=…:failed_open`).
 - `CHANGELOG.md` — version-by-version feature history (NOT README).
 - `README.md` — concise overview + config tables; links to CHANGELOG.
 - `AGENTS.md` — this file. `CONTRIBUTING.md` — human contributor guide.
@@ -49,6 +54,13 @@ prefix cache is reused.
 - **Config**: all settings are pydantic-settings with `MOEPT_` prefix and `__`
   nesting (e.g. `MOEPT_AGENTIC__QUALITY_PROFILE`). Add new settings in `config.py`
   (the `AppConfig` model) and document them in `README.md` + `.env.example`.
+- **Gated features stay OFF**: the context-rewriting features
+  (`reversible_compression_enabled`, `code_slicing_enabled`,
+  `tool_output_dedup_enabled`, `volatile_field_neutralization_enabled`) default to
+  `false` pending backend-validated benchmarks. Do not flip them ON by default without
+  a benchmark round showing no quality/cache regression. `fold_window_fraction=0.25`
+  (space-based folding) is the one cache-stability feature that IS on by default — it
+  is the mission-critical cliff fix; do not regress it.
 - **Changelog**: add user-visible changes to `CHANGELOG.md`; keep `README.md` concise.
 - **Imports**: prefer `from moeptimizer import <Symbol>` (re-exported) over deep
   submodule imports in new code, matching `__init__.py`.
@@ -74,7 +86,17 @@ reuse or response quality and will not be caught by tests alone.
   context; only append (incremental update) or front-evict. The full DO/DON'T
   reference for KV-cache stability when interfacing with a Qwen MoE-MTP model on
   llama.cpp lives in `cache_preservation_guide.md` — consult it before changing any
-  prefix-reuse or context-mutation logic.
+  prefix-reuse or context-mutation logic. The local dry-run
+  (`scripts/diag_dryrun_opencode.py --max-breaks`) is the prefix-stability gate for
+  any cache-touching change — but it proves only **local serialized-prefix** stability,
+  NOT backend KV retention; the backend's authoritative cache state is third-party and
+  is not observable without Lemonade slot/cache events. Do not claim a cache regression
+  is fixed on dry-run evidence alone.
+- **Bounded diagnostics**: never put the full session state or optimized prompt in a
+  normal OpenAI-compatible response. Diagnostic transport is bounded scalar headers +
+  request ids; full prompt dumps are opt-in, capped (8 KB), and served through
+  `GET /v1/debug/requests`, not response headers. Prompt-sized headers can be rejected
+  by proxies/clients and contaminate the request/measurement path.
 - **No model-visible markers**: internal cache hints (attention sinks, pattern
   markers, reasoning preseed) are stripped before the model sees the prompt. The
   `ATTENTION_SINKS_ENABLED` / `REASONING_PRESEED_ENABLED` flags are WARN-level config
@@ -91,6 +113,7 @@ pytest tests/ -v                    # tests only
 ruff check src/ tests/              # lint
 mypy src/moeptimizer/               # type-check
 python -m moeptimizer --check-config  # validate resolved config
+python scripts/diag_dryrun_opencode.py --persistent-session --turns 30 --max-breaks 0 2>&1  # dry-run prefix-stability gate (exits non-zero on any break)
 python scripts/benchmark.py --scenario opencode --turns 30 --json > report.json 2> run.log
 ```
 
@@ -104,6 +127,12 @@ If you changed `config.py`, `.env.example`, or any default, re-run
 
 If you changed pipeline behavior, run a benchmark round and confirm token savings and
 quality metrics did not regress (see `README.md` "Benchmarking" for the regression gate).
+
+If you touched prefix-reuse / context-mutation logic (anything marked ⚠ cache in
+`REVIEW.md`), also run the dry-run gate
+(`python scripts/diag_dryrun_opencode.py --persistent-session --turns 30 --max-breaks 0`)
+and keep it at 0 breaks. Remember it proves local prefix stability only, not backend KV
+retention — a green dry-run is necessary but not sufficient.
 
 ### Commit conventions
 
