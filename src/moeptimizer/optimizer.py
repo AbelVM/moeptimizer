@@ -3480,8 +3480,7 @@ class AgentContextOptimizer:
                 out.append(msg)
         return out
 
-    @staticmethod
-    def _slice_code_in_text(text: str, query: str) -> str:
+    def _slice_code_in_text(self, text: str, query: str) -> str:
         """Slice each fenced code block in ``text`` to the query-referenced defs (B4).
 
         Replaces each block with ``slice_code_to_query(code, lang, query)`` — strictly
@@ -3490,16 +3489,23 @@ class AgentContextOptimizer:
         Idempotent: re-slicing a collapsed block sees only the kept definitions (all
         matching the query) and fails open, returning it unchanged — so the transform
         is cache-stable when applied on every turn.
+
+        A block whose grammar is unavailable fails open (full file retained) and is
+        surfaced as a ``code_slicing``/``parser_unavailable`` degradation, so the
+        silent no-delta path is visible in ``/v1/metrics`` (REVIEW_luna P1).
         """
         blocks = extract_code_blocks(text)
         if not blocks:
             return text
         result = text
+        unavailable: set[str] = set()
         for lang, code, start, end in reversed(blocks):
             lang_id = LANG_MAP.get(lang, lang) if lang else detect_language_and_id(code)
-            sliced = slice_code_to_query(code, lang_id or "generic", query)
+            sliced = slice_code_to_query(code, lang_id or "generic", query, unavailable)
             if sliced != code:
                 result = result[:start] + f"```{lang}\n{sliced}\n```" + result[end:]
+        for lang_id in sorted(unavailable):
+            self._record_degradation("code_slicing", RuntimeError(f"parser_unavailable:{lang_id}"))
         return result
 
     def _slice_message_code_to_query(self, msg: dict[str, Any], query: str) -> dict[str, Any]:

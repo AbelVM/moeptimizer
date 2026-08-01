@@ -162,7 +162,12 @@ def _definition_name(code_bytes: bytes, node: Any) -> str | None:
     return None
 
 
-def slice_code_to_query(code: str, lang_id: str, query: str) -> str:
+def slice_code_to_query(
+    code: str,
+    lang_id: str,
+    query: str,
+    unavailable: set[str] | None = None,
+) -> str:
     """Slice a code block down to the top-level definitions referenced by ``query``.
 
     Review §4.5.3: for a multi-hundred-line file read, keep the imports header plus
@@ -175,6 +180,11 @@ def slice_code_to_query(code: str, lang_id: str, query: str) -> str:
     the query, or everything matches (nothing to drop). Only ever shrinks — never
     expands — so it cannot bloat the context.
 
+    When ``unavailable`` is given and the grammar for ``lang_id`` is missing, the
+    language id is added to it before failing open — so callers can report a
+    ``parser_unavailable`` reason code instead of silently retaining the full file
+    (REVIEW_luna P1: never imply a delta was produced when nothing was sliced).
+
     Uses the tree-sitter 0.25 property API (``tree.root_node``, ``node.type``,
     ``node.child_count``, ``node.byte_range`` are properties; ``node.child(i)`` and
     ``node.child_by_field_name(name)`` are methods).
@@ -183,6 +193,8 @@ def slice_code_to_query(code: str, lang_id: str, query: str) -> str:
         return code
     parser = _get_cached_parser(lang_id)
     if parser is None:
+        if unavailable is not None:
+            unavailable.add(lang_id)
         return code
     code_bytes = code.encode()
     try:

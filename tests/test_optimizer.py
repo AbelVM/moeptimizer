@@ -146,7 +146,7 @@ class TestAgentContextOptimizer:
             "def gamma():\n    return 3\n"
             "```\n"
         )
-        sliced = AgentContextOptimizer._slice_code_in_text(text, "refactor the beta function")
+        sliced = self.optimizer._slice_code_in_text(text, "refactor the beta function")
         assert "def beta():" in sliced
         assert "import os" in sliced
         assert "def alpha" not in sliced
@@ -157,13 +157,24 @@ class TestAgentContextOptimizer:
     def test_slice_code_in_text_is_idempotent(self) -> None:
         """Re-slicing a collapsed block fails open (all kept defs match) => stable."""
         text = "```python\ndef alpha():\n    return 1\n\ndef beta():\n    return 2\n```"
-        once = AgentContextOptimizer._slice_code_in_text(text, "beta")
-        twice = AgentContextOptimizer._slice_code_in_text(once, "beta")
+        once = self.optimizer._slice_code_in_text(text, "beta")
+        twice = self.optimizer._slice_code_in_text(once, "beta")
         assert twice == once
 
     def test_slice_code_in_text_no_match_unchanged(self) -> None:
         text = "```python\ndef alpha():\n    return 1\n```"
-        assert AgentContextOptimizer._slice_code_in_text(text, "zzz") == text
+        assert self.optimizer._slice_code_in_text(text, "zzz") == text
+
+    def test_slice_code_in_text_reports_unavailable_grammar(self) -> None:
+        """REVIEW_luna P1: a block whose grammar is missing fails open (full file
+        retained) and records a ``code_slicing``/``parser_unavailable`` degradation
+        so the silent no-delta path is visible in ``/v1/metrics``."""
+        opt = self.optimizer
+        assert opt.degradation_counts == {}
+        text = "```not_a_real_language_xyz\ndef beta():\n    return 2\n```"
+        out = opt._slice_code_in_text(text, "beta")
+        assert out == text  # fail-open: full block retained
+        assert opt.degradation_counts.get("code_slicing") == 1
 
     def test_code_slicing_off_by_default(self) -> None:
         assert self.optimizer._config.agentic.code_slicing_enabled is False

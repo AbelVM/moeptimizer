@@ -118,3 +118,21 @@ def unrelated():
         assert "return 2" in sliced
         assert "def alpha" not in sliced
         assert len(sliced) < len(code)
+
+    def test_unavailable_grammar_reports_reason_code(self) -> None:
+        """REVIEW_luna P1: when the grammar is missing, slicing fails open (full
+        file retained) AND reports the language via the ``unavailable`` out-param,
+        so callers can surface a ``parser_unavailable`` reason code rather than
+        silently implying a delta was produced."""
+        unavailable: set[str] = set()
+        sliced = slice_code_to_query(_PY_CODE, "not_a_real_language_xyz", "beta", unavailable)
+        # Fail-open: the full file is retained unchanged.
+        assert sliced == _PY_CODE
+        # And the missing grammar is reported.
+        assert unavailable == {"not_a_real_language_xyz"}
+
+    def test_available_grammar_reports_nothing(self) -> None:
+        """A working grammar leaves the ``unavailable`` set untouched."""
+        unavailable: set[str] = set()
+        slice_code_to_query(_PY_CODE, "python", "beta", unavailable)
+        assert unavailable == set()
