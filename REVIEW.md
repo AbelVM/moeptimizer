@@ -286,7 +286,7 @@ gate uses the headline block; `print_report` runs clean (non-`--json` path no lo
 |---|---|---|---|
 | E1 | 🟡 **Decompose the god object** — extract `PrefixLayout` + `StageRunner` (`BudgetGovernor` already out); `optimizer.py` < ~1500 lines. | §4.2.3 | **[L]** |
 | E2 | ⬜ **Typed summary region** replacing the scattered content-marker guards. | §4.7.3 | **[M]** |
-| E3 | ⬜ **Surface persistent stage failures + route mutators through the optimizer lock** (same-session race). | §4.8.5, §4.8.7 | **[M]** |
+| E3 | ✅ **Route mutators through the optimizer lock** — `set_token_calibration`, `record_cache_outcome`, `capture_thinking`, `get_session_state` now acquire the (reentrant) optimizer lock, so they can't tear state racing with `optimize_messages` on the same session (§4.8.7). The "surface persistent stage failures" half (§4.8.5) is done via D4's `degradation_counts`. | §4.8.5, §4.8.7 | **[M]** |
 | E4 | ✅ **Session reaper + prune `AgentStateStore.goals`** — daemon reaper started/stopped in the lifespan + single-goal store (commit `a6dd948`). | §4.10.3, §4.10.4 | **[S]** |
 | E5 | 🟡 **Executor scaling + real cancellation** (the 2-worker + 300 s-timeout hazard). | §4.9.6 | **[M]** |
 
@@ -1122,12 +1122,13 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    the result off by up to the calibration factor (~2×, `optimizer.py:533`). The
    "trim to budget" guarantee is fuzzy. **Fix:** use one consistent (calibrated)
    count throughout the governor. → Phase 1 (with the governor).
-7. ⬜ **MED — same-session concurrent requests race shared optimizer state.** The
+7. ✅ **MED — same-session concurrent requests race shared optimizer state.** The
    endpoint/generator call `get_session_state`, `record_cache_outcome`,
-   `capture_thinking`, `set_token_calibration` (`app.py:838-885,1530`) without
-   obviously holding the optimizer lock that `optimize_messages` uses
-   (`optimizer.py:892`). Low impact (agentic turns are sequential) but calibration/
-   thinking state can tear. **Fix:** route mutators through the lock. → Phase 4.
+   `capture_thinking`, `set_token_calibration` without holding the optimizer lock that
+   `optimize_messages` uses. Low impact (agentic turns are sequential) but calibration/
+   thinking state could tear. **Fixed (E3):** all four mutators now acquire the
+   (reentrant) optimizer lock, so they can't race `optimize_messages` on the same
+   session. → Phase 4.
 8. ✅ **HIGH — remote `/tokenize` is silently dead in the async app (observed in the
    fresh benchmark log).** `tokenize_count_sync` (`backend_capabilities.py:293-306`)
    does `asyncio.run(self.tokenize_count(text))`; called from a running event loop
@@ -1237,12 +1238,15 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    surfaced in `/v1/agent/sessions/{id}/debug`, regression-tested) so a
    consistently-failing stage is no longer invisible. **Remaining:** a process-wide
    roll-up into `/v1/metrics`. → Phase 1.
-4. ⬜ **Per-tool compression budgets + escape hatch (MED).** Borrow snip/rtk: per-tool
-   result token budgets and a `full_output` passthrough flag so the agent can request
-   the uncompressed original when a compressed result is insufficient (pairs with
-   reversible compression, §4.1.2). → Phase 3.
-5. ⬜ **Savings analytics by tool/command (LOW).** Track which tool outputs waste the
-   most tokens (snip/rtk `gain` reports) to guide filter tuning. → Phase 3.
+4. ✅ **Per-tool compression budgets + escape hatch (MED).** Borrow snip/rtk: per-tool
+   result budgets via `agentic.tool_output_budgets` (tool name → max-chars; unlisted
+   tools use the dynamic default), applied in `_compress_tool_output_message` (B6). The
+   `full_output` escape hatch is B1's model-facing `expand_content(handle)` tool
+   (reversible compression, §4.1.2). → Phase 3.
+5. ✅ **Savings analytics by tool/command (LOW).** `_compress_tool_output_message`
+   accumulates per-tool chars in/out (`_tool_savings`), surfaced in
+   `/v1/agent/sessions/{id}/debug` as `tool_savings` (chars_in / chars_out / saved per
+   tool) to guide per-tool budget tuning (B6). → Phase 3.
 
 ### 4.12 Benchmark improvements
 
@@ -1403,8 +1407,9 @@ the quality the cliff fix traded away.*
 ### Phase 4 — Maintainability (reduce the chance of regressions)
 1. 🟡 **Decompose the god object** (§4.2.3): `BudgetGovernor`/`PrefixLayout`/`StageRunner`.
 2. ⬜ **Typed summary region** (§4.7.3) replacing scattered content-marker guards.
-3. ⬜ **Surface persistent stage failures** (§4.8.5, §4.8.7); prune `AgentStateStore.goals`
-   (§4.10.4); session reaper (§4.10.3).
+3. ✅ **Surface persistent stage failures** (§4.8.5 via D4 `degradation_counts`; §4.8.7
+   via E3 lock routing); prune `AgentStateStore.goals` (§4.10.4) + session reaper
+   (§4.10.3) done (E4).
    *Phase gate: `optimizer.py` < ~1500 lines; no stage with two gate predicates;
    `dev.sh` green.*
 

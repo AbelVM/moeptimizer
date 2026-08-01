@@ -303,6 +303,11 @@ class AgentContextOptimizer:
         # outputs that appear across turns.
         self._tool_output_cache: dict[str, dict[str, Any]] = {}
         self._tool_output_cache_max: int = 1024
+        # Per-tool compression savings (review §4.11.5 / Forward plan B6): tool name
+        # -> [chars_in, chars_out] accumulated across the session, so operators can see
+        # which tools waste the most tokens and tune per-tool budgets. Surfaced in
+        # get_debug_info. Keyed by the tool message's `name` ("unknown" when absent).
+        self._tool_savings: dict[str, list[int]] = {}
         # Count of complete user-assistant turns dropped by front-eviction on the
         # most recent optimize_messages call (review §11.4 / C8). Surfaced to the
         # client as an SSE comment so it knows history was compacted.
@@ -482,9 +487,14 @@ class AgentContextOptimizer:
         if ratio is None or ratio <= 0:
             return
         clamped = max(0.5, min(2.0, float(ratio)))
-        self.budget.set_token_calibration(clamped)
-        if self.token_aware_truncator is not None:
-            self.token_aware_truncator._token_calibration = clamped
+        # Route through the optimizer lock (review §4.8.7 / E3): this mutator is
+        # called from the app layer after the stream, concurrently with
+        # optimize_messages on the same session; the RLock keeps the calibration
+        # state from tearing (reentrant, so it is safe if already held).
+        with self._lock:
+            self.budget.set_token_calibration(clamped)
+            if self.token_aware_truncator is not None:
+                self.token_aware_truncator._token_calibration = clamped
 
     def calibrated_token_count(self, messages: list[dict[str, Any]]) -> int:
         """Return the token count scaled by the learned backend ratio (#6)."""
@@ -2091,13 +2101,17 @@ class AgentContextOptimizer:
         if not content or not reasoning:
             return
         key = self._thinking_key(content)
-        if key in self._thinking_store:
-            self._thinking_order.remove(key)
-        self._thinking_store[key] = reasoning
-        self._thinking_order.append(key)
-        while len(self._thinking_order) > 32:
-            old = self._thinking_order.pop(0)
-            self._thinking_store.pop(old, None)
+        # Route through the optimizer lock (review §4.8.7 / E3): called from the app
+        # layer after the stream, concurrently with optimize_messages (which reads the
+        # store via _restore_thinking); the RLock keeps the LRU from tearing.
+        with self._lock:
+            if key in self._thinking_store:
+                self._thinking_order.remove(key)
+            self._thinking_store[key] = reasoning
+            self._thinking_order.append(key)
+            while len(self._thinking_order) > 32:
+                old = self._thinking_order.pop(0)
+                self._thinking_store.pop(old, None)
 
     def _restore_thinking(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Re-inject stored thinking blocks into assistant messages (review P1.1).
@@ -2868,32 +2882,37 @@ class AgentContextOptimizer:
         if cached_tokens is None:
             return
         hit = cached_tokens > 0
-        # Rolling real-reuse ratio (review P1.3). Exponential moving average so a
-        # single transient miss does not flip the drift flag, but a sustained
-        # collapse (prefix shifted) does.
-        self._real_cache_samples += 1
-        alpha = 0.3
-        self._real_cache_hit_ratio = (
-            self._real_cache_hit_ratio * (1 - alpha) + (1.0 if hit else 0.0) * alpha
-        )
-        # Declare drift only after we have a few real samples and reuse has
-        # genuinely collapsed. This is a *reduction* of mutation, so it is
-        # cache-safe: it never increases eviction or prefix mutation.
-        if self._real_cache_samples >= 3 and self._real_cache_hit_ratio < 0.34:
-            if not self._prefix_drift:
-                logger.info(
-                    "[AgentOptimizer] Prefix-cache reuse collapsed (ratio=%.2f); "
-                    "entering drift-safe mode (reduce mutation).",
-                    self._real_cache_hit_ratio,
-                )
-            self._prefix_drift = True
-        elif self._real_cache_hit_ratio > 0.6:
-            self._prefix_drift = False
-        if self.hit_prediction is not None:
-            try:
-                self.hit_prediction.record_outcome(self._last_optimized, hit=hit)
-            except Exception as e:  # pragma: no cover - defensive
-                logger.debug("Hit prediction outcome recording failed: %s", e)
+        # Route through the optimizer lock (review §4.8.7 / E3): called from the app
+        # layer after the response, concurrently with optimize_messages on the same
+        # session; the RLock keeps the reuse/drift state and the _last_optimized read
+        # consistent (reentrant, so safe if already held).
+        with self._lock:
+            # Rolling real-reuse ratio (review P1.3). Exponential moving average so a
+            # single transient miss does not flip the drift flag, but a sustained
+            # collapse (prefix shifted) does.
+            self._real_cache_samples += 1
+            alpha = 0.3
+            self._real_cache_hit_ratio = (
+                self._real_cache_hit_ratio * (1 - alpha) + (1.0 if hit else 0.0) * alpha
+            )
+            # Declare drift only after we have a few real samples and reuse has
+            # genuinely collapsed. This is a *reduction* of mutation, so it is
+            # cache-safe: it never increases eviction or prefix mutation.
+            if self._real_cache_samples >= 3 and self._real_cache_hit_ratio < 0.34:
+                if not self._prefix_drift:
+                    logger.info(
+                        "[AgentOptimizer] Prefix-cache reuse collapsed (ratio=%.2f); "
+                        "entering drift-safe mode (reduce mutation).",
+                        self._real_cache_hit_ratio,
+                    )
+                self._prefix_drift = True
+            elif self._real_cache_hit_ratio > 0.6:
+                self._prefix_drift = False
+            if self.hit_prediction is not None:
+                try:
+                    self.hit_prediction.record_outcome(self._last_optimized, hit=hit)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug("Hit prediction outcome recording failed: %s", e)
 
     def _find_static_layer_end(self, messages: list[dict[str, Any]]) -> int:
         """Find the end index of the static layer (system + first user)."""
@@ -3279,7 +3298,14 @@ class AgentContextOptimizer:
         content = msg.get("content") or ""
         if not isinstance(content, str):
             return msg
-        compressor = ToolOutputCompressor(max_chars=self._dynamic_tool_output_max_chars())
+        # Per-tool compression budget (review §4.11.4 / B6): a tool listed in
+        # agentic.tool_output_budgets gets its own max-chars; others use the dynamic
+        # default. Keyed by the tool message's `name` ("unknown" when absent).
+        tool_name = msg.get("name") or "unknown"
+        max_chars = self._config.agentic.tool_output_budgets.get(
+            tool_name, self._dynamic_tool_output_max_chars()
+        )
+        compressor = ToolOutputCompressor(max_chars=max_chars)
         if not compressor.should_compress(content):
             return msg
         cache_key = self._content_hash([msg])
@@ -3287,6 +3313,13 @@ class AgentContextOptimizer:
             return self._tool_output_cache[cache_key]
         compressed = compress_tool_messages([msg], compressor)
         compressed_msg = compressed[0] if compressed else msg
+        # Savings analytics (review §4.11.5 / B6): accumulate chars in/out per tool so
+        # operators can see which tools waste the most and tune per-tool budgets.
+        out_content = compressed_msg.get("content") or ""
+        if isinstance(out_content, str) and len(out_content) < len(content):
+            entry = self._tool_savings.setdefault(tool_name, [0, 0])
+            entry[0] += len(content)
+            entry[1] += len(out_content)
         # Reversible compression (review §4.1.2 / Forward plan B1): keep the original
         # behind a handle so compression is not lossy. The handle is the content hash,
         # so the placeholder is deterministic — cache-stable when applied on first
@@ -3459,15 +3492,19 @@ class AgentContextOptimizer:
 
     def get_session_state(self) -> str:
         """Get serialized state for persistence across requests."""
-        progress = self.progress_tracker.get_progress()
-        goal = self.store.get_goal()
-        return json.dumps({
-            "store": self.store.serialize(),
-            "progress": progress.to_dict(),
-            "goal_subtasks": self.goal_decomposer.decompose(
-                goal.original_prompt if goal else ""
-            ),
-        })
+        # Route through the optimizer lock (review §4.8.7 / E3): serializes the
+        # store/progress/goal, which optimize_messages mutates; the RLock keeps the
+        # snapshot consistent (reentrant, so safe if already held).
+        with self._lock:
+            progress = self.progress_tracker.get_progress()
+            goal = self.store.get_goal()
+            return json.dumps({
+                "store": self.store.serialize(),
+                "progress": progress.to_dict(),
+                "goal_subtasks": self.goal_decomposer.decompose(
+                    goal.original_prompt if goal else ""
+                ),
+            })
 
     def _zone_token_breakdown(self) -> dict[str, int]:
         """Token sizes of the frozen prefix / rolling summary / live zone for the
@@ -3530,6 +3567,10 @@ class AgentContextOptimizer:
             "embedding_breaker": breaker_stats,
             "degradation": self.last_degradation,
             "degradation_counts": self.degradation_counts,
+            "tool_savings": {
+                name: {"chars_in": io[0], "chars_out": io[1], "saved": io[0] - io[1]}
+                for name, io in self._tool_savings.items()
+            },
             "evicted_turns": self._last_evicted_turns,
             "goal": goal.original_prompt if goal is not None else None,
             "step_count": len(self.store.steps),

@@ -184,6 +184,31 @@ class TestAgentContextOptimizer:
         # Surfaced in the debug snapshot.
         assert opt.get_debug_info()["degradation_counts"]["code_block_optimization"] == 2
 
+    def test_per_tool_compression_budget(self) -> None:
+        """B6 (§4.11.4): a tool listed in tool_output_budgets gets its own budget."""
+        opt = self.optimizer
+        opt._config.agentic.tool_output_budgets = {"noisy_tool": 50}
+        content = "line of output text\n" * 100  # ~2000 chars, compressible
+        msg = {"role": "tool", "name": "noisy_tool", "content": content}
+        compressed = opt._compress_tool_output_message(msg)
+        # A tight per-tool budget compresses the noisy output harder than the input.
+        assert len(compressed["content"]) < len(content)
+
+    def test_tool_savings_analytics(self) -> None:
+        """B6 (§4.11.5): per-tool chars in/out are tracked and surfaced in debug."""
+        opt = self.optimizer
+        # Tight per-tool budget forces compression so savings are recorded.
+        opt._config.agentic.tool_output_budgets = {"test_runner": 100}
+        content = "repetitive output line\n" * 100
+        msg = {"role": "tool", "name": "test_runner", "content": content}
+        opt._compress_tool_output_message(msg)
+        savings = opt._tool_savings.get("test_runner")
+        assert savings is not None
+        assert savings[0] == len(content)  # chars in
+        assert savings[1] < savings[0]  # compressed -> chars out < in
+        debug = opt.get_debug_info()
+        assert debug["tool_savings"]["test_runner"]["saved"] == savings[0] - savings[1]
+
     def test_zone_token_breakdown(self) -> None:
         """D1 (review §4.11.2): the debug endpoint exposes frozen/summary/live token
         sizes that are non-negative and sum to the total."""

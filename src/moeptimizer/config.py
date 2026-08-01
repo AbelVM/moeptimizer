@@ -352,6 +352,16 @@ class AgenticConfig(BaseModel):
         description="Only store originals for compression of tool outputs at least this "
                     "many chars (smaller outputs are not worth a retrieval handle).",
     )
+    tool_output_budgets: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Per-tool compression budgets (review §4.11.4 / Forward plan B6): map a "
+            "tool name (the tool message's `name`) to a max-chars budget for its "
+            "output. Tools not listed use the dynamic default "
+            "(tool_output_compression_max_chars / budget fraction). Lets noisy tools "
+            "(e.g. a test runner) be compressed harder than others (e.g. a file read)."
+        ),
+    )
     tool_output_dedup_enabled: bool = Field(
         default=False,
         description=(
