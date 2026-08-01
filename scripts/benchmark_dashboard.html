@@ -381,7 +381,8 @@ function renderCouplingBanner(root, J, L){
 }
 
 /* ============================ chart engine ============================ */
-const PALETTE = { direct:'#58a6ff', proxy:'#f78166', sem:'#3fb950', jaccard:'#d2a8ff',
+const PALETTE = { direct:'#58a6ff', proxy:'#f78166', directSoft:'#8fc4ff', proxySoft:'#fca891',
+  sem:'#3fb950', jaccard:'#d2a8ff',
   rouge:'#e3b341', pos:'#3fb950', neg:'#f85149', cache:'#39c5cf', raw:'#8b949e' };
 
 function setupCanvas(canvas){
@@ -1044,8 +1045,8 @@ function renderJSONView(root,J,L,ri){
       lineBarCfg(perf.per_turn.map(r=>'T'+r.turn),[
         {label:'Direct prompt',color:PALETTE.direct,type:'line',data:perf.per_turn.map(r=>r.direct_prompt_tokens)},
         {label:'Proxy prompt',color:PALETTE.proxy,type:'line',data:perf.per_turn.map(r=>r.proxy_prompt_tokens)},
-        {label:'Direct completion',color:PALETTE.cache,type:'line',data:perf.per_turn.map(r=>r.direct_completion_tokens)},
-        {label:'Proxy completion',color:PALETTE.sem,type:'line',data:perf.per_turn.map(r=>r.proxy_completion_tokens)}
+        {label:'Direct completion',color:PALETTE.directSoft,type:'line',data:perf.per_turn.map(r=>r.direct_completion_tokens)},
+        {label:'Proxy completion',color:PALETTE.proxySoft,type:'line',data:perf.per_turn.map(r=>r.proxy_completion_tokens)}
       ], fmt), 'Prompt size is the proxy-controlled input signal; completion tokens remain model behavior.'));
   }
 
