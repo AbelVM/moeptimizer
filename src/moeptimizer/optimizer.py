@@ -110,6 +110,21 @@ _OPENAI_MESSAGE_KEYS = {
 # boundary dedup skips it so re-running is idempotent (cache-stable).
 _DEDUP_MARKER = "[moept-dedup: "
 
+# Volatile-field neutralization (review §4.1.4 / Forward plan B3): high-entropy tokens
+# that change between turns (timestamps, UUIDs, commit SHAs) break the prefix cache
+# when they appear in otherwise-stable content. Each is replaced with a FIXED
+# placeholder so a changing value no longer invalidates the prefix. Deterministic
+# (same input -> same output) so the transform is cache-stable when applied on first
+# appearance.
+_VOLATILE_FIELD_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # ISO-8601 timestamps (2026-07-31T12:34:56, with optional fractional seconds / zone).
+    (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "[TIMESTAMP]"),
+    # UUIDs.
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "[UUID]"),
+    # Commit SHAs (7-40 hex chars, bounded so short words aren't matched).
+    (re.compile(r"\b[0-9a-f]{7,40}\b"), "[SHA]"),
+]
+
 
 class AgentContextOptimizer:
     """Main orchestrator for agentic context optimization."""
@@ -2745,6 +2760,21 @@ class AgentContextOptimizer:
                 logger.warning("User paste compression failed: %s", e)
                 self._record_degradation("user_paste_compression", e)
 
+        # B3 (review §4.1.4): neutralize volatile fields (timestamps/UUIDs/SHAs) in
+        # tool outputs so a value that changes between turns does not break the prefix
+        # cache. Deterministic + applied via the stable/live split, so cache-stable.
+        if self._config.agentic.volatile_field_neutralization_enabled:
+            try:
+                optimized = self._transform_stable_then_live(
+                    optimized,
+                    live_zone_start,
+                    lambda m: self._neutralize_volatile_fields(m),
+                    shrink_floor=None,
+                )
+            except Exception as e:
+                logger.warning("Volatile-field neutralization failed: %s", e)
+                self._record_degradation("volatile_field_neutralization", e)
+
         # B2 (review §4.1.3/§4.5.2): collapse repeated tool outputs to a handle
         # reference. List-level + idempotent (rebuilt from the context each turn), so
         # it runs on the whole optimized prompt after the per-message compression.
@@ -3348,6 +3378,32 @@ class AgentContextOptimizer:
         tool: returns the full uncompressed text, or None if the handle is unknown
         or was evicted from the per-session store."""
         return self.content_store.get(handle)
+
+    def _neutralize_volatile_fields(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Replace volatile high-entropy tokens (timestamps/UUIDs/SHAs) in a tool
+        output with fixed placeholders (review §4.1.4 / Forward plan B3).
+
+        A volatile value that changes between turns breaks the prefix cache when it
+        sits in otherwise-stable content; replacing it with a fixed placeholder keeps
+        the prefix stable. Deterministic, so re-running reproduces the same bytes
+        (cache-stable on first appearance). Returns the message unchanged when there
+        is nothing to neutralize.
+        """
+        if msg.get("role") != "tool":
+            return msg
+        if self._is_summary_block(msg):
+            return msg
+        content = msg.get("content") or ""
+        if not isinstance(content, str) or not content:
+            return msg
+        neutralized = content
+        for pattern, placeholder in _VOLATILE_FIELD_PATTERNS:
+            neutralized = pattern.sub(placeholder, neutralized)
+        if neutralized == content:
+            return msg
+        new_msg = dict(msg)
+        new_msg["content"] = neutralized
+        return new_msg
 
     def _dedup_repeated_tool_outputs(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Collapse repeated tool outputs to a handle reference (review §4.1.3/§4.5.2, B2).

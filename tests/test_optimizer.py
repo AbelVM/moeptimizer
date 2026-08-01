@@ -209,6 +209,27 @@ class TestAgentContextOptimizer:
         debug = opt.get_debug_info()
         assert debug["tool_savings"]["test_runner"]["saved"] == savings[0] - savings[1]
 
+    def test_volatile_field_neutralization(self) -> None:
+        """B3 (§4.1.4): timestamps/UUIDs/SHAs in tool outputs become fixed
+        placeholders, deterministically (so the transform is cache-stable)."""
+        opt = self.optimizer
+        opt._config.agentic.volatile_field_neutralization_enabled = True
+        content = (
+            "Build at 2026-07-31T12:34:56Z by 550e8400-e29b-41d4-a716-446655440000 "
+            "in commit abc1234def5678."
+        )
+        msg = {"role": "tool", "content": content}
+        out = opt._neutralize_volatile_fields(msg)
+        assert "[TIMESTAMP]" in out["content"]
+        assert "[UUID]" in out["content"]
+        assert "[SHA]" in out["content"]
+        assert "2026-07-31" not in out["content"]
+        # Idempotent on its own output (re-running changes nothing further).
+        assert opt._neutralize_volatile_fields(out)["content"] == out["content"]
+
+    def test_volatile_field_neutralization_off_by_default(self) -> None:
+        assert self.optimizer._config.agentic.volatile_field_neutralization_enabled is False
+
     def test_zone_token_breakdown(self) -> None:
         """D1 (review §4.11.2): the debug endpoint exposes frozen/summary/live token
         sizes that are non-negative and sum to the total."""

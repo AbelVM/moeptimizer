@@ -249,10 +249,10 @@ quality loss.
 |---|---|---|---|
 | B1 | ✅ **Reversible compression + retrieval handles** — per-session content-addressed `ContentStore` + handle embedded in the compressed placeholder (`e21675b`); the model-facing **`expand_content(handle)` tool** is now injected into the schema and fulfilled from the store, with a bounded continuation loop in **both** the non-streaming path and the streaming generator (tool-call chunks are buffered so the internal round-trip never reaches the client; content streams immediately so TTFT is unaffected). All config-gated OFF (`reversible_compression_enabled`). **Needs a backend-validated benchmark** before enabling (the streaming flow especially). | §4.1.2 | **[L]** |
 | B2 | ✅ **Cached re-read collapse + global code dedup** — stateless, idempotent boundary transform: first occurrence of a repeated tool output stays full, later identical ones collapse to a handle reference (original retained in B1's `ContentStore`) (commit `39b080e`, config-gated OFF). **Keep OFF:** an A/B benchmark (dedup ON vs phaseA OFF) was aborted when the backend crashed, but the partial run showed dedup ON made the **backend** cliff to the frozen prefix at turns 11–12 (then recover) — cliffs absent with dedup OFF — even though the dry-run showed **zero proxy-side breaks**. So dedup is idempotent/proxy-stable but perturbs the backend's prefix cache; do not flip ON until that backend-side interaction is understood. | §4.1.3, §4.5.2 | **[M]** |
-| B3 | ⬜ **Volatile-field relocation** — move dates / UUIDs / SHAs / timestamps out of the cacheable prefix. | §4.1.4, §4.7.4 | **[M]** ⚠ cache |
+| B3 | ✅ **Volatile-field relocation** — `_neutralize_volatile_fields` replaces timestamps / UUIDs / commit SHAs in tool outputs with fixed placeholders (`[TIMESTAMP]`/`[UUID]`/`[SHA]`) so a value that changes between turns no longer breaks the prefix; deterministic + applied via the stable/live split ⇒ cache-stable. Config-gated OFF (`volatile_field_neutralization_enabled`) — with A1-lite the prefix is already stable at low utilization, so this mainly helps window-bound sessions and rewrites content the model sees. | §4.1.4, §4.7.4 | **[M]** ⚠ cache |
 | B4 | ✅ **Wire syntactic code slicing into the pipeline** — wired as a config-gated (`code_slicing_enabled`, OFF) boundary transform using the stable original request as the query; idempotent + fail-open + never-expands ⇒ cache-stable (commit `09f9770`). **Kept OFF by default** pending better relevance detection (current sub-task, not the session goal) + a benchmark. | §4.5.3 | **[M]** ⚠ cache |
 | B5 | ✅ **Fix AST chunk-0 duplicate imports** — body loop skips the header node indices so imports appear only via the per-chunk prefix (done, regression-tested). | §4.5 #5 | **[S]** |
-| B6 | ⬜ **Per-tool compression budgets + `full_output` escape hatch + savings analytics.** | §4.11.4, §4.11.5 | **[M]** |
+| B6 | ✅ **Per-tool compression budgets + `full_output` escape hatch + savings analytics** — `agentic.tool_output_budgets` (tool name → max-chars) applied in `_compress_tool_output_message`; per-tool chars in/out tracked (`_tool_savings`) and surfaced in the session-debug `tool_savings`; the `full_output` escape hatch is B1's `expand_content` tool (commit `47055f3`). | §4.11.4, §4.11.5 | **[M]** |
 
 *Gate:* token savings **up** AND headline quality (`code_block_ratio`, `rouge_l_f1`)
 **up** vs the Phase-A baseline; dry-run shows **no new prefix breaks** from slicing.
@@ -814,11 +814,13 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    full and collapses later identical ones (by content hash, regardless of eviction)
    to a handle reference; the original is retained in the per-session `ContentStore`
    for retrieval. → Phase 3.
-4. ⬜ **Volatile-field relocation (MED).** lean-ctx/headroom move dates, UUIDs, commit
-   SHAs, and timestamps **out of the cacheable prefix**. The proxy has a "volatile
-   anchor" but it is a *quality* anchor (a 3rd copy of the original request — see
-   §4.2.6), not a volatile-field scrubber. Detecting and neutralizing
-   high-entropy/changing tokens in otherwise-stable messages would raise reuse. → Phase 3.
+4. ✅ **Volatile-field relocation (MED).** lean-ctx/headroom move dates, UUIDs, commit
+   SHAs, and timestamps **out of the cacheable prefix**. **Done (B3):**
+   `_neutralize_volatile_fields` replaces timestamps / UUIDs / commit SHAs in tool
+   outputs with fixed placeholders so a changing value no longer breaks the prefix;
+   deterministic + stable/live-split ⇒ cache-stable. Config-gated OFF
+   (`volatile_field_neutralization_enabled`) — with A1-lite the prefix is already
+   stable at low utilization, so this mainly helps window-bound sessions. → Phase 3.
 5. ✅ **Effort routing — already present but mis-scoped (see §4.2.5).** headroom's
    "lower reasoning_effort on routine tool-result turns" is the *right* idea but the
    proxy's implementation (`OutputShaper`) violates the hard constraint; do it via

@@ -362,6 +362,18 @@ class AgenticConfig(BaseModel):
             "(e.g. a test runner) be compressed harder than others (e.g. a file read)."
         ),
     )
+    volatile_field_neutralization_enabled: bool = Field(
+        default=False,
+        description=(
+            "Volatile-field relocation (review §4.1.4 / Forward plan B3): neutralize "
+            "high-entropy volatile tokens (timestamps, UUIDs, commit SHAs) in tool "
+            "outputs by replacing them with stable per-value placeholders, so a value "
+            "that changes between turns does not break the prefix cache. OFF by "
+            "default: with space-based folding (A1-lite) the prefix is already stable "
+            "at low utilization, so this mainly helps window-bound sessions, and it "
+            "rewrites content the model sees (the exact value is replaced)."
+        ),
+    )
     tool_output_dedup_enabled: bool = Field(
         default=False,
         description=(
