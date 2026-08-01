@@ -2160,47 +2160,72 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 },
             )
 
-        try:
-            embed_client = getattr(app.state, "embed_client", backend_client._client)
-            result = await embed_client.embeddings.create(
-                model=model,
-                input=input_list,
-            )
-            resp_dict = result.model_dump() if hasattr(result, "model_dump") else dict(result)
-            embeddings_data = resp_dict.get("data", [])
-            usage = resp_dict.get("usage", {})
+        embed_client = getattr(app.state, "embed_client", backend_client._client)
+        # Bounded retry: the embed-gemma-300m-FLM backend occasionally returns an
+        # empty response ("No embedding data received") on a transient NPU hiccup.
+        # Try twice with a short backoff so a single hiccup does not drop the
+        # embedding; only log — concisely, not a full traceback — if BOTH attempts
+        # fail (a recovered retry logs at debug only).
+        resp_dict: dict[str, Any] | None = None
+        last_error: Exception | None = None
+        for attempt in range(2):
+            if attempt:
+                await asyncio.sleep(0.25)
+            try:
+                result = await embed_client.embeddings.create(
+                    model=model,
+                    input=input_list,
+                )
+                candidate = result.model_dump() if hasattr(result, "model_dump") else dict(result)
+                if candidate.get("data"):
+                    resp_dict = candidate
+                    if attempt:
+                        logger.debug("Embedding recovered on retry (model=%s)", model)
+                    break
+                # Empty data is a transient failure worth retrying.
+                last_error = ValueError("No embedding data received")
+            except Exception as e:
+                last_error = e
 
-            return JSONResponse(
-                content={
-                    "object": "list",
-                    "data": [
-                        {
-                            "object": "embedding",
-                            "index": i,
-                            "embedding": emb.get("embedding", []),
-                        }
-                        for i, emb in enumerate(embeddings_data)
-                    ],
-                    "model": model,
-                    "usage": {
-                        "prompt_tokens": usage.get("prompt_tokens", 0),
-                        "total_tokens": usage.get("total_tokens", 0),
-                    },
-                },
+        if resp_dict is None:
+            logger.warning(
+                "Embedding request failed after 2 attempts (model=%s, inputs=%d): %s",
+                model,
+                len(input_list),
+                last_error,
             )
-        except Exception as e:
-            logger.exception("Embedding error")
             return JSONResponse(
                 status_code=500,
                 content={
                     "error": {
-                        "message": f"Embedding error: {e}",
+                        "message": f"Embedding error: {last_error}",
                         "type": "api_error",
                         "param": None,
                         "code": None,
                     }
                 },
             )
+
+        embeddings_data = resp_dict.get("data", [])
+        usage = resp_dict.get("usage", {})
+        return JSONResponse(
+            content={
+                "object": "list",
+                "data": [
+                    {
+                        "object": "embedding",
+                        "index": i,
+                        "embedding": emb.get("embedding", []),
+                    }
+                    for i, emb in enumerate(embeddings_data)
+                ],
+                "model": model,
+                "usage": {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            },
+        )
 
     @app.get("/v1/health")
     async def health_check():

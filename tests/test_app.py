@@ -1170,3 +1170,91 @@ class TestExpandContentTool:
         # ...but declined it: the continuation loop exited on the first round.
         assert len(calls) == 1
 
+
+class _FakeEmbedClient:
+    """Stand-in for the AsyncOpenAI embed client.
+
+    Replays a scripted sequence of outcomes from ``embeddings.create()`` — each
+    outcome is either a response dict (returned via ``model_dump``) or an exception
+    (raised). Once the scripted list is exhausted the last outcome repeats, so a
+    two-attempt retry is driven with exactly two entries.
+    """
+
+    def __init__(self, outcomes: list[Any]) -> None:
+        self._outcomes = outcomes
+        self.calls = 0
+
+    async def close(self) -> None:
+        pass
+
+    @property
+    def embeddings(self) -> _FakeEmbedClient:
+        return self
+
+    async def create(self, **kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
+        outcome = self._outcomes[min(self.calls, len(self._outcomes) - 1)]
+        self.calls += 1
+        if isinstance(outcome, Exception):
+            raise outcome
+        return SimpleNamespace(model_dump=lambda: outcome)
+
+
+class TestEmbeddingsEndpoint:
+    """Bounded-retry behavior of POST /v1/embeddings (transient NPU hiccup)."""
+
+    def _app(self, monkeypatch: pytest.MonkeyPatch, outcomes: list[Any]):
+        import moeptimizer.app as app_module
+
+        fake = _FakeEmbedClient(outcomes)
+        monkeypatch.setattr(app_module, "AsyncOpenAI", lambda *a, **kw: fake)
+        return create_app(AppConfig()), fake
+
+    @staticmethod
+    def _ok(embedding: list[float]) -> dict[str, Any]:
+        return {
+            "data": [{"embedding": embedding}],
+            "usage": {"prompt_tokens": 3, "total_tokens": 3},
+        }
+
+    def test_embeddings_success_first_attempt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        app, fake = self._app(monkeypatch, [self._ok([0.1, 0.2])])
+        resp = TestClient(app).post(
+            "/v1/embeddings", json={"model": "embed-gemma-300m-FLM", "input": "hi"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["data"][0]["embedding"] == [0.1, 0.2]
+        assert fake.calls == 1  # no retry needed
+
+    def test_embeddings_recovers_on_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        app, fake = self._app(monkeypatch, [
+            ValueError("No embedding data received"),  # first attempt: NPU hiccup
+            self._ok([0.5]),  # retry succeeds
+        ])
+        resp = TestClient(app).post("/v1/embeddings", json={"model": "m", "input": "hi"})
+        assert resp.status_code == 200
+        assert resp.json()["data"][0]["embedding"] == [0.5]
+        assert fake.calls == 2  # exactly one retry
+
+    def test_embeddings_empty_data_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A 200 with empty data is also treated as transient and retried.
+        app, fake = self._app(monkeypatch, [
+            {"data": [], "usage": {}},
+            self._ok([0.7]),
+        ])
+        resp = TestClient(app).post("/v1/embeddings", json={"model": "m", "input": "hi"})
+        assert resp.status_code == 200
+        assert resp.json()["data"][0]["embedding"] == [0.7]
+        assert fake.calls == 2
+
+    def test_embeddings_unrecovered_returns_500(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        app, fake = self._app(monkeypatch, [
+            ValueError("No embedding data received"),
+            ValueError("No embedding data received"),
+        ])
+        resp = TestClient(app).post("/v1/embeddings", json={"model": "m", "input": "hi"})
+        assert resp.status_code == 500
+        assert "Embedding error" in resp.json()["error"]["message"]
+        assert fake.calls == 2  # both attempts made, then gave up
+
