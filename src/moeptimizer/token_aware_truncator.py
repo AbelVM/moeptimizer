@@ -12,7 +12,7 @@ from typing import Any
 import tiktoken
 
 from moeptimizer.context_aligner import ContextAligner, get_context_aligner
-from moeptimizer.hierarchical_summarizer import ROLLING_SUMMARY_MARKER
+from moeptimizer.hierarchical_summarizer import is_summary_block
 
 logger = logging.getLogger(__name__)
 
@@ -30,16 +30,12 @@ class TokenAwareTruncator:
     def _is_summary_block(msg: dict[str, Any]) -> bool:
         """Return True if msg is the append-only rolling-summary block.
 
-        Detected by its internal ``_summary_id`` / ``_rolling_summary`` markers
-        OR by its content marker (``ROLLING_SUMMARY_MARKER``). The content check
-        is required because ``_strip_internal_flags`` removes the ``_summary_id``
-        key before the prompt is sent to the backend, and the stable-prefix
-        detection must still recognize the summary on subsequent turns.
+        Thin delegate to the shared ``hierarchical_summarizer.is_summary_block``
+        (E2, review §4.7.3) so the truncator, optimizer, and compactor agree on one
+        detector (recognized by its content marker whether or not ``_summary_id``
+        survived stripping).
         """
-        if msg.get("_summary_id") or msg.get("_rolling_summary"):
-            return True
-        content = msg.get("content")
-        return isinstance(content, str) and content.startswith(ROLLING_SUMMARY_MARKER)
+        return is_summary_block(msg)
 
     def __init__(
         self,

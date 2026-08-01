@@ -81,6 +81,36 @@ class TestScratchpadCompactor:
         assert result[frozen_end].get("_summary_id") == "abc123"
         assert result[frozen_end] is not result[-1]
 
+    def test_compactor_protects_content_marker_only_summary(self) -> None:
+        """E2 (review §4.7.3): the compactor uses the shared ``is_summary_block``,
+        so a rolling-summary block that lost its ``_summary_id`` (stripped before the
+        backend call) is STILL recognized by its content marker and protected from
+        front-eviction. The prior raw guard checked only the ``_summary_id`` /
+        ``_rolling_summary`` keys, so a stripped summary could be dropped."""
+        compactor = ScratchpadCompactor(keep_full=2, cache_stable_mode=True, frozen_prefix_turns=1)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "turn1 user"},
+            {"role": "assistant", "content": "turn1 asst"},
+        ]
+        for i in range(6):
+            messages.append({"role": "user", "content": f"user {i} content here"})
+            messages.append({"role": "assistant", "content": f"asst {i} content here"})
+        # A stripped summary: content marker present, but NO _summary_id / _rolling_summary.
+        summary_content = "Context summary (rolling):\nfolded task state from evicted turns"
+        summary = {"role": "user", "content": summary_content}
+        from moeptimizer.context_aligner import get_context_aligner
+
+        frozen_end = get_context_aligner().frozen_prefix_end(messages, 1)
+        messages.insert(frozen_end, summary)
+
+        result = compactor.compact_messages(messages)
+
+        # Recognized by its content marker and protected from front-eviction.
+        assert any(m.get("content") == summary_content for m in result), (
+            "content-marker-only summary was evicted by the compactor"
+        )
+
     def test_compactor_honors_shrink_floor(self) -> None:
         """P0.6: a per-turn shrink floor bounds one-shot front-eviction.
 

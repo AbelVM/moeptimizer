@@ -3,9 +3,29 @@
 from typing import Any
 
 from moeptimizer.hierarchical_summarizer import (
+    ROLLING_SUMMARY_MARKER,
     HierarchicalSummarizer,
     get_hierarchical_summarizer,
+    is_summary_block,
 )
+
+
+class TestIsSummaryBlock:
+    """E2 (review §4.7.3): the single shared rolling-summary detector."""
+
+    def test_detects_internal_markers(self) -> None:
+        assert is_summary_block({"role": "user", "_summary_id": "abc"})
+        assert is_summary_block({"role": "user", "_rolling_summary": True})
+
+    def test_detects_content_marker_after_strip(self) -> None:
+        # No internal markers (stripped) — the content marker alone must match.
+        msg = {"role": "user", "content": f"{ROLLING_SUMMARY_MARKER}\nfolded state"}
+        assert is_summary_block(msg)
+
+    def test_rejects_plain_message(self) -> None:
+        assert not is_summary_block({"role": "user", "content": "just a turn"})
+        assert not is_summary_block({"role": "user", "content": 123})  # non-str content
+        assert not is_summary_block({"role": "user"})
 
 
 class TestHierarchicalSummarizer:

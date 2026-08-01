@@ -31,6 +31,25 @@ _PERSISTENCE_PATH = Path.home() / ".moeptimizer" / "hierarchical_summaries.json"
 ROLLING_SUMMARY_MARKER = "Context summary (rolling):"
 
 
+def is_summary_block(msg: dict[str, Any]) -> bool:
+    """Return True if ``msg`` is the append-only rolling-summary block.
+
+    Single shared detector (E2, review §4.7.3) used by the optimizer, the
+    token-aware truncator, and the compactor — these previously each
+    re-implemented the check, and the compactor's copy diverged (it missed the
+    content marker). Detected by the internal ``_summary_id`` / ``_rolling_summary``
+    markers OR by the content marker (``ROLLING_SUMMARY_MARKER``). The content check
+    is required because ``_strip_internal_flags`` removes ``_summary_id`` before the
+    prompt is sent, and stable-prefix detection runs on the stripped list on the next
+    turn; without it the summary falls into the live zone and is re-optimized every
+    turn, breaking prefix-cache reuse (the turn-11 cliff: cached 3192 -> 882).
+    """
+    if msg.get("_summary_id") or msg.get("_rolling_summary"):
+        return True
+    content = msg.get("content")
+    return isinstance(content, str) and content.startswith(ROLLING_SUMMARY_MARKER)
+
+
 class HierarchicalSummarizer:
     """
     Summarizes older conversation turns hierarchically.

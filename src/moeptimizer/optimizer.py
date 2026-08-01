@@ -67,8 +67,8 @@ from moeptimizer.delta_encoder import CodeDeltaEncoder
 from moeptimizer.embedding import EmbeddingService
 from moeptimizer.goal_decomposer import GoalDecomposer
 from moeptimizer.hierarchical_summarizer import (
-    ROLLING_SUMMARY_MARKER,
     HierarchicalSummarizer,
+    is_summary_block,
 )
 from moeptimizer.hit_prediction_model import get_hit_prediction_model
 from moeptimizer.loop_detector import LoopDetector
@@ -622,20 +622,12 @@ class AgentContextOptimizer:
     def _is_summary_block(msg: dict[str, Any]) -> bool:
         """Return True if ``msg`` is the append-only rolling-summary block.
 
-        Detected by its internal ``_summary_id`` / ``_rolling_summary`` markers OR
-        by its content marker (``ROLLING_SUMMARY_MARKER``). The content check is
-        required because ``_strip_internal_flags`` removes the ``_summary_id`` key
-        before the prompt is sent to the backend, and the stable-prefix detection
-        runs on the stripped list on the *next* turn. Without content detection the
-        summary would fall into the live zone and be re-optimized every turn,
-        breaking the backend's prefix-cache reuse (the turn-11 cliff: cached 3192
-        -> 882). The block is part of the STABLE PREFIX, so it must be recognized
-        whether or not the internal marker survived stripping.
+        Thin delegate to the shared ``hierarchical_summarizer.is_summary_block``
+        (E2, review §4.7.3) so the optimizer, truncator, and compactor agree on one
+        detector. The block is part of the STABLE PREFIX, so it must be recognized
+        by its content marker whether or not ``_summary_id`` survived stripping.
         """
-        if msg.get("_summary_id") or msg.get("_rolling_summary"):
-            return True
-        content = msg.get("content")
-        return isinstance(content, str) and content.startswith(ROLLING_SUMMARY_MARKER)
+        return is_summary_block(msg)
 
     def _frozen_prefix_end(self, messages: list[dict[str, Any]]) -> int:
         """Return the index just past the frozen prefix (before the summary).

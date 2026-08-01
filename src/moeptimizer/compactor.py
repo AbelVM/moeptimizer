@@ -21,6 +21,7 @@ from typing import Any
 
 from moeptimizer.config import get_config
 from moeptimizer.context_aligner import ContextAligner, get_context_aligner
+from moeptimizer.hierarchical_summarizer import is_summary_block
 
 
 class ScratchpadCompactor:
@@ -104,10 +105,13 @@ class ScratchpadCompactor:
             return messages
 
         # Pull out the rolling-summary block(s) so front-eviction can never drop
-        # them. They are re-appended to the protected tail below.
-        summary_blocks = [dict(m) for m in messages if m.get("_summary_id") or m.get("_rolling_summary")]
+        # them. They are re-appended to the protected tail below. Use the shared
+        # detector (E2, review §4.7.3): the prior raw guard checked only the
+        # ``_summary_id`` / ``_rolling_summary`` keys and missed the content marker,
+        # so a stripped summary (no ``_summary_id``) could be front-evicted.
+        summary_blocks = [dict(m) for m in messages if is_summary_block(m)]
         if summary_blocks:
-            messages = [m for m in messages if not (m.get("_summary_id") or m.get("_rolling_summary"))]
+            messages = [m for m in messages if not is_summary_block(m)]
 
         # Partition into zones
         system_anchor, evictable_body, protected_tail = self._partition_zones(messages)
