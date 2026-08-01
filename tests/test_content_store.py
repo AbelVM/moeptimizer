@@ -1,6 +1,6 @@
 """Tests for the reversible-compression content store (review §4.1.2 / B1)."""
 
-from moeptimizer.content_store import ContentStore
+from moeptimizer.content_store import ContentStore, extract_placeholder_handle
 
 
 class TestContentStore:
@@ -19,6 +19,18 @@ class TestContentStore:
     def test_get_unknown_returns_none(self) -> None:
         store = ContentStore()
         assert store.get("does-not-exist") is None
+
+    def test_extract_placeholder_handle(self) -> None:
+        assert extract_placeholder_handle(
+            "[original retained: handle=abc123def4567890, 42 chars; use expand_content]"
+        ) == "abc123def4567890"
+        assert extract_placeholder_handle("ordinary output") is None
+
+    def test_stores_are_isolated(self) -> None:
+        first = ContentStore()
+        second = ContentStore()
+        handle = first.put("private output")
+        assert second.get(handle) is None
 
     def test_lru_eviction(self) -> None:
         store = ContentStore(max_entries=2)

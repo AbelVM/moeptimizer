@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import queue
+import threading
 import time
 from collections.abc import Coroutine
 from typing import Any
@@ -34,12 +36,22 @@ class AsyncIOStage:
         self._max_async_concurrency = max_async_concurrency
         self._thread_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._semaphore: asyncio.Semaphore | None = None
+        self._queue: queue.Queue[tuple[concurrent.futures.Future[Any], Any, tuple[Any, ...], dict[str, Any], str, float]] | None = None
+        self._consumer_loop: threading.Event | None = None
+        self._consumer_thread: threading.Thread | None = None
         self._stats: dict[str, int] = {
             "sync_stages_completed": 0,
             "async_stages_completed": 0,
             "thread_offloads": 0,
             "total_sync_ms": 0,
             "total_async_ms": 0,
+            "queue_submitted": 0,
+            "queue_processed": 0,
+            "queue_depth": 0,
+            "max_queue_depth": 0,
+            "total_queue_wait_ms": 0,
+            "queue_wait_samples": 0,
+            "cancellation_attempts": 0,
         }
 
     def _get_thread_executor(self) -> concurrent.futures.ThreadPoolExecutor:
@@ -116,8 +128,62 @@ class AsyncIOStage:
             self._stats["total_sync_ms"] += int(elapsed)
             logger.debug("[AsyncIO] %s completed in %.1fms", stage_name, elapsed)
             return result
+        except concurrent.futures.TimeoutError:
+            self._stats["cancellation_attempts"] += 1
+            future.cancel()
+            logger.warning("[AsyncIO] %s timed out; cancellation requested", stage_name)
+            raise
         except Exception as e:
             logger.warning("[AsyncIO] %s failed: %s", stage_name, e)
+            raise
+
+    def _ensure_queue_consumer(self) -> queue.Queue[tuple[concurrent.futures.Future[Any], Any, tuple[Any, ...], dict[str, Any], str, float]]:
+        if self._queue is not None and self._consumer_thread is not None and self._consumer_thread.is_alive():
+            return self._queue
+        self._queue = queue.Queue()
+        self._consumer_loop = threading.Event()
+        self._consumer_thread = threading.Thread(
+            target=self._consume_sync_queue,
+            name="heavy_stage_queue",
+            daemon=True,
+        )
+        self._consumer_thread.start()
+        return self._queue
+
+    def _consume_sync_queue(self) -> None:
+        assert self._queue is not None
+        assert self._consumer_loop is not None
+        while not self._consumer_loop.is_set():
+            try:
+                future, fn, args, kwargs, stage_name, submitted_at = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            self._stats["queue_depth"] = self._queue.qsize()
+            self._stats["total_queue_wait_ms"] += int((time.monotonic() - submitted_at) * 1000)
+            self._stats["queue_wait_samples"] += 1
+            try:
+                future.set_result(self.run_sync_stage(fn, *args, stage_name=stage_name, **kwargs))
+            except BaseException as exc:
+                future.set_exception(exc)
+            finally:
+                self._stats["queue_processed"] += 1
+                self._queue.task_done()
+
+    def submit_sync(self, fn: Any, *args: Any, stage_name: str = "unknown", **kwargs: Any) -> Any:
+        """Submit synchronous work through the background queue consumer."""
+        work_queue = self._ensure_queue_consumer()
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        work_queue.put((future, fn, args, kwargs, stage_name, time.monotonic()))
+        self._stats["queue_submitted"] += 1
+        depth = work_queue.qsize()
+        self._stats["queue_depth"] = depth
+        self._stats["max_queue_depth"] = max(self._stats["max_queue_depth"], depth)
+        try:
+            return future.result(timeout=30.0)
+        except concurrent.futures.TimeoutError:
+            self._stats["cancellation_attempts"] += 1
+            future.cancel()
+            logger.warning("[AsyncIO] %s timed out; cancellation requested", stage_name)
             raise
 
     async def run_ast_parsing(
@@ -227,6 +293,13 @@ class AsyncIOStage:
 
     def shutdown(self) -> None:
         """Shutdown the thread pool executor."""
+        if self._consumer_loop is not None:
+            self._consumer_loop.set()
+        if self._consumer_thread is not None:
+            self._consumer_thread.join(timeout=1.0)
+        self._consumer_thread = None
+        self._consumer_loop = None
+        self._queue = None
         if self._thread_executor is not None:
             self._thread_executor.shutdown(wait=False)
             self._thread_executor = None
@@ -243,6 +316,13 @@ class AsyncIOStage:
             "thread_offloads": 0,
             "total_sync_ms": 0,
             "total_async_ms": 0,
+            "queue_submitted": 0,
+            "queue_processed": 0,
+            "queue_depth": 0,
+            "max_queue_depth": 0,
+            "total_queue_wait_ms": 0,
+            "queue_wait_samples": 0,
+            "cancellation_attempts": 0,
         }
 
 

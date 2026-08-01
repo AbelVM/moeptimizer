@@ -7,7 +7,7 @@ from unittest.mock import patch
 from moeptimizer import ROLLING_SUMMARY_MARKER
 from moeptimizer.budget_governor import BudgetGovernor
 from moeptimizer.config import AppConfig
-from moeptimizer.optimizer import AgentContextOptimizer
+from moeptimizer.optimizer import AgentContextOptimizer, PrefixLayout
 
 
 class TestAgentContextOptimizer:
@@ -838,6 +838,28 @@ class TestToolOutputCompressionPipeline:
         # Under the threshold -> quality-safe verbatim forwarding.
         assert tool_msg["content"] == small
 
+    def test_tool_output_compression_is_monotonic_across_turns(self) -> None:
+        config = AppConfig()
+        config.agentic.max_optimized_chars = 200_000
+        optimizer = AgentContextOptimizer(config)
+        first_log = "\n".join(["DEBUG first output"] * 400)
+        second_log = "\n".join(["DEBUG second output"] * 400)
+        first_turn = [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Run the first command."},
+            {"role": "tool", "tool_call_id": "c1", "content": first_log},
+        ]
+        second_turn = first_turn + [
+            {"role": "user", "content": "Run the second command."},
+            {"role": "tool", "tool_call_id": "c2", "content": second_log},
+        ]
+
+        first_result = optimizer.optimize_messages(first_turn)
+        second_result = optimizer.optimize_messages(second_turn)
+
+        assert second_result[: len(first_result)] == first_result
+        assert second_result[-1]["content"] != second_log
+
 
 class TestUserPasteCompression:
     """Review §5 / C13: large user code pastes must be boundary-compressed by the
@@ -1022,8 +1044,10 @@ class TestFastPathSingleGate:
 
     def test_rag_runs_on_over_threshold_context(self) -> None:
         opt = self._make_optimizer()
-        # A large conversation that exceeds the proactive threshold -> RAG should run.
-        # The threshold is ~1350 tokens; use a 20k-char user turn to clear it.
+        # Lower the pressure gate explicitly; this test targets RAG dispatch rather
+        # than the adaptive budget selected by the production defaults.
+        opt._config.agentic.proactive_trim_ratio = 0.01
+        # A large conversation that exceeds the pressure threshold -> RAG should run.
         big_user = "x" * 20_000
         messages = [
             {"role": "system", "content": "You are a coding agent."},
@@ -1257,6 +1281,7 @@ class TestQualityAnchorMonotonic:
 
     def test_oldest_constraint_drops_from_front_not_middle(self) -> None:
         opt = self._make_optimizer()
+        opt._config.agentic.dynamic_budget_enabled = False
         # Feed 7 distinct constraints; cap is 5, so the 2 oldest drop from the FRONT.
         contents = ["Task"] + [f"constraint {i}" for i in range(1, 8)]
         anchor = opt._build_quality_anchor(self._user_turns(*contents))
@@ -1826,6 +1851,27 @@ class TestCacheStabilityAcrossTurns:
             "non-cache-stable _trim_to_budget should still evict toward the budget"
         )
 
+    def test_cache_stable_mode_skips_legacy_token_truncator(self) -> None:
+        config = AppConfig()
+        config.agentic.adaptive_budget_enabled = False
+        config.agentic.dynamic_budget_enabled = False
+        config.agentic.max_optimized_tokens = 1
+        config.agentic.max_optimized_chars = 4
+        config.v050.cache_stable_mode = True
+        opt = AgentContextOptimizer(config)
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "x" * 1000},
+            {"role": "assistant", "content": "y" * 1000},
+        ]
+
+        with patch.object(
+            opt.token_aware_truncator,
+            "trim_messages_to_budget",
+            side_effect=AssertionError("legacy truncator must stay disabled"),
+        ):
+            opt.optimize_messages(messages)
+
     def test_no_per_turn_eviction_cliff_when_zones_exceed_budget(self) -> None:
         """Regression (turn-12 cliff): with heavy code turns the immutable zones
         (frozen prefix + rolling summary + keep window) exceed the small budget
@@ -1968,6 +2014,25 @@ class TestAdaptiveBudget:
         opt.budget._turns_seen = 30
         # Horizon must not move the budget once adaptive is off.
         assert opt._budget_tokens() == fixed_at_0
+
+    def test_budget_governor_selects_units_and_clamps_remainder(self) -> None:
+        opt = self._opt()
+        opt._config.agentic.max_optimized_chars = 8000
+        opt._config.agentic.adaptive_budget_enabled = False
+        assert opt.budget.budget_for(True) == opt.budget.budget_tokens()
+        assert opt.budget.budget_for(False) == 8000
+        assert opt.budget.remaining_budget(100, 40) == 60
+        assert opt.budget.remaining_budget(100, 120) == 0
+
+    def test_layout_reserved_budget_uses_active_measurement_unit(self) -> None:
+        opt = self._opt()
+        layout = PrefixLayout(
+            system_anchor=[{"role": "system", "content": "rules"}],
+            evictable_body=[],
+            protected_tail=[{"role": "user", "content": "task"}],
+        )
+        assert opt._layout_reserved_budget(layout, use_tokens=False) == 9
+        assert opt._layout_reserved_budget(layout, use_tokens=True) > 0
 
     def test_count_code_tokens_counts_only_fenced_code(self) -> None:
         msgs = [

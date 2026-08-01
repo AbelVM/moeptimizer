@@ -93,7 +93,13 @@ def _format_project(files: list[tuple[str, str]]) -> str:
     """Render the current project state as fenced file blocks."""
     blocks = []
     for rel, content in files:
-        blocks.append(f"# {rel}\n```python\n{content.rstrip()}\n```")
+        suffix = Path(rel).suffix.lower()
+        language = {
+            ".jsonl": "json",
+            ".toml": "toml",
+            ".py": "python",
+        }.get(suffix, "dockerfile" if Path(rel).name == "Dockerfile" else "text")
+        blocks.append(f"# {rel}\n```{language}\n{content.rstrip()}\n```")
     return "\n\n".join(blocks)
 
 

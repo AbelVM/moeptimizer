@@ -55,6 +55,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import asyncio
+import hashlib
 import json
 import os
 import random
@@ -62,10 +64,12 @@ import re
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 # ---------------------------------------------------------------------------
 # Config
@@ -76,6 +80,232 @@ MODEL_ID = os.environ.get(
     "MOEPT_SERVER__LLM_MODEL", "Qwen3.6-35B-A3B-MTP-GGUF"
 )
 MOEPT_PORT = int(os.environ.get("MOEPT_PORT", "8080"))
+
+BACKEND_LOG_EVENT_CAP = 2000
+BACKEND_LOG_CONNECT_TIMEOUT = 2.0
+
+
+def _health_url_for_lemonade(url: str) -> str:
+    """Return Lemonade's versioned health URL from an API base URL."""
+    parts = urlsplit(url)
+    path = parts.path.rstrip("/")
+    for suffix in ("/api/v1", "/v1", "/api/v0", "/v0"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return urlunsplit((parts.scheme, parts.netloc, f"{path}/v1/health", "", ""))
+
+
+def _discover_backend_log_endpoint(
+    health_url: str, profile: dict[str, Any] | None = None
+) -> tuple[str | None, str]:
+    """Discover the optional Lemonade log WebSocket endpoint."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(health_url, timeout=BACKEND_LOG_CONNECT_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        port = payload.get("websocket_port")
+        if not isinstance(port, int) or port <= 0 or port > 65535:
+            return None, "unavailable: websocket_port not reported"
+        if profile is not None:
+            loaded_llm = next(
+                (model for model in payload.get("all_models_loaded", [])
+                 if isinstance(model, dict) and model.get("type") == "llm"),
+                {},
+            )
+            args = str((loaded_llm.get("recipe_options") or {}).get("llamacpp_args", ""))
+
+            def arg_value(name: str) -> int | None:
+                match = re.search(rf"--{name}\s+(\d+)", args)
+                return int(match.group(1)) if match else None
+
+            profile.update({
+                "version": payload.get("version"),
+                "websocket_port": port,
+                "model": loaded_llm.get("model_name"),
+                "context_window": loaded_llm.get("max_context_window"),
+                "cache_ram_mb": arg_value("cache-ram"),
+                "cache_reuse_tokens": arg_value("cache-reuse"),
+                "draft_enabled": "--spec-type" in args,
+            })
+        host = urlsplit(health_url).hostname or "127.0.0.1"
+        return f"ws://{host}:{port}/logs/stream", "available"
+    except Exception as exc:
+        return None, f"unavailable: {type(exc).__name__}"
+
+
+class BackendLogCollector:
+    """Best-effort, bounded Lemonade log capture for one benchmark run."""
+
+    def __init__(self, health_url: str, cap: int = BACKEND_LOG_EVENT_CAP) -> None:
+        self.health_url = health_url
+        self.cap = cap
+        self.status = "not_started"
+        self.profile: dict[str, Any] = {}
+        self.websocket_url: str | None = None
+        self.events: list[dict[str, Any]] = []
+        self.dropped_events = 0
+        self._seen_sequences: set[int] = set()
+        self._baseline_seq = 0
+        self._snapshot_seen = False
+        self._round_index: int | None = None
+        self._phase: str | None = None
+        self._turn_index: int | None = None
+        self._snapshot_ready = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.websocket_url, self.status = _discover_backend_log_endpoint(
+            self.health_url, self.profile
+        )
+        if not self.websocket_url:
+            return
+        self._thread = threading.Thread(target=self._run, name="benchmark-backend-logs", daemon=True)
+        self._thread.start()
+        self._snapshot_ready.wait(timeout=BACKEND_LOG_CONNECT_TIMEOUT)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=BACKEND_LOG_CONNECT_TIMEOUT + 1.0)
+
+    def set_round(self, round_index: int) -> None:
+        self._round_index = round_index
+
+    def set_context(self, phase: str, turn_index: int) -> None:
+        self._phase = phase
+        self._turn_index = turn_index
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "profile": dict(self.profile),
+            "websocket_url": self.websocket_url,
+            "event_count": len(self.events),
+            "dropped_events": self.dropped_events,
+            "first_seq": self.events[0].get("seq") if self.events else None,
+            "last_seq": self.events[-1].get("seq") if self.events else None,
+            "per_round": [
+                {
+                    "round": round_index,
+                    "event_count": sum(1 for event in self.events if event.get("round") == round_index),
+                }
+                for round_index in sorted({event.get("round") for event in self.events if event.get("round") is not None})
+            ],
+            "events": list(self.events),
+            "mtp_per_turn": self._mtp_per_turn(),
+            "baseline_seq": self._baseline_seq,
+        }
+
+    def _mtp_per_turn(self) -> list[dict[str, Any]]:
+        grouped: dict[tuple[int, str, int], list[tuple[int, int]]] = {}
+        for event in self.events:
+            round_index = event.get("round")
+            phase = event.get("phase")
+            turn_index = event.get("turn")
+            if not isinstance(round_index, int) or phase not in {"direct", "proxy"} or not isinstance(turn_index, int):
+                continue
+            match = re.search(
+                r"draft acceptance\s*=\s*[\d.]+\s*\(\s*(\d+)\s+accepted\s*/\s*(\d+)\s+generated",
+                str(event.get("line", "")), re.IGNORECASE,
+            )
+            if match:
+                grouped.setdefault((round_index, phase, turn_index), []).append(
+                    (int(match.group(1)), int(match.group(2)))
+                )
+        return [
+            {
+                "round": key[0], "phase": key[1], "turn": key[2],
+                "samples": len(samples),
+                "accepted_tokens": sum(accepted for accepted, _ in samples),
+                "draft_tokens": sum(drafted for _, drafted in samples),
+                "acceptance_rate": round(
+                    sum(accepted for accepted, _ in samples) / sum(drafted for _, drafted in samples), 4
+                ),
+            }
+            for key, samples in sorted(grouped.items())
+        ]
+
+    def _append(self, entry: Any) -> None:
+        if not isinstance(entry, dict):
+            return
+        seq = entry.get("seq")
+        if not isinstance(seq, int) or seq in self._seen_sequences:
+            return
+        self._seen_sequences.add(seq)
+        event = {
+            "seq": seq,
+            "round": self._round_index,
+            "phase": self._phase,
+            "turn": self._turn_index,
+            "timestamp": str(entry.get("timestamp", ""))[:64],
+            "severity": str(entry.get("severity", ""))[:16],
+            "tag": str(entry.get("tag", ""))[:64],
+            "line": str(entry.get("line", ""))[:512],
+        }
+        if len(self.events) >= self.cap:
+            self.events.pop(0)
+            self.dropped_events += 1
+        self.events.append(event)
+
+    def _handle_message(self, message: Any) -> None:
+        if not isinstance(message, dict):
+            return
+        msg_type = message.get("type")
+        entries = message.get("entries")
+        if (msg_type == "logs.snapshot" or msg_type is None) and isinstance(entries, list):
+            if not self._snapshot_seen:
+                self._snapshot_seen = True
+                self._baseline_seq = max(
+                    (entry.get("seq", 0) for entry in entries if isinstance(entry, dict)),
+                    default=0,
+                )
+                self._snapshot_ready.set()
+                return
+            for entry in entries:
+                self._append(entry)
+        elif msg_type == "logs.entry":
+            self._append(message.get("entry"))
+        elif msg_type == "error":
+            self.status = "error: server message"
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._stream())
+            if self.status == "connected":
+                self.status = "stopped"
+        except Exception as exc:
+            self.status = f"error: {type(exc).__name__}"
+
+    async def _stream(self) -> None:
+        try:
+            import websockets
+        except ImportError:
+            self.status = "unavailable: websockets not installed"
+            return
+
+        async with websockets.connect(
+            self.websocket_url,
+            open_timeout=BACKEND_LOG_CONNECT_TIMEOUT,
+            close_timeout=BACKEND_LOG_CONNECT_TIMEOUT,
+            max_size=2 * 1024 * 1024,
+        ) as websocket:
+            await websocket.send(json.dumps({"type": "logs.subscribe", "after_seq": None}))
+            self.status = "connected"
+            while not self._stop.is_set():
+                try:
+                    raw = await asyncio.wait_for(websocket.recv(), timeout=0.25)
+                except TimeoutError:
+                    continue
+                if isinstance(raw, bytes) or len(raw) > 2 * 1024 * 1024:
+                    continue
+                try:
+                    message = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                self._handle_message(message)
 
 # Realistic agentic-coding system prompt. This is the frozen-prefix anchor that
 # the proxy keeps byte-stable across turns, so it should resemble what a real
@@ -1804,12 +2034,14 @@ def _build_request_body(
     return body
 
 
-def _request(url: str, body: dict, timeout: float = 180.0) -> tuple[dict, float, dict[str, str]]:
+def _request(
+    url: str, body: dict, timeout: float = 180.0, headers: dict[str, str] | None = None
+) -> tuple[dict, float, dict[str, str]]:
     """Send a POST request and return (response_json, elapsed_ms, headers)."""
     import requests
 
     t0 = time.monotonic()
-    resp = requests.post(url, json=body, timeout=timeout)
+    resp = requests.post(url, json=body, timeout=timeout, headers=headers)
     try:
         resp.raise_for_status()
     except requests.HTTPError as e:
@@ -1820,7 +2052,7 @@ def _request(url: str, body: dict, timeout: float = 180.0) -> tuple[dict, float,
 
 
 def _stream_request(
-    url: str, body: dict, timeout: float = 180.0
+    url: str, body: dict, timeout: float = 180.0, headers: dict[str, str] | None = None
 ) -> tuple[str, str, dict, float | None, float, dict[str, str], int, list[dict] | None]:
     """Streaming POST for TTFT measurement.
 
@@ -1844,7 +2076,7 @@ def _stream_request(
 
     t0 = time.monotonic()
     ttft_ms: float | None = None
-    resp = requests.post(url, json=stream_body, timeout=timeout, stream=True)
+    resp = requests.post(url, json=stream_body, timeout=timeout, stream=True, headers=headers)
     try:
         resp.raise_for_status()
     except requests.HTTPError as e:
@@ -2103,7 +2335,7 @@ def _proxy_request(
 ) -> tuple[dict, float, dict[str, str]]:
     url = f"http://127.0.0.1:{MOEPT_PORT}/v1/chat/completions"
     body = _build_request_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature, session_id=session_id)
-    return _request(url, body, timeout)
+    return _request(url, body, timeout, {"X-MOEPT-Diagnostics": "true"})
 
 
 def _direct_stream_request(messages: list[dict], max_tokens: int = 8192, timeout: float = 180.0, tools: list[dict] | None = None, temperature: float = 0.0):
@@ -2117,7 +2349,7 @@ def _proxy_stream_request(
 ):
     url = f"http://127.0.0.1:{MOEPT_PORT}/v1/chat/completions"
     body = _build_request_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature, session_id=session_id)
-    return _stream_request(url, body, timeout)
+    return _stream_request(url, body, timeout, {"X-MOEPT-Diagnostics": "true"})
 
 
 def _reset_proxy_metrics(port: int) -> None:
@@ -2772,6 +3004,17 @@ def _prompt_faithfulness(full_prompt: str, optimized_prompt: str) -> float | Non
     return round(intersection / max(union, 1), 6)
 
 
+def _prompt_source_token_recall(full_prompt: str, optimized_prompt: str) -> float | None:
+    """Measure the fraction of unique source tokens retained after compaction."""
+    if not full_prompt or not optimized_prompt:
+        return None
+    full_tokens = set(full_prompt.lower().split())
+    opt_tokens = set(optimized_prompt.lower().split())
+    if not full_tokens or not opt_tokens:
+        return None
+    return round(len(full_tokens & opt_tokens) / len(full_tokens), 6)
+
+
 def _evicted_content_recall(full_prompt: str, optimized_prompt: str) -> float | None:
     """Recall of content that lived ONLY in the evicted (early) part of the prompt.
 
@@ -3088,6 +3331,7 @@ def _compute_quality_metrics(
     # the primary quality signal for a context optimizer; the response-vs-
     # response overlap scores above are only informational for this use case.
     metrics["prompt_faithfulness"] = _prompt_faithfulness(full_prompt, optimized_prompt)
+    metrics["prompt_source_token_recall"] = _prompt_source_token_recall(full_prompt, optimized_prompt)
     metrics["evicted_content_recall"] = _evicted_content_recall(full_prompt, optimized_prompt)
 
     return metrics
@@ -3190,6 +3434,9 @@ class TurnMetrics:
     prefix_cache_hit_tokens: int = 0  # Proxy's authoritative prefix-cache hit count (X-Prefix-Cache-Hit-Tokens)
     proxy_process_ms: float | None = None  # Proxy's own optimization/forwarding overhead (X-Proxy-Process-Ms), if emitted
     ttft_ms: float | None = None  # Time to first token (streaming / --measure-ttft path only)
+    request_id: str = ""
+    prompt_hash: str = ""
+    backend_slot: int | None = None
 
 
 @dataclass
@@ -3213,6 +3460,7 @@ class BenchmarkReport:
     config: dict = field(default_factory=dict)
     turns: list[TurnComparison] = field(default_factory=list)
     cache_reuse: list[dict] = field(default_factory=list)  # per-round proxy /v1/metrics snapshots
+    backend_logs: dict[str, Any] = field(default_factory=dict)
     # Long-horizon cross-turn signals (computed post-hoc, not per-turn).
     contradictions: dict[str, int] = field(default_factory=dict)  # {"proxy": int, "direct": int}
     fact_recall: dict[str, float | None] = field(default_factory=dict)  # {"proxy": float|None, "direct": float|None}
@@ -3250,6 +3498,8 @@ class BenchmarkReport:
             return {
                 "mean": round(statistics.mean(s), 2),
                 "median": round(statistics.median(s), 2),
+                "q1": _percentile(s, 25),
+                "q3": _percentile(s, 75),
                 "p90": _percentile(s, 90),
                 "p95": _percentile(s, 95),
                 "p99": _percentile(s, 99),
@@ -3309,7 +3559,7 @@ class BenchmarkReport:
         #   response verbosity, so its verbosity_count is mis-attributed and is
         #   reported only as an informational "model verbosity delta".
         headline_quality_metrics = [
-            "prompt_faithfulness", "evicted_content_recall",
+            "prompt_source_token_recall", "evicted_content_recall",
             "code_syntax_validity", "code_block_ratio",
         ]
         secondary_quality_metrics = [
@@ -3473,6 +3723,115 @@ class BenchmarkReport:
         if self.cache_reuse:
             cache_reuse_trend["per_round_proxy_metrics"] = self.cache_reuse
 
+        mtp_rounds = [
+            snapshot for snapshot in self.cache_reuse
+            if int(snapshot.get("mtp_samples", 0) or 0) > 0
+        ]
+        mtp_per_turn = []
+        mtp_source = "proxy metrics"
+        if not mtp_rounds:
+            mtp_per_turn = list(self.backend_logs.get("mtp_per_turn", []))
+            log_rounds: dict[int, list[dict[str, Any]]] = {}
+            for metric in mtp_per_turn:
+                log_rounds.setdefault(int(metric["round"]), []).append(metric)
+            mtp_rounds = [
+                {
+                    "round": round_index,
+                    "mtp_samples": sum(int(metric["samples"]) for metric in metrics),
+                    "total_mtp_accepted_tokens": sum(int(metric["accepted_tokens"]) for metric in metrics),
+                    "total_mtp_draft_tokens": sum(int(metric["draft_tokens"]) for metric in metrics),
+                    "mtp_acceptance_rate": round(
+                        sum(int(metric["accepted_tokens"]) for metric in metrics)
+                        / sum(int(metric["draft_tokens"]) for metric in metrics), 4
+                    ),
+                }
+                for round_index, metrics in sorted(log_rounds.items())
+            ]
+            mtp_source = "backend logs" if mtp_rounds else "unavailable"
+        mtp_samples = sum(int(snapshot.get("mtp_samples", 0) or 0) for snapshot in mtp_rounds)
+        mtp_accepted = sum(
+            int(snapshot.get("total_mtp_accepted_tokens", round(
+                float(snapshot.get("avg_mtp_accepted_tokens", 0) or 0)
+                * int(snapshot.get("mtp_samples", 0) or 0)
+            )))
+            for snapshot in mtp_rounds
+        )
+        mtp_drafted = sum(
+            int(snapshot.get("total_mtp_draft_tokens", round(
+                float(snapshot.get("avg_mtp_draft_tokens", 0) or 0)
+                * int(snapshot.get("mtp_samples", 0) or 0)
+            )))
+            for snapshot in mtp_rounds
+        )
+        mtp_summary = {
+            "samples": mtp_samples,
+            "total_accepted_tokens": mtp_accepted,
+            "total_draft_tokens": mtp_drafted,
+            "acceptance_rate": round(mtp_accepted / mtp_drafted, 4) if mtp_drafted else None,
+            "source": mtp_source,
+            "per_turn": mtp_per_turn,
+            "per_round": [
+                {
+                    "round": snapshot.get("round"),
+                    "samples": snapshot.get("mtp_samples"),
+                    "acceptance_rate": snapshot.get("mtp_acceptance_rate"),
+                }
+                for snapshot in mtp_rounds
+            ],
+        }
+
+        observability_rounds = [
+            snapshot for snapshot in self.cache_reuse
+            if int(snapshot.get("requests", 0) or 0) > 0
+        ]
+        optimizer_samples = sum(
+            int(snapshot.get("optimizer_samples", snapshot.get("requests", 0)) or 0)
+            for snapshot in observability_rounds
+        )
+        token_count_samples = sum(
+            int(snapshot.get("token_count_samples", 0) or 0)
+            for snapshot in observability_rounds
+        )
+        observability_summary = {
+            "requests": sum(int(snapshot.get("requests", 0) or 0) for snapshot in observability_rounds),
+            "backend_errors": sum(int(snapshot.get("backend_errors", 0) or 0) for snapshot in observability_rounds),
+            "degradation_events": sum(
+                sum(int(value or 0) for value in (snapshot.get("degradation_counts", {}) or {}).values())
+                for snapshot in observability_rounds
+            ),
+            "avg_optimizer_ms": round(sum(
+                float(snapshot.get("avg_optimizer_ms", 0) or 0)
+                * int(snapshot.get("optimizer_samples", snapshot.get("requests", 0)) or 0)
+                for snapshot in observability_rounds
+            ) / max(1, optimizer_samples), 1),
+            "avg_token_count_ms": round(sum(
+                float(snapshot.get("avg_token_count_ms", 0) or 0)
+                * int(snapshot.get("token_count_samples", 0) or 0)
+                for snapshot in observability_rounds
+            ) / max(1, token_count_samples), 3),
+            "avg_fresh_prefill_tokens": round(sum(
+                float(snapshot.get("avg_fresh_prefill_tokens", 0) or 0)
+                * int(snapshot.get("fresh_prefill_samples", snapshot.get("requests", 0)) or 0)
+                for snapshot in observability_rounds
+            ) / max(1, sum(
+                int(snapshot.get("fresh_prefill_samples", snapshot.get("requests", 0)) or 0)
+                for snapshot in observability_rounds
+            )), 1),
+            "per_round": [
+                {
+                    "round": snapshot.get("round"),
+                    "backend_errors": snapshot.get("backend_errors", 0),
+                    "degradation_events": sum(
+                        int(value or 0)
+                        for value in (snapshot.get("degradation_counts", {}) or {}).values()
+                    ),
+                    "avg_optimizer_ms": snapshot.get("avg_optimizer_ms"),
+                    "avg_token_count_ms": snapshot.get("avg_token_count_ms"),
+                }
+                for snapshot in observability_rounds
+            ],
+        }
+
         # ── TTFT aggregation (streaming / --measure-ttft path) ──────────
         direct_ttft = [t.direct.ttft_ms for t in self.turns if t.direct.ttft_ms is not None]
         proxy_ttft = [t.proxy.ttft_ms for t in self.turns if t.proxy.ttft_ms is not None]
@@ -3495,6 +3854,62 @@ class BenchmarkReport:
 
         # ── Proxy overhead (X-Proxy-Process-Ms, when the proxy emits it) ─
         proxy_process = [t.proxy.proxy_process_ms for t in self.turns if t.proxy.proxy_process_ms is not None]
+
+        # Backend-independent paired performance views. Decode TPS is an
+        # approximation: request latency minus TTFT includes queueing and
+        # transport overhead, so it is never presented as backend decode speed.
+        performance_rows: list[dict[str, Any]] = []
+        previous_prompt_text: dict[str, str] = {"direct": "", "proxy": ""}
+        direct_decode_tps: list[float] = []
+        proxy_decode_tps: list[float] = []
+        direct_cache_reuse_pct: list[float] = []
+        proxy_cache_reuse_pct: list[float] = []
+        direct_fresh_prefill: list[float] = []
+        proxy_fresh_prefill: list[float] = []
+        for comparison in self.turns:
+            row: dict[str, Any] = {"turn": comparison.turn_index, "round": comparison.round_index}
+            for label, metrics in (("direct", comparison.direct), ("proxy", comparison.proxy)):
+                fresh = float(max(0, metrics.prompt_tokens - metrics.cached_tokens))
+                reuse_pct = (
+                    min(metrics.cached_tokens, metrics.prompt_tokens) / metrics.prompt_tokens * 100
+                    if metrics.prompt_tokens else None
+                )
+                decode_tps = None
+                if metrics.ttft_ms is not None and metrics.latency_ms > metrics.ttft_ms and metrics.completion_tokens > 0:
+                    decode_tps = metrics.completion_tokens / ((metrics.latency_ms - metrics.ttft_ms) / 1000)
+                row[f"{label}_prompt_tokens"] = metrics.prompt_tokens
+                row[f"{label}_completion_tokens"] = metrics.completion_tokens
+                row[f"{label}_ttft_ms"] = metrics.ttft_ms
+                row[f"{label}_fresh_prefill_tokens"] = fresh
+                row[f"{label}_cache_reuse_pct"] = round(reuse_pct, 3) if reuse_pct is not None else None
+                row[f"{label}_prefix_cache_hit_tokens"] = metrics.prefix_cache_hit_tokens
+                row[f"{label}_approx_decode_tps"] = round(decode_tps, 3) if decode_tps is not None else None
+                prompt_text = metrics.optimized_prompt_text or metrics.full_prompt_text
+                common_prefix = 0
+                previous = previous_prompt_text[label]
+                for left, right in zip(previous, prompt_text):
+                    if left != right:
+                        break
+                    common_prefix += 1
+                row[f"{label}_prompt_sha256"] = (
+                    hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+                    if prompt_text else None
+                )
+                row[f"{label}_local_common_prefix_chars"] = common_prefix if previous else None
+                previous_prompt_text[label] = prompt_text
+                if label == "direct":
+                    direct_fresh_prefill.append(fresh)
+                    if reuse_pct is not None and comparison.turn_index > 0:
+                        direct_cache_reuse_pct.append(reuse_pct)
+                    if decode_tps is not None:
+                        direct_decode_tps.append(decode_tps)
+                else:
+                    proxy_fresh_prefill.append(fresh)
+                    if reuse_pct is not None and comparison.turn_index > 0:
+                        proxy_cache_reuse_pct.append(reuse_pct)
+                    if decode_tps is not None:
+                        proxy_decode_tps.append(decode_tps)
+            performance_rows.append(row)
 
         # ── Latency delta confidence interval + sign test ───────────────
         # Bootstrap CI on the per-turn proxy-minus-direct latency delta, plus a
@@ -3531,6 +3946,22 @@ class BenchmarkReport:
                 "fresh_prefill_vs_ttft_correlation": cache_ttft_correlation,
             },
             "proxy_overhead_ms": _stats(proxy_process) if proxy_process else {},
+            "performance": {
+                "approximate_decode_tps": {
+                    "direct": _stats(direct_decode_tps),
+                    "proxy": _stats(proxy_decode_tps),
+                    "approximation": "completion_tokens / (latency_ms - ttft_ms)",
+                },
+                "cache_reuse_pct": {
+                    "direct": _stats(direct_cache_reuse_pct),
+                    "proxy": _stats(proxy_cache_reuse_pct),
+                },
+                "fresh_prefill_tokens": {
+                    "direct": _stats(direct_fresh_prefill),
+                    "proxy": _stats(proxy_fresh_prefill),
+                },
+                "per_turn": performance_rows,
+            },
             "tokens": {
                 "total_direct_prompt": total_direct_prompt,
                 "total_proxy_prompt": total_proxy_prompt,
@@ -3606,6 +4037,9 @@ class BenchmarkReport:
                 "eviction_triggered_at_turns": eviction_turns if eviction_turns else None,
             },
             "cache_reuse": cache_reuse_trend,
+            "mtp": mtp_summary,
+            "proxy_observability": observability_summary,
+            "backend_logs": self.backend_logs or {"status": "not_enabled", "event_count": 0, "events": []},
             "per_round": _per_round_summary(self.turns, total_direct_prompt, total_proxy_prompt),
             # Long-horizon / cross-turn signals. These answer "does the proxy
             # still remember early context by the end of a 30-turn session?" —
@@ -3755,6 +4189,7 @@ def _collect_direct_conversation(
     tools: list[dict] | None = None,
     temperature: float = 0.0,
     stream: bool = False,
+    backend_logs: BackendLogCollector | None = None,
 ) -> tuple[list[TurnMetrics], list[str]]:
     """Run a full conversation against direct Lemonade.
 
@@ -3768,6 +4203,8 @@ def _collect_direct_conversation(
 
     for local_turn in range(num_turns):
         turn_index = turn_offset + local_turn + 1
+        if backend_logs:
+            backend_logs.set_context("direct", local_turn + 1)
         # Select scenario content by the WITHIN-ROUND position (local_turn), not
         # the global turn_index, so every round replays the SAME num_turns-long
         # slice of exchanges/tasks. Indexing by the global turn_index made rounds
@@ -3846,6 +4283,7 @@ def _collect_direct_conversation(
                 response_chars=len(d_content),
                 finish_reason=d_finish_reason,
                 content_preview=d_content[:200],
+                full_prompt_text=_serialize_messages_text(messages),
             )
             _human_print(
                 f"    → backend-facing: {metrics.prompt_tokens:,} tok "
@@ -3889,6 +4327,7 @@ def _collect_proxy_conversation(
     tools: list[dict] | None = None,
     temperature: float = 0.0,
     stream: bool = False,
+    backend_logs: BackendLogCollector | None = None,
 ) -> tuple[list[TurnMetrics], list[str]]:
     """Run a full conversation through the moeptimizer proxy.
 
@@ -3900,6 +4339,8 @@ def _collect_proxy_conversation(
 
     for local_turn in range(num_turns):
         turn_index = turn_offset + local_turn + 1
+        if backend_logs:
+            backend_logs.set_context("proxy", local_turn + 1)
         # Select scenario content by the WITHIN-ROUND position (local_turn) so
         # every round replays the SAME slice; see _collect_direct_conversation
         # for the rationale (global-index selection broke round comparability).
@@ -4023,6 +4464,13 @@ def _collect_proxy_conversation(
                 ttft_ms=round(p_ttft, 2) if p_ttft is not None else None,
                 prefix_cache_hit_tokens=p_prefix_hit,
                 proxy_process_ms=round(_p_process_ms, 2) if _p_process_ms is not None else None,
+                request_id=p_headers.get("X-MOEPT-Request-Id") or p_headers.get("x-moept-request-id") or "",
+                prompt_hash=p_headers.get("X-MOEPT-Prompt-Hash") or p_headers.get("x-moept-prompt-hash") or "",
+                backend_slot=(
+                    int(p_headers.get("X-MOEPT-Backend-Slot") or p_headers.get("x-moept-backend-slot"))
+                    if (p_headers.get("X-MOEPT-Backend-Slot") or p_headers.get("x-moept-backend-slot"))
+                    else None
+                ),
                 response_chars=len(p_content),
                 finish_reason=p_finish_reason,
                 content_preview=p_content[:200],
@@ -4310,6 +4758,9 @@ def run_benchmark(
     # cold-start bias that would otherwise advantage the direct run.
     _warm_up_backend(request_timeout)
 
+    backend_logs = BackendLogCollector(_health_url_for_lemonade(LEMONADE_URL))
+    backend_logs.start()
+
     _wall_start = time.monotonic()
     # Long-horizon signal accumulators (summed across rounds; rounds are
     # isolated sessions, so contradictions/fact-recall are additive).
@@ -4319,6 +4770,7 @@ def run_benchmark(
     _fact_recall_direct: float | None = None
     _drift_probe_turn = num_turns  # 1-based; the probe is the final turn
     for round_num in range(rounds):
+        backend_logs.set_round(round_num)
         # Wall-clock guard: abort remaining rounds if we exceed the budget so a
         # long --scenario all run cannot hang indefinitely.
         if max_wall_seconds is not None and (time.monotonic() - _wall_start) > max_wall_seconds:
@@ -4393,6 +4845,7 @@ def run_benchmark(
             tools=tools,
             temperature=temperature,
             stream=measure_ttft,
+            backend_logs=backend_logs,
         )
 
         if measure_ttft:
@@ -4415,6 +4868,7 @@ def run_benchmark(
             tools=tools,
             temperature=temperature,
             stream=measure_ttft,
+            backend_logs=backend_logs,
         )
 
         # ── Long-horizon cross-turn signals ──────────────────────────────
@@ -4473,6 +4927,9 @@ def run_benchmark(
                 f"{' '.join(quality_parts)}"
                 f"{direct_error}{proxy_error}"
             )
+
+    backend_logs.stop()
+    report.backend_logs = backend_logs.summary()
 
     # Finalize long-horizon signals on the report (derived from all rounds).
     report.contradictions = {"proxy": _contradiction_proxy, "direct": _contradiction_direct}

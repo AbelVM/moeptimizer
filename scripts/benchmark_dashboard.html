@@ -32,6 +32,8 @@
   main{padding:20px 22px;max-width:1500px;margin:0 auto}
   .empty{text-align:center;color:var(--muted);padding:60px 20px;font-size:15px}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:22px}
+  .metric-label,.chart-label{grid-column:1/-1;color:var(--accent);font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;border-bottom:1px solid var(--border);padding:4px 0 6px;margin-top:6px}
+  .metric-label:first-child,.chart-label:first-child{margin-top:0}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
   .card .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
   .card .value{font-size:26px;font-weight:650;margin-top:6px}
@@ -42,7 +44,9 @@
   .callout-title{font-size:13px;font-weight:650;text-transform:uppercase;letter-spacing:.5px;color:var(--good);margin-bottom:6px}
   .callout p{margin:4px 0;font-size:12.5px;color:var(--text);line-height:1.5}
   .callout p:last-child{color:var(--muted)}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:18px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:18px}
+  .chart-label{margin-top:14px}
+  .grid > .callout{grid-column:1/-1}
   .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px 8px}
   .panel h2{font-size:14px;margin:0 0 4px;font-weight:600}
   .panel .hint{color:var(--muted);font-size:11.5px;margin:0 0 8px}
@@ -123,6 +127,8 @@ const fmt2 = n => isNum(n) ? n.toFixed(2) : '—';
 const fmtPct = n => isNum(n) ? n.toFixed(1)+'%' : '—';
 const fmtMs = ms => { if(!isNum(ms)) return '—'; if(ms>=1000) return (ms/1000).toFixed(1)+'s'; return Math.round(ms)+'ms'; };
 const fmtSec = ms => isNum(ms) ? (ms/1000).toFixed(1)+'s' : '—';
+const statsFromValues = values => { const s=values.filter(isNum).sort((a,b)=>a-b); if(!s.length)return {}; const q=p=>s[Math.floor((s.length-1)*p)]; return {min:s[0],q1:q(.25),median:q(.5),q3:q(.75),max:s[s.length-1],mean:s.reduce((a,b)=>a+b,0)/s.length}; };
+const boundedPctStats = s => s ? Object.fromEntries(Object.entries(s).map(([k,v])=>[k,isNum(v)?Math.max(0,Math.min(100,v)):v])) : {};
 const baseName = f => f.replace(/\.[^.]+$/,'');
 
 /* ============================ JSON parser ============================ */
@@ -139,12 +145,16 @@ function parseJSON(text){
   out.context = get(['context_window'])||{};
   out.eviction = get(['eviction'])||{};
   out.cache = get(['cache_reuse'])||{};
+  out.mtp = get(['mtp'])||{};
+  out.observability = get(['proxy_observability'])||{};
   out.correctness = get(['correctness'])||{};
   out.cost = get(['cost_usd'])||{};
   out.perRound = get(['per_round'])||{};
   out.qualityTrend = get(['quality_trend'])||{};
   out.vocab = get(['vocab_richness'])||{};
   out.longHorizon = get(['long_horizon'])||{};
+  out.backendLogs = get(['backend_logs'])||{};
+  out.performance = get(['performance'])||{};
   return out;
 }
 
@@ -398,7 +408,11 @@ function renderChart(canvas, cfg, hover){
   const axes={y:{min:Infinity,max:-Infinity}, y1:{min:Infinity,max:-Infinity}};
   for(const ds of cfg.datasets){
     const ax=ds.axis==='y1'?'y1':'y';
-    for(const v of ds.data){ if(isNum(v)){ axes[ax].min=Math.min(axes[ax].min,v); axes[ax].max=Math.max(axes[ax].max,v);} }
+    for(const v of ds.data){
+      if(cfg.type==='boxplot' && v){
+        for(const value of [v.min,v.q1,v.median,v.q3,v.max]) if(isNum(value)){ axes[ax].min=Math.min(axes[ax].min,value); axes[ax].max=Math.max(axes[ax].max,value); }
+      } else if(isNum(v)){ axes[ax].min=Math.min(axes[ax].min,v); axes[ax].max=Math.max(axes[ax].max,v); }
+    }
   }
   if(!isFinite(axes.y.min)){ axes.y.min=0; axes.y.max=1; }
   if(cfg.yMin!=null) axes.y.min=cfg.yMin; if(cfg.yMax!=null) axes.y.max=cfg.yMax;
@@ -418,6 +432,42 @@ function renderChart(canvas, cfg, hover){
 
   const xAt = i => n<=1 ? padL+plotW/2 : padL + (plotW*i/(n-1));
   const yAt = (v,ax) => { const A=ax==='y1'?axes.y1:axes.y; return padT + plotH*(1-(v-A.min)/(A.max-A.min||1)); };
+
+  if(cfg.type==='interval'){
+    for(const ds of cfg.datasets){
+      const color=ds.color||'#58a6ff';
+      for(let i=0;i<n;i++){
+        const range=ds.intervals[i]; if(!range||!isNum(range.min)||!isNum(range.max)||!isNum(ds.data[i])) continue;
+        const x=xAt(i), yMin=yAt(range.min,'y'), yMax=yAt(range.max,'y'), yMean=yAt(ds.data[i],'y');
+        ctx.strokeStyle=color; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(x,yMin); ctx.lineTo(x,yMax); ctx.stroke();
+        ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x-7,yMin); ctx.lineTo(x+7,yMin); ctx.moveTo(x-7,yMax); ctx.lineTo(x+7,yMax); ctx.stroke();
+        ctx.fillStyle=color; ctx.beginPath(); ctx.arc(x,yMean,4,0,Math.PI*2); ctx.fill();
+      }
+    }
+  }
+  if(cfg.type==='boxplot'){
+    const groups=cfg.datasets.length;
+    const slot=plotW/Math.max(1,n), groupW=Math.min(slot*0.72, 54);
+    for(let i=0;i<n;i++){
+      for(let di=0;di<groups;di++){
+        const ds=cfg.datasets[di], s=ds.data[i];
+        if(!s||![s.min,s.median,s.max].every(isNum)) continue;
+        const q1=isNum(s.q1)?s.q1:s.median, q3=isNum(s.q3)?s.q3:s.median;
+        const x=xBarCenter(i)+(di-(groups-1)/2)*(groupW/Math.max(1,groups));
+        const boxW=groupW/Math.max(1,groups)*0.72;
+        const color=ds.color||'#58a6ff';
+        const yMin=yAt(s.min,'y'), yQ1=yAt(q1,'y'), yMed=yAt(s.median,'y'), yQ3=yAt(q3,'y'), yMax=yAt(s.max,'y');
+        ctx.strokeStyle=color; ctx.fillStyle=color; ctx.lineWidth=1.5;
+        ctx.beginPath(); ctx.moveTo(x,yMin); ctx.lineTo(x,yQ1); ctx.moveTo(x,yQ3); ctx.lineTo(x,yMax); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x-boxW*.35,yMin); ctx.lineTo(x+boxW*.35,yMin); ctx.moveTo(x-boxW*.35,yMax); ctx.lineTo(x+boxW*.35,yMax); ctx.stroke();
+        ctx.globalAlpha=0.28; ctx.fillRect(x-boxW/2,yQ3,boxW,yQ1-yQ3); ctx.globalAlpha=1;
+        ctx.strokeRect(x-boxW/2,yQ3,boxW,yQ1-yQ3);
+        // Keep the median legible over the translucent box, including when
+        // its value is close to q1 or q3.
+        ctx.strokeStyle='#ffffff'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(x-boxW/2,yMed); ctx.lineTo(x+boxW/2,yMed); ctx.stroke();
+      }
+    }
+  }
 
   // grid + y ticks
   ctx.font='11px -apple-system,Segoe UI,Roboto,sans-serif';
@@ -469,6 +519,7 @@ function renderChart(canvas, cfg, hover){
     const ds=cfg.datasets[di];
     const ax=ds.axis==='y1'?'y1':'y';
     const color=ds.color||PALETTE[ds.label.toLowerCase().replace(/[^a-z]/g,'')]||'#58a6ff';
+    if(cfg.type==='interval'||cfg.type==='boxplot') continue;
     if(ds.type==='bar'){
       const bi=barSets.indexOf(ds);
       const off=(bi-barSets.length/2)*bw;
@@ -621,6 +672,23 @@ function attachHover(canvas){
       tip.style.top=(e.clientY+14)+'px';
       return;
     }
+    if(g.cfg.type==='boxplot'){
+      if(x<g.padL||x>g.padL+g.plotW||g.n<1){ tip.style.display='none'; renderChart(canvas,g.cfg,null); return; }
+      const idx=g.n<=1?0:Math.max(0,Math.min(g.n-1,Math.round((x-g.padL)/g.plotW*(g.n-1))));
+      renderChart(canvas,g.cfg,idx);
+      let html=`<div class="tt-title">${g.labels[idx]}</div>`;
+      for(const ds of g.cfg.datasets){
+        const s=ds.data[idx]; if(!s||!isNum(s.median)) continue;
+        const col=ds.color||PALETTE[ds.label.toLowerCase().replace(/[^a-z]/g,'')]||'#58a6ff';
+        const f=g.cfg.yFmt||fmt2;
+        const q1=isNum(s.q1)?s.q1:s.median, q3=isNum(s.q3)?s.q3:s.median;
+        html+=`<div class="tt-row"><span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${col};margin-right:5px"></i>${ds.label}</span><b>min ${f(s.min)} · q1 ${f(q1)} · med ${f(s.median)} · q3 ${f(q3)} · max ${f(s.max)}</b></div>`;
+      }
+      tip.innerHTML=html; tip.style.display='block';
+      tip.style.left=Math.min(e.clientX+14, window.innerWidth-tip.offsetWidth-10)+'px';
+      tip.style.top=(e.clientY+14)+'px';
+      return;
+    }
     if(x<g.padL||x>g.padL+g.plotW||g.n<=1){ tip.style.display='none'; renderChart(canvas,g.cfg,null); return; }
     let idx=Math.round((x-g.padL)/g.plotW*(g.n-1));
     idx=Math.max(0,Math.min(g.n-1,idx));
@@ -633,7 +701,8 @@ function attachHover(canvas){
       const v=ds.data[idx];
       const col=ds.color||PALETTE[ds.label.toLowerCase().replace(/[^a-z]/g,'')]||'#58a6ff';
       const f=ds.axis==='y1'?(g.cfg.yFmt1||g.cfg.yFmt):g.cfg.yFmt;
-      const shown = isBad ? '—' : (f?f(v):fmt(v));
+      const range = g.cfg.type==='interval' && ds.intervals ? ds.intervals[idx] : null;
+      const shown = isBad ? '—' : (range ? `${f?f(v):fmt(v)} (${f?f(range.min):fmt(range.min)}–${f?f(range.max):fmt(range.max)})` : (f?f(v):fmt(v)));
       html+=`<div class="tt-row"><span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${col};margin-right:5px"></i>${ds.label}</span><b>${shown}</b></div>`;
     }
     tip.innerHTML=html; tip.style.display='block';
@@ -703,19 +772,26 @@ function render(){
   const ri=getRoundInfo(p.json,p.log);
   if(p.json) renderJSONView(root,p.json,p.log,ri);
   if(p.log) renderLogView(root,p.log,ri,p.json);
+  if(root._logTrace) root.appendChild(root._logTrace);
+  if(root._jsonTables) root.appendChild(root._jsonTables);
+  if(root._logTable) root.appendChild(root._logTable);
+  if(root._backendLogTable) root.appendChild(root._backendLogTable);
 }
 
 function renderJSONView(root,J,L,ri){
-  const c=J.config, tok=J.tokens, lat=J.latency, ttft=J.ttft, q=J.quality, sem=J.semantic, sec=J.secondary, ctxw=J.context, cache=J.cache, ev=J.eviction, pr=J.perRound;
-  const faith=q.prompt_faithfulness||null, evict=q.evicted_content_recall||null;
+  const c=J.config, tok=J.tokens, lat=J.latency, ttft=J.ttft, mtp=J.mtp, obs=J.observability, q=J.quality, sem=J.semantic, sec=J.secondary, ctxw=J.context, cache=J.cache, ev=J.eviction, pr=J.perRound, perf=J.performance||{};
+  const faith=q.prompt_source_token_recall!=null?q.prompt_source_token_recall:(q.prompt_faithfulness!=null?q.prompt_faithfulness:null);
+  const evict=q.evicted_content_recall!=null?q.evicted_content_recall:null;
 
   // ---- summary cards ----
   const cards=el('div','cards');
+  const metricLabel = text => Object.assign(el('div','metric-label'),{textContent:text});
   const card=(label,value,cls,delta)=>{ const d=el('div','card');
     d.appendChild(Object.assign(el('div','label'),{textContent:label}));
     d.appendChild(Object.assign(el('div','value '+(cls||'')),{textContent:value}));
     if(delta) d.appendChild(Object.assign(el('div','delta'),{textContent:delta}));
     return d; };
+  cards.appendChild(metricLabel('Input reduction'));
   // Token savings — two complementary baselines, clearly labelled so they are
   // not read as contradictory:
   //  • vs proxy raw input = INTRINSIC compaction: what the proxy did to the
@@ -724,11 +800,12 @@ function renderJSONView(root,J,L,ri){
   //  • vs direct = REAL-WORLD savings: proxy output vs the full un-compacted
   //    direct conversation (with proxy vs without). Higher because the direct
   //    path sends the entire context every turn (no eviction/compaction).
-  cards.appendChild(card('Token savings (intrinsic, vs raw input)', fmtPct(tok.token_savings_vs_raw_pct), tok.token_savings_vs_raw_pct>0?'good':'bad',
+  cards.appendChild(card('Token savings (intrinsic, vs raw input)', fmtPct(tok.token_savings_vs_raw_pct), isNum(tok.token_savings_vs_raw_pct)?(tok.token_savings_vs_raw_pct>0?'good':'warn'):'info',
     `HEADLINE · ${fmt(tok.total_raw_input_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok · proxy's own compaction (honest metric)`));
-  cards.appendChild(card('Token savings (real-world, vs direct)', fmtPct(tok.token_savings_pct), tok.token_savings_pct>0?'good':'bad',
+  cards.appendChild(card('Token savings (real-world, vs direct)', fmtPct(tok.token_savings_pct), isNum(tok.token_savings_pct)?(tok.token_savings_pct>0?'good':'warn'):'info',
     `${fmt(tok.total_direct_prompt)} → ${fmt(tok.total_proxy_prompt)} prompt tok · inflated: direct sends full context every turn`));
   const latD = lat.delta_proxy_minus_direct_ms;
+  cards.appendChild(metricLabel('Runtime & proxy cost'));
   // Focus this card on the latency OVERHEAD the proxy adds (proxy − direct),
   // not the absolute proxy latency (which is dominated by backend generation
   // time and is not what the proxy controls). Positive Δ = proxy slower (bad).
@@ -750,12 +827,25 @@ function renderJSONView(root,J,L,ri){
     ttftHasData
       ? `proxy ${isNum(ttftP)?fmtSec(ttftP):'n/a'} vs direct ${isNum(ttftD)?fmtSec(ttftD):'n/a'} (streaming run)`
       : 'no TTFT captured (run with --measure-ttft)'));
+  const obsErrors = obs && isNum(obs.backend_errors) ? obs.backend_errors : NaN;
+  const obsDegradations = obs && isNum(obs.degradation_events) ? obs.degradation_events : NaN;
+  cards.appendChild(card('Proxy overhead / failures',
+    isNum(obs.avg_optimizer_ms) ? `${fmtMs(obs.avg_optimizer_ms)} / ${isNum(obs.avg_token_count_ms)?fmtMs(obs.avg_token_count_ms):'—'}` : '—',
+    (obsErrors>0||obsDegradations>0)?'bad':(isNum(obs.avg_optimizer_ms)?'':'info'),
+    `optimizer / token count · ${isNum(obsErrors)?obsErrors:'—'} backend errors · ${isNum(obsDegradations)?obsDegradations:'—'} degradation events`));
+  const tpsD = perf.approximate_decode_tps && perf.approximate_decode_tps.direct;
+  const tpsP = perf.approximate_decode_tps && perf.approximate_decode_tps.proxy;
+  cards.appendChild(card('Request-level throughput estimate',
+    (tpsD&&isNum(tpsD.mean))||(tpsP&&isNum(tpsP.mean))
+      ? `${tpsP&&isNum(tpsP.mean)?tpsP.mean.toFixed(1):'—'} / ${tpsD&&isNum(tpsD.mean)?tpsD.mean.toFixed(1):'—'} tok/s`
+      : '—', 'info', 'proxy / direct · derived from completion tokens, latency, and TTFT'));
+  cards.appendChild(metricLabel('Context retention & quality'));
   // PRIMARY quality signal: context retention (the optimizer's actual job).
   // Promoted to the top of the quality cards — these are what a context
   // optimizer is measured on, not response-vs-response similarity.
-  cards.appendChild(card('Context faithfulness', faith&&faith.mean!=null?fmt2(faith.mean):'—',
+  cards.appendChild(card('Source-token recall', faith&&faith.mean!=null?fmt2(faith.mean):'—',
     faith&&faith.mean!=null?(faith.mean>=0.7?'good':faith.mean>=0.5?'warn':'bad'):'',
-    `PRIMARY · min ${faith&&faith.min!=null?fmt2(faith.min):'—'} · fraction of original prompt kept`));
+    `PRIMARY · min ${faith&&faith.min!=null?fmt2(faith.min):'—'} · unique source tokens retained`));
   cards.appendChild(card('Evicted-content recall', evict&&evict.mean!=null?fmt2(evict.mean):'—',
     evict&&evict.mean!=null?(evict.mean>=0.7?'good':evict.mean>=0.5?'warn':'bad'):'',
     `PRIMARY · min ${evict&&evict.min!=null?fmt2(evict.min):'—'} · early-turn content carried fwd`));
@@ -763,14 +853,32 @@ function renderJSONView(root,J,L,ri){
   // Demoted below the primary context-retention cards and explicitly labelled.
   cards.appendChild(card('Mean semantic sim', fmt2(sem.mean), 'info',
     `informational only · min ${fmt2(sem.min)} · median ${fmt2(sem.median)}`));
-  const cacheRate = cache.per_round_proxy_metrics && cache.per_round_proxy_metrics[0] ? cache.per_round_proxy_metrics[0].cache_hit_rate : NaN;
-  cards.appendChild(card('Prefix cache hit rate', fmtPct(cacheRate*100), cacheRate>=0.9?'good':cacheRate>0?'warn':'bad',
-    `${fmt(cache.total_prefix_cache_hit_tokens)} hit tok`));
-  cards.appendChild(card('Context utilization', fmtPct(ctxw.utilization_pct), ctxw.utilization_pct<50?'good':'warn',
-    `final ${fmt(ctxw.final_prompt_tokens)} / ${fmt(ctxw.max_context_window)} tok`));
+  cards.appendChild(card('Final context utilization', fmtPct(ctxw.utilization_pct), isNum(ctxw.utilization_pct)?(ctxw.utilization_pct<75?'good':'warn'):'info',
+    `proxy final prompt ${fmt(ctxw.final_prompt_tokens)} / ${fmt(ctxw.max_context_window)} tok`));
   const qskip = q.quality_skipped_turns||0;
   cards.appendChild(card('Quality-skipped turns', fmt(qskip), qskip===0?'good':'warn',
-    `low-sem ${q.low_semantic_similarity_turns||0} · trunc ${q.truncation_count||0}`));
+    `${fmt(qskip)} / ${fmt(J.num_turns)} excluded · low-sem ${q.low_semantic_similarity_turns||0} · trunc ${q.truncation_count||0}`));
+  cards.appendChild(card('Invalid code turns', fmt((q.code_syntax_invalid_turns||[]).length),
+    (q.code_syntax_invalid_turns||[]).length===0?'good':'warn', 'proxy response syntax checks only'));
+  const blog = J.backendLogs || {};
+  const blogStatus = String(blog.status || 'not_enabled');
+  const blogStatusClass = blogStatus === 'connected' || blogStatus === 'stopped' ? 'good' :
+    (blogStatus === 'not_enabled' || blogStatus.startsWith('unavailable')) ? 'info' : 'warn';
+  cards.appendChild(metricLabel('Cache & backend telemetry'));
+  const cacheRounds = cache.per_round_proxy_metrics||[];
+  const cacheRequests = cacheRounds.reduce((n,r)=>n+(isNum(r.requests)?r.requests:0),0);
+  const cacheHits = cacheRounds.reduce((n,r)=>n+(isNum(r.cache_hits)?r.cache_hits:0),0);
+  const cacheRate = cacheRequests>0 ? cacheHits/cacheRequests : NaN;
+  cards.appendChild(card('Prefix cache hit rate', fmtPct(cacheRate*100), isNum(cacheRate)?(cacheRate>=0.9?'good':cacheRate>0?'warn':'bad'):'info',
+    isNum(cacheRate) ? `${fmt(cacheHits)} / ${fmt(cacheRequests)} requests` : 'no request-level cache counters'));
+  const mtpRate = mtp && isNum(mtp.acceptance_rate) ? mtp.acceptance_rate : NaN;
+  cards.appendChild(card('MTP acceptance rate', isNum(mtpRate)?fmtPct(mtpRate*100):'—',
+    isNum(mtpRate)?(mtpRate>=0.5?'good':mtpRate>0?'warn':'bad'):'info',
+    isNum(mtpRate)
+      ? `${fmt(mtp.total_accepted_tokens)} accepted / ${fmt(mtp.total_draft_tokens)} drafted tokens`
+      : 'no backend MTP counters reported'));
+  cards.appendChild(card('Backend log capture', blogStatus === 'not_enabled' ? '—' : blogStatus,
+    blogStatusClass, `${fmt(blog.event_count)} events · ${fmt(blog.dropped_events)} dropped`));
 
   // ---- long-horizon / cross-turn cards ----
   // These answer "does the proxy still remember early context by Turn N?" — the
@@ -783,6 +891,7 @@ function renderJSONView(root,J,L,ri){
   const wall = lh.context_window_wall || null;
   const frP = fr && isNum(fr.proxy) ? fr.proxy : NaN;
   const frD = fr && isNum(fr.direct) ? fr.direct : NaN;
+  cards.appendChild(metricLabel('Long-horizon behavior'));
   cards.appendChild(card('Fact recall @ Turn N (drift)',
     (isNum(frP)||isNum(frD)) ? `${isNum(frP)?fmtPct(frP*100):'—'} / ${isNum(frD)?fmtPct(frD*100):'—'}` : '—',
     isNum(frP) ? (frP>=0.8?'good':frP>=0.6?'warn':'bad') : 'info',
@@ -798,8 +907,11 @@ function renderJSONView(root,J,L,ri){
   cards.appendChild(card('Context-window wall (turn)',
     (isNum(wP)||isNum(wD)) ? `${isNum(wP)?wP:'—'} / ${isNum(wD)?wD:'—'}` : '—',
     isNum(wP) ? 'warn' : 'good',
-    `proxy / direct · first turn code/semantic fidelity collapses (null = no wall)`));
+    `proxy / direct · heuristic sustained quality drop (null = none detected)`));
   root.appendChild(cards);
+
+  // Backend logs render after the complete dashboard, below all other tables.
+  const profile = blog.profile || {};
 
   // ---- primary-signal callout ----
   // Make the metric hierarchy explicit: context faithfulness + evicted recall
@@ -808,13 +920,13 @@ function renderJSONView(root,J,L,ri){
   const note=el('div','callout');
   note.appendChild(Object.assign(el('div','callout-title'),{textContent:'How to read quality'}));
   note.appendChild(Object.assign(el('p'),{textContent:
-    'PRIMARY signals (top cards + first table): Context faithfulness = fraction of the original prompt that survived compaction (1.0 = nothing lost); Evicted-content recall = fraction of early-turn content still carried forward. These measure the proxy\'s one job — compacting the INPUT context — and are the metrics to watch for regressions.'}));
+    'PRIMARY input-preservation signals (top cards + Optimizer quality table): Source-token recall is the fraction of unique tokens from the full prompt still present after compaction. The legacy faithfulness score is token-set Jaccard, so it also penalizes added summary tokens. Evicted-content recall is a heuristic recall of tokens from the early prompt, not an entity-aware measure.'}));
   note.appendChild(Object.assign(el('p'),{textContent:
     'INFORMATIONAL only: Semantic similarity, ROUGE/Jaccard/edit overlap, and response stability compare the proxy\'s answer to the direct (un-compressed) answer. They conflate optimizer quality with the model\'s phrasing variance and are weak on code, so low absolute values are EXPECTED (not a defect) — especially at long outputs (max_tokens ≥ 8192), where the two prompts produce genuinely different long answers.'}));
-  root.appendChild(note);
-
   // ---- charts grid ----
   const grid=el('div','grid');
+  const chartLabel = text => Object.assign(el('div','chart-label'),{textContent:text});
+  grid.appendChild(chartLabel('Latency & generation'));
 
   // Latency percentiles (direct vs proxy)
   if(lat.direct&&lat.proxy){
@@ -844,24 +956,96 @@ function renderJSONView(root,J,L,ri){
     }
   }
 
+  grid.appendChild(chartLabel('Prompt & cache economics'));
+  if(perf.per_turn && perf.per_turn.length){
+    grid.appendChild(panel('Fresh prefill by turn (proxy vs direct)','tok',
+      lineBarCfg(perf.per_turn.map(r=>'T'+r.turn),[
+        {label:'Direct fresh prefill',color:PALETTE.direct,type:'line',data:perf.per_turn.map(r=>r.direct_fresh_prefill_tokens)},
+        {label:'Proxy fresh prefill',color:PALETTE.proxy,type:'line',data:perf.per_turn.map(r=>r.proxy_fresh_prefill_tokens)}
+      ], fmt),
+      'Per-turn prompt tokens minus cached tokens. Compare this with the TTFT chart above; a fresh-prefill spike should explain a matching TTFT spike.'));
+  }
+
   // Token usage per turn (from log) OR aggregate
   if(J.raw.tokens && J.raw.tokens.per_turn_direct && J.raw.tokens.per_turn_proxy){
     const pd=J.raw.tokens.per_turn_direct, pp=J.raw.tokens.per_turn_proxy;
-    const labels=pd.mean!=null?['mean','median','p90','p95','p99','min','max']:Object.keys(pd);
-    grid.appendChild(panel('Prompt tokens / turn (distribution)','tok',
-      lineBarCfg(labels,[
-        {label:'Direct',color:PALETTE.direct,type:'bar',data:labels.map(k=>pd[k])},
-        {label:'Proxy',color:PALETTE.proxy,type:'bar',data:labels.map(k=>pp[k])}
-      ], fmt), 'Per-turn prompt token distribution. Proxy keeps each turn small.'));
+    grid.appendChild(panel('Prompt tokens / turn (summary statistics)','tok',
+      {type:'boxplot',labels:['Direct','Proxy'],datasets:[
+        {label:'Direct',color:PALETTE.direct,data:[pd,null]},
+        {label:'Proxy',color:PALETTE.proxy,data:[null,pp]}
+      ],yFmt:fmt}, 'Per-turn distribution: box = q1..q3, center line = median, whiskers = min..max. Proxy keeps each turn small.'));
   }
 
+  if(perf.fresh_prefill_tokens && (perf.fresh_prefill_tokens.direct||perf.fresh_prefill_tokens.proxy)){
+    const d=perf.fresh_prefill_tokens.direct?.q1!=null?perf.fresh_prefill_tokens.direct:statsFromValues((perf.per_turn||[]).map(r=>r.direct_fresh_prefill_tokens));
+    const p=perf.fresh_prefill_tokens.proxy?.q1!=null?perf.fresh_prefill_tokens.proxy:statsFromValues((perf.per_turn||[]).map(r=>r.proxy_fresh_prefill_tokens));
+    grid.appendChild(panel('Fresh prefill tokens (summary statistics)','tok',
+      {type:'boxplot',labels:['Direct','Proxy'],datasets:[
+        {label:'Direct',color:PALETTE.direct,data:[d,null]},
+        {label:'Proxy',color:PALETTE.proxy,data:[null,p]}
+      ],yFmt:fmt}, 'Fresh prefill distribution: box = q1..q3, center line = median, whiskers = min..max. Lower values indicate more prefix reuse.'));
+  }
+
+  if(perf.cache_reuse_pct && (perf.cache_reuse_pct.direct||perf.cache_reuse_pct.proxy)){
+    const measuredTurns=(perf.per_turn||[]).filter(r=>Number(r.turn)>0);
+    const d=statsFromValues(measuredTurns.map(r=>isNum(r.direct_cache_reuse_pct)?Math.min(100,Math.max(0,r.direct_cache_reuse_pct)):NaN));
+    const p=statsFromValues(measuredTurns.map(r=>isNum(r.proxy_cache_reuse_pct)?Math.min(100,Math.max(0,r.proxy_cache_reuse_pct)):NaN));
+    const summaryD=boundedPctStats(perf.cache_reuse_pct.direct), summaryP=boundedPctStats(perf.cache_reuse_pct.proxy);
+    if(!Object.keys(d).length && Object.keys(summaryD).length) Object.assign(d,summaryD);
+    if(!Object.keys(p).length && Object.keys(summaryP).length) Object.assign(p,summaryP);
+    grid.appendChild(panel('Cache reuse ratio (direct vs proxy)','%',
+      {type:'boxplot',labels:['Direct','Proxy'],datasets:[
+        {label:'Direct',color:PALETTE.direct,data:[d,null]},
+        {label:'Proxy',color:PALETTE.proxy,data:[null,p]}
+      ],yFmt:v=>isNum(v)?v.toFixed(1)+'%':'—',yMin:0,yMax:100},
+      'Cached prompt tokens divided by total prompt tokens. Box = q1..q3, center line = median, whiskers = min..max.'));
+  }
+
+  const hasTpsRows=(perf.per_turn||[]).some(r=>isNum(r.direct_approx_decode_tps)||isNum(r.proxy_approx_decode_tps));
+  const hasTpsSummary=[tpsD,tpsP].some(s=>s&&isNum(s.min)&&isNum(s.median)&&isNum(s.max));
+  if(perf.approximate_decode_tps && (hasTpsSummary||hasTpsRows)){
+    const d=tpsD?.q1!=null?tpsD:statsFromValues((perf.per_turn||[]).map(r=>r.direct_approx_decode_tps));
+    const p=tpsP?.q1!=null?tpsP:statsFromValues((perf.per_turn||[]).map(r=>r.proxy_approx_decode_tps));
+    grid.appendChild(panel('Approximate decode throughput','tok/s',
+      {type:'boxplot',labels:['Direct','Proxy'],datasets:[
+        {label:'Direct',color:PALETTE.direct,data:[d,null]},
+        {label:'Proxy',color:PALETTE.proxy,data:[null,p]}
+      ],yFmt:v=>isNum(v)?v.toFixed(1):'—'},
+      'Approximation only: completion tokens / (request latency − TTFT). Box = q1..q3, center line = median, whiskers = min..max; it is not backend instrumentation.'));
+  }
+
+  if(perf.per_turn && perf.per_turn.length){
+    grid.appendChild(panel('Prompt and completion tokens per turn','tok',
+      lineBarCfg(perf.per_turn.map(r=>'T'+r.turn),[
+        {label:'Direct prompt',color:PALETTE.direct,type:'line',data:perf.per_turn.map(r=>r.direct_prompt_tokens)},
+        {label:'Proxy prompt',color:PALETTE.proxy,type:'line',data:perf.per_turn.map(r=>r.proxy_prompt_tokens)},
+        {label:'Direct completion',color:PALETTE.cache,type:'line',data:perf.per_turn.map(r=>r.direct_completion_tokens)},
+        {label:'Proxy completion',color:PALETTE.sem,type:'line',data:perf.per_turn.map(r=>r.proxy_completion_tokens)}
+      ], fmt), 'Prompt size is the proxy-controlled input signal; completion tokens remain model behavior.'));
+  }
+
+  grid.appendChild(chartLabel('Proxy overhead'));
+  if(obs && obs.per_round && obs.per_round.length){
+    const labels=obs.per_round.map(r=>'R'+(Number(r.round)+1));
+    grid.appendChild(panel('Proxy processing overhead per round','ms',
+      lineBarCfg(labels,[
+        {label:'Optimizer',color:PALETTE.proxy,type:'bar',data:obs.per_round.map(r=>r.avg_optimizer_ms)},
+        {label:'Token count',color:PALETTE.cache,type:'bar',data:obs.per_round.map(r=>r.avg_token_count_ms)}
+      ], fmtMs),
+      'Proxy-side work only. Backend generation latency is excluded; backend errors and degradation events are shown in the summary card.'));
+  }
+
+  grid.appendChild(chartLabel('Context retention & quality'));
+  grid.appendChild(note);
+
   // Quality metrics — radar (multivariate 0–1 comparison)
-  // Headline = the optimizer's ACTUAL job (context retention) + the hard
-  // correctness/structure checks (code syntax, code blocks, code structure).
+  // Keep the radar for a compact overview, but only combine comparable
+  // input-retention and proxy-output correctness measures.
   // Response-vs-response overlap scores (ROUGE/Jaccard/edit) and Semantic sim
   // are now secondary (see the secondary radar + quality detail below).
-  if(faith||evict||q.code_syntax_validity||q.code_block_ratio||sec.code_structure_consistency){
-    const labels=['Context faith','Evicted recall','Syntax valid','Code blocks','Code struct'];
+  const semRadar = sem&&isNum(sem.mean) ? (sem.mean+1)/2 : NaN;
+  if(faith||evict||q.code_syntax_validity||q.code_block_ratio||isNum(semRadar)){
+    const labels=['Source recall','Evicted recall','Syntax valid','Code blocks','Semantic sim*'];
     // Radar axes are 0..1. Code struct is a 0..1 consistency score, so no
     // clamping needed. (Semantic sim was moved to the secondary radar because
     // it is a cosine in [-1,1] and the noisiest of the metrics.)
@@ -869,45 +1053,121 @@ function renderJSONView(root,J,L,ri){
     grid.appendChild(panel('Optimizer quality (mean, 0–1)','score',
       {type:'radar', labels,
         datasets:[
-          {label:'Optimizer quality',color:PALETTE.sem,data:[mk(faith),mk(evict),mk(q.code_syntax_validity),mk(q.code_block_ratio),mk(sec.code_structure_consistency)]}
+          {label:'Input, correctness + response diagnostic',color:PALETTE.sem,data:[mk(faith),mk(evict),mk(q.code_syntax_validity),mk(q.code_block_ratio),semRadar]}
         ], yFmt:fmt2, yMin:0, yMax:1},
-      'Mean scores across measured turns. The FIRST TWO axes (Context faith, Evicted recall) are the PRIMARY signal — they measure the proxy\'s one job (compacting the INPUT context) and are the metrics to watch for regressions. Syntax valid / Code blocks / Code struct are structural-preservation checks (does the proxy\'s optimized prompt still produce code that parses and matches the direct response\'s structure?). All axes are 0..1.'));
+      'Mean scores across measured turns. Source recall and evicted recall measure input preservation; syntax validity and code-block ratio are diagnostics. Semantic sim* is response cosine normalized from −1..1 to 0..1 for this radar only; see the signed chart below.'));
   }
 
-  // Per-round token savings + semantic
+  // Secondary / informational quality metrics — radar (0–1).
+  // These compare responses, so they stay with the quality guidance rather
+  // than getting their own response-comparison section.
+  if(sec.trigram_overlap||sec.markdown_structure_similarity||sec.rouge_l_precision||sec.rouge_l_recall||sec.response_stability||q.rouge_l_f1||q.token_jaccard||q.edit_similarity){
+    const labels=['ROUGE-L F1','Token Jaccard','Edit sim','Trigram overlap','Markdown struct'];
+    const mk=(o)=>o&&o.mean!=null?o.mean:NaN;
+    grid.appendChild(panel('Secondary quality metrics (mean, 0–1, informational)','score',
+      {type:'radar', labels,
+        datasets:[
+          {label:'Secondary quality (proxy vs direct)',color:PALETTE.rouge,data:[mk(q.rouge_l_f1),mk(q.token_jaccard),mk(q.edit_similarity),mk(sec.trigram_overlap),mk(sec.markdown_structure_similarity)]}
+        ], yFmt:fmt2, yMin:0, yMax:1},
+      'Informational only — response-vs-response overlap. Low absolute values are expected (LLM phrasing variance), NOT optimizer failure. Semantic similarity is shown separately because its cosine scale is signed.'));
+  }
+  if(sem && sem.mean!=null){
+    grid.appendChild(panel('Semantic similarity (signed, informational)','score',
+      {type:'boxplot', labels:['Proxy vs direct'], datasets:[{label:'Cosine similarity',color:PALETTE.sem,data:[sem]}], yFmt:fmt2, yMin:-1, yMax:1},
+      'Cosine similarity distribution: box = q1..q3, center line = median, whiskers = min..max. Negative values are valid; this is informational and weak on code-heavy traffic.'));
+  }
+
+  grid.appendChild(chartLabel('Cache & MTP telemetry'));
+  // Aggregate per-turn telemetry so the chart remains useful even when the
+  // proxy metrics snapshot is unavailable or the run contains one round.
+  const cacheByRound=new Map();
+  for(const r of (perf.per_turn||[])){
+    const key=Number(r.round); const entry=cacheByRound.get(key)||{hits:0,total:0,reuse:[]};
+    entry.total++;
+    if(isNum(r.proxy_prefix_cache_hit_tokens)&&r.proxy_prefix_cache_hit_tokens>0) entry.hits++;
+    if(isNum(r.proxy_cache_reuse_pct)) entry.reuse.push(r.proxy_cache_reuse_pct);
+    cacheByRound.set(key,entry);
+  }
+  const hasPerTurnHit=(perf.per_turn||[]).some(r=>isNum(r.proxy_prefix_cache_hit_tokens));
+  const hasPerTurnReuse=(perf.per_turn||[]).some(r=>isNum(r.proxy_cache_reuse_pct));
+  const cacheSnapshots=cache.per_round_proxy_metrics||[];
+  if(hasPerTurnHit){
+    const rounds=[...cacheByRound.keys()].sort((a,b)=>a-b), labels=rounds.map(r=>'R'+(r+1));
+    grid.appendChild(panel('Cache hit rate per round (requests)','%',
+      lineBarCfg(labels,[{label:'Cache hit rate',color:PALETTE.cache,type:'bar',data:rounds.map(r=>{const x=cacheByRound.get(r);return x.total?x.hits/x.total*100:NaN;})}],
+        v=>isNum(v)?v.toFixed(0)+'%':'—', 0, 100),
+      'Percentage of requests with a prefix-cache hit.'));
+  } else if(cacheSnapshots.length){
+    const labels=cacheSnapshots.map(r=>'R'+(Number(r.round)+1));
+    grid.appendChild(panel('Cache hit rate per round (requests)','%',
+      lineBarCfg(labels,[{label:'Cache hit rate',color:PALETTE.cache,type:'bar',data:cacheSnapshots.map(r=>isNum(r.cache_hit_rate)?r.cache_hit_rate*100:NaN)}],v=>isNum(v)?v.toFixed(0)+'%':'—',0,100),
+      'Percentage of requests with a prefix-cache hit.'));
+  }
+  if(hasPerTurnReuse){
+    const rounds=[...cacheByRound.keys()].sort((a,b)=>a-b), labels=rounds.map(r=>'R'+(r+1));
+    grid.appendChild(panel('Cache reuse ratio per round (tokens)','%',
+      lineBarCfg(labels,[{label:'Reuse ratio',color:'#ff7bd5',type:'bar',data:rounds.map(r=>{const values=cacheByRound.get(r).reuse;return values.length?values.reduce((a,b)=>a+b,0)/values.length:NaN;})}],
+        v=>isNum(v)?v.toFixed(0)+'%':'—', 0, 100),
+      'Percentage of prompt tokens served from the prefix cache.'));
+  } else if(cacheSnapshots.length){
+    const labels=cacheSnapshots.map(r=>'R'+(Number(r.round)+1));
+    grid.appendChild(panel('Cache reuse ratio per round (tokens)','%',
+      lineBarCfg(labels,[{label:'Reuse ratio',color:'#ff7bd5',type:'bar',data:cacheSnapshots.map(r=>isNum(r.prefix_cache_reuse_ratio)?Math.min(1,r.prefix_cache_reuse_ratio)*100:NaN)}],v=>isNum(v)?v.toFixed(0)+'%':'—',0,100),
+      'Percentage of prompt tokens served from the prefix cache.'));
+  }
+
+  if(mtp && mtp.per_round && mtp.per_round.length){
+    const labels=mtp.per_round.map(r=>'R'+(Number(r.round)+1));
+    const boxStats=values=>{const s=values.filter(isNum).sort((a,b)=>a-b);return s.length?{min:s[0],q1:s[Math.floor((s.length-1)*.25)],median:s[Math.floor((s.length-1)*.5)],q3:s[Math.floor((s.length-1)*.75)],max:s[s.length-1]}:null;};
+    const byRound=new Map();
+    for(const r of (mtp.per_turn||[])){const a=byRound.get(Number(r.round))||[];if(isNum(r.acceptance_rate))a.push(r.acceptance_rate*100);byRound.set(Number(r.round),a);}
+    grid.appendChild(panel('MTP acceptance per round','%',
+      {type:'boxplot',labels,datasets:[{label:'Accepted / drafted',color:PALETTE.sem,data:mtp.per_round.map(r=>boxStats(byRound.get(Number(r.round))||[]))}],yFmt:v=>isNum(v)?v.toFixed(0)+'%':'—',yMin:0,yMax:100},
+      'Backend-reported per-turn acceptance distribution by round: box = q1..q3, center line = median, whiskers = min..max. Acceptance does not by itself prove faster generation.'));
+  }
+
+  if(mtp && mtp.per_turn && mtp.per_turn.length){
+    const turns=[...new Set(mtp.per_turn.map(r=>`R${Number(r.round)+1} T${r.turn}`))];
+    const values=(phase)=>turns.map(label=>{
+      const match=mtp.per_turn.find(r=>`R${Number(r.round)+1} T${r.turn}`===label && r.phase===phase);
+      return match && isNum(match.acceptance_rate) ? match.acceptance_rate*100 : NaN;
+    });
+    grid.appendChild(panel('MTP acceptance per turn','%',
+      lineBarCfg(turns,[
+        {label:'Direct',color:PALETTE.direct,type:'line',data:values('direct')},
+        {label:'Proxy',color:PALETTE.proxy,type:'line',data:values('proxy')}
+      ], v=>isNum(v)?v.toFixed(0)+'%':'—', 0, 100),
+      'Draft acceptance parsed from streaming backend logs. Values compare direct and proxy requests by benchmark turn.'));
+    if(perf.per_turn && perf.per_turn.length){
+      const perfByTurn=new Map(perf.per_turn.map(r=>[`${r.round}:${r.turn}`,r]));
+      const throughput=(phase)=>turns.map(label=>{
+        const match=mtp.per_turn.find(r=>`R${Number(r.round)+1} T${r.turn}`===label && r.phase===phase);
+        const row=match&&perfByTurn.get(`${match.round}:${match.turn}`);
+        return row&&isNum(row[`${phase}_approx_decode_tps`]) ? row[`${phase}_approx_decode_tps`] : NaN;
+      });
+      grid.appendChild(panel('MTP acceptance and throughput estimate per turn','%',
+        {dual:true, labels:turns, datasets:[
+          {label:'Direct acceptance',color:PALETTE.direct,type:'line',data:values('direct')},
+          {label:'Proxy acceptance',color:PALETTE.proxy,type:'line',data:values('proxy')},
+          {label:'Direct request TPS',color:PALETTE.direct,axis:'y1',data:throughput('direct')},
+          {label:'Proxy request TPS',color:PALETTE.proxy,axis:'y1',data:throughput('proxy')}
+        ], yFmt:v=>isNum(v)?v.toFixed(0)+'%':'—', yFmt1:v=>isNum(v)?v.toFixed(1):'—', yMin:0, yMax:100},
+        'Acceptance uses the left axis; request-level throughput estimate uses the right axis. Correlation is descriptive, not proof that MTP caused a speed change.'));
+    }
+  }
+
+  grid.appendChild(chartLabel('Compaction impact'));
   if(pr && pr._pooled==null && Object.keys(pr).length){
     const rounds=Object.keys(pr).filter(k=>k!=='_pooled').map(Number).sort((a,b)=>a-b);
     if(rounds.length){
       const labels=rounds.map(r=>'R'+(r+1));
-      grid.appendChild(panel('Per-round: token savings % & semantic sim','',
+      grid.appendChild(panel('Per-round token savings','%',
         lineBarCfg(labels,[
-          {label:'Token savings %',color:PALETTE.proxy,type:'bar',data:rounds.map(r=>pr[r].token_savings_pct)},
-          {label:'Semantic sim',color:PALETTE.sem,data:rounds.map(r=>pr[r].semantic_similarity&&pr[r].semantic_similarity.mean)}
-        ], v=>isNum(v)?(v<=1.5?v.toFixed(2):v.toFixed(1)+'%'):'—', 0, null),
-        'Each round is an INDEPENDENT replay of the same fixture (a fresh 10-turn conversation), not a continuation. So per-round swings in semantic sim are mostly model phrasing variance, NOT an optimizer regression — read token savings % (the real signal) across rounds instead. Semantic sim is cosine in [-1,1]; negatives are valid.'));
+          {label:'Token savings %',color:PALETTE.proxy,type:'bar',data:rounds.map(r=>pr[r].token_savings_pct)}
+        ], v=>isNum(v)?v.toFixed(1)+'%':'—', 0, null),
+        'Each round is an independent replay. Read this alongside the per-turn savings chart to see whether compaction is stable across runs.'));
     }
   }
-
-  // Cache reuse per round
-  if(cache.per_round_proxy_metrics && cache.per_round_proxy_metrics.length){
-    const m=cache.per_round_proxy_metrics;
-    const labels=m.map(r=>'R'+(r.round+1));
-    // Both series are percentages but of DIFFERENT denominators:
-    //  - Cache hit rate  = hits/requests           (fraction of requests, 0..1)
-    //  - Reuse ratio     = cached_tok/prompt_tok   (fraction of tokens,   0..1)
-    // Plot BOTH as % on a shared 0..100 axis. Previously the reuse ratio was
-    // plotted raw (0.16..0.65) against hit-rate bars scaled to ~100, so it was
-    // squashed onto the baseline and looked like a flat 0 even when it wasn't.
-    grid.appendChild(panel('Cache reuse per round (proxy)','%',
-      lineBarCfg(labels,[
-        {label:'Cache hit rate',color:PALETTE.cache,type:'bar',data:m.map(r=>isNum(r.cache_hit_rate)?r.cache_hit_rate*100:NaN)},
-        // High-contrast magenta line so the reuse-ratio series stays legible on
-        // top of the cyan cache-hit bars (green-on-cyan was hard to see).
-        {label:'Reuse ratio (tokens)',color:'#ff7bd5',data:m.map(r=>isNum(r.prefix_cache_reuse_ratio)?r.prefix_cache_reuse_ratio*100:NaN)}
-      ], v=>isNum(v)?v.toFixed(0)+'%':'—', 0, null),
-      'Cache hit rate = % of requests with a prefix-cache hit. Reuse ratio = % of prompt tokens served from cache. Both shown as %.'));
-  }
-
   // Eviction / compaction — per-turn TOKEN SAVINGS (proxy vs direct prompt tokens).
   // Derived from the same per-turn token counts as "Prompt tokens per turn", but
   // shows the savings magnitude per turn rather than the two raw series.
@@ -949,30 +1209,26 @@ function renderJSONView(root,J,L,ri){
     }
   }
 
-  // Secondary / informational quality metrics — radar (0–1).
-  // These are response-vs-response overlap scores. They conflate optimizer
-  // quality with the model's phrasing variance and have near-zero
-  // discriminative power for a context optimizer, so they are informational
-  // only (see the optimizer-quality radar above for the real signals).
-  if(sec.trigram_overlap||sec.markdown_structure_similarity||sec.rouge_l_precision||sec.rouge_l_recall||sec.response_stability||q.rouge_l_f1||q.token_jaccard||q.edit_similarity||sem.mean!=null){
-    const labels=['ROUGE-L F1','Token Jaccard','Edit sim','Trigram overlap','Markdown struct','Semantic sim'];
-    const mk=(o)=>o&&o.mean!=null?o.mean:NaN;
-    grid.appendChild(panel('Secondary quality metrics (mean, 0–1, informational)','score',
-      {type:'radar', labels,
-        datasets:[
-          {label:'Secondary quality (proxy vs direct)',color:PALETTE.rouge,data:[mk(q.rouge_l_f1),mk(q.token_jaccard),mk(q.edit_similarity),mk(sec.trigram_overlap),mk(sec.markdown_structure_similarity),mk(sem)]}
-        ], yFmt:fmt2, yMin:0, yMax:1},
-      'Informational only — response-vs-response overlap. Low absolute values are expected (LLM phrasing variance), NOT optimizer failure. Axes: ROUGE-L F1 / Token Jaccard / Edit sim = overlap with the direct response; Trigram overlap = 3-gram token overlap; Markdown struct = structure similarity; Semantic sim = embedding cosine vs direct (weak on code, expected low at long outputs, can be negative — clamped to 0 here, shown signed in the table/per-turn chart).'));
-  }
-
   root.appendChild(grid);
 
-  // ---- config + per-round tables ----
-  root.appendChild(sectionTitle('Run configuration'));
-  root.appendChild(kvTable('Config', Object.entries(c).map(([k,v])=>[k, typeof v==='object'?JSON.stringify(v):String(v)])));
+  // ---- tables ----
+  const tables=el('div','tables');
+  if(Object.keys(profile).length){
+    tables.appendChild(sectionTitle('Backend configuration snapshot'));
+    tables.appendChild(kvTable('Setting', [
+      ['Version', profile.version || '—'],
+      ['Model', profile.model || '—'],
+      ['Context window', isNum(profile.context_window) ? fmt(profile.context_window)+' tok' : '—'],
+      ['Cache RAM', isNum(profile.cache_ram_mb) ? fmt(profile.cache_ram_mb)+' MB' : '—'],
+      ['Cache reuse', isNum(profile.cache_reuse_tokens) ? fmt(profile.cache_reuse_tokens)+' tok' : '—'],
+      ['Draft/MTP configured', profile.draft_enabled == null ? '—' : (profile.draft_enabled ? 'yes' : 'no')]
+    ]));
+  }
+  tables.appendChild(sectionTitle('Run configuration'));
+  tables.appendChild(kvTable('Config', Object.entries(c).map(([k,v])=>[k, typeof v==='object'?JSON.stringify(v):String(v)])));
 
   if(pr && Object.keys(pr).length){
-    root.appendChild(sectionTitle('Per-round summary'));
+    tables.appendChild(sectionTitle('Per-round summary'));
     const rounds=Object.keys(pr).filter(k=>k!=='_pooled').map(Number).sort((a,b)=>a-b);
     const rows=rounds.map(r=>{ const o=pr[r]; return {
       'Round':r+1, 'Turns':o.turns, 'Token savings %':fmtPct(o.token_savings_pct),
@@ -981,18 +1237,18 @@ function renderJSONView(root,J,L,ri){
       'Sem max':fmt2(o.semantic_similarity&&o.semantic_similarity.max) }; });
     if(pr._pooled) rows.push({'Round':'pooled','Turns':'','Token savings %':'',
       'Sem mean':fmt2(pr._pooled.round_mean_of_means),'Sem min':fmt2(pr._pooled.round_min_of_mins),'Sem max':''});
-    root.appendChild(dataTable(rows));
+    tables.appendChild(dataTable(rows));
   }
 
   // quality detail table
-  root.appendChild(sectionTitle('Optimizer quality (headline — context retention + correctness)'));
+  tables.appendChild(sectionTitle('Optimizer quality (headline — context retention + correctness)'));
   const qrows=[];
   const addQ=(name,o)=>{ if(o&&o.mean!=null) qrows.push({Metric:name,'Mean':fmt2(o.mean),'Median':fmt2(o.median),'Min':fmt2(o.min),'Max':fmt2(o.max)}); };
-  addQ('Prompt faithfulness',q.prompt_faithfulness); addQ('Evicted-content recall',q.evicted_content_recall);
+  addQ('Source-token recall',q.prompt_source_token_recall); addQ('Legacy prompt Jaccard',q.prompt_faithfulness); addQ('Evicted-content recall',q.evicted_content_recall);
   addQ('Code syntax validity',q.code_syntax_validity); addQ('Code block ratio',q.code_block_ratio);
-  if(qrows.length) root.appendChild(dataTable(qrows));
+  if(qrows.length) tables.appendChild(dataTable(qrows));
 
-  root.appendChild(sectionTitle('Response-overlap quality (secondary — informational only)'));
+  tables.appendChild(sectionTitle('Response-overlap quality (secondary — informational only)'));
   const srows=[];
   const addS=(name,o)=>{ if(o&&o.mean!=null) srows.push({Metric:name,'Mean':fmt2(o.mean),'Median':fmt2(o.median),'Min':fmt2(o.min),'Max':fmt2(o.max)}); };
   addS('ROUGE-L F1',q.rouge_l_f1); addS('Token Jaccard',q.token_jaccard); addS('Edit similarity',q.edit_similarity);
@@ -1001,28 +1257,47 @@ function renderJSONView(root,J,L,ri){
   addS('Markdown struct',J.secondary.markdown_structure_similarity); addS('Vocab richness Δ',J.secondary.vocabulary_richness_delta);
   addS('ROUGE precision',J.secondary.rouge_l_precision); addS('ROUGE recall',J.secondary.rouge_l_recall);
   addS('Response stability',J.secondary.response_stability); addS('Code struct consist.',J.secondary.code_structure_consistency);
-  if(srows.length) root.appendChild(dataTable(srows));
+  if(srows.length) tables.appendChild(dataTable(srows));
   const verb = q.model_verbosity_delta_turns||0;
   if(verb>0){
     const note=el('div','coupling warn');
     note.innerHTML=`<b>&#9888; ${verb} turn(s) verbose inflation (length_ratio >2.0):</b> this is MODEL verbosity under a different prompt, NOT optimizer-caused. Reported for context only.`;
-    root.appendChild(note);
+    tables.appendChild(note);
   }
+  const backendLogTable=el('div','tables');
+  backendLogTable.appendChild(sectionTitle('Synchronized backend logs'));
+  if(blogStatus === 'not_enabled'){
+    backendLogTable.appendChild(Object.assign(el('div','coupling info'),{textContent:'Backend log capture was not enabled for this report.'}));
+  } else {
+    const logMeta = el('div','meta');
+    logMeta.textContent = `${blogStatus} · ${fmt(blog.event_count)} captured · ${fmt(blog.dropped_events)} dropped · sequence ${blog.first_seq ?? '—'} → ${blog.last_seq ?? '—'}`;
+    backendLogTable.appendChild(logMeta);
+    const logRows = (blog.events||[]).slice(-200).map(e=>({
+      'Seq': e.seq, 'Round': e.round == null ? '—' : Number(e.round)+1,
+      'Time': e.timestamp || '—', 'Severity': e.severity || '—',
+      'Tag': e.tag || '—', 'Log line': e.line || '—'
+    }));
+    if(logRows.length) backendLogTable.appendChild(dataTable(logRows));
+    else backendLogTable.appendChild(Object.assign(el('div','coupling info'),{textContent:'No backend log entries were received.'}));
+  }
+  root._jsonTables=tables;
+  root._backendLogTable=backendLogTable;
 }
 
 function renderLogView(root,L,ri,J){
+  const trace=el('div','trace-section');
   const rs = (ri && isNum(ri.numTurns) && ri.numTurns>1) ? ri.numTurns : null;
   const roundTag = (isNum(ri.numTurns)&&isNum(ri.rounds)) ? ` — ${ri.numTurns} turns × ${ri.rounds} rounds` : '';
-  root.appendChild(sectionTitle('Per-turn trace (from log)'+roundTag));
+  trace.appendChild(sectionTitle('Per-turn trace (from log)'+roundTag));
   if(L.meta && Object.keys(L.meta).length){
     const m=L.meta;
     const line=el('div','meta');
     line.innerHTML=[m['Scenario'],m['Model'],m['Lemonade']?'Lemonade '+m['Lemonade']:'',m['Context profile']?'profile: '+m['Context profile']:'']
       .filter(Boolean).join(' &middot; ');
-    root.appendChild(line);
+    trace.appendChild(line);
   }
   const tl=L.turnList;
-  if(!tl.length){ root.appendChild(Object.assign(el('div','meta'),{textContent:'No "Turn NN:" lines parsed from log.'})); return; }
+  if(!tl.length){ trace.appendChild(Object.assign(el('div','meta'),{textContent:'No "Turn NN:" lines parsed from log.'})); root._logTrace=trace; return; }
 
   // Detect failed/estimated turns so their per-turn points are visibly flagged
   // (red column + × marker) rather than plotted as real data. `flaggedIdx` maps
@@ -1037,7 +1312,7 @@ function renderLogView(root,L,ri,J){
       `These had a failed or estimated direct-side result (empty response / missing usage), `+
       `so their per-turn points are marked <span style="color:#f85149">red ✕</span> and omitted from the line/bar series `+
       `(they are also excluded from the JSON aggregates).`;
-    root.appendChild(note);
+    trace.appendChild(note);
   }
 
   // charts from log
@@ -1108,10 +1383,12 @@ function renderLogView(root,L,ri,J){
       withFlags(lineBarCfg(phKeys.map(k=>'T'+k),[{label:'Prefix hits',color:PALETTE.cache,data:phKeys.map(k=>L.proxyTurns[k].prefixHits)}], fmt, null, null, rs), phFlagged),
       'Tokens reused from the KV prefix cache each proxy turn. Red ✕ = turn flagged (direct-side failure/estimate).'));
   }
-  root.appendChild(grid);
+  trace.appendChild(grid);
+  root._logTrace=trace;
 
-  // per-turn table
-  root.appendChild(sectionTitle('Per-turn table'));
+  // Keep the per-turn table separate so its charts stay in the charts phase.
+  const logTable=el('div','tables');
+  logTable.appendChild(sectionTitle('Per-turn table'));
   const rows=tl.map(t=>({
     'Turn':t.turn, 'Round':t.round,
     'Flag': bad.has(t.turn) ? (reasons[t.turn]||'flagged') : '',
@@ -1139,7 +1416,8 @@ function renderLogView(root,L,ri,J){
     {k:'Jacc',f:v=>isNum(v)?fmt2(v):'n/a'},
     {k:'Rouge',f:v=>isNum(v)?fmt2(v):'n/a'}
   ];
-  root.appendChild(dataTable(rows,cols,row=>row._bad?'badrow':''));
+  logTable.appendChild(dataTable(rows,cols,row=>row._bad?'badrow':''));
+  root._logTable=logTable;
 }
 
 /* ============================ chart/table helpers ============================ */

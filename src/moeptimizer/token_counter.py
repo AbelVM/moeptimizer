@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import time
 from collections.abc import Callable
 from functools import lru_cache
 from typing import Any, ClassVar
@@ -174,6 +175,8 @@ class TokenCounter:
         self._text_cache: dict[str, int] = {}
         self._text_cache_order: list[str] = []
         self._max_text_cache = self._max_cache * 4
+        self._total_count_ms = 0.0
+        self._count_samples = 0
 
         # 1) Explicit HF tokenizer id/path (or "auto" -> try common Qwen ids).
         #    "auto" is restricted to LOCAL files only so it never triggers a
@@ -365,6 +368,14 @@ class TokenCounter:
         message contents into a single text and asks the backend's own tokenizer
         for an exact count in one round-trip, then adds per-message overhead.
         """
+        started = time.perf_counter()
+        try:
+            return self._count_messages(messages)
+        finally:
+            self._total_count_ms += (time.perf_counter() - started) * 1000.0
+            self._count_samples += 1
+
+    def _count_messages(self, messages: list[dict[str, Any]]) -> int:
         if not messages:
             return 0
         fp = self._fingerprint(messages)
@@ -423,6 +434,10 @@ class TokenCounter:
             old = self._cache_order.pop(0)
             self._cache.pop(old, None)
         return total
+
+    def get_timing_stats(self) -> tuple[float, int]:
+        """Return cumulative count time in milliseconds and sample count."""
+        return self._total_count_ms, self._count_samples
 
     def count_messages_remote_raw(self, messages: list[dict[str, Any]]) -> int:
         """Return the raw remote joined-token count WITHOUT the overhead delta.

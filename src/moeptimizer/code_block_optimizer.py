@@ -207,13 +207,30 @@ def slice_code_to_query(code: str, lang_id: str, query: str) -> str:
         return code
 
     query_tokens = {t.lower() for t in re.findall(r"\w+", query)}
-    matched = [(name, s, e) for name, s, e in defs if name.lower() in query_tokens]
+    selected = {i for i, (name, _s, _e) in enumerate(defs) if name.lower() in query_tokens}
     # Nothing to drop: no match (fail-open, keep everything the model might need)
     # or every definition is referenced (slicing would remove nothing).
-    if not matched or len(matched) == len(defs):
+    if not selected or len(selected) == len(defs):
         return code
 
-    matched.sort(key=lambda t: t[1])
+    # Keep definitions referenced by retained definitions, so slicing does not
+    # remove a helper needed by the task-relevant function.
+    changed = True
+    while changed:
+        changed = False
+        referenced = {
+            token.lower()
+            for i in selected
+            for token in re.findall(r"\w+", code_bytes[defs[i][1] : defs[i][2]].decode(errors="replace"))
+        }
+        for i, (name, _s, _e) in enumerate(defs):
+            if i not in selected and name.lower() in referenced:
+                selected.add(i)
+                changed = True
+
+    matched = [definition for i, definition in enumerate(defs) if i in selected]
+    if len(matched) == len(defs):
+        return code
     kept: list[str] = []
     if header_parts:
         kept.append("\n".join(header_parts))

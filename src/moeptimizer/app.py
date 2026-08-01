@@ -72,6 +72,19 @@ class _ProxyMetrics:
         # truncated tool call) while streaming/serving. Surfaced in /v1/metrics so
         # operators can distinguish "proxy not helping" from "backend failing".
         self.backend_errors = 0
+        self.degradation_counts: dict[str, int] = {}
+        self.mtp_samples = 0
+        self.total_mtp_accepted_tokens = 0
+        self.total_mtp_draft_tokens = 0
+        self.total_mtp_fallbacks = 0
+        self.total_mtp_decode_ms = 0.0
+        self.mtp_decode_samples = 0
+        self.total_optimizer_ms = 0.0
+        self.optimizer_samples = 0
+        self.total_token_count_ms = 0.0
+        self.token_count_samples = 0
+        self._request_traces: list[dict[str, Any]] = []
+        self._max_request_traces = 512
         # Per-session breakdown, bounded LRU so it can never grow without limit
         # even under a flood of distinct session ids (review §11.1).
         self._per_session: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -102,6 +115,70 @@ class _ProxyMetrics:
                 while len(self._per_session) > self._max_sessions_tracked:
                     self._per_session.popitem(last=False)
 
+    def record_degradations(self, counts: dict[str, int]) -> None:
+        """Aggregate optimizer stage failures for the process-wide metrics view."""
+        if not counts:
+            return
+        with self._lock:
+            for stage, count in counts.items():
+                if count > 0:
+                    self.degradation_counts[stage] = self.degradation_counts.get(stage, 0) + count
+
+    def record_mtp_usage(
+        self,
+        usage: Any,
+        *,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        decode_ms: float | None = None,
+    ) -> None:
+        """Record optional backend-reported speculative decoding counters."""
+        values = usage if isinstance(usage, dict) else getattr(usage, "__dict__", {})
+        details = values.get("completion_tokens_details", {}) or {}
+        if not isinstance(details, dict):
+            details = getattr(details, "__dict__", {})
+        accepted = values.get("accepted_prediction_tokens", details.get("accepted_prediction_tokens"))
+        drafted = values.get("draft_tokens", details.get("draft_tokens"))
+        fallback = values.get("fallback_count", details.get("fallback_count"))
+        reported_decode_ms = values.get("decode_ms", details.get("decode_ms"))
+        if not isinstance(accepted, int) and not isinstance(drafted, int) and not isinstance(fallback, int):
+            return
+        with self._lock:
+            self.mtp_samples += 1
+            self.total_mtp_accepted_tokens += max(0, accepted) if isinstance(accepted, int) else 0
+            self.total_mtp_draft_tokens += max(0, drafted) if isinstance(drafted, int) else 0
+            self.total_mtp_fallbacks += max(0, fallback) if isinstance(fallback, int) else 0
+            decode_value = decode_ms if decode_ms is not None else reported_decode_ms
+            if isinstance(decode_value, (int, float)) and decode_value >= 0:
+                self.total_mtp_decode_ms += float(decode_value)
+                self.mtp_decode_samples += 1
+            if request_id:
+                self._append_trace_locked({
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "mtp": {
+                        "draft_tokens": max(0, drafted) if isinstance(drafted, int) else None,
+                        "accepted_tokens": max(0, accepted) if isinstance(accepted, int) else None,
+                        "fallback_count": max(0, fallback) if isinstance(fallback, int) else None,
+                        "decode_ms": max(0.0, decode_ms) if isinstance(decode_ms, (int, float)) else None,
+                    },
+                })
+
+    def _append_trace_locked(self, trace: dict[str, Any]) -> None:
+        self._request_traces.append(trace)
+        if len(self._request_traces) > self._max_request_traces:
+            del self._request_traces[: len(self._request_traces) - self._max_request_traces]
+
+    def record_optimizer_duration(self, duration_ms: float) -> None:
+        with self._lock:
+            self.total_optimizer_ms += max(0.0, duration_ms)
+            self.optimizer_samples += 1
+
+    def record_token_count_duration(self, duration_ms: float, samples: int) -> None:
+        with self._lock:
+            self.total_token_count_ms += max(0.0, duration_ms)
+            self.token_count_samples += max(0, samples)
+
     def record_turn(
         self,
         *,
@@ -111,6 +188,9 @@ class _ProxyMetrics:
         saved_tokens: int | None = None,
         latency_ms: float | None = None,
         ttft_ms: float | None = None,
+        request_id: str | None = None,
+        prompt_hash: str | None = None,
+        slot: int | None = None,
     ) -> None:
         with self._lock:
             self.requests += 1
@@ -141,6 +221,26 @@ class _ProxyMetrics:
                     latency_ms=latency_ms,
                     ttft_ms=ttft_ms,
                 )
+            if request_id:
+                self._append_trace_locked({
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "prompt_hash": prompt_hash,
+                    "slot": slot,
+                    "prompt_tokens": prompt_tokens,
+                    "cached_tokens": cached_tokens,
+                    "fresh_prefill_tokens": (
+                        max(0, prompt_tokens - cached_tokens)
+                        if prompt_tokens is not None and cached_tokens is not None
+                        else None
+                    ),
+                    "latency_ms": round(latency_ms, 1) if latency_ms is not None else None,
+                    "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None,
+                })
+
+    def request_traces(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(trace) for trace in self._request_traces]
 
     def _record_session_locked(
         self,
@@ -251,7 +351,37 @@ class _ProxyMetrics:
                 "avg_fresh_prefill_tokens": round(
                     self.total_fresh_prefill_tokens / max(1, self.fresh_prefill_samples), 1
                 ),
+                "fresh_prefill_samples": self.fresh_prefill_samples,
                 "backend_errors": self.backend_errors,
+                "degradation_counts": dict(self.degradation_counts),
+                "mtp_samples": self.mtp_samples,
+                "avg_mtp_accepted_tokens": round(
+                    self.total_mtp_accepted_tokens / max(1, self.mtp_samples), 1
+                ),
+                "avg_mtp_draft_tokens": round(
+                    self.total_mtp_draft_tokens / max(1, self.mtp_samples), 1
+                ),
+                "total_mtp_accepted_tokens": self.total_mtp_accepted_tokens,
+                "total_mtp_draft_tokens": self.total_mtp_draft_tokens,
+                "total_mtp_fallbacks": self.total_mtp_fallbacks,
+                "mtp_fallback_rate": round(
+                    self.total_mtp_fallbacks / max(1, self.mtp_samples), 4
+                ),
+                "avg_mtp_decode_ms": round(
+                    self.total_mtp_decode_ms / max(1, self.mtp_decode_samples), 1
+                ),
+                "mtp_decode_samples": self.mtp_decode_samples,
+                "mtp_acceptance_rate": round(
+                    self.total_mtp_accepted_tokens / max(1, self.total_mtp_draft_tokens), 4
+                ),
+                "avg_optimizer_ms": round(
+                    self.total_optimizer_ms / max(1, self.optimizer_samples), 1
+                ),
+                "optimizer_samples": self.optimizer_samples,
+                "avg_token_count_ms": round(
+                    self.total_token_count_ms / max(1, self.token_count_samples), 3
+                ),
+                "token_count_samples": self.token_count_samples,
                 "sessions": sessions,
             }
 
@@ -739,6 +869,8 @@ def _make_streaming_generator(
     id_slot: int | None = None,
     turn_start: float | None = None,
     session_id: str | None = None,
+    request_id: str | None = None,
+    prompt_hash: str | None = None,
 ) -> Any:
     """Create an async generator for SSE streaming using OpenAI SDK."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -865,6 +997,9 @@ def _make_streaming_generator(
                         prompt_tokens = getattr(usage, "prompt_tokens", None)
                         if isinstance(prompt_tokens, int) and prompt_tokens > 0:
                             backend_prompt_tokens = prompt_tokens
+                        PROXY_METRICS.record_mtp_usage(
+                            usage, request_id=request_id, session_id=session_id
+                        )
 
                     # Buffer tool-call deltas and the tool_calls finish-reason chunk
                     # (replayed to the client only if the call is NOT an expand the
@@ -1054,7 +1189,12 @@ def _make_streaming_generator(
                 saved_tokens=(optimizer.last_saved_token_count if optimizer is not None else None),
                 latency_ms=((time.time() - turn_start) * 1000.0 if turn_start is not None else None),
                 ttft_ms=_ttft_ms,
+                request_id=request_id,
+                prompt_hash=prompt_hash,
+                slot=id_slot,
             )
+            if optimizer is not None:
+                PROXY_METRICS.record_degradations(optimizer.last_degradation_counts)
 
             # Calibrate the proxy's token estimates against the backend's real
             # tokenizer (review §1/§9, priority fix #6). The backend reports its true
@@ -1155,6 +1295,8 @@ async def _do_non_streaming(
     id_slot: int | None = None,
     turn_start: float | None = None,
     session_id: str | None = None,
+    request_id: str | None = None,
+    prompt_hash: str | None = None,
 ) -> JSONResponse:
     """Execute non-streaming backend call using LemonadeClient (OpenAI SDK)."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -1224,6 +1366,9 @@ async def _do_non_streaming(
         # Record cache hit for cache registry. Lemonade may expose cached tokens
         # either as top-level cache_hit_tokens or inside prompt_tokens_details.
         usage_dict = usage if isinstance(usage, dict) else getattr(usage, "__dict__", {})
+        PROXY_METRICS.record_mtp_usage(
+            usage_dict, request_id=request_id, session_id=session_id
+        )
         prompt_details = usage_dict.get("prompt_tokens_details", {}) or {}
         cache_hit_tokens = (
             usage_dict.get("cache_hit_tokens")
@@ -1251,7 +1396,12 @@ async def _do_non_streaming(
             prompt_tokens=(optimizer.last_optimized_token_count if optimizer is not None else None),
             saved_tokens=(optimizer.last_saved_token_count if optimizer is not None else None),
             latency_ms=((time.time() - turn_start) * 1000.0 if turn_start is not None else None),
+            request_id=request_id,
+            prompt_hash=prompt_hash,
+            slot=id_slot,
         )
+        if optimizer is not None:
+            PROXY_METRICS.record_degradations(optimizer.last_degradation_counts)
 
         # Calibrate the proxy's token estimates against the backend's real
         # tokenizer (review §1/§9, priority fix #6). The backend reports its true
@@ -1295,7 +1445,6 @@ async def _do_non_streaming(
             },
             headers={
                 **dict(response_headers or {}),
-                "_session_state": session_state[:64000] if session_state and len(session_state) > 64000 else (session_state or ""),
             },
         )
 
@@ -1558,6 +1707,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
           Custom session fields are stripped before forwarding to Lemonade.
         """
         _turn_start = time.time()
+        request_id = uuid.uuid4().hex[:16]
         try:
             body = await request.json()
         except Exception:
@@ -1633,6 +1783,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
         optimized_messages = messages
         optimization_error: str | None = None
+        token_count_before = optimizer.token_counter.get_timing_stats()
+        optimization_started = time.perf_counter()
         try:
             # Run the (CPU-bound, synchronous) optimizer in a worker thread so the
             # asyncio event loop stays free for concurrent sessions. Previously the
@@ -1649,6 +1801,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             # X-Optimization-Error response header, which must be latin-1-encodable.
             optimization_error = _header_safe(f"{type(e).__name__}: {e}")
             optimized_messages = _fallback_optimized_messages(messages, cfg.agentic.keep_full_steps)
+        PROXY_METRICS.record_optimizer_duration(
+            (time.perf_counter() - optimization_started) * 1000.0
+        )
+        token_count_after = optimizer.token_counter.get_timing_stats()
+        PROXY_METRICS.record_token_count_duration(
+            token_count_after[0] - token_count_before[0],
+            token_count_after[1] - token_count_before[1],
+        )
 
         # P1.2 (cache guide DO #5): pin the `tools` schema per session so the
         # backend's prefix cache (which includes the serialized tools array) is not
@@ -1763,6 +1923,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 if optimizer.last_optimized_token_count is not None
                 else optimizer.token_counter.count_messages(optimized_messages)
             ),
+            "X-MOEPT-Request-Id": request_id,
         }
 
         # Expose the exact optimized prompt TEXT the proxy sends to the backend.
@@ -1779,9 +1940,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             _c = _m.get("content")
             if isinstance(_c, str):
                 _content_len += len(_c)
-        if _content_len <= 32000:
-            _opt_text = _serialize_messages_text(optimized_messages)
-            if _opt_text and len(_opt_text) <= 32000:
+        diagnostics_on = str(request.headers.get("X-MOEPT-Diagnostics", "")).strip().lower() in (
+            "1", "true", "yes"
+        )
+        if diagnostics_on:
+            _opt_text = _serialize_messages_text(optimized_messages) if _content_len <= 8000 else ""
+            if _opt_text and len(_opt_text) <= 8000:
                 # HTTP headers must be latin-1-encodable. Optimized prompt text can
                 # contain unicode (em-dash, smart quotes, non-latin scripts from code
                 # comments / fixture content); an un-sanitized value makes Starlette's
@@ -1789,6 +1953,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 # 500 for that turn. Fold non-latin-1 chars to safe ASCII substitutes
                 # so the header (consumed only by local benchmarking) stays valid.
                 response_headers["X-MOEPT-Optimized-Prompt-Text"] = _header_safe(_opt_text)
+            else:
+                response_headers["X-MOEPT-Diagnostics-Limit"] = (
+                    "optimized prompt exceeds 8000-byte header limit"
+                )
 
         # Dry-run / explain mode (review03.md §10): expose the exact optimized
         # prompt the proxy would send to the backend so operators can inspect
@@ -1799,9 +1967,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         ).strip().lower() in ("1", "true", "yes") or bool(body.get("_explain"))
         if explain_on:
             response_headers["X-MOEPT-Explain"] = "true"
-            response_headers["X-MOEPT-Optimized-Messages"] = _explain_header_value(
-                optimized_messages
-            )
+            explain_payload = _explain_header_value(optimized_messages)
+            if len(explain_payload) <= 8000:
+                response_headers["X-MOEPT-Optimized-Messages"] = explain_payload
+            else:
+                response_headers["X-MOEPT-Explain-Limit"] = "optimized prompt exceeds 8000-byte header limit"
 
         # Serialize session state off the event loop (review §4.9.4): for long
         # agentic sessions get_session_state() json.dumps the whole store + runs
@@ -1835,6 +2005,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         # Scrub proxy-internal ``_*`` keys (e.g. the late-appended ``_volatile_turn``)
         # at the backend boundary so nothing internal reaches the model.
         body["messages"] = _scrub_internal_keys(optimized_messages)
+        prompt_hash = hashlib.sha256(
+            json.dumps(body["messages"], sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()[:16]
+        response_headers["X-MOEPT-Prompt-Hash"] = prompt_hash
+        if id_slot is not None:
+            response_headers["X-MOEPT-Backend-Slot"] = str(id_slot)
         body.setdefault("temperature", 0.1)
         body.setdefault("stream", True)
 
@@ -1850,16 +2026,6 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
         is_streaming = body.get("stream", True)
 
-        # Only include session state in header if it's reasonably sized
-        # (full state is maintained server-side via session_id)
-        if session_state and len(session_state) <= 64000:
-            response_headers["_session_state"] = session_state
-        elif session_state:
-            logger.warning(
-                "Session state too large for header (%d bytes), omitting from response",
-                len(session_state),
-            )
-
         if is_streaming:
             # _make_streaming_generator returns a factory; invoke it to get the
             # async generator (an async iterator) that StreamingResponse expects.
@@ -1868,13 +2034,17 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             # not iterable, which killed the stream and made clients see a
             # truncated response ("Response ended prematurely").
             return StreamingResponse(
-                _make_streaming_generator(body, cfg, backend_client, optimizer, id_slot, _turn_start, session_id)(),
+                _make_streaming_generator(
+                    body, cfg, backend_client, optimizer, id_slot, _turn_start, session_id,
+                    request_id, prompt_hash,
+                )(),
                 media_type="text/event-stream",
                 headers=response_headers,
             )
         else:
             return await _do_non_streaming(
-                body, session_state, cfg, backend_client, response_headers, optimization_error, optimizer, id_slot, _turn_start, session_id
+                body, session_state, cfg, backend_client, response_headers, optimization_error,
+                optimizer, id_slot, _turn_start, session_id, request_id, prompt_hash,
             )
 
     @app.get("/v1/models")
@@ -1908,6 +2078,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         contract; purely observational for operators.
         """
         return {"object": "proxy.metrics", **PROXY_METRICS.snapshot()}
+
+    @app.get("/v1/debug/requests")
+    async def proxy_request_debug():
+        """Return bounded per-request cache fingerprints for local diagnostics."""
+        return {"object": "proxy.request_debug", "requests": PROXY_METRICS.request_traces()}
 
     @app.post("/v1/metrics/reset")
     async def proxy_metrics_reset():

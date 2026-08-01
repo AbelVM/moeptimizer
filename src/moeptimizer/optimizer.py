@@ -32,6 +32,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -85,6 +86,16 @@ from moeptimizer.token_counter import TokenCounter
 from moeptimizer.tool_output_compressor import ToolOutputCompressor, compress_tool_messages
 from moeptimizer.tool_output_filter import ToolOutputFilter
 from moeptimizer.tool_streamer import get_tool_streamer
+
+
+@dataclass(frozen=True)
+class PrefixLayout:
+    """The immutable, evictable, and protected prompt regions."""
+
+    system_anchor: list[dict[str, Any]]
+    evictable_body: list[dict[str, Any]]
+    protected_tail: list[dict[str, Any]]
+
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +283,7 @@ class AgentContextOptimizer:
         # it reflects only the current turn. Cheap: no allocation on the hot path
         # when no stage fails (the list stays empty and the header is omitted).
         self._last_degradation: list[str] = []
+        self._last_degradation_counts: dict[str, int] = {}
         # Cumulative per-stage failure counts (review §4.8.5 / Forward plan D4).
         # _last_degradation resets every turn, so a stage that fails *consistently*
         # (e.g. a missing tree-sitter parser) left no persistent, test-visible signal
@@ -529,6 +541,7 @@ class AgentContextOptimizer:
             if str(error):
                 msg = f"{msg}:{str(error)[:200]}"
             self._last_degradation.append(msg)
+            self._last_degradation_counts[stage] = self._last_degradation_counts.get(stage, 0) + 1
             # Cumulative per-stage count (never resets) so a consistently-failing
             # stage is visible in get_debug_info, not just the per-turn header.
             self._degradation_counts[stage] = self._degradation_counts.get(stage, 0) + 1
@@ -541,6 +554,11 @@ class AgentContextOptimizer:
         (review §4.8.5 / D4). A stage with a high count is failing consistently
         and silently degrading quality — the signal that was previously invisible."""
         return dict(self._degradation_counts)
+
+    @property
+    def last_degradation_counts(self) -> dict[str, int]:
+        """Return stage failure counts from the most recent optimization turn."""
+        return dict(self._last_degradation_counts)
 
     def calibrate_remote_overhead(
         self, backend_prompt_tokens: int, messages: list[dict[str, Any]]
@@ -899,6 +917,7 @@ class AgentContextOptimizer:
         # Reset the per-turn degradation vector (review §11 / P4b) so it only
         # reflects failures from THIS turn's pipeline run.
         self._last_degradation = []
+        self._last_degradation_counts = {}
         # Reset the per-turn eviction counter (review §11.4 / C8).
         self._last_evicted_turns = 0
 
@@ -1546,7 +1565,9 @@ class AgentContextOptimizer:
         # no-op when the immutable zones already exceed the budget in cache-stable
         # mode). The token_aware_truncator is a second front-evictor; gate it on
         # skip_front_eviction so it does not slide the post-summary body every turn
-        # while the batch fold is armed and owning cache-stable sizing.
+        # while the batch fold is armed and owning cache-stable sizing. Cache-stable
+        # mode is an independent hard guard for edge configurations where folding
+        # is not armed yet.
         try:
             total_tokens = self.calibrated_token_count(optimized)
             if total_tokens > max_tokens:
@@ -1556,6 +1577,7 @@ class AgentContextOptimizer:
                     total_tokens > max_tokens
                     and self.token_aware_truncator is not None
                     and not skip_front_eviction
+                    and not self._config.v050.cache_stable_mode
                 ):
                     optimized = self.token_aware_truncator.trim_messages_to_budget(
                         optimized,
@@ -2328,22 +2350,21 @@ class AgentContextOptimizer:
             use_tokens: If True, use token-based budget; if False, use character-based
         """
         if use_tokens:
-            max_tokens = self._budget_tokens()
+            max_tokens = self.budget.budget_for(True)
         else:
-            max_chars = self._config.agentic.max_optimized_chars
+            max_chars = self.budget.budget_for(False)
 
         # Partition into zones
-        system_anchor, evictable_body, protected_tail = self._partition_for_budget(messages)
+        layout = self._partition_for_budget(messages)
+        system_anchor = layout.system_anchor
+        evictable_body = layout.evictable_body
+        protected_tail = layout.protected_tail
 
         # Reserve space for non-evictable zones; remaining budget is what's available
-        if use_tokens:
-            reserved = (self.calibrated_token_count(system_anchor)
-                        + self.calibrated_token_count(protected_tail))
-            evictable_budget = max(0, max_tokens - reserved)
-        else:
-            reserved = (sum(len(m.get("content") or "") for m in system_anchor)
-                        + sum(len(m.get("content") or "") for m in protected_tail))
-            evictable_budget = max(0, max_chars - reserved)
+        reserved = self._layout_reserved_budget(layout, use_tokens)
+        evictable_budget = self.budget.remaining_budget(
+            max_tokens if use_tokens else max_chars, reserved
+        )
 
         # Cache-stable reconciliation of budget <-> keep window: when the
         # immutable zones (system anchor + frozen prefix + append-only summary +
@@ -2386,10 +2407,21 @@ class AgentContextOptimizer:
 
         return system_anchor + evictable_body + protected_tail
 
+    def _layout_reserved_budget(self, layout: PrefixLayout, use_tokens: bool) -> int:
+        """Measure the immutable layout zones in the active budget unit."""
+        if use_tokens:
+            return self.calibrated_token_count(layout.system_anchor) + self.calibrated_token_count(
+                layout.protected_tail
+            )
+        return sum(
+            len(m.get("content") or "")
+            for m in [*layout.system_anchor, *layout.protected_tail]
+        )
+
     def _partition_for_budget(
         self,
         messages: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> PrefixLayout:
         """Partition messages into three immutable zones for budget trimming."""
         system_anchor: list[dict[str, Any]] = []
         i = 0
@@ -2475,7 +2507,7 @@ class AgentContextOptimizer:
                 evictable = [m for m in evictable if not self._is_summary_block(m)]
                 protected.extend(remaining_summaries)
 
-        return system_anchor, evictable, protected
+        return PrefixLayout(system_anchor, evictable, protected)
 
     def _evict_for_budget(
         self,
@@ -3021,9 +3053,10 @@ class AgentContextOptimizer:
         summary drifts to the tail as new turns are appended and the leading
         bytes change on every turn, defeating the backend's prefix cache.
         """
-        system_anchor, evictable_body, protected_tail = self._partition_for_budget(
-            messages
-        )
+        layout = self._partition_for_budget(messages)
+        system_anchor = layout.system_anchor
+        evictable_body = layout.evictable_body
+        protected_tail = layout.protected_tail
         summary_blocks = [m for m in protected_tail if self._is_summary_block(m)]
         non_summary_protected = [m for m in protected_tail if not self._is_summary_block(m)]
         return [*system_anchor, *summary_blocks, *evictable_body, *non_summary_protected]
@@ -3064,21 +3097,22 @@ class AgentContextOptimizer:
             if total_chars <= target:
                 return messages
 
-        system_anchor, evictable_body, protected_tail = self._partition_for_budget(messages)
+        layout = self._partition_for_budget(messages)
+        system_anchor = layout.system_anchor
+        evictable_body = layout.evictable_body
+        protected_tail = layout.protected_tail
 
         if use_tokens:
             # Calibrated counts throughout so the (calibrated) target is compared
             # against calibrated reserved/body sizes (review §4.8.6 / Forward plan A5).
-            reserved = (self.calibrated_token_count(system_anchor)
-                        + self.calibrated_token_count(protected_tail))
-            evictable_budget = max(0, target - reserved)
+            reserved = self._layout_reserved_budget(layout, True)
+            evictable_budget = self.budget.remaining_budget(target, reserved)
             # P0.6: convert the whole-context floor to an evictable-body floor.
             if shrink_floor is not None:
                 shrink_floor = max(0, shrink_floor - reserved)
         else:
-            reserved = (sum(len(m.get("content") or "") for m in system_anchor)
-                        + sum(len(m.get("content") or "") for m in protected_tail))
-            evictable_budget = max(0, target - reserved)
+            reserved = self._layout_reserved_budget(layout, False)
+            evictable_budget = self.budget.remaining_budget(target, reserved)
 
         evictable_body = self._evict_for_budget(
             evictable_body, evictable_budget, use_tokens, shrink_floor=shrink_floor

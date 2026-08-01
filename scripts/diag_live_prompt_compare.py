@@ -40,7 +40,10 @@ def main() -> None:
         req = urllib.request.Request(
             "http://127.0.0.1:8080/v1/chat/completions",
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-MOEPT-Diagnostics": "true",
+            },
         )
         try:
             resp = urllib.request.urlopen(req, timeout=180)

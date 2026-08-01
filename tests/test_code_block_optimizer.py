@@ -62,6 +62,21 @@ class TestSliceCodeToQuery:
         assert "def delta" not in sliced
         assert sliced.index("def beta") < sliced.index("class Gamma")
 
+    def test_keeps_direct_dependencies_of_queried_definition(self) -> None:
+        code = """def helper():
+    return 1
+
+def target():
+    return helper()
+
+def unrelated():
+    return [
+""" + "        3,\n" * 100 + "    ]\n"
+        sliced = slice_code_to_query(code, "python", "update target")
+        assert "def target():" in sliced
+        assert "def helper():" in sliced
+        assert "def unrelated():" not in sliced
+
     def test_no_match_fails_open(self) -> None:
         assert slice_code_to_query(_PY_CODE, "python", "xyzzy") == _PY_CODE
 

@@ -220,7 +220,7 @@ def _dump_messages(msgs: list[dict[str, Any]], label: str = "messages") -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Replay opencode scenario through proxy dry-run to detect prefix-cache breaks."
+        description="Replay opencode scenario through proxy dry-run to detect local prefix breaks."
     )
     parser.add_argument("--turns", type=int, default=30, help="Number of turns to replay (default: 30)")
     parser.add_argument("--max-tokens", type=int, default=None, help="Override max_tokens per request")
@@ -242,8 +242,8 @@ def main() -> int:
     parser.add_argument("--cliff-only", action="store_true",
                         help="Only show turns around known cliff regions (11-15, 28-30)")
     parser.add_argument("--reuse-threshold", type=float, default=0.8,
-                        help="Common-prefix reuse ratio at/above which a non-append-only turn "
-                             "counts as cache-stable (REUSED) instead of a BREAK. The volatile "
+                            help="Common-prefix reuse ratio at/above which a non-append-only turn "
+                                "counts as locally prefix-stable (REUSED) instead of a BREAK. The volatile "
                              "trailing anchor differs every turn by design but does not break "
                              "backend prefix reuse, so reuse ratio — not strict append-only — "
                              "is the cache metric (default: 0.8)")
@@ -482,7 +482,7 @@ def main() -> int:
             }
             print(json.dumps(summary, indent=2, default=str))
         else:
-            print("\n=== dry-run summary ===")
+            print("\n=== local prefix dry-run summary ===")
             print(f"  turns: {args.turns}")
             print(f"  breaks: {breaks if breaks else 'none'}")
             print(f"  model: {model}")

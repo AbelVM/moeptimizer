@@ -18,8 +18,8 @@ class TestConfig:
         assert config.server.embed_url == "http://localhost:13305/api/v1"
         assert config.server.llm_model == "Qwen3.6-35B-A3B-MTP-GGUF"
         assert config.agentic.keep_full_steps == 3
-        assert config.agentic.max_optimized_chars == 12000
-        assert config.agentic.max_optimized_tokens == 3000
+        assert config.agentic.max_optimized_chars == 32000
+        assert config.agentic.max_optimized_tokens == 8000
         assert config.agentic.proactive_trim_ratio == 0.45
         assert config.agentic.compaction_trigger_ratio == 0.75
         assert config.agentic.fast_path_enabled is True

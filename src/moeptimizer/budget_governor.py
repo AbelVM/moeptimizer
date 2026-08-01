@@ -139,6 +139,19 @@ class BudgetGovernor:
         # against true backend tokens (clamped to [0.5, 2.0] upstream).
         return max(1, round(budget * self._token_calibration))
 
+    def character_budget(self) -> int:
+        """Return the configured character fallback budget."""
+        return self._config.agentic.max_optimized_chars
+
+    def budget_for(self, use_tokens: bool) -> int:
+        """Return the active budget in the requested measurement unit."""
+        return self.budget_tokens() if use_tokens else self.character_budget()
+
+    @staticmethod
+    def remaining_budget(total_budget: int, reserved: int) -> int:
+        """Return the non-negative budget left for the evictable region."""
+        return max(0, total_budget - reserved)
+
     def adaptive_budget_tokens(self, base: int) -> int:
         """Adaptive, horizon-growing budget (review §3.1 / §4.2.2).
 

@@ -1,3 +1,4 @@
+
 """Smoke tests for moeptimizer app endpoints, streaming, and metrics.
 
 Covers:
@@ -10,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -61,6 +63,53 @@ def _mock_backend(cached_tokens: int = 10) -> MagicMock:
     return mock
 
 
+def test_metrics_snapshot_records_optional_mtp_usage() -> None:
+    metrics = _ProxyMetrics()
+    metrics.record_mtp_usage({
+        "completion_tokens_details": {
+            "accepted_prediction_tokens": 12,
+            "draft_tokens": 20,
+            "fallback_count": 1,
+            "decode_ms": 42.5,
+        }
+    })
+    snap = metrics.snapshot()
+    assert snap["mtp_samples"] == 1
+    assert snap["avg_mtp_accepted_tokens"] == 12.0
+    assert snap["avg_mtp_draft_tokens"] == 20.0
+    assert snap["total_mtp_accepted_tokens"] == 12
+    assert snap["total_mtp_draft_tokens"] == 20
+    assert snap["mtp_acceptance_rate"] == 0.6
+    assert snap["total_mtp_fallbacks"] == 1
+    assert snap["mtp_fallback_rate"] == 1.0
+    assert snap["avg_mtp_decode_ms"] == 42.5
+
+
+def test_metrics_request_trace_is_bounded_and_keeps_mtp_context() -> None:
+    metrics = _ProxyMetrics()
+    metrics.record_mtp_usage(
+        {"completion_tokens_details": {"accepted_prediction_tokens": 2, "draft_tokens": 4}},
+        request_id="req-1",
+        session_id="session-1",
+    )
+    metrics.record_turn(
+        request_id="req-1",
+        session_id="session-1",
+        prompt_hash="abc123",
+        slot=7,
+        prompt_tokens=20,
+        cached_tokens=12,
+    )
+    traces = metrics.request_traces()
+    assert traces[0]["mtp"]["accepted_tokens"] == 2
+    assert traces[1]["prompt_hash"] == "abc123"
+    assert traces[1]["slot"] == 7
+
+    for index in range(600):
+        metrics.record_turn(request_id=f"req-{index}")
+    assert len(metrics.request_traces()) == 512
+
+
 class TestHealthAndModels:
     """Smoke tests for non-chat endpoints."""
 
@@ -89,6 +138,29 @@ class TestHealthAndModels:
         assert "cache_hit_rate" in data
         assert "backend_errors" in data
 
+    def test_request_debug_endpoint_returns_bounded_trace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import moeptimizer.app as app_module
+
+        _reset_metrics()
+        fake_backend = _mock_backend()
+        monkeypatch.setattr(app_module, "LemonadeClient", lambda *a, **kw: fake_backend)
+        client = TestClient(create_app(AppConfig()))
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL_ID,
+                "messages": [{"role": "user", "content": "trace me"}],
+                "stream": False,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.headers["X-MOEPT-Request-Id"]
+        debug = client.get("/v1/debug/requests").json()
+        assert debug["object"] == "proxy.request_debug"
+        assert debug["requests"][-1]["prompt_hash"]
+        assert debug["requests"][-1]["cached_tokens"] == 10
+
     def test_metrics_reset_clears_counters(self) -> None:
         app = create_app(AppConfig())
         client = TestClient(app)
@@ -108,11 +180,65 @@ class TestHealthAndModels:
 class TestChatCompletionsNonStreaming:
     """Smoke tests for non-streaming chat completions."""
 
+    def test_non_streaming_fulfils_expand_content_before_returning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import moeptimizer.app as app_module
+        from moeptimizer.optimizer import AgentContextOptimizer
+        from moeptimizer.session_manager import SessionManager
+
+        optimizer = AgentContextOptimizer(AppConfig())
+        handle = optimizer.content_store.put("full retained tool output")
+        calls: list[dict[str, Any]] = []
+        first = _backend_response()
+        first["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_expand",
+                "type": "function",
+                "function": {
+                    "name": "expand_content",
+                    "arguments": f'{{"handle":"{handle}"}}',
+                },
+            }],
+        }
+        second = _backend_response()
+
+        async def fake_create(*args: Any, **kwargs: Any):
+            calls.append(kwargs)
+            result = first if len(calls) == 1 else second
+            return MagicMock(model_dump=lambda: result)
+
+        fake_backend = MagicMock()
+        fake_backend.chat_completions_create = fake_create
+        monkeypatch.setattr(app_module, "LemonadeClient", lambda *a, **kw: fake_backend)
+        monkeypatch.setattr(
+            SessionManager,
+            "get_or_create",
+            classmethod(lambda cls, session_id=None: optimizer),
+        )
+
+        response = TestClient(create_app(AppConfig())).post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL_ID,
+                "messages": [{"role": "user", "content": "use the retained output"}],
+                "stream": False,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "Hello!"
+        assert len(calls) == 2
+        assert calls[1]["messages"][-1]["content"] == "full retained tool output"
+
     def test_non_streaming_returns_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import moeptimizer.app as app_module
 
         fake_backend = _mock_backend()
         monkeypatch.setattr(app_module, "LemonadeClient", lambda *a, **kw: fake_backend)
+        monkeypatch.setattr(app_module, "_serialize_messages_text", lambda _: "x" * 8001)
 
         app = create_app(AppConfig())
         client = TestClient(app)
@@ -152,7 +278,7 @@ class TestChatCompletionsNonStreaming:
         assert snap["requests"] == 1
         assert snap["total_cached_tokens"] == 15
 
-    def test_non_streaming_sets_optimized_prompt_header(
+    def test_non_streaming_sets_optimized_prompt_header_when_diagnostics_enabled(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import moeptimizer.app as app_module
@@ -170,12 +296,143 @@ class TestChatCompletionsNonStreaming:
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": False,
             },
+            headers={"X-MOEPT-Diagnostics": "true"},
         )
         assert "X-MOEPT-Optimized-Prompt-Text" in response.headers
+
+    def test_non_streaming_omits_prompt_header_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import moeptimizer.app as app_module
+
+        fake_backend = _mock_backend()
+        monkeypatch.setattr(app_module, "LemonadeClient", lambda *a, **kw: fake_backend)
+
+        app = create_app(AppConfig())
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL_ID,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": False,
+            },
+        )
+        assert "X-MOEPT-Optimized-Prompt-Text" not in response.headers
+
+    def test_diagnostics_reports_prompt_header_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import moeptimizer.app as app_module
+
+        fake_backend = _mock_backend()
+        monkeypatch.setattr(app_module, "LemonadeClient", lambda *a, **kw: fake_backend)
+        monkeypatch.setattr(app_module, "_serialize_messages_text", lambda _: "x" * 8001)
+
+        response = TestClient(create_app(AppConfig())).post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL_ID,
+                "messages": [{"role": "user", "content": "x" * 7000}],
+                "stream": False,
+            },
+            headers={"X-MOEPT-Diagnostics": "true"},
+        )
+        assert "X-MOEPT-Optimized-Prompt-Text" not in response.headers
+        assert response.headers["X-MOEPT-Diagnostics-Limit"]
 
 
 class TestChatCompletionsStreaming:
     """Smoke tests for streaming chat completions."""
+
+    def test_streaming_fulfils_expand_content_before_client_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import moeptimizer.app as app_module
+        from moeptimizer.optimizer import AgentContextOptimizer
+        from moeptimizer.session_manager import SessionManager
+
+        optimizer = AgentContextOptimizer(AppConfig())
+        handle = optimizer.content_store.put("full retained tool output")
+        calls: list[dict[str, Any]] = []
+
+        async def fake_stream(*args: Any, **kwargs: Any):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                yield MagicMock(
+                    choices=[SimpleNamespace(
+                        delta=SimpleNamespace(
+                            role="assistant",
+                            content=None,
+                            reasoning_content=None,
+                            tool_calls=[SimpleNamespace(
+                                index=0,
+                                id="call_expand",
+                                function=SimpleNamespace(
+                                    name="expand_content",
+                                    arguments=f'{{"handle":"{handle}"}}',
+                                ),
+                            )],
+                        ),
+                        finish_reason=None,
+                    )],
+                    usage=None,
+                )
+                yield MagicMock(
+                    choices=[MagicMock(
+                        delta=MagicMock(
+                            role=None,
+                            content=None,
+                            reasoning_content=None,
+                            tool_calls=None,
+                        ),
+                        finish_reason="tool_calls",
+                    )],
+                    usage=None,
+                )
+                return
+
+            yield MagicMock(
+                choices=[MagicMock(
+                    delta=MagicMock(
+                        role="assistant",
+                        content="done",
+                        reasoning_content=None,
+                        tool_calls=None,
+                    ),
+                    finish_reason="stop",
+                )],
+                usage=None,
+            )
+
+        fake_backend = MagicMock()
+        fake_backend.chat_completions_stream = fake_stream
+        monkeypatch.setattr(app_module, "LemonadeClient", lambda *a, **kw: fake_backend)
+        monkeypatch.setattr(
+            SessionManager,
+            "get_or_create",
+            classmethod(lambda cls, session_id=None: optimizer),
+        )
+
+        response = TestClient(create_app(AppConfig())).post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL_ID,
+                "messages": [{"role": "user", "content": "use the retained output"}],
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert "done" in response.text
+        assert "expand_content" not in response.text
+        assert len(calls) == 2
+        second_messages = calls[1]["messages"]
+        assert second_messages[-2]["tool_calls"][0]["function"]["name"] == "expand_content"
+        assert second_messages[-1] == {
+            "role": "tool",
+            "tool_call_id": "call_expand",
+            "content": "full retained tool output",
+        }
 
     def test_streaming_returns_sse_events(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import moeptimizer.app as app_module
@@ -444,9 +701,26 @@ class TestMetricsSmoke:
             "total_latency_ms",
             "avg_latency_ms",
             "backend_errors",
+            "avg_optimizer_ms",
+            "avg_token_count_ms",
+            "token_count_samples",
             "sessions",
         }
         assert expected_keys.issubset(snap.keys())
+
+    def test_metrics_records_optimizer_duration(self) -> None:
+        metrics = _ProxyMetrics()
+        metrics.record_optimizer_duration(12.5)
+        metrics.record_optimizer_duration(7.5)
+        assert metrics.snapshot()["avg_optimizer_ms"] == 10.0
+
+    def test_metrics_records_token_count_duration(self) -> None:
+        metrics = _ProxyMetrics()
+        metrics.record_token_count_duration(3.0, 2)
+        metrics.record_token_count_duration(1.0, 1)
+        snapshot = metrics.snapshot()
+        assert snapshot["avg_token_count_ms"] == 1.333
+        assert snapshot["token_count_samples"] == 3
 
     def test_metrics_reset_clears_everything(self) -> None:
         metrics = _ProxyMetrics()
@@ -677,6 +951,8 @@ class TestDegradationHeader:
         # The degradation header is present and names the failing stage.
         assert "X-MOEPT-Optimization-Degraded" in resp.headers
         assert "context_canonicalization" in resp.headers["X-MOEPT-Optimization-Degraded"]
+        metrics = client.get("/v1/metrics").json()
+        assert metrics["degradation_counts"]["context_canonicalization"] >= 1
 
 
 class TestMetricsDashboard:
@@ -772,6 +1048,17 @@ class TestExpandContentTool:
         opt, handle = self._optimizer_with_content(original)
         assert opt.expand_content(handle) == original
         assert opt.expand_content("unknown-handle") is None
+
+    def test_expand_content_retrieval_repeats_until_evicted(self) -> None:
+        from moeptimizer.content_store import ContentStore
+
+        opt, handle = self._optimizer_with_content("repeatable content")
+        assert opt.expand_content(handle) == "repeatable content"
+        assert opt.expand_content(handle) == "repeatable content"
+
+        opt.content_store = ContentStore(max_entries=1)
+        opt.content_store.put("new content")
+        assert opt.expand_content(handle) is None
 
     def test_expand_tool_results_fulfils_expand_call(self) -> None:
         from moeptimizer.app import _expand_tool_results

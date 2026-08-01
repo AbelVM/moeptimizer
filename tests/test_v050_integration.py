@@ -142,6 +142,9 @@ class TestV050Integration:
         # trim threshold), so lower it too to ensure the path runs on this small
         # context and populates the fingerprint cache.
         self.optimizer._config.agentic.proactive_trim_ratio = 0.01
+        self.optimizer._config.agentic.dynamic_budget_enabled = False
+        self.optimizer._config.agentic.max_optimized_chars = 12000
+        self.optimizer._config.agentic.max_optimized_tokens = 3000
         self.optimizer._config.agentic.optimize_code_blocks = True
         self.optimizer._config.agentic.fast_path_enabled = False
 

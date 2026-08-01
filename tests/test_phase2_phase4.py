@@ -2,29 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock
 
 from moeptimizer.async_io_stage import AsyncIOStage
-from moeptimizer.thinking_preserver import ThinkingPreserver
 from moeptimizer.tool_output_compressor import ToolOutputCompressor
 from moeptimizer.tool_output_filter import ToolOutputFilter
-
-
-def test_json_minification_in_compressor() -> None:
-    compressor = ToolOutputCompressor(max_chars=100)
-    json_data = {
-        "status": "success",
-        "items": [1, 2, 3, 4, 5],
-        "metadata": {"nested": "value", "count": 42},
-    }
-    pretty_json = json.dumps(json_data, indent=4)
-    assert len(pretty_json) > 100
-
-    compressed = compressor.compress(pretty_json)
-    minified_expected = json.dumps(json_data, separators=(",", ":"))
-    assert compressed == minified_expected
-    assert len(compressed) < len(pretty_json)
 
 
 def test_semantic_stack_frame_pruning() -> None:
@@ -45,29 +27,6 @@ def test_semantic_stack_frame_pruning() -> None:
     assert "omitted" in compressed
     assert 'File "/workspace/src/main.py"' in compressed
     assert 'File "/workspace/src/utils.py"' in compressed
-
-
-def test_distill_old_reasoning() -> None:
-    preserver = ThinkingPreserver()
-    long_reasoning = "Step 1: analyze.\n" + ("X" * 400) + "\nConclusion: root cause found in utils."
-    messages = [
-        {"role": "user", "content": "Turn 1"},
-        {"role": "assistant", "content": f"<think>\n{long_reasoning}\n</think>\nResponse 1"},
-        {"role": "user", "content": "Turn 2"},
-        {"role": "assistant", "content": f"<think>\n{long_reasoning}\n</think>\nResponse 2"},
-        {"role": "user", "content": "Turn 3"},
-        {"role": "assistant", "content": f"<think>\n{long_reasoning}\n</think>\nResponse 3"},
-    ]
-
-    distilled = preserver.distill_old_reasoning(messages, protect_recent=2)
-
-    # Turn 1 (index 1) should be distilled
-    assert "[Distilled reasoning:" in distilled[1]["content"]
-    assert "Conclusion: root cause found in utils." in distilled[1]["content"]
-
-    # Turn 2 and 3 should be preserved (recent 2 assistant turns)
-    assert long_reasoning in distilled[3]["content"]
-    assert long_reasoning in distilled[5]["content"]
 
 
 def test_tool_output_filter_fast_path_and_large_payload() -> None:

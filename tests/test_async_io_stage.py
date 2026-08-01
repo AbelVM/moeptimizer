@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+
 import pytest
 
 from moeptimizer.async_io_stage import AsyncIOStage
@@ -92,3 +94,22 @@ class TestAsyncIOStageQueue:
         result = stage.submit_sync(lambda: 2, stage_name="second")
         assert result == 2
         stage.shutdown()
+
+    def test_sync_timeout_requests_cancellation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stage = AsyncIOStage(max_thread_workers=2)
+        future: concurrent.futures.Future[object] = concurrent.futures.Future()
+
+        class Executor:
+            def submit(self, fn: object, *args: object, **kwargs: object) -> concurrent.futures.Future[object]:
+                return future
+
+        monkeypatch.setattr(stage, "_get_thread_executor", lambda: Executor())
+        future.result = lambda timeout=None: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            concurrent.futures.TimeoutError()
+        )
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                stage.run_sync_stage(lambda: None, stage_name="timeout")
+            assert stage.get_stats()["cancellation_attempts"] == 1
+        finally:
+            stage.shutdown()
