@@ -15,8 +15,55 @@ byte-stable (cache-safe) when the transform is applied on first appearance.
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 from collections import OrderedDict
+from typing import Any
+
+# Name of the model-facing tool that retrieves a compressed tool output's original
+# by handle (review §4.1.2 / Forward plan B1). The proxy injects this tool into the
+# schema when reversible compression is on and fulfils it from the ContentStore.
+EXPAND_TOOL_NAME = "expand_content"
+
+# Matches the handle embedded in a reversible-compression placeholder, e.g.
+# "[original retained: handle=abc123def456, 5000 chars; ...]".
+_HANDLE_RE = re.compile(r"\[original retained: handle=([0-9a-f]+)")
+
+
+def expand_content_tool() -> dict[str, Any]:
+    """OpenAI tool schema for ``expand_content(handle)``.
+
+    Advertised to the model so it can request the full original of a tool output
+    that reversible compression replaced with a ``[original retained: handle=...]``
+    placeholder. The proxy fulfils the call from the per-session ContentStore.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": EXPAND_TOOL_NAME,
+            "description": (
+                "Retrieve the full original text of a tool output that was compressed "
+                "to a '[original retained: handle=...]' placeholder. Pass the handle "
+                "from the placeholder; returns the complete uncompressed content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "string",
+                        "description": "The handle from the '[original retained: handle=...]' placeholder.",
+                    },
+                },
+                "required": ["handle"],
+            },
+        },
+    }
+
+
+def extract_placeholder_handle(content: str) -> str | None:
+    """Return the handle embedded in a reversible-compression placeholder, or None."""
+    m = _HANDLE_RE.search(content)
+    return m.group(1) if m else None
 
 
 class ContentStore:

@@ -22,6 +22,7 @@ from openai import APIError, APIStatusError, AsyncOpenAI
 
 from moeptimizer.backend_client import LemonadeClient
 from moeptimizer.config import AppConfig, get_config
+from moeptimizer.content_store import EXPAND_TOOL_NAME, expand_content_tool
 from moeptimizer.embedding import EmbeddingService
 from moeptimizer.optimizer import AgentContextOptimizer
 from moeptimizer.output_shaper import OutputShaper
@@ -798,75 +799,168 @@ def _make_streaming_generator(
             # (review §4.12.1). reasoning/role-only chunks don't count.
             first_content_time: float | None = None
 
-            async for chunk in backend_client.chat_completions_stream(
-                messages=messages,
-                model=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                **request_kwargs,
-            ):
-                # Extract fields from OpenAI SDK ChatCompletionChunk
-                delta = {}
-                finish_reason = None
+            # B1 expand continuation (review §4.1.2): with reversible compression on,
+            # the model may call expand_content(handle) to retrieve a compressed tool
+            # output's original. Tool-call chunks are BUFFERED (not streamed) so an
+            # all-expand response can be fulfilled locally and the conversation
+            # continued without the client seeing the internal round-trip. Content and
+            # reasoning chunks stream immediately, so TTFT is unaffected for normal
+            # (content) responses; tool-call chunks carry no content tokens, so
+            # buffering them does not affect TTFT either.
+            messages = list(messages)
+            for _round in range(_MAX_EXPAND_ROUNDS):
+                tool_calls_acc: dict[int, dict[str, str]] = {}
+                buffered_tool_sse: list[str] = []
+                saw_tool_calls = False
+                tool_calls_finish = False
 
-                if hasattr(chunk, "choices") and chunk.choices:
-                    choice = chunk.choices[0]
-                    if hasattr(choice, "delta"):
-                        d = choice.delta
-                        if hasattr(d, "role") and d.role:
-                            delta["role"] = d.role
-                        if hasattr(d, "content") and d.content is not None:
-                            delta["content"] = d.content
-                            _acc_content.append(d.content)
-                            if first_content_time is None:
-                                first_content_time = time.time()
-                        if hasattr(d, "reasoning_content") and d.reasoning_content is not None:
-                            delta["reasoning_content"] = d.reasoning_content
-                            _acc_reasoning.append(d.reasoning_content)
-                    if hasattr(choice, "finish_reason") and choice.finish_reason:
-                        finish_reason = choice.finish_reason
+                async for chunk in backend_client.chat_completions_stream(
+                    messages=messages,
+                    model=model_name,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **request_kwargs,
+                ):
+                    # Extract fields from OpenAI SDK ChatCompletionChunk
+                    delta = {}
+                    finish_reason = None
+                    tool_call_deltas = None
 
-                # Some backends report usage (incl. cached_tokens) on the final
-                # chunk. Capture it so we can feed the real cache outcome to the
-                # hit-prediction model.
-                if hasattr(chunk, "usage") and chunk.usage is not None:
-                    usage = chunk.usage
-                    details = getattr(usage, "prompt_tokens_details", None)
-                    details = details if isinstance(details, dict) else getattr(details, "__dict__", {})
-                    cached_tokens = (
-                        getattr(usage, "cache_hit_tokens", None)
-                        or getattr(usage, "cached_tokens", None)
-                        or details.get("cached_tokens")
-                        if isinstance(details, dict)
-                        else None
-                    )
-                    # Backend's true prompt token count for the optimized prompt
-                    # we sent; used to calibrate the proxy's estimates (#6).
-                    prompt_tokens = getattr(usage, "prompt_tokens", None)
-                    if isinstance(prompt_tokens, int) and prompt_tokens > 0:
-                        backend_prompt_tokens = prompt_tokens
+                    if hasattr(chunk, "choices") and chunk.choices:
+                        choice = chunk.choices[0]
+                        if hasattr(choice, "delta"):
+                            d = choice.delta
+                            if hasattr(d, "role") and d.role:
+                                delta["role"] = d.role
+                            if hasattr(d, "content") and d.content is not None:
+                                delta["content"] = d.content
+                                _acc_content.append(d.content)
+                                if first_content_time is None:
+                                    first_content_time = time.time()
+                            if hasattr(d, "reasoning_content") and d.reasoning_content is not None:
+                                delta["reasoning_content"] = d.reasoning_content
+                                _acc_reasoning.append(d.reasoning_content)
+                            if hasattr(d, "tool_calls") and d.tool_calls:
+                                tool_call_deltas = d.tool_calls
+                        if hasattr(choice, "finish_reason") and choice.finish_reason:
+                            finish_reason = choice.finish_reason
 
-                if not delta and finish_reason is None:
-                    continue
+                    # Some backends report usage (incl. cached_tokens) on the final
+                    # chunk. Capture it so we can feed the real cache outcome to the
+                    # hit-prediction model. (Usage chunks are captured for metrics but
+                    # not forwarded to the client.)
+                    if hasattr(chunk, "usage") and chunk.usage is not None:
+                        usage = chunk.usage
+                        details = getattr(usage, "prompt_tokens_details", None)
+                        details = details if isinstance(details, dict) else getattr(details, "__dict__", {})
+                        cached_tokens = (
+                            getattr(usage, "cache_hit_tokens", None)
+                            or getattr(usage, "cached_tokens", None)
+                            or details.get("cached_tokens")
+                            if isinstance(details, dict)
+                            else None
+                        )
+                        # Backend's true prompt token count for the optimized prompt
+                        # we sent; used to calibrate the proxy's estimates (#6).
+                        prompt_tokens = getattr(usage, "prompt_tokens", None)
+                        if isinstance(prompt_tokens, int) and prompt_tokens > 0:
+                            backend_prompt_tokens = prompt_tokens
 
-                sse_chunk = json.dumps({
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": delta,
-                        "finish_reason": finish_reason,
-                    }],
-                })
-                yield f"data: {sse_chunk}\n\n"
+                    # Buffer tool-call deltas and the tool_calls finish-reason chunk
+                    # (replayed to the client only if the call is NOT an expand the
+                    # proxy fulfils internally).
+                    if tool_call_deltas is not None or finish_reason == "tool_calls":
+                        if tool_call_deltas:
+                            saw_tool_calls = True
+                            for tc_delta in tool_call_deltas:
+                                idx = getattr(tc_delta, "index", 0) or 0
+                                acc = tool_calls_acc.setdefault(
+                                    idx, {"id": "", "name": "", "arguments": ""}
+                                )
+                                if getattr(tc_delta, "id", None):
+                                    acc["id"] = tc_delta.id
+                                fn = getattr(tc_delta, "function", None)
+                                if fn is not None:
+                                    if getattr(fn, "name", None):
+                                        acc["name"] = fn.name
+                                    if getattr(fn, "arguments", None):
+                                        acc["arguments"] += fn.arguments
+                            delta["tool_calls"] = [
+                                {
+                                    "index": getattr(tc, "index", 0) or 0,
+                                    "id": getattr(tc, "id", None),
+                                    "type": "function",
+                                    "function": {
+                                        "name": getattr(getattr(tc, "function", None), "name", None),
+                                        "arguments": getattr(getattr(tc, "function", None), "arguments", None),
+                                    },
+                                }
+                                for tc in tool_call_deltas
+                            ]
+                        if finish_reason == "tool_calls":
+                            tool_calls_finish = True
+                        sse_chunk = json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": delta,
+                                "finish_reason": finish_reason,
+                            }],
+                        })
+                        buffered_tool_sse.append(f"data: {sse_chunk}\n\n")
+                        continue
 
-                # Do NOT break on finish_reason. With stream_options.include_usage=True
-                # the backend emits the authoritative usage chunk (incl. cached_tokens)
-                # *after* the finish_reason chunk. Breaking here would skip the real
-                # prefix-cache outcome, so we let the loop run until the stream ends
-                # and capture usage on the trailing chunk below.
+                    if not delta and finish_reason is None:
+                        continue
+
+                    sse_chunk = json.dumps({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": delta,
+                            "finish_reason": finish_reason,
+                        }],
+                    })
+                    yield f"data: {sse_chunk}\n\n"
+
+                    # Do NOT break on finish_reason. With stream_options.include_usage=True
+                    # the backend emits the authoritative usage chunk (incl. cached_tokens)
+                    # *after* the finish_reason chunk. Breaking here would skip the real
+                    # prefix-cache outcome, so we let the loop run until the stream ends
+                    # and capture usage on the trailing chunk below.
+
+                # The inner stream ended. If it was an all-expand_content tool-call
+                # response, fulfil it locally and re-query the backend; otherwise
+                # replay any buffered (non-expand) tool-call chunks and finish.
+                if saw_tool_calls and tool_calls_finish and tool_calls_acc:
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": "".join(_acc_content) or None,
+                        "tool_calls": [
+                            {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                            }
+                            for _idx, tc in sorted(tool_calls_acc.items())
+                        ],
+                    }
+                    expand_results = _expand_tool_results(optimizer, assistant_msg)
+                    if expand_results is not None:
+                        messages.append(assistant_msg)
+                        messages.extend(expand_results)
+                        _acc_content = []
+                        _acc_reasoning = []
+                        continue  # re-query the backend with the fulfilled expand
+                for sse in buffered_tool_sse:
+                    yield sse
+                break
 
         except (APIStatusError, APIError) as e:
             # Backend failed while streaming (e.g. HTTP 500 when the model's
@@ -1001,6 +1095,55 @@ def _make_streaming_generator(
     return stream_generator
 
 
+# Max times the proxy will fulfil expand_content tool calls and re-query the backend
+# within a single request, bounding the continuation loop (review §4.1.2 / B1).
+_MAX_EXPAND_ROUNDS = 4
+
+
+def _expand_tool_results(
+    optimizer: AgentContextOptimizer | None, message: dict[str, Any]
+) -> list[dict[str, Any]] | None:
+    """Fulfil ``expand_content`` tool calls in an assistant message from the store.
+
+    Returns the list of ``role=tool`` result messages to append when *every*
+    tool_call in ``message`` is an ``expand_content`` call (so the proxy can satisfy
+    them itself and re-query the backend). Returns ``None`` when the message has no
+    tool_calls, or any tool_call is NOT ``expand_content`` (those must be returned to
+    the client to fulfil). Never raises.
+    """
+    if optimizer is None:
+        return None
+    tool_calls = message.get("tool_calls") or []
+    if not tool_calls:
+        return None
+    results: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        if fn.get("name") != EXPAND_TOOL_NAME:
+            return None
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+        handle = str(args.get("handle") or "")
+        try:
+            original = optimizer.expand_content(handle)
+        except Exception:  # pragma: no cover - defensive
+            original = None
+        results.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc.get("id"),
+                "content": (
+                    original
+                    if original is not None
+                    else f"[content for handle {handle} is no longer available]"
+                ),
+            }
+        )
+    return results
+
+
 async def _do_non_streaming(
     body: dict,
     session_state: str,
@@ -1028,21 +1171,35 @@ async def _do_non_streaming(
             if key not in {"messages", "model", "temperature", "max_tokens", "stream"}
         }
 
-        response = await backend_client.chat_completions_create(
-            messages=messages,
-            model=model_name,
-            temperature=temperature,
-            stream=False,
-            max_tokens=max_tokens,
-            id_slot=id_slot,
-            **request_kwargs,
-        )
-
-        # Convert OpenAI SDK ChatCompletion to dict format
-        backend_data = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-
-        # Normalize choices for OpenAI compatibility
-        _normalize_response_choices(backend_data)
+        # Continuation loop for expand_content tool calls (review §4.1.2 / B1): with
+        # reversible compression on, the model may call expand_content(handle) to
+        # retrieve a compressed tool output's original. The proxy fulfils it from the
+        # per-session ContentStore and re-queries the backend, transparently to the
+        # client, until the model returns content (or a non-expand tool call). The
+        # loop is bounded by _MAX_EXPAND_ROUNDS.
+        backend_data: dict[str, Any] = {}
+        for _round in range(_MAX_EXPAND_ROUNDS):
+            response = await backend_client.chat_completions_create(
+                messages=messages,
+                model=model_name,
+                temperature=temperature,
+                stream=False,
+                max_tokens=max_tokens,
+                id_slot=id_slot,
+                **request_kwargs,
+            )
+            # Convert OpenAI SDK ChatCompletion to dict format
+            backend_data = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+            # Normalize choices for OpenAI compatibility
+            _normalize_response_choices(backend_data)
+            _choices = backend_data.get("choices", [])
+            _assistant_msg = _choices[0].get("message", {}) if _choices else {}
+            _expand_results = _expand_tool_results(optimizer, _assistant_msg)
+            if _expand_results is None:
+                break  # content, or a non-expand tool call -> return to the client
+            # Fulfil expand_content locally and continue the conversation.
+            messages.append(_assistant_msg)
+            messages.extend(_expand_results)
 
         usage = backend_data.get("usage", {})
 
@@ -1504,6 +1661,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     body["tools"] = pinned
             except Exception:
                 logger.debug("tools pinning failed; forwarding client tools as-is", exc_info=True)
+
+        # B1 (review §4.1.2): when reversible compression is on, advertise the
+        # expand_content tool so the model can retrieve a compressed tool output's
+        # original by handle. Appended AFTER pinning so the pinned client schema stays
+        # byte-stable and the proxy's tool is added consistently every turn (keeping
+        # the backend's serialized-tools cache valid). The proxy fulfils the call from
+        # the per-session ContentStore (non-streaming continuation loop + streaming
+        # generator) so the client never sees the internal expand round-trip.
+        if cfg.agentic.reversible_compression_enabled and isinstance(body.get("tools"), list):
+            body["tools"] = [*body["tools"], expand_content_tool()]
 
         # Dry-run mode (review §11 / P4a): when the X-MOEPT-Dry-Run header is set,
         # return the optimized prompt the proxy WOULD send to the backend plus a

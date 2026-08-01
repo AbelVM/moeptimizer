@@ -740,3 +740,90 @@ class TestConfigHotReload:
         # A brand-new session picks up the reloaded config.
         assert sm.get_or_create("sess-2")._config is sm._config
 
+
+class TestExpandContentTool:
+    """B1 (review §4.1.2): model-facing expand_content tool + fulfilment."""
+
+    def _optimizer_with_content(self, content: str):
+        from moeptimizer.optimizer import AgentContextOptimizer
+
+        opt = AgentContextOptimizer(AppConfig())
+        handle = opt.content_store.put(content)
+        return opt, handle
+
+    def test_expand_content_tool_schema(self) -> None:
+        from moeptimizer.content_store import EXPAND_TOOL_NAME, expand_content_tool
+
+        tool = expand_content_tool()
+        assert tool["type"] == "function"
+        assert tool["function"]["name"] == EXPAND_TOOL_NAME
+        assert "handle" in tool["function"]["parameters"]["properties"]
+        assert tool["function"]["parameters"]["required"] == ["handle"]
+
+    def test_extract_placeholder_handle(self) -> None:
+        from moeptimizer.content_store import extract_placeholder_handle
+
+        placeholder = '[original retained: handle=abc123def456, 5000 chars; call expand_content(handle="abc123def456") to retrieve the full original]'
+        assert extract_placeholder_handle(placeholder) == "abc123def456"
+        assert extract_placeholder_handle("no placeholder here") is None
+
+    def test_optimizer_expand_content_round_trip(self) -> None:
+        original = "def f():\n    return 42\n" * 50
+        opt, handle = self._optimizer_with_content(original)
+        assert opt.expand_content(handle) == original
+        assert opt.expand_content("unknown-handle") is None
+
+    def test_expand_tool_results_fulfils_expand_call(self) -> None:
+        from moeptimizer.app import _expand_tool_results
+
+        original = "the full original tool output"
+        opt, handle = self._optimizer_with_content(original)
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "expand_content", "arguments": f'{{"handle": "{handle}"}}'},
+            }],
+        }
+        results = _expand_tool_results(opt, message)
+        assert results is not None
+        assert len(results) == 1
+        assert results[0]["role"] == "tool"
+        assert results[0]["tool_call_id"] == "call_1"
+        assert results[0]["content"] == original
+
+    def test_expand_tool_results_none_for_non_expand(self) -> None:
+        from moeptimizer.app import _expand_tool_results
+
+        opt, _ = self._optimizer_with_content("x")
+        # A non-expand tool call must go to the client -> None.
+        message = {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "function": {"name": "some_other_tool", "arguments": "{}"},
+            }],
+        }
+        assert _expand_tool_results(opt, message) is None
+        # No tool calls -> None.
+        assert _expand_tool_results(opt, {"role": "assistant", "content": "hi"}) is None
+        # No optimizer -> None.
+        assert _expand_tool_results(None, message) is None
+
+    def test_expand_tool_results_missing_handle_placeholder(self) -> None:
+        from moeptimizer.app import _expand_tool_results
+
+        opt, _ = self._optimizer_with_content("x")
+        message = {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "function": {"name": "expand_content", "arguments": '{"handle": "does-not-exist"}'},
+            }],
+        }
+        results = _expand_tool_results(opt, message)
+        assert results is not None
+        assert "no longer available" in results[0]["content"]
+

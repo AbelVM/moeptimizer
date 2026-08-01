@@ -3301,13 +3301,20 @@ class AgentContextOptimizer:
             compressed_msg = dict(compressed_msg)
             compressed_msg["content"] = (
                 f"[original retained: handle={handle}, {len(content)} chars; "
-                f"retrieve via GET /v1/content/{handle}]\n"
+                f'call expand_content(handle="{handle}") to retrieve the full original]\n'
                 f"{compressed_msg.get('content') or ''}"
             )
         self._tool_output_cache[cache_key] = compressed_msg
         if len(self._tool_output_cache) > self._tool_output_cache_max:
             self._tool_output_cache.pop(next(iter(self._tool_output_cache)))
         return compressed_msg
+
+    def expand_content(self, handle: str) -> str | None:
+        """Retrieve the original of a reversibly-compressed tool output by handle
+        (review §4.1.2 / Forward plan B1). Backs the model-facing ``expand_content``
+        tool: returns the full uncompressed text, or None if the handle is unknown
+        or was evicted from the per-session store."""
+        return self.content_store.get(handle)
 
     def _dedup_repeated_tool_outputs(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Collapse repeated tool outputs to a handle reference (review §4.1.3/§4.5.2, B2).
