@@ -1193,6 +1193,42 @@ function renderJSONView(root,J,L,ri){
     }
   }
 
+  // Authoritative backend throughput, parsed from the captured llama.cpp
+  // print_timing log lines (backend_logs.events). Broken down by type:
+  // prompt-eval (prompt processing), generation (decode), and total
+  // (Inference completed). Unlike the approximate decode TPS above (derived
+  // from request timings), these are measured by the backend itself. Only
+  // rendered when backend log capture was available for this run.
+  const blEvents=(J.backendLogs&&J.backendLogs.events)||[];
+  const tpsByTurn=new Map();
+  for(const e of blEvents){
+    const line=e.line;
+    if(typeof line!=='string'||e.phase!=='proxy'||e.turn==null) continue;
+    const t=Number(e.turn);
+    const rec=tpsByTurn.get(t)||{};
+    let m;
+    if(line.includes('prompt eval time =')&&(m=line.match(/prompt eval time\s*=[\s\S]*?\(\s*[\d.]+\s*ms per token,\s*([\d.]+)\s*tokens per second/))){
+      rec.prompt=parseFloat(m[1]);
+    } else if(!line.includes('prompt eval time')&&line.includes('eval time =')&&(m=line.match(/eval time\s*=[\s\S]*?\(\s*[\d.]+\s*ms per token,\s*([\d.]+)\s*tokens per second/))){
+      rec.gen=parseFloat(m[1]);
+    } else if(line.includes('Inference completed:')&&(m=line.match(/tps=([\d.]+)/))){
+      rec.total=parseFloat(m[1]);
+    }
+    tpsByTurn.set(t,rec);
+  }
+  if(tpsByTurn.size){
+    const tpsTurns=[...tpsByTurn.keys()].sort((a,b)=>a-b);
+    const tpsLabels=tpsTurns.map(t=>'T'+t);
+    const tpsCol=(k)=>tpsTurns.map(t=>{const v=tpsByTurn.get(t)[k];return isNum(v)?v:NaN;});
+    grid.appendChild(panel('Backend throughput per turn (from backend logs)','tok/s',
+      {dual:true, labels:tpsLabels, datasets:[
+        {label:'Generation TPS',color:PALETTE.proxy,type:'line',data:tpsCol('gen')},
+        {label:'Total TPS',color:PALETTE.cache,type:'line',data:tpsCol('total')},
+        {label:'Prompt-eval TPS',color:PALETTE.direct,axis:'y1',type:'line',data:tpsCol('prompt')}
+      ], yFmt:v=>isNum(v)?v.toFixed(0):'—', yFmt1:v=>isNum(v)?v.toFixed(0):'—'},
+      'Authoritative backend-measured throughput from llama.cpp print_timing log lines (proxy requests): generation + total on the left axis, prompt-processing on the right (different scale). Only present when backend log capture was available.'));
+  }
+
   grid.appendChild(chartLabel('Compaction impact'));
   if(pr && pr._pooled==null && Object.keys(pr).length){
     const rounds=Object.keys(pr).filter(k=>k!=='_pooled').map(Number).sort((a,b)=>a-b);
