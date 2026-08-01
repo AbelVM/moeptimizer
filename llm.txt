@@ -16,24 +16,32 @@ request context on the way in and passes the response straight through.
 
 - **Language / runtime**: Python 3.11+ (also 3.12). FastAPI + uvicorn,
   pydantic-settings, tree-sitter, LanceDB, tiktoken, numpy.
-- **Version**: `0.7.4` (source of truth: `pyproject.toml`). Note
-  `src/moeptimizer/__init__.__version__` may lag behind.
+- **Version**: `0.7.27` (source of truth: `pyproject.toml`; kept in sync with
+  `src/moeptimizer/__init__.__version__`).
 - **Package**: `src/moeptimizer/`. Entry point `python -m moeptimizer` (console script
   `moeptimizer`). Config validator: `moeptimizer-config-check` / `--check-config`.
 - **Ports**: proxy `:8080` (start via `bash scripts/run.sh`); backend `:13305`
   (`MOEPT_SERVER__URL`, default `http://localhost:13305/api/v1`).
 - **Config**: environment variables with `MOEPT_` prefix and `__` nesting, e.g.
   `MOEPT_AGENTIC__QUALITY_PROFILE` (one of `quality` / `balanced` / `aggressive`),
-  `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS`, `MOEPT_V050__CACHE_STABLE_MODE`. Copy
+  `MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS`, `MOEPT_V050__CACHE_STABLE_MODE`,
+  `MOEPT_V050__FOLD_WINDOW_FRACTION` (space-based folding, default 0.25 = on). Copy
   `.env.example` to `.env`.
 - **Endpoints**: `POST /v1/chat/completions`, `POST /v1/embeddings`, `GET /v1/models`,
   `GET /v1/health`, `POST /v1/agent/state`, `POST /v1/agent/state/reset`,
-  `GET /v1/agent/sessions`, `DELETE /v1/agent/session/{id}`, `POST /v1/cache/clear`,
-  `GET /v1/metrics`, `POST /v1/metrics/reset`.
+  `GET /v1/agent/sessions`, `GET /v1/agent/sessions/{id}/debug`,
+  `GET /v1/agent/sessions/{id}/content/{handle}`, `DELETE /v1/agent/session/{id}`,
+  `POST /v1/cache/clear`, `POST /v1/config/reload`, `GET /v1/metrics`,
+  `POST /v1/metrics/reset`, `GET /v1/metrics/ui`, `GET /v1/debug/requests`
+  (bounded per-request trace: prompt hash, slot, prompt/cache/fresh-prefill tokens,
+  TTFT — no prompt contents by default).
 - **Core modules**: `app.py` (FastAPI + streaming), `optimizer.py` (main pipeline),
-  `config.py` (settings), `session_manager.py`, `compactor.py`, `context_compressor.py`,
-  `code_chunking.py`, `state_rag.py`, `hierarchical_summarizer.py`, `backend_client.py`,
-  `backend_capabilities.py`.
+  `config.py` (settings), `budget_governor.py` (budget math, extracted from optimizer),
+  `session_manager.py`, `compactor.py`, `token_aware_truncator.py`, `token_counter.py`,
+  `tool_output_compressor.py` / `tool_output_filter.py` (error-aware tool compression),
+  `content_store.py` (reversible-compression handles + `expand_content`),
+  `code_chunking.py` / `code_block_optimizer.py`, `state_rag.py`,
+  `hierarchical_summarizer.py`, `backend_client.py`, `backend_capabilities.py`.
 - **Tests**: `pytest tests/` (`asyncio_mode = "auto"`), one `test_<module>.py` per
   module. Integration tests: `test_e2e.py`, `test_optimizer.py`. Fixtures in
   `tests/conftest.py`.
@@ -57,13 +65,18 @@ moeptimizer/
 │   ├── backend_client.py   # backend HTTP communication
 │   ├── backend_capabilities.py  # live, device-aware capability probing
 │   ├── session_manager.py  # per-session isolation
+│   ├── budget_governor.py  # BudgetGovernor (budget math, extracted from optimizer)
 │   ├── compactor.py        # scratchpad compaction
+│   ├── token_counter.py / token_aware_truncator.py  # token counting + truncation
+│   ├── tool_output_compressor.py / tool_output_filter.py  # error-aware tool compression
+│   ├── content_store.py    # reversible-compression handles + expand_content tool
 │   ├── context_compressor.py / context_canonicalizer.py / selective_truncator.py
 │   ├── code_chunking.py / code_block_optimizer.py / cache_aware_chunker.py
 │   ├── state_store.py / state_rag.py / symbol_index.py
 │   ├── hierarchical_summarizer.py / summarize_old_turns.py
 │   ├── static_prefix_kv.py / cache_registry.py / hit_prediction_model.py
-│   ├── mtp_speculative.py / mtp_state.py / kv_slot_tracker.py
+│   ├── circuit_breaker.py / chunk_fingerprint.py / delta_encoder.py
+│   ├── cache.py / embedding.py / models.py  # support modules
 │   └── __init__.py         # public re-exports
 ├── tests/                  # pytest suite (test_<module>.py per module)
 ├── scripts/
@@ -71,6 +84,7 @@ moeptimizer/
 │   ├── dev.sh              # install + pytest + ruff + mypy
 │   ├── benchmark.py        # direct-vs-proxy benchmark
 │   ├── benchmark_dashboard.html  # report UI
+│   ├── diag_dryrun_opencode.py  # local prefix-stability dry-run gate (--max-breaks)
 │   ├── benchmark_all.sh
 │   └── fixtures/           # real project replayed by opencode/fixtures scenario
 ├── CHANGELOG.md            # version-by-version feature history
@@ -96,26 +110,46 @@ moeptimizer/
 - **Loop detection** — `loop_detector.py` (repeated tool calls / actions / thinking).
 - **Progress tracking** — `progress_tracker.py` + `goal_decomposer.py`.
 - **Code chunking** — `code_chunking.py` (tree-sitter-aware splitting + language
-  detection) + `code_block_optimizer.py` (chunk dedup) + `cache_aware_chunker.py`.
+  detection) + `code_block_optimizer.py` (chunk dedup, query-aware slicing) +
+  `cache_aware_chunker.py`.
+- **Tool-output compression** — `tool_output_compressor.py` (error-aware: keeps
+  failures/stack frames, drops passing-test noise) + `tool_output_filter.py`;
+  per-tool budgets + first-appearance (monotonic) normalization in `optimizer.py`.
+- **Budget & eviction** — `budget_governor.py` (BudgetGovernor: calibrated/horizon/
+  code-density budget math) + `token_aware_truncator.py` + `token_counter.py`;
+  space-based folding (`fold_window_fraction`, default 0.25) keeps the prefix stable.
 - **Context compression** — `context_compressor.py`, `context_canonicalizer.py`,
-  `selective_truncator.py`, `context_aligner.py`, `context_template_matcher.py`,
-  `dependency_orderer.py` (newest-user-turn only).
+  `selective_truncator.py`, `context_aligner.py`.
 - **Hierarchical summarization** — `hierarchical_summarizer.py` (cache-stable
   rolling-summary compaction) + `summarize_old_turns.py`.
+- **Reversible compression** — `content_store.py` (content-addressed handles +
+  model-facing `expand_content(handle)` retrieval; config-gated OFF).
 - **Prefix reuse & prediction** — `static_prefix_kv.py`, `cache_registry.py`,
   `hit_prediction_model.py` (XGBoost early-exit), `chunk_fingerprint.py`,
-  `delta_encoder.py`, `kv_slot_tracker.py`.
+  `delta_encoder.py`.
 - **Backend communication** — `backend_client.py`, `backend_capabilities.py`
   (live, device-aware auto-detection of slot pinning, native MTP, tokenizer).
+- **Observability** — process-wide `/v1/metrics`, bounded per-request `/v1/debug/requests`
+  trace, and per-stage degradation counters with structured reason codes
+  (e.g. `code_slicing:parser_unavailable:lang=…:size=…:failed_open`).
 - **Async offload** — `async_io_stage.py` (offloads tree-sitter + embedding ranking
   to a thread pool; primary TTFT cost).
 
 ## Hard constraints (do not violate)
 
 - Proxy scope = input compaction only; never compress response verbosity.
-- Keep cached prefixes byte-stable; never mutate the middle of cached context.
+- Keep cached prefixes byte-stable; never mutate the middle of cached context. The
+  dry-run (`scripts/diag_dryrun_opencode.py --max-breaks`) is the local prefix-stability
+  gate for cache-touching changes — but it proves LOCAL prefix stability only, not
+  backend KV retention.
+- Bounded diagnostics: never put the full session state / optimized prompt in a normal
+  response; use bounded scalar headers + `/v1/debug/requests` (opt-in, capped).
+- Gated context-rewriting features (`reversible_compression_enabled`,
+  `code_slicing_enabled`, `tool_output_dedup_enabled`,
+  `volatile_field_neutralization_enabled`) stay OFF by default pending benchmarks.
 - Benchmark invariant: never interleave direct and proxified requests within a round.
 - Only the new benchmark format is supported (no legacy logs).
+- Dashboard charts follow the FT Visual Vocabulary.
 - Internal cache hints (attention sinks, pattern markers) are stripped before model input.
 - Capability auto-detection drives slot pinning / MTP passthrough / tokenizer; the
   explicit force-on flags are overrides, not defaults.
@@ -129,6 +163,7 @@ pytest tests/ -v                    # tests only
 ruff check src/ tests/              # lint
 mypy src/moeptimizer/               # type-check
 python -m moeptimizer --check-config  # validate resolved config
+python scripts/diag_dryrun_opencode.py --persistent-session --turns 30 --max-breaks 0 2>&1  # dry-run prefix-stability gate
 python scripts/benchmark.py --scenario opencode --turns 30 --json > report.json 2> run.log
 ```
 
