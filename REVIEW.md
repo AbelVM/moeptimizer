@@ -219,7 +219,7 @@ slicing) are implemented config-gated OFF (see the config-default review below).
 wins D2/D3/D5/E4/F2 and the C2 consolidation are done.
 
 - **Icons** show an item's *current* state (✅ done · 🟡 partial/gated · ⬜ not
-  started); the phase gate is the definition of done.
+  started · ❌ rejected / won't-do); the phase gate is the definition of done.
 - **Effort:** **[S]** ≤ ~half day · **[M]** ~1–3 days · **[L]** > 3 days / needs design.
 - **⚠ cache** = touches prefix-reuse / context-mutation logic (AGENTS.md caution):
   always run the dry-run (`diag_dryrun_opencode.py --max-breaks`) **and** a benchmark
@@ -235,7 +235,7 @@ few turns. Highest-ROI remaining work; unblocks append-only (F3).
 |---|---|---|---|
 | A1 | 🟡 **Adaptive budget — full policy + cache-break amortization trigger.** Add task-complexity / code-density / codebase-size signals to the ceiling; fold only when `marginal_per_turn_prefill × remaining_turns > re_prefill_cost`. **A1-lite done:** `fold_window_fraction` default `0.25` (space-based folding) → **zero dry-run breaks**; the full horizon/complexity amortization policy is still pending. | §3.1, §4.2.2, §4.7.2 | **[L]** |
 | A2 | ⬜ **Single size governor.** Collapse the 6 governors into `BudgetGovernor` + `PrefixLayout`; delete `_proactive_trim` & `_sliding_window_trim`; add `evictable_budget ≤ 0 → return` to the truncator + compactor. **Deferred:** maintainability consolidation that is dormant under the space-based-folding default and would remove the still-tested turn-count fallback (AGENTS.md cautions against large pipeline refactors as an early change). | §4.2.1, §4.7.1 | **[M]** |
-| A3 | ⬜ **Compaction-geometry redesign — RETHOUGHT, likely superseded by F3.** The phaseA benchmark (A4 + A1-lite) has **zero cliffs across all 30 turns** (per-turn cache grows monotonically 0 → 24,254): below ~25% window utilization A1-lite fires **no folds**, so there are no fold-turn breaks for a geometry redesign to fix. A3's premise only holds for **window-bound** sessions (context climbing past ~25% of the window), which the opencode scenario (4%) never reaches. For that case **F3 (append-only + native `--context-shift`) likely supersedes A3**: if the proxy never folds and the backend shifts the KV cache contiguously when the window fills, the prefix stays cached with nothing for a geometry redesign to fix. The only open question is the quality tradeoff — native context-shift drops old tokens whereas a rolling summary preserves one. **Defer** the geometry redesign unless a long/window-bound benchmark shows native context-shift hurts quality enough to justify intricate cache-safe folding. | break attribution | **[L]** ⚠ cache |
+| A3 | ⬜ **Compaction-geometry redesign — the safe window-bound strategy (deferred).** The phaseA benchmark (A4 + A1-lite) has **zero cliffs across all 30 turns** (per-turn cache grows monotonically 0 → 24,254): below ~25% window utilization A1-lite fires **no folds**, so there are no fold-turn breaks at low utilization (the common case). A3's premise only holds for **window-bound** sessions (context climbing past ~25% of the window), which the opencode scenario (4%) never reaches. For window-bound sessions the proxy *must* fold to stay under the window; A3 would relocate the rolling summary so a fold does not shift the live zone, preserving the prefix cache across folds. Native `--context-shift` (F3) is **not** a safe alternative (rejected — see F3), so A3 remains the only cache-preserving option for window-bound sessions. **Defer:** complex ([L]) and only matters for window-bound sessions; until then A1-lite folding (with cache breaks on fold turns) is the window-bound fallback. | break attribution | **[L]** ⚠ cache |
 | A4 | ✅ **Compress tool outputs on first appearance** (monotonic) so the cached form *is* the compressed form — removed the turn-19 late-compression break class (commit `1a271a9`; dry-run breaks 5 → 3). | break attribution | **[S]** ⚠ cache |
 | A5 | ✅ **Calibrated-token consistency** across the partition/evict boundary — `_evict_for_budget` + `_proactive_trim` now measure the body in calibrated tokens, matching the calibrated budget (commit `240321f`). | §4.8.6 | **[S]** |
 
@@ -299,20 +299,22 @@ fails N× surfaces in `/v1/metrics`; `dev.sh` green.
 |---|---|---|---|
 | F1 | ⬜ **ChatML / tool-schema / code-fence byte-stability hardening** (MTP draft acceptance). | §4.6.2 | **[M]** ⚠ cache |
 | F2 | ✅ **Verbatim `<think>` round-trip verification** — confirmed `capture_thinking`/`_restore_thinking` round-trip `reasoning_content` byte-for-byte (no normalization, no mutation, client-echoed reasoning never overwritten); regression test added (commit `f8b1239`). | §4.6.3 | **[S]** |
-| F3 | ⬜ **Append-only + native `--context-shift` — the preferred window-bound strategy (supersedes A3).** Lossless compression of new content only; the proxy never folds and lets llama.cpp's native context-shift bound the window (shifting the KV cache contiguously so the prefix stays cached). At low utilization A1-lite already behaves append-only (phaseA: zero cliffs); F3 extends that to window-bound sessions without proxy folds, making A3's geometry redesign unnecessary. **Open question:** native context-shift drops old tokens (no rolling summary) — validate the quality tradeoff on a long/window-bound benchmark before adopting. | §4.3.1 | **[L]** ⚠ cache |
+| F3 | ❌ **Append-only + native `--context-shift` — REJECTED.** Letting llama.cpp's native `--context-shift` bound the window (shifting the KV cache when it fills) is **risky for MoE chat assistants on hardware-limited backends**: shifting the KV cache mid-conversation can cause unpredictable hardware stutter, severe model degradation, and broken chat logic. The proxy must NOT rely on native context-shift. Window-bound sessions are instead handled by A1-lite folding (cache breaks on fold turns) and — if preserving cache across folds becomes a priority — A3 (cache-safe folding). At *low* utilization A1-lite already behaves append-only (phaseA: zero cliffs), so nothing is lost by rejecting context-shift for the common case. | §4.3.1 | **[L]** ⚠ cache |
 
 *Gate:* injected messages are well-formed ChatML and never split a code fence;
 append-only validated on a genuinely window-bound session (near-100 % reuse, TTFT collapses).
 
 **Dependencies & ordering.** **Phase A is essentially complete** — A4 + A1-lite give
 zero cliffs at low utilization (phaseA), so the mission-critical cliff is fixed and the
-remaining A items are deferred (A2 maintainability; A3 superseded by F3, see below).
-**A3 → F3:** the geometry redesign is likely unnecessary; append-only + native
-`--context-shift` (F3) is the preferred window-bound strategy and needs a long-session
-benchmark to validate its quality tradeoff (it drops old tokens vs a rolling summary).
-B1 (reversible handles) is the largest single *quality* lever but is self-contained
-(needs the model-facing `expand(id)` tool). C / D / E are largely independent and can
-interleave. Every ⚠-cache item must be followed by the dry-run gate and a benchmark round.
+remaining A items are deferred (A2 maintainability; A3 window-bound only, see below).
+**Window-bound strategy:** native `--context-shift` (F3) is **rejected** — risky for MoE
+chat assistants on hardware-limited backends (hardware stutter, model degradation,
+broken chat logic). So for window-bound sessions the proxy folds (A1-lite, cache breaks
+on fold turns), and **A3 (cache-safe folding) remains the only cache-preserving option**
+— deferred ([L]) until window-bound performance matters. B1 (reversible handles +
+`expand_content` tool) is done but config-gated OFF pending a backend-validated
+benchmark. C / D / E are largely independent and can interleave. Every ⚠-cache item must
+be followed by the dry-run gate and a benchmark round.
 
 ### Config default review — should the new gated features be ON?
 
@@ -695,9 +697,14 @@ the prefix cached — deleting changes the sequence. The honest design space is:
 
 - **(A) Append-only + backend-managed eviction.** The proxy does only *lossless*
   compression of **new** content (tool outputs, code, user pastes), never touches
-  history, and lets llama.cpp `--context-shift` / native eviction bound the window.
-  Maximum cache reuse; context fills the window (not "lean"), but on a 262K window
-  that is fine and TTFT-optimal because every turn is a pure tail append.
+  history, and lets the backend bound the window. Maximum cache reuse; context fills
+  the window (not "lean"), but on a 262K window that is fine and TTFT-optimal because
+  every turn is a pure tail append. **Caveat:** the *low-utilization* half of this is
+  achieved (A1-lite: no folds below ~25% window → append-only, phaseA zero cliffs), but
+  the originally-proposed window-bound mechanism — llama.cpp `--context-shift` / native
+  eviction — is **rejected for this deployment** (risky for MoE chat assistants on
+  hardware-limited backends: hardware stutter, model degradation, broken chat logic).
+  Window-bound sessions therefore fold (A1-lite / A3), not native context-shift.
 - **(B) Periodic compaction with an amortized prefill.** Append-only most of the
   time; *rarely* (every N turns) do one big compaction and accept **one** full
   re-prefill, amortized over the N cheap turns. This is what the fold attempts —
@@ -708,7 +715,11 @@ The current design is a hybrid that gets the worst of both: context is **not lea
 (16–18K, budget unenforced) **and** the cache breaks frequently (folds every 2 turns
 + the five evictors). The single most impactful architectural decision is to
 **commit to (A) as the default for cache-stable mode and reserve (B) for genuinely
-window-bound sessions**, with **one** size governor instead of six.
+window-bound sessions**, with **one** size governor instead of six. **Status:** the
+low-utilization append-only of (A) is done (A1-lite → phaseA zero cliffs); the
+window-bound mechanism is folding (B/A3), **not** native `--context-shift` (rejected
+for this deployment — see option A caveat). The "one size governor" consolidation is
+A2 (deferred).
 
 ### 3.1 The budget must be dynamic, not a hard limit
 
@@ -915,12 +926,16 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
 
 ### 4.3 Better alternatives
 
-1. ⬜ **Default to append-only + native context-shift (HIGH).** For cache-stable mode
-   on a large window (262K here), stop deleting history entirely; do only lossless
-   boundary compression of *new* content and let `llama.cpp --context-shift` bound
-   the window. Every turn becomes a pure tail append → near-100 % reuse → TTFT
-   collapses. Reserve compaction for genuinely window-bound sessions. This is the
-   biggest lever for the mission (§3, option A). → Phase 2 (after Phase 1 cleanup).
+1. 🟡 **Append-only at low utilization — achieved via A1-lite; native `--context-shift`
+   REJECTED.** The append-only ideal (every turn a pure tail append → near-100 % reuse)
+   is realized at *low* utilization by A1-lite (`fold_window_fraction=0.25`: no folds
+   below ~25% of the window → phaseA zero cliffs). The originally-proposed mechanism for
+   the window-bound case — letting `llama.cpp --context-shift` bound the window — is
+   **rejected**: shifting the KV cache mid-conversation is risky for MoE chat assistants
+   on hardware-limited backends (unpredictable hardware stutter, severe model
+   degradation, broken chat logic). Window-bound sessions instead fold (A1-lite, cache
+   breaks on fold turns) or, if cache preservation across folds matters, A3 (cache-safe
+   folding, deferred). → Phase 2 (low-utilization append-only done; window-bound via A3).
 2. ✅ **Native slot pinning is already done well — keep it (positive).**
    `backend_capabilities.py` device-aware auto-detection of `/slots`, native MTP
    passthrough, and exact tokenizer is sound and NPU/GPU hot-swap aware
@@ -1353,9 +1368,11 @@ the quality the cliff fix traded away.*
    remaining_turns > re_prefill_cost`). This is what removes the fold-turn TTFT
    spikes (cached→882 re-prefills) and stops the quality regression (more verbatim
    context retained).
-2. ⬜ **Append-only default for cache-stable mode** (§4.3.1): lossless compression of
-   new content only; let `--context-shift` bound the window; reserve compaction for
-   genuinely window-bound sessions.
+2. 🟡 **Append-only default for cache-stable mode** (§4.3.1): lossless compression of
+   new content only. **Low-utilization append-only is done** (A1-lite → phaseA zero
+   cliffs). Native `--context-shift` to bound the window is **rejected** for this
+   deployment (risky for MoE on hardware-limited backends); genuinely window-bound
+   sessions fold (A1-lite) or use cache-safe folding (A3, deferred).
 3. ⬜ **Zero-copy SSE passthrough** (§4.4.1).
 4. 🟡 **Token-counting overhaul** (§4.4.2, §4.4.3): per-message memo + running totals +
    count-once-per-stage; remove the O(n²) floor pass.
