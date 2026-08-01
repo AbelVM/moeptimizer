@@ -1055,7 +1055,7 @@ function renderJSONView(root,J,L,ri){
     const labels=obs.per_round.map(r=>'R'+(Number(r.round)+1));
     grid.appendChild(panel('Proxy processing overhead per round','ms',
       lineBarCfg(labels,[
-        {label:'Optimizer',color:PALETTE.proxy,type:'bar',data:obs.per_round.map(r=>r.avg_optimizer_ms)},
+        {label:'Optimizer',color:PALETTE.jaccard,type:'bar',data:obs.per_round.map(r=>r.avg_optimizer_ms)},
         {label:'Token count',color:PALETTE.cache,type:'bar',data:obs.per_round.map(r=>r.avg_token_count_ms)}
       ], fmtMs),
       'Proxy-side work only. Backend generation latency is excluded; backend errors and degradation events are shown in the summary card.'));
@@ -1234,7 +1234,7 @@ function renderJSONView(root,J,L,ri){
       const labels=rounds.map(r=>'R'+(r+1));
       grid.appendChild(panel('Per-round token savings','%',
         lineBarCfg(labels,[
-          {label:'Token savings %',color:PALETTE.proxy,type:'bar',data:rounds.map(r=>pr[r].token_savings_pct)}
+          {label:'Token savings %',color:PALETTE.sem,type:'bar',data:rounds.map(r=>pr[r].token_savings_pct)}
         ], v=>isNum(v)?v.toFixed(1)+'%':'—', 0, null),
         'Each round is an independent replay. Read this alongside the per-turn savings chart to see whether compaction is stable across runs.'));
     }
@@ -1275,7 +1275,7 @@ function renderJSONView(root,J,L,ri){
       grid.appendChild(panel('Token savings (aggregate)','%',
         {labels:['Savings %'],
           datasets:[
-            {label:'Token savings %',color:PALETTE.proxy,type:'bar',data:[sp]}
+            {label:'Token savings %',color:PALETTE.sem,type:'bar',data:[sp]}
           ], yFmt:v=>isNum(v)?v.toFixed(1)+'%':'—', yMin:0      }, desc));
     }
   }
@@ -1439,7 +1439,7 @@ function renderLogView(root,L,ri,J){
   if(faithData.some(v=>isNum(v)) || evictData.some(v=>isNum(v))){
     grid.appendChild(panel('Context faithfulness per turn (optimizer job)','score',
       withFlags(lineBarCfg(labels,[
-        {label:'Prompt faithfulness',color:PALETTE.proxy,data:faithData},
+        {label:'Prompt faithfulness',color:PALETTE.sem,data:faithData},
         {label:'Evicted-content recall',color:'#ff7bd5',data:evictData}
       ], fmt2, 0, 1, rs), flaggedIdx),
       'PRIMARY optimizer signal: how much of the original input context survived compaction (1.0 = nothing lost). Low/declining = the optimizer dropped context the agent needed. Red ✕ = flagged turn.'));
