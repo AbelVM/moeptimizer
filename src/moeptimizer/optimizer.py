@@ -3462,6 +3462,34 @@ class AgentContextOptimizer:
             ),
         })
 
+    def _zone_token_breakdown(self) -> dict[str, int]:
+        """Token sizes of the frozen prefix / rolling summary / live zone for the
+        last optimized context (review §4.11.2 / Forward plan D1 debug breakdown).
+
+        Lets operators see how the context is composed — e.g. whether a growing
+        summary or a large live zone is driving prefill. Read-only and defensive
+        (never affects the optimization path); boundaries are re-derived fresh from
+        ``_last_optimized`` so they cannot go stale relative to it.
+        """
+        msgs = self._last_optimized
+        empty = {"frozen_prefix": 0, "rolling_summary": 0, "live_zone": 0, "total": 0}
+        if not msgs:
+            return empty
+        try:
+            frozen_end = self._frozen_prefix_end(msgs)
+            stable_end = self._stable_prefix_end(msgs)
+            frozen = self.token_counter.count_messages(msgs[:frozen_end])
+            stable = self.token_counter.count_messages(msgs[:stable_end])
+            total = self.token_counter.count_messages(msgs)
+            return {
+                "frozen_prefix": frozen,
+                "rolling_summary": max(0, stable - frozen),
+                "live_zone": max(0, total - stable),
+                "total": total,
+            }
+        except Exception:  # pragma: no cover - defensive (debug-only)
+            return empty
+
     def get_debug_info(self) -> dict[str, Any]:
         """Return per-session debug snapshot for the operator dashboard (P4).
 
@@ -3483,6 +3511,7 @@ class AgentContextOptimizer:
                 "live_zone_start": self._live_zone_start,
                 "stable_prefix_len": len(self._last_stable_prefix),
                 "live_zone_compression_enabled": self._config.agentic.live_zone_compression_enabled,
+                "zone_tokens": self._zone_token_breakdown(),
             },
             "cache": {
                 "last_static_prefix_hit": self._last_static_prefix_hit,

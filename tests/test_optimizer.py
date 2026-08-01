@@ -184,6 +184,30 @@ class TestAgentContextOptimizer:
         # Surfaced in the debug snapshot.
         assert opt.get_debug_info()["degradation_counts"]["code_block_optimization"] == 2
 
+    def test_zone_token_breakdown(self) -> None:
+        """D1 (review §4.11.2): the debug endpoint exposes frozen/summary/live token
+        sizes that are non-negative and sum to the total."""
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Remember this task"},
+            {"role": "assistant", "content": "I will keep it in mind."},
+            {"role": "user", "content": "Now do something else " * 20},
+            {"role": "assistant", "content": "Sure, here is a response " * 20},
+        ]
+        self.optimizer.optimize_messages(messages)
+        breakdown = self.optimizer._zone_token_breakdown()
+        assert breakdown["total"] > 0
+        assert breakdown["frozen_prefix"] >= 0
+        assert breakdown["rolling_summary"] >= 0
+        assert breakdown["live_zone"] >= 0
+        assert (
+            breakdown["frozen_prefix"]
+            + breakdown["rolling_summary"]
+            + breakdown["live_zone"]
+            == breakdown["total"]
+        )
+        assert "zone_tokens" in self.optimizer.get_debug_info()["live_zone"]
+
     def test_set_token_calibration_clamps_and_scales(self) -> None:
         # ratio clamped to [0.5, 2.0]
         self.optimizer.set_token_calibration(10.0)
