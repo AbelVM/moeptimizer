@@ -155,6 +155,7 @@ function parseJSON(text){
   out.longHorizon = get(['long_horizon'])||{};
   out.backendLogs = get(['backend_logs'])||{};
   out.performance = get(['performance'])||{};
+  out.cache_ttft = get(['cache_ttft'])||{};
   return out;
 }
 
@@ -958,12 +959,22 @@ function renderJSONView(root,J,L,ri){
 
   grid.appendChild(chartLabel('Prompt & cache economics'));
   if(perf.per_turn && perf.per_turn.length){
+    // Surface the cache→TTFT Pearson r (benchmark.py cache_ttft) inline: a strong
+    // positive value means more re-prefill ⇒ slower first token, so a reuse
+    // regression shows up here before the aggregate TTFT mean moves (D2).
+    const corr=J.cache_ttft.fresh_prefill_vs_ttft_correlation;
+    let corrNote='';
+    if(isNum(corr)){
+      const strength=Math.abs(corr)>=0.7?'strong':Math.abs(corr)>=0.4?'moderate':'weak';
+      const dir=corr>=0?'positive':'negative';
+      corrNote=` Proxy fresh-prefill↔TTFT Pearson r = ${corr.toFixed(2)} (${strength} ${dir}).`;
+    }
     grid.appendChild(panel('Fresh prefill by turn (proxy vs direct)','tok',
       lineBarCfg(perf.per_turn.map(r=>'T'+r.turn),[
         {label:'Direct fresh prefill',color:PALETTE.direct,type:'line',data:perf.per_turn.map(r=>r.direct_fresh_prefill_tokens)},
         {label:'Proxy fresh prefill',color:PALETTE.proxy,type:'line',data:perf.per_turn.map(r=>r.proxy_fresh_prefill_tokens)}
       ], fmt),
-      'Per-turn prompt tokens minus cached tokens. Compare this with the TTFT chart above; a fresh-prefill spike should explain a matching TTFT spike.'));
+      'Per-turn prompt tokens minus cached tokens. Compare this with the TTFT chart above; a fresh-prefill spike should explain a matching TTFT spike.'+corrNote));
   }
 
   // Token usage per turn (from log) OR aggregate
