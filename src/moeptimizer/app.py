@@ -1591,7 +1591,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         # Live capability detection (review: NPU<->GPU aware). A single probe
         # reads the backend's own metadata (active device, /slots, native MTP,
         # exact /tokenize, tokenizer id) instead of guessing. This drives slot
-        # pinning, MTP passthrough, and tokenizer selection, and is refreshed on
+        # pinning and MTP passthrough; tokenizer selection remains local-first and is refreshed on
         # a TTL per request so device hot-swaps are picked up without a restart.
         caps = None
         if cfg.v050.capability_autodetect:
@@ -1624,23 +1624,19 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 except Exception as exc:
                     logger.warning("MTP support auto-detection failed: %s", exc)
 
-        # Derive the tokenizer from the backend's model checkpoint when the
-        # operator left it on 'auto' and metadata gave us a concrete id. This
-        # makes budget counts use the model's real BPE without manual config.
-        # Session optimizers are built lazily after startup and read
-        # cfg.server.tokenizer, so setting it here propagates to all sessions.
+        # Keep the detected checkpoint for diagnostics, but do not turn it into
+        # a network-capable tokenizer override. ``auto`` must remain local-first;
+        # exact backend tokenization is handled by the capability probe.
         if (
             cfg.v050.capability_autodetect
             and cfg.server.tokenizer == "auto"
             and caps
             and caps.tokenizer_id
         ):
-            cfg.server.tokenizer = caps.tokenizer_id
             app.state.detected_tokenizer_id = caps.tokenizer_id
             logger.info(
-                "Using tokenizer '%s' derived from backend model checkpoint; "
-                "sessions will load it (falling back to tiktoken if unavailable "
-                "locally). Backend prompt_tokens still calibrates the residual.",
+                "Detected backend tokenizer '%s'; keeping local-first tokenizer "
+                "selection. Backend prompt_tokens still calibrates the residual.",
                 caps.tokenizer_id,
             )
 
