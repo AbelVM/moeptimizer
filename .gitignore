@@ -8,6 +8,7 @@ notes.md
 notes2.md
 .kilo/
 tmp/
+.qwen/
 
 # C extensions
 *.so
