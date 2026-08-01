@@ -319,6 +319,34 @@ class TestChatCompletionsNonStreaming:
         )
         assert "X-MOEPT-Optimized-Prompt-Text" not in response.headers
 
+    def test_non_streaming_emits_faithfulness_scalar_headers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#7: with diagnostics on, the proxy emits bounded faithfulness SCALAR
+        headers (computed proxy-side) so the benchmark gets faithfulness even when
+        the full optimized-prompt text exceeds the 8 KB header cap."""
+        import moeptimizer.app as app_module
+
+        fake_backend = _mock_backend()
+        monkeypatch.setattr(app_module, "LemonadeClient", lambda *a, **kw: fake_backend)
+
+        app = create_app(AppConfig())
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL_ID,
+                "messages": [{
+                    "role": "user",
+                    "content": "Please help me refactor the authentication module and add tests for it",
+                }],
+                "stream": False,
+            },
+            headers={"X-MOEPT-Diagnostics": "true"},
+        )
+        faith = response.headers.get("X-MOEPT-Prompt-Faithfulness")
+        assert faith is not None
+        assert 0.0 <= float(faith) <= 1.0
+
     def test_diagnostics_reports_prompt_header_limit(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -505,6 +533,40 @@ class TestChatCompletionsStreaming:
         snap = client.get("/v1/metrics").json()
         assert snap["requests"] == 1
         assert snap["total_cached_tokens"] == 10
+
+    def test_streaming_forwards_usage_chunk_to_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#3: the proxy must forward the backend's authoritative usage chunk to the
+        client (empty choices + usage) so the client sees completion_tokens — without
+        this the benchmark's proxy decode-TPS is empty."""
+        import moeptimizer.app as app_module
+
+        class FakeUsage:
+            def model_dump(self) -> dict[str, int]:
+                return {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}
+
+        async def fake_stream(*args: Any, **kwargs: Any):
+            yield MagicMock(
+                choices=[MagicMock(delta=MagicMock(role="assistant", content="Hi", reasoning_content=None), finish_reason="stop")],
+                usage=None,
+            )
+            yield MagicMock(choices=[], usage=FakeUsage())
+
+        fake_backend = MagicMock()
+        fake_backend.chat_completions_stream = fake_stream
+        monkeypatch.setattr(app_module, "LemonadeClient", lambda *a, **kw: fake_backend)
+
+        app = create_app(AppConfig())
+        client = TestClient(app)
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": MODEL_ID, "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+        ) as resp:
+            body = "".join(resp.iter_text())
+        assert '"usage"' in body
+        assert '"completion_tokens": 5' in body
 
     def test_streaming_emits_context_budget_comment_when_evicted(
         self, monkeypatch: pytest.MonkeyPatch

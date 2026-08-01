@@ -516,6 +516,16 @@ def _serialize_messages_text(messages: list[dict[str, Any]]) -> str:
     compaction. Newlines are replaced with ``\\n`` to keep the value
     header-safe; the benchmark reverses this on read.
     """
+    return _messages_to_text(messages).replace("\n", "\\n")
+
+
+def _messages_to_text(messages: list[dict[str, Any]]) -> str:
+    """Render messages as plain ``[role]\\ncontent`` text joined by newlines.
+
+    The raw (newline-preserving) form used for the proxy-side faithfulness
+    computation (#7); ``_serialize_messages_text`` escapes the newlines for the
+    HTTP header.
+    """
     parts: list[str] = []
     for msg in messages:
         role = str(msg.get("role", "unknown"))
@@ -523,7 +533,46 @@ def _serialize_messages_text(messages: list[dict[str, Any]]) -> str:
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
         parts.append(f"[{role}]\n{content}")
-    return "\n".join(parts).replace("\n", "\\n")
+    return "\n".join(parts)
+
+
+def _prompt_faithfulness(full_prompt: str, optimized_prompt: str) -> float | None:
+    """Token-set Jaccard between the full and optimized prompt (1.0 = nothing
+    lost). Proxy-side mirror of the benchmark metric (#7). None if either empty."""
+    if not full_prompt or not optimized_prompt:
+        return None
+    full_tokens = set(full_prompt.lower().split())
+    opt_tokens = set(optimized_prompt.lower().split())
+    if not full_tokens or not opt_tokens:
+        return None
+    return round(len(full_tokens & opt_tokens) / max(len(full_tokens | opt_tokens), 1), 6)
+
+
+def _prompt_source_token_recall(full_prompt: str, optimized_prompt: str) -> float | None:
+    """Fraction of unique source tokens retained after compaction (#7)."""
+    if not full_prompt or not optimized_prompt:
+        return None
+    full_tokens = set(full_prompt.lower().split())
+    opt_tokens = set(optimized_prompt.lower().split())
+    if not full_tokens or not opt_tokens:
+        return None
+    return round(len(full_tokens & opt_tokens) / len(full_tokens), 6)
+
+
+def _evicted_content_recall(full_prompt: str, optimized_prompt: str) -> float | None:
+    """Recall of tokens from the evicted (first ~60%) part of the prompt that the
+    optimized prompt retained (#7). None when the prompt is too short to split."""
+    if not full_prompt or not optimized_prompt:
+        return None
+    full_tokens = full_prompt.lower().split()
+    if len(full_tokens) < 40:
+        return None
+    split = int(len(full_tokens) * 0.6)
+    evicted_tokens = set(full_tokens[:split])
+    if not evicted_tokens:
+        return None
+    opt_tokens = set(optimized_prompt.lower().split())
+    return round(len(evicted_tokens & opt_tokens) / max(len(evicted_tokens), 1), 6)
 
 
 # Common unicode punctuation that appears in code comments / fixture text but
@@ -945,6 +994,10 @@ def _make_streaming_generator(
                 buffered_tool_sse: list[str] = []
                 saw_tool_calls = False
                 tool_calls_finish = False
+                # Authoritative usage captured from the backend's trailing chunk,
+                # forwarded to the client as a final usage chunk (#3). Reset each
+                # round so an expand-content re-query's usage supersedes the prior.
+                final_usage: dict[str, Any] | None = None
 
                 async for chunk in backend_client.chat_completions_stream(
                     messages=messages,
@@ -979,8 +1032,8 @@ def _make_streaming_generator(
 
                     # Some backends report usage (incl. cached_tokens) on the final
                     # chunk. Capture it so we can feed the real cache outcome to the
-                    # hit-prediction model. (Usage chunks are captured for metrics but
-                    # not forwarded to the client.)
+                    # hit-prediction model, AND forward it to the client as a final
+                    # usage chunk so it sees completion_tokens / prompt_tokens (#3).
                     if hasattr(chunk, "usage") and chunk.usage is not None:
                         usage = chunk.usage
                         details = getattr(usage, "prompt_tokens_details", None)
@@ -1000,6 +1053,16 @@ def _make_streaming_generator(
                         PROXY_METRICS.record_mtp_usage(
                             usage, request_id=request_id, session_id=session_id
                         )
+                        # Serialize for forwarding to the client as the final usage
+                        # chunk (empty choices + usage), OpenAI streaming format.
+                        # Only forward a plain dict (a real backend usage object);
+                        # skip non-dict stand-ins (e.g. test mocks) so json.dumps
+                        # never raises mid-stream.
+                        if isinstance(usage, dict):
+                            final_usage = usage
+                        else:
+                            _dumped = usage.model_dump() if hasattr(usage, "model_dump") else None
+                            final_usage = _dumped if isinstance(_dumped, dict) else None
 
                     # Buffer tool-call deltas and the tool_calls finish-reason chunk
                     # (replayed to the client only if the call is NOT an expand the
@@ -1095,6 +1158,20 @@ def _make_streaming_generator(
                         continue  # re-query the backend with the fulfilled expand
                 for sse in buffered_tool_sse:
                     yield sse
+                # Forward the authoritative usage as the final chunk (OpenAI
+                # streaming format: empty choices + usage) so the client sees
+                # completion_tokens / prompt_tokens. Emitted once, after any
+                # expand-content continuation resolves (#3).
+                if final_usage is not None:
+                    usage_chunk = json.dumps({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [],
+                        "usage": final_usage,
+                    })
+                    yield f"data: {usage_chunk}\n\n"
                 break
 
         except (APIStatusError, APIError) as e:
@@ -1777,6 +1854,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 with suppress(Exception):
                     optimizer.load_session_state(session_state)
 
+        # Capture the pristine original prompt text for the proxy-side
+        # faithfulness computation BEFORE optimization mutates the messages (#7).
+        # Only when diagnostics are requested (benchmarking), to avoid overhead.
+        _diag_wanted = str(request.headers.get("X-MOEPT-Diagnostics", "")).strip().lower() in (
+            "1", "true", "yes",
+        )
+        _original_prompt_text = _messages_to_text(messages) if _diag_wanted else ""
+
         optimized_messages = messages
         optimization_error: str | None = None
         token_count_before = optimizer.token_counter.get_timing_stats()
@@ -1940,6 +2025,25 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "1", "true", "yes"
         )
         if diagnostics_on:
+            # Proxy-side faithfulness metrics (#7): computed from the pristine
+            # original text (captured before optimization) and the optimized text,
+            # and emitted as bounded SCALAR headers so they survive even when the
+            # full optimized prompt exceeds the 8 KB header cap — turns 3+ used to
+            # drop to n/a because the text header was omitted. Mirrors the
+            # benchmark's text-based metrics so the per-turn faithfulness chart is
+            # populated for the whole run.
+            _opt_text_raw = _messages_to_text(optimized_messages)
+            _faith = _prompt_faithfulness(_original_prompt_text, _opt_text_raw)
+            _source_recall = _prompt_source_token_recall(_original_prompt_text, _opt_text_raw)
+            _evicted_recall = _evicted_content_recall(_original_prompt_text, _opt_text_raw)
+            if _faith is not None:
+                response_headers["X-MOEPT-Prompt-Faithfulness"] = f"{_faith:.6f}"
+            if _source_recall is not None:
+                response_headers["X-MOEPT-Source-Token-Recall"] = f"{_source_recall:.6f}"
+            if _evicted_recall is not None:
+                response_headers["X-MOEPT-Evicted-Content-Recall"] = f"{_evicted_recall:.6f}"
+            # The full optimized prompt TEXT (for backward-compatible text-based
+            # faithfulness in older benchmarks) stays bounded to 8 KB.
             _opt_text = _serialize_messages_text(optimized_messages) if _content_len <= 8000 else ""
             if _opt_text and len(_opt_text) <= 8000:
                 # HTTP headers must be latin-1-encodable. Optimized prompt text can

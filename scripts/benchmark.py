@@ -3044,6 +3044,17 @@ def _evicted_content_recall(full_prompt: str, optimized_prompt: str) -> float | 
     return round(retained / max(len(evicted_tokens), 1), 6)
 
 
+def _parse_float_header(headers: dict[str, Any], name: str) -> float | None:
+    """Read a numeric response header (case-insensitive); None if absent/invalid."""
+    raw = headers.get(name) or headers.get(name.lower())
+    if raw in (None, ""):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Long-horizon / cross-turn quality metrics (drift, contradiction, wall)
 # ---------------------------------------------------------------------------
@@ -3437,6 +3448,12 @@ class TurnMetrics:
     request_id: str = ""
     prompt_hash: str = ""
     backend_slot: int | None = None
+    # Proxy-side faithfulness scalars (X-MOEPT-Prompt-Faithfulness etc., #7):
+    # bounded headers that survive the 8 KB optimized-prompt-text cap, so
+    # faithfulness stays available for large contexts where the text is omitted.
+    prompt_faithfulness_header: float | None = None
+    source_token_recall_header: float | None = None
+    evicted_content_recall_header: float | None = None
 
 
 @dataclass
@@ -4427,6 +4444,11 @@ def _collect_proxy_conversation(
             # Header value has newlines escaped as literal "\n"; restore them.
             if _p_optimized_text:
                 _p_optimized_text = _p_optimized_text.replace("\\n", "\n")
+            # Proxy-side faithfulness scalars (#7): bounded headers that survive the
+            # 8 KB optimized-prompt-text cap (turns 3+ otherwise drop to n/a).
+            _p_faithfulness_hdr = _parse_float_header(p_headers, "X-MOEPT-Prompt-Faithfulness")
+            _p_source_recall_hdr = _parse_float_header(p_headers, "X-MOEPT-Source-Token-Recall")
+            _p_evicted_recall_hdr = _parse_float_header(p_headers, "X-MOEPT-Evicted-Content-Recall")
             _p_prompt, _p_prompt_source, _p_cached_response = _resolve_prompt_tokens(
                 _p_prompt_raw,
                 messages,
@@ -4475,6 +4497,9 @@ def _collect_proxy_conversation(
                 finish_reason=p_finish_reason,
                 content_preview=p_content[:200],
                 chars_before_optimization=_chars_before,
+                prompt_faithfulness_header=_p_faithfulness_hdr,
+                source_token_recall_header=_p_source_recall_hdr,
+                evicted_content_recall_header=_p_evicted_recall_hdr,
             )
 
             # Check for leaked internal markers
@@ -4539,6 +4564,16 @@ def _build_turn_comparisons(
         quality: dict[str, float | None] = {}
         if d_content and p_content:
             quality.update(_compute_quality_metrics(d_content, p_content, proxy.full_prompt_text, proxy.optimized_prompt_text))
+            # Prefer the proxy-side faithfulness scalars when the text-based metrics
+            # are None — i.e. the optimized-prompt text was capped at 8 KB and could
+            # not be shipped (#7). Keeps the per-turn faithfulness chart populated
+            # for large contexts (turns 3+) instead of dropping to n/a.
+            if quality.get("prompt_faithfulness") is None and proxy.prompt_faithfulness_header is not None:
+                quality["prompt_faithfulness"] = proxy.prompt_faithfulness_header
+            if quality.get("prompt_source_token_recall") is None and proxy.source_token_recall_header is not None:
+                quality["prompt_source_token_recall"] = proxy.source_token_recall_header
+            if quality.get("evicted_content_recall") is None and proxy.evicted_content_recall_header is not None:
+                quality["evicted_content_recall"] = proxy.evicted_content_recall_header
 
         comparison = TurnComparison(
             turn_index=direct.turn_index,
