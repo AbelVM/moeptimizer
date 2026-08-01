@@ -2,6 +2,7 @@
 
 Version-by-version feature history for MOE-ptimizer.
 
+
 ## Feature History
 
 ### First version (v0.1.0)
@@ -1180,4 +1181,46 @@ latency gains end-to-end (the earlier 16-turn numbers were misleading — the
 residual turns-13-30 breaks were this budget/keep-window bug, not external slot
 contention).
 
+### v0.7.27 — Observability, cache diagnostics, and benchmark hardening (2026-08-01)
 
+- **Benchmark backend logs.** `scripts/benchmark.py` discovers Lemonade's optional
+  WebSocket log stream from `/v1/health`, captures bounded sequence-deduplicated
+  events without making log support a benchmark requirement, and adds capture
+  status, sequence range, drop counts, and per-round events to the JSON report.
+- **Dashboard visibility.** `benchmark_dashboard.html` shows backend log
+  availability and a bounded synchronized event table while remaining compatible
+  with older reports that have no backend log data.
+- **Tests.** Added regression coverage for health discovery and bounded event
+  collection. Full suite: **519 passed, 2 skipped**.
+- **Derived performance metrics.** Benchmark reports now include paired direct
+  and proxy fresh-prefill tokens, cache-reuse ratios, prompt/completion tokens,
+  and approximate decode throughput when TTFT is available.
+- **Backend profile.** Reports capture selected static Lemonade health settings
+  such as context window, cache configuration, model, and draft configuration.
+- **Dependency floors.** Updated runtime, development, optional, and build
+  dependencies to the latest stable releases compatible with Python 3.11.
+- **Dashboard charts.** Added direct/proxy comparison charts and a backend
+  configuration snapshot without requiring backend instrumentation.
+- **Bounded request diagnostics.** Replaced prompt-sized diagnostic headers with
+  bounded scalar headers, request ids, capped prompt diagnostics, and the
+  `/v1/debug/requests` trace endpoint. Traces retain prompt/cache/fresh-prefill
+  counts, TTFT, latency, prompt hashes, and backend slots without exposing prompt
+  contents by default.
+- **Benchmark request fingerprints.** Proxy `TurnMetrics` now records request ids,
+  prompt hashes, and backend slots for per-turn correlation with debug traces.
+- **Optional MTP telemetry.** Request traces and aggregate metrics preserve backend
+  accepted/draft/fallback/decode fields when Lemonade provides them; absent backend
+  fields remain unavailable rather than being inferred.
+- **Monotonic context transforms.** Tool output normalization runs before first
+  backend emission, and code slicing is query-aware, idempotent, fail-open, and
+  config-gated pending quality benchmarks.
+- **Reversible handles.** Content-addressed tool-output handles support bounded
+  `expand_content(handle)` continuation in streaming and non-streaming paths, with
+  eviction, missing-handle, repeated-expansion, and session-isolation coverage.
+- **Quality and replay gates.** Added local multi-file replay checks for required
+  files, constraints, syntax, fixture tests, CLI smoke tests, and worst-case quality
+  metrics; the dashboard now exposes bounded per-turn prompt fingerprints and
+  fresh-prefill diagnostics.
+- **Release status.** Proxy-owned review work is implemented and validated. Release
+  remains held pending Lemonade-authoritative cache/slot events, authoritative MTP
+  throughput fields, repeated cold/warm backend rounds, and live task-success evidence.

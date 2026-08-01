@@ -8,7 +8,7 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 
 MOE-ptimizer is a transparent OpenAI API proxy that optimizes context for MoE + MTP models in multi-turn agentic tasks — large token savings with byte-stable prefixes so the backend's native prefix cache is reused.
 
-The full version-by-version feature history (v0.1.0 → v0.5.4, plus the review03.md §10 UX/operability fixes) lives in [CHANGELOG.md](CHANGELOG.md).
+The full version-by-version feature history through v0.7.27 lives in [CHANGELOG.md](CHANGELOG.md).
 
 
 ## Architecture
@@ -113,7 +113,7 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_AGENTIC__ROLLING_SUMMARY_BUDGET_FRACTION` | `0.25` | Fraction of the dynamic context budget used as the SATURATING ceiling for the adaptive rolling-summary cap. The summary cap grows with the number of folded turns up to this ceiling, so a long session keeps a denser summary than a short one without ever eating into the verbatim recent window. 0.25 of a ~15.7K budget ≈ 3.9K tokens. |
 | `MOEPT_AGENTIC__TOOL_OUTPUT_COMPRESSION_BUDGET_FRACTION` | `0.10` | Fraction of the LEAN dynamic context budget (not the raw window) used as the tool/assistant output boundary-compression threshold. The optimized context is already capped at 6% of the window, so this stays tiny even on huge windows — the proxy keeps the context lean. `MOEPT_AGENTIC__TOOL_OUTPUT_COMPRESSION_MAX_CHARS` is the hard floor (chars). |
 | `MOEPT_AGENTIC__USER_PASTE_COMPRESSION_BUDGET_FRACTION` | `0.10` | Fraction of the lean dynamic budget used as the large user-code-paste compression threshold. `MOEPT_AGENTIC__USER_PASTE_COMPRESSION_MAX_CHARS` is the hard floor (chars). |
-| `MOEPT_AGENTIC__REVERSIBLE_COMPRESSION_ENABLED` | `false` | **Reversible compression** (review §4.1.2 / Forward plan B1). When a tool output is compressed, keep the original in a per-session content-addressed store and embed its handle in the placeholder, so it is retrievable (`GET /v1/agent/sessions/{id}/content/{handle}`) instead of lost forever. OFF by default: the model-facing `expand(id)` retrieval tool is not yet wired into the protocol. |
+| `MOEPT_AGENTIC__REVERSIBLE_COMPRESSION_ENABLED` | `false` | **Reversible compression** (review §4.1.2 / Forward plan B1). When a tool output is compressed, keep the original in a per-session content-addressed store and embed its handle in the placeholder; the model-facing `expand_content(handle)` continuation can retrieve it in streaming and non-streaming flows. OFF by default pending backend-validated retrieval benchmarks. |
 | `MOEPT_AGENTIC__REVERSIBLE_COMPRESSION_MIN_CHARS` | `2000` | Only store originals for compression of tool outputs at least this many chars (smaller outputs are not worth a retrieval handle). |
 | `MOEPT_AGENTIC__TOOL_OUTPUT_DEDUP_ENABLED` | `false` | **Whole-file tool-output dedup** (review §4.1.3/§4.5.2 / Forward plan B2). Keep the FIRST occurrence of a repeated tool output (e.g. a file read) full and collapse later identical occurrences to a handle reference (original retained in the per-session content store). Stateless + idempotent ⇒ cache-stable. OFF by default: it rewrites context and should be benchmarked before enabling. |
 | `MOEPT_AGENTIC__TOOL_OUTPUT_DEDUP_MIN_CHARS` | `200` | Only dedup tool outputs at least this many chars (for smaller outputs the reference marker would outweigh the saving). |
@@ -231,6 +231,7 @@ Conversation continuity is OpenAI-compatible by default. Clients can set the sta
 | `POST` | `/v1/agent/state/reset` | Reset agent session |
 | `GET` | `/v1/agent/sessions` | List active sessions |
 | `GET` | `/v1/agent/sessions/{id}/debug` | Per-session debug snapshot: live-zone boundary, real prefix-cache outcome + token savings, embedding circuit-breaker state, and per-session metrics (review §11.6) |
+| `GET` | `/v1/debug/requests` | Bounded process-wide request traces keyed by request id, including prompt hash, backend slot, prompt/cache/fresh-prefill tokens, TTFT, and latency |
 | `DELETE` | `/v1/agent/session/{id}` | Delete a session |
 | `POST` | `/v1/cache/clear` | Clear caches |
 | `GET` | `/v1/metrics` | Proxy metrics: per-turn `cached_tokens`, `prompt_tokens`, `saved_tokens`, `latency_ms`, aggregate token savings / latency, a `backend_errors` count (turns the backend failed to serve, e.g. a truncated tool call), plus a per-session breakdown under `sessions{}` (review03.md §10) |
@@ -380,7 +381,7 @@ python scripts/benchmark.py --scenario opencode --json > benchmark_opencode_10_5
 |---|---|---|
 | `--turns` | `10` | Number of conversation turns per round. |
 | `--rounds` | `3` | Number of full conversation rounds (run ≥3 so per-round variance is observable and the regression gate can use the robust round-mean-of-means). |
-| `--max-tokens` | `1024` | Max tokens per response (realistic for agentic coding; `256` understates proxy savings). |
+| `--max-tokens` | `8192` | Max tokens per response; large agentic tool-call arguments may contain complete source files. |
 | `--port` | `8080` | Proxy server port. |
 | `--json` | off | Output the report as JSON to stdout. |
 | `--dump-responses` | off | Print direct vs proxy response pairs for quality inspection. |

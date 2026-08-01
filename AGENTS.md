@@ -15,8 +15,7 @@ prefix cache is reused.
 - Proxy listens on `:8080` (start with `bash scripts/run.sh`).
 - Backend (Lemonade) listens on `:13305` (`MOEPT_SERVER__URL`).
 - Python 3.11+, FastAPI, pydantic-settings, tree-sitter, LanceDB.
-- Current version: `0.7.26` (see `pyproject.toml`; note `__init__.__version__` may
-  lag — treat `pyproject.toml` as the source of truth).
+- Current version: `0.7.27` (see `pyproject.toml`; keep `__init__.__version__` in sync).
 
 ## Repository layout
 
@@ -131,9 +130,8 @@ the architectural constraints above.
 
 - Add user-visible changes to `CHANGELOG.md` (imperative, user-facing language;
   group as Added / Changed / Fixed / Removed). Keep `README.md` concise.
-- The version of record is `pyproject.toml` (`version = "0.7.26"`). Bump it per
-  semantic versioning on a release PR; treat `pyproject.toml` as the source of truth
-  (note `__init__.__version__` may lag).
+- The version of record is `pyproject.toml` (`version = "0.7.27"`). Bump it per
+  semantic versioning on a release PR and keep `__init__.__version__` synchronized.
 
 ### Good first tasks
 
