@@ -11,8 +11,14 @@ local, hardware-limited infrastructure. Mission: improve **TTFT and TPS** while
 **not degrading response quality**, by keeping the context as lean as possible
 **without** triggering backend KV-cache refills.
 
-**Version reviewed:** `0.7.26` (`pyproject.toml`), working tree containing the
-2026-07-30 eviction-cliff fix (unstaged).
+**Version reviewed:** `0.7.27` (`pyproject.toml`). The 0.7.27 release work
+(observability, bounded diagnostics, request fingerprints, optional MTP telemetry,
+monotonic transforms, reversible handles, replay gates, dependency floors) is
+committed; see `CHANGELOG.md` v0.7.27 and the senior review in `REVIEW_luna.md`.
+**Release status: HOLD** — proxy-owned review work is implemented and validated
+(533 passed / 2 skipped; ruff clean), pending external evidence: Lemonade-authoritative
+cache/slot events, authoritative MTP throughput fields, repeated cold/warm backend
+rounds, and live task-success evidence.
 
 ---
 
@@ -170,10 +176,24 @@ header is prepended to every chunk. `test_ast_path_actually_runs`
 non-first chunk (which the fallback never does). `slice_code_to_query` uses the same
 correct API. **Observed wart (pre-existing, now visible):** chunk 0 emits the imports
 twice — once via the header prefix and once as the file's leading top-level nodes;
-only chunk 0 is affected. Left as-is to keep the change scoped to the API fix;
-candidate for a small follow-up (skip header-kind nodes in the body loop). **Because
-this changes chunking output, it needs a benchmark round to confirm no regression in
-token savings / quality / prefix-cache reuse.**
+only chunk 0 is affected. **Since fixed (B5 ✅):** the body loop skips the header-kind
+nodes so imports appear only via the per-chunk prefix. **Because this changes chunking
+output, it needs a benchmark round to confirm no regression in token savings / quality
+/ prefix-cache reuse.**
+
+**Silent-failure guards added since (REVIEW_luna P1, both committed).** The silent
+no-op above was the worst case of a general "swallowed behind broad `except`" weakness.
+Two guards now cover the parser-lookup path: (1) `_get_cached_parser` returns `None`
+(cached) for an unavailable grammar, so chunking falls back to line chunking instead of
+raising on every block (commit `fbe3f72`, regression-tested); (2) `slice_code_to_query`
+reports a missing grammar via an out-param so the optimizer surfaces a
+`code_slicing`/`parser_unavailable` degradation in `/v1/metrics` instead of silently
+retaining the full file and implying a delta was produced (commit `a2e2bd9`,
+regression-tested). The 0.7.27 dependency floors added a `diff` grammar, so the
+```` ```diff ```` lookup failures in the validate run no longer occur; the guard covers
+any future unavailable grammar. The broader "every optional stage emits input size +
+language + failed-open-vs-changed reason codes" ask remains future work (D4 already
+provides the per-stage failure counters).
 
 **Phase 4 — god-object decomposition (started).** Extracted `BudgetGovernor`
 (`budget_governor.py`) out of the 3.3K-line `optimizer.py` (~250 lines moved): it
@@ -212,10 +232,12 @@ unless a dependency is noted.
 
 **Progress:** proxy-owned instrumentation, bounded diagnostics, first-appearance
 normalization, handle continuation, task-aware slicing, local replay quality gates,
-and benchmark fingerprint capture are implemented and tested. Backend-authoritative
-cache/MTP evidence, repeated cold/warm rounds, and live task-success evidence remain
-release gates. A2/A3 remain deferred (maintainability consolidation / window-bound
-only); B1/B2/B4 remain config-gated OFF pending backend and quality evidence.
+benchmark fingerprint capture, and the parser-lookup silent-failure guards
+(`fbe3f72`/`a2e2bd9`) are implemented and tested. **Release verdict: HOLD** (per
+`REVIEW_luna.md`) — proxy-owned work is complete; backend-authoritative cache/MTP
+evidence, repeated cold/warm rounds, and live task-success evidence remain release
+gates. A2/A3 remain deferred (maintainability consolidation / window-bound only);
+B1/B2/B4 remain config-gated OFF pending backend and quality evidence.
 
 - **Icons** show an item's *current* state (✅ done · 🟡 partial/gated · ⬜ not
   started · ❌ rejected / won't-do); the phase gate is the definition of done.
@@ -272,7 +294,7 @@ quality loss.
 | D1 | ✅ **Real TTFT + fresh-prefill telemetry** — real TTFT, `avg_fresh_prefill_tokens`, frozen-prefix/rolling-summary/live-zone breakdowns, and bounded per-request debug traces are exposed; benchmark `TurnMetrics` also retains request id, prompt hash, and backend slot. | §4.11.2 | **[M]** |
 | D2 | ✅ **cache → TTFT correlation metric** — `cache_ttft` summary section: per-turn `fresh_prefill_tokens` stats + `fresh_prefill_vs_ttft_correlation` (Pearson) (commit `64a87e0`). A dashboard *plot* of the series is the only remaining nice-to-have. | §4.12.3 | **[S]** |
 | D3 | ✅ **Quality regression-gate hardening** — gate + diff table now read lexical metrics from `secondary_quality` (they were silently zeroed by a wrong path), add `code_syntax_validity`, and flag `length_ratio` outside [0.5, 2.0] (commit `3b4cf94`). The gate already preferred the lexical battery over the weak embedder (§4.12.4 mostly pre-done). | §4.12.6, §4.12.4 | **[S]** |
-| D4 | ✅ **Make degradation visible** — cumulative per-stage failure counts are surfaced in session debug and rolled up process-wide in `/v1/metrics`; regression-tested. | §4.11.3, §4.8.5 | **[M]** |
+| D4 | ✅ **Make degradation visible** — cumulative per-stage failure counts are surfaced in session debug and rolled up process-wide in `/v1/metrics`; regression-tested. Extended with a `parser_unavailable:<lang>` reason code on the code-slicing fail-open path (commit `a2e2bd9`; REVIEW_luna P1). The remaining "input size + failed-open-vs-changed" reason fields are future work. | §4.11.3, §4.8.5 | **[M]** |
 | D5 | ✅ **Fix `print_report` faith-dict crash** — unwrap `prompt_faithfulness`/`evicted_content_recall` to the mean (commit `bba5daa`); benchmark-only. | §4.12 #10 | **[S]** |
 | D6 | ✅ **Multi-file agentic replay fixtures** — local required-file, constraint, syntax, fixture-test, CLI-smoke, and quality-gate checks are implemented and tested; live backend replay remains deferred. | §4.12.9 | **[M]** |
 
