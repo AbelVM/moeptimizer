@@ -34,6 +34,19 @@ class TestCodeChunking:
         assert "python" in LANG_MAP
         assert "javascript" in LANG_MAP
 
+    def test_unavailable_grammar_falls_back(self) -> None:
+        """An unavailable grammar returns None (cached) and chunking falls back to
+        line chunking instead of raising (review §4.5 silent-failure path)."""
+        from moeptimizer.code_chunking import _get_cached_parser
+
+        assert _get_cached_parser("not_a_real_language_xyz") is None
+        # The failure is cached, so the second lookup also returns None (no raise).
+        assert _get_cached_parser("not_a_real_language_xyz") is None
+        # Chunking an unknown-language block falls back to line chunking, no raise.
+        chunks = chunk_code_with_treesitter("line1\nline2\n" * 20, "not_a_real_language_xyz", 50)
+        assert isinstance(chunks, list)
+        assert chunks
+
     def test_ast_path_actually_runs(self) -> None:
         """Regression: the tree-sitter AST path must run, not silently fall back.
 

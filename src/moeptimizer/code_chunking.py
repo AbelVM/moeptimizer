@@ -131,12 +131,22 @@ _LANG_CACHE_MAX = 256
 
 
 def _get_cached_parser(lang_id: str) -> Any | None:
-    """Get a cached tree-sitter parser, or create and cache one."""
+    """Get a cached tree-sitter parser, or create and cache one.
+
+    Returns ``None`` when the grammar is unavailable (a fence tag the installed
+    language pack has no grammar for) so callers fall back to line chunking instead
+    of raising. The failure is cached so an unavailable grammar is looked up only
+    once, not on every block (review §4.5 silent-failure path / REVIEW_luna P1).
+    """
     if lang_id in _parser_cache:
         return _parser_cache[lang_id]
     from tree_sitter_language_pack import get_parser
 
-    parser = get_parser(lang_id)
+    try:
+        parser = get_parser(lang_id)
+    except Exception:
+        _parser_cache[lang_id] = None
+        return None
     _parser_cache[lang_id] = parser
     return parser
 
