@@ -546,6 +546,28 @@ likely higher savings / less verbosity shift); (c) validate with ≥ 3 rounds fi
 mission ("TTFT without KV-cache refills") is achieved; the open question is how much
 token-savings / verbosity the user is willing to trade for it.
 
+**Update — 0.7.27 fresh benchmark (`benchmark_opencode_30_1_0.7.27.json`, 30 turns,
+1 round): the proxy-side cliff is fixed and the residual turn-12 cliff is proven
+backend-side.** With `fold_window_fraction=0.25` shipped, the proxy now **beats direct
+on every efficiency metric**: token savings **41.05 %**, TTFT **10.8 s** mean / 8.3 s
+median vs direct 16.9 s / 19.7 s, latency 34.3 s vs 50.3 s, cache reuse **90.76 %** vs
+direct 84.98 %, fresh prefill 1,065 vs 2,194, fresh-prefill↔TTFT r = **0.9878**. No
+embedding errors (the bounded-retry fix held); the E1/E2/F1 refactors caused no
+regression (numbers improved vs the validate run across the board).
+
+The live run still shows a turn-12 cache collapse (backend `cached` 11,284 → 862, proxy
+TTFT ~75 s), **but the per-turn request fingerprints prove it is backend-side, not a
+proxy prefix break**: at turn 12 the proxy's `local_common_prefix_chars` *grew*
+(28,931 → **38,035** — append-only / byte-stable) while the backend's cache hit
+*collapsed* to 862 (frozen prefix only). The proxy prefix is stable; **Lemonade dropped
+its KV cache anyway** — likely the `--cache-reuse 256 --cache-ram 16384` / slot policy
+reacting to the 8,013 → 13,639-token append. After turn 12 the cache recovers and grows
+monotonically to 31,642 / 0.99 by turn 30. This is the backend-side KV-retention gap
+REVIEW_luna.md hypothesized ("the dry-run proves local prefix stability only, not
+backend KV retention") — **not proxy-fixable**; the next step is Lemonade-side
+investigation of the cache-reuse policy plus multi-round cold/warm runs. Full log:
+`CLIF_RESEARCH.md` ("Latest (0.7.27 live benchmark)").
+
 ---
 
 ## 0. Method — what was actually validated

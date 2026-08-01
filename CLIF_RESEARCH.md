@@ -12,6 +12,57 @@ Always stop stale proxy and clear pycache before running the dryrun or benchmark
 - Cache breaks occur when the optimized output is neither byte-identical nor append-only compared to the previous turn
 - The improved dryrun script (`scripts/diag_dryrun_opencode.py`) manages the proxy lifecycle itself and replays the opencode scenario through the proxy's dry-run endpoint. Command: `python scripts/diag_dryrun_opencode.py --persistent-session --turns 30 2>&1`
 
+## Latest (0.7.27 live benchmark): proxy-side cliff FIXED; the residual turn-12 cliff is BACKEND-SIDE (proven)
+
+### Proxy-side eviction cliff: resolved
+The every-turn front-eviction cliff documented below is fixed (A1-lite space-based folding
+`fold_window_fraction=0.25` + A4 first-appearance tool-output compression). The local prefix
+dry-run (`python scripts/diag_dryrun_opencode.py --persistent-session --turns 30 --max-breaks 0`)
+now reads **0 breaks / 30 turns** (all append-only). The proxy's serialized prefix is byte-stable.
+
+### The residual turn-12 cliff in the LIVE benchmark is backend-side — proven, not theorized
+The 0.7.27 live benchmark (`scripts/benchmark_opencode_30_1_0.7.27.json` / `.log`) still shows a
+cache cliff at turn 12: backend `cached` collapses 11,284 → 862 tokens (reuse 100% → 6.3%) and
+proxy TTFT spikes to ~75 s. BUT the per-turn request fingerprints prove this is NOT a proxy prefix
+break — it is the backend dropping its KV cache:
+
+| turn | proxy prompt tok | local common-prefix chars | backend cache hit | reuse% |
+|---|---|---|---|---|
+| 11 | 8,013 | 28,931 | 11,284 | 100% |
+| **12** | 13,639 | **38,035** (grew) | **862** (collapsed) | 6.3% |
+| 13 | 14,147 | 45,597 | 13,687 | 96.7% |
+
+`proxy_local_common_prefix_chars` is the length of the proxy's serialized prompt that is
+byte-identical to the previous turn. At turn 12 it **grew** (28,931 → 38,035) — the proxy prefix is
+append-only / byte-stable — yet the backend's cache hit **collapsed** to 862 (frozen prefix only).
+The proxy did its job; **Lemonade dropped its KV cache anyway**. After turn 12 the cache recovers
+and grows monotonically to 31,642 / 0.99 by turn 30 (a minor dip at turn 21: 18,878 / 0.78).
+
+This is a DIFFERENT phenomenon from the proxy-side eviction cliff below (which is fixed). It is the
+backend-side KV-retention gap `REVIEW_luna.md` hypothesized ("the dry-run proves local
+serialized-prefix stability only, not backend KV retention") — now proven with fingerprint data.
+Note this revises the 2026-07-24 note "the previous assumption that the cliff was caused by backend
+slot contention was incorrect": that was correct for the *proxy-side* cliff (a real code bug, now
+fixed), but the *residual live* turn-12 cliff really is backend-side.
+
+### Likely backend cause (investigate Lemonade-side — NOT proxy-fixable)
+The proxy prompt jumped 8,013 → 13,639 tokens at turn 12 (a large append). Lemonade's cache settings
+(`--cache-reuse 256 --cache-prompt --cache-ram 16384`, vulkan backend) likely re-prefilled or
+evicted/reassigned the slot when the append crossed a threshold. Next step: Lemonade-side
+investigation of the cache-reuse policy / `--cache-ram` / slot management, plus multi-round
+cold/warm benchmarks to separate this from single-round variance.
+
+### Headline 0.7.27 numbers (30 turns, 1 round) — proxy wins on every efficiency metric
+- Token savings **41.05%**; proxy TTFT **10.8 s** mean / 8.3 s median vs direct 16.9 s / 19.7 s
+  (proxy FASTER — the validate run had proxy slower at 19.15 s); latency proxy 34.3 s vs direct
+  50.3 s; cache reuse proxy **90.76%** vs direct 84.98%; fresh prefill proxy 1,065 vs direct 2,194;
+  fresh-prefill↔TTFT Pearson r = **0.9878** (strong — confirms the cache→TTFT mechanism).
+- Quality modest: ROUGE-L 0.194, Jaccard 0.189, semantic 0.136; length_ratio mean 1.58 (one
+  outlier turn at 12.0; median 0.83).
+- **No embedding errors** — the bounded-retry fix in `POST /v1/embeddings` held; clean run.
+- The E1 mixin decomposition / E2 summary-dedup / F1 fence-balancing refactors landed before this
+  run and caused **no regression** (numbers improved vs the validate run across the board).
+
 ## Current Status: EVICTION CLIFF FIXED (2026-07-30); fold-turn reuse is the remaining axis
 
 ### Result after the fix (dryrun, persistent session, 30 turns, reuse metric)
