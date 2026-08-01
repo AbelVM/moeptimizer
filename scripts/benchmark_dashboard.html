@@ -1220,8 +1220,8 @@ function renderJSONView(root,J,L,ri){
     const tpsCol=(k)=>tpsTurns.map(t=>{const v=tpsByTurn.get(t)[k];return isNum(v)?v:NaN;});
     grid.appendChild(panel('Backend throughput per turn (from backend logs)','tok/s',
       {dual:true, labels:tpsLabels, datasets:[
-        {label:'Generation TPS',color:PALETTE.proxy,type:'line',data:tpsCol('gen')},
-        {label:'Prompt-eval TPS',color:PALETTE.direct,axis:'y1',type:'line',data:tpsCol('prompt')}
+        {label:'Generation TPS',color:PALETTE.sem,type:'line',data:tpsCol('gen')},
+        {label:'Prompt-eval TPS',color:PALETTE.jaccard,axis:'y1',type:'line',data:tpsCol('prompt')}
       ], yFmt:v=>isNum(v)?v.toFixed(0):'—', yFmt1:v=>isNum(v)?v.toFixed(0):'—'},
       'Authoritative backend-measured throughput from llama.cpp print_timing log lines (proxy requests), by inference phase: generation (decode) on the left axis, prompt-processing on the right (different scale). The backend\'s "Inference completed: tps" equals the generation TPS, so it is not plotted separately. Only present when backend log capture was available.'));
   }
