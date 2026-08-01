@@ -1114,3 +1114,59 @@ class TestExpandContentTool:
         assert results is not None
         assert "no longer available" in results[0]["content"]
 
+    def test_backend_refusal_to_call_expand_content_degrades_gracefully(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REVIEW_luna P2 test matrix — backend refusal: the model is offered the
+        expand_content tool but returns plain content without calling it. The proxy
+        must return that response normally on a SINGLE backend call (the continuation
+        loop exits on the first round) — not hang, error, or loop up to
+        ``_MAX_EXPAND_ROUNDS`` waiting for an expansion that never comes."""
+        import moeptimizer.app as app_module
+        from moeptimizer.optimizer import AgentContextOptimizer
+        from moeptimizer.session_manager import SessionManager
+
+        cfg = AppConfig()
+        cfg.agentic.reversible_compression_enabled = True
+        optimizer = AgentContextOptimizer(cfg)
+        # A retained handle exists in the store, but the model declines to expand it.
+        optimizer.content_store.put("full retained tool output")
+
+        calls: list[dict[str, Any]] = []
+
+        async def fake_create(*args: Any, **kwargs: Any):
+            calls.append(kwargs)
+            # Plain content, no tool_calls: the model refuses the retrieval tool.
+            return MagicMock(model_dump=lambda: _backend_response())
+
+        fake_backend = MagicMock()
+        fake_backend.chat_completions_create = fake_create
+        monkeypatch.setattr(app_module, "LemonadeClient", lambda *a, **kw: fake_backend)
+        monkeypatch.setattr(
+            SessionManager,
+            "get_or_create",
+            classmethod(lambda cls, session_id=None: optimizer),
+        )
+
+        response = TestClient(create_app(cfg)).post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL_ID,
+                "messages": [{"role": "user", "content": "use the retained output"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "run_tests", "parameters": {}},
+                }],
+                "stream": False,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "Hello!"
+        # The model was offered expand_content (appended after the client tools)...
+        offered = [t["function"]["name"] for t in calls[0]["tools"]]
+        assert "run_tests" in offered
+        assert "expand_content" in offered
+        # ...but declined it: the continuation loop exited on the first round.
+        assert len(calls) == 1
+
