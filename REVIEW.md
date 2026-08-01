@@ -273,7 +273,7 @@ quality loss.
 | D1 | 🟡 **Real TTFT + fresh-prefill telemetry** — real TTFT done (Phase 2); `avg_fresh_prefill_tokens` (per-turn `prompt − cached`, global + per-session) added to `/v1/metrics` (commit `c43b4b6`). **Pending:** the live/frozen/summary token breakdown in the session-debug endpoint (needs the optimizer to expose zone sizes). | §4.11.2 | **[M]** |
 | D2 | ✅ **cache → TTFT correlation metric** — `cache_ttft` summary section: per-turn `fresh_prefill_tokens` stats + `fresh_prefill_vs_ttft_correlation` (Pearson) (commit `64a87e0`). A dashboard *plot* of the series is the only remaining nice-to-have. | §4.12.3 | **[S]** |
 | D3 | ✅ **Quality regression-gate hardening** — gate + diff table now read lexical metrics from `secondary_quality` (they were silently zeroed by a wrong path), add `code_syntax_validity`, and flag `length_ratio` outside [0.5, 2.0] (commit `3b4cf94`). The gate already preferred the lexical battery over the weak embedder (§4.12.4 mostly pre-done). | §4.12.6, §4.12.4 | **[S]** |
-| D4 | 🟡 **Make degradation visible** — embedding-breaker state + consistently-failing stages in `/v1/metrics` + `X-MOEPT-Optimization-Degraded`. | §4.11.3, §4.8.5 | **[M]** |
+| D4 | ✅ **Make degradation visible** — embedding-breaker state was already in the session-debug endpoint; added **cumulative per-stage failure counts** (`degradation_counts`, never resets) so a consistently-failing stage — previously invisible because the per-turn vector resets every turn — now accumulates and is surfaced in `/v1/agent/sessions/{id}/debug` + regression-tested. A process-wide roll-up into `/v1/metrics` is the only minor follow-up. | §4.11.3, §4.8.5 | **[M]** |
 | D5 | ✅ **Fix `print_report` faith-dict crash** — unwrap `prompt_faithfulness`/`evicted_content_recall` to the mean (commit `bba5daa`); benchmark-only. | §4.12 #10 | **[S]** |
 | D6 | ⬜ **Multi-file agentic replay fixtures** (real test / lint / compiler failures). | §4.12.9 | **[M]** |
 
@@ -1091,14 +1091,15 @@ measurable TTFT/TPS/quality/correctness regression; **MED** = latent risk / wast
    the opposite. **Fix:** apply the profile as *defaults* and let explicit env/field
    values win (track which fields were set explicitly), or apply the profile before
    env parsing. → Phase 1.
-5. 🟡 **MED — silently swallowed exceptions.** Almost every stage is
-   `try/except Exception → logger.warning` (`optimizer.py:1146,1175,…,1834`) and
-   uvicorn runs at `log_level="warning"`; a stage that consistently fails (e.g.
-   tree-sitter parser missing) degrades quality with no test-visible signal. The
-   `_trim_to_budget` failure (`optimizer.py:1594`) being swallowed means a
-   budget-enforcement crash can leave an over-window context the backend hard-rejects.
-   **Fix:** surface persistent degradation via the `/v1/metrics` `backend_errors`/
-   degradation counters and a test assertion. → Phase 4.
+5. ✅ **MED — silently swallowed exceptions.** Almost every stage is
+   `try/except Exception → logger.warning` and uvicorn runs at `log_level="warning"`;
+   a stage that consistently fails (e.g. tree-sitter parser missing) degraded quality
+   with no test-visible signal. **Mostly fixed (D4):** `_record_degradation` now also
+   increments a **cumulative per-stage counter** (`degradation_counts`, never resets)
+   surfaced in `/v1/agent/sessions/{id}/debug`, with a regression test — so a
+   consistently-failing stage accumulates and is visible/testable (this is exactly what
+   would have caught the silent tree-sitter API bug). **Remaining:** a process-wide
+   roll-up into `/v1/metrics` (the counts are per-session today). → Phase 4.
 6. 🟡 **MED — calibrated vs uncalibrated token-count drift in eviction.**
    `_evict_for_budget` sums per-pair `count_messages(pair)` (`optimizer.py:2532`)
    while the outer loop compares calibrated whole-list counts (`calibrated_token_count`,

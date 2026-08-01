@@ -168,6 +168,22 @@ class TestAgentContextOptimizer:
     def test_code_slicing_off_by_default(self) -> None:
         assert self.optimizer._config.agentic.code_slicing_enabled is False
 
+    def test_degradation_counts_accumulate(self) -> None:
+        """D4 (review §4.8.5): a consistently-failing stage accumulates a cumulative
+        count that persists across the per-turn reset (the per-turn vector alone
+        resets every turn, so a steady failure was previously invisible)."""
+        opt = self.optimizer
+        assert opt.degradation_counts == {}
+        opt._record_degradation("code_block_optimization", ValueError("boom"))
+        opt._record_degradation("code_block_optimization", ValueError("boom"))
+        opt._record_degradation("rag_loop_warning", RuntimeError("x"))
+        assert opt.degradation_counts == {"code_block_optimization": 2, "rag_loop_warning": 1}
+        # The per-turn vector resets, but the cumulative count persists.
+        opt._last_degradation = []
+        assert opt.degradation_counts["code_block_optimization"] == 2
+        # Surfaced in the debug snapshot.
+        assert opt.get_debug_info()["degradation_counts"]["code_block_optimization"] == 2
+
     def test_set_token_calibration_clamps_and_scales(self) -> None:
         # ratio clamped to [0.5, 2.0]
         self.optimizer.set_token_calibration(10.0)

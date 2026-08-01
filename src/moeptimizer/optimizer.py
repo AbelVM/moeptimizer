@@ -257,6 +257,13 @@ class AgentContextOptimizer:
         # it reflects only the current turn. Cheap: no allocation on the hot path
         # when no stage fails (the list stays empty and the header is omitted).
         self._last_degradation: list[str] = []
+        # Cumulative per-stage failure counts (review §4.8.5 / Forward plan D4).
+        # _last_degradation resets every turn, so a stage that fails *consistently*
+        # (e.g. a missing tree-sitter parser) left no persistent, test-visible signal
+        # — it only showed up in the per-turn header if you happened to look at the
+        # right moment. This counter never resets, so a consistently-failing stage
+        # accumulates and is surfaced in get_debug_info /v1/agent/.../debug.
+        self._degradation_counts: dict[str, int] = {}
         # Token-count calibration (review §1/§9, priority fix #6) is initialized
         # earlier in __init__ (see top) so _budget_tokens() is safe during setup.
         # It is later updated by set_token_calibration() from the backend's real
@@ -497,8 +504,18 @@ class AgentContextOptimizer:
             if str(error):
                 msg = f"{msg}:{str(error)[:200]}"
             self._last_degradation.append(msg)
+            # Cumulative per-stage count (never resets) so a consistently-failing
+            # stage is visible in get_debug_info, not just the per-turn header.
+            self._degradation_counts[stage] = self._degradation_counts.get(stage, 0) + 1
         except Exception:  # pragma: no cover - defensive
             pass
+
+    @property
+    def degradation_counts(self) -> dict[str, int]:
+        """Cumulative per-stage swallowed-failure counts since session start
+        (review §4.8.5 / D4). A stage with a high count is failing consistently
+        and silently degrading quality — the signal that was previously invisible."""
+        return dict(self._degradation_counts)
 
     def calibrate_remote_overhead(
         self, backend_prompt_tokens: int, messages: list[dict[str, Any]]
@@ -3476,6 +3493,7 @@ class AgentContextOptimizer:
             },
             "embedding_breaker": breaker_stats,
             "degradation": self.last_degradation,
+            "degradation_counts": self.degradation_counts,
             "evicted_turns": self._last_evicted_turns,
             "goal": goal.original_prompt if goal is not None else None,
             "step_count": len(self.store.steps),
