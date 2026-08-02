@@ -71,6 +71,9 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from moeptimizer.backend_capabilities import BackendCapabilityProbe
+from moeptimizer.token_counter import TokenCounter
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -83,6 +86,7 @@ MOEPT_PORT = int(os.environ.get("MOEPT_PORT", "8080"))
 
 BACKEND_LOG_EVENT_CAP = 2000
 BACKEND_LOG_CONNECT_TIMEOUT = 2.0
+_benchmark_token_counter: TokenCounter | None = None
 
 
 def _health_url_for_lemonade(url: str) -> str:
@@ -1967,6 +1971,7 @@ def _apply_profile_overrides(args: argparse.Namespace) -> None:
         "quality": {
             "MOEPT_AGENTIC__QUALITY_PROFILE": "quality",
             "MOEPT_AGENTIC__KEEP_FULL_STEPS": "6",
+            "MOEPT_V050__HIERARCHICAL_SUMMARY_MAX_FULL_TURNS": "6",
             "MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS": "24000",
             "MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS": "6000",
             "MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO": "0.7",
@@ -1978,6 +1983,7 @@ def _apply_profile_overrides(args: argparse.Namespace) -> None:
         "aggressive": {
             "MOEPT_AGENTIC__QUALITY_PROFILE": "aggressive",
             "MOEPT_AGENTIC__KEEP_FULL_STEPS": "2",
+            "MOEPT_V050__HIERARCHICAL_SUMMARY_MAX_FULL_TURNS": "2",
             "MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS": "8000",
             "MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS": "2000",
             "MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO": "0.35",
@@ -1986,9 +1992,10 @@ def _apply_profile_overrides(args: argparse.Namespace) -> None:
         "balanced": {
             "MOEPT_AGENTIC__QUALITY_PROFILE": "balanced",
             "MOEPT_AGENTIC__KEEP_FULL_STEPS": "3",
+            "MOEPT_V050__HIERARCHICAL_SUMMARY_MAX_FULL_TURNS": "3",
             "MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS": "12000",
             "MOEPT_AGENTIC__MAX_OPTIMIZED_TOKENS": "3000",
-            "MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO": "0.45",
+            "MOEPT_AGENTIC__PROACTIVE_TRIM_RATIO": "0.37",
             "MOEPT_AGENTIC__COMPACTION_TRIGGER_RATIO": "0.75",
         },
     }
@@ -2225,26 +2232,22 @@ def _serialize_messages_text(messages: list[dict]) -> str:
 
 
 def _estimate_prompt_tokens(messages: list[dict]) -> int:
-    """Estimate prompt tokens when the backend omits usage.prompt_tokens."""
-    try:
-        import tiktoken
+    """Estimate prompt tokens with the same strategy used by the proxy."""
+    global _benchmark_token_counter
+    if _benchmark_token_counter is None:
+        probe = BackendCapabilityProbe(LEMONADE_URL, MODEL_ID)
+        try:
+            import asyncio
 
-        encoder = tiktoken.get_encoding("cl100k_base")
-        total = 0
-        for msg in messages:
-            content = _message_text(msg.get("content", ""))
-            if content.strip():
-                total += len(encoder.encode(content))
-            total += 4
-        return max(total, 1)
-    except Exception:
-        total = 0
-        for msg in messages:
-            content = _message_text(msg.get("content", ""))
-            if content.strip():
-                total += max(1, len(content.strip()) // 4)
-            total += 4
-        return max(total, 1)
+            asyncio.run(probe.get(force=True))
+        except Exception:
+            pass
+        _benchmark_token_counter = TokenCounter(
+            tokenizer="auto",
+            model_name=MODEL_ID,
+            capability_probe=probe,
+        )
+    return _benchmark_token_counter.count_messages(messages)
 
 
 def _context_size_summary(messages: list[dict]) -> dict[str, int]:
@@ -5017,6 +5020,7 @@ class _Tee:
     def write(self, data: str) -> int:
         for s in self._streams:
             s.write(data)
+        self.flush()
         return len(data)
 
     def flush(self) -> None:

@@ -1,8 +1,8 @@
-"""Replay the opencode scenario through the LIVE proxy's dry-run endpoint and
-dump the optimized prompt bytes per turn, to find the byte-level divergence
-that breaks the backend prefix cache (cached=724 at turns 4 and 10 in the live
-log). Dry-run uses the real running optimizer (with real backend calibration)
-but does NOT call the backend, so it's fast and safe.
+"""Replay the opencode scenario through an owned, offline proxy dry-run endpoint.
+
+The child runs the real optimizer and HTTP proxy path, but its backend URL is
+deliberately unreachable and capability probing is disabled. This keeps the
+check focused on local prompt optimization, prefix stability, and savings.
 """
 from __future__ import annotations
 
@@ -19,13 +19,19 @@ from typing import Any
 
 import requests
 
-from benchmark import benchmark as bench
+# Running this file directly puts ``benchmark/`` first on sys.path, where
+# benchmark.py shadows the package. Keep the documented direct invocation
+# pointed at the repository package.
+_ROOT = str(Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-from moeptimizer.output_shaper import OutputShaper
+from benchmark import benchmark as bench  # noqa: E402
+from moeptimizer.output_shaper import OutputShaper  # noqa: E402
 
 SHAPER = OutputShaper(enabled=True)
 
-PROXY = "http://127.0.0.1:8080/v1/chat/completions"
+PROXY = ""
 _PROXY_PROCESS: subprocess.Popen | None = None
 
 
@@ -56,6 +62,12 @@ def _start_proxy(port: int = 8080, wait: float = 60.0) -> subprocess.Popen | Non
     print(f"  Starting moeptimizer proxy on port {port} ...")
     env = os.environ.copy()
     env["MOEPT_PORT"] = str(port)
+    # Isolation contract: the child must be able to complete with Lemonade
+    # unreachable. The endpoint still runs the real proxy optimizer and dry-run
+    # response path; it simply cannot probe or call a backend.
+    env["MOEPT_SERVER__URL"] = "http://127.0.0.1:1/api/v1"
+    env["MOEPT_V050__CAPABILITY_AUTODETECT"] = "false"
+    env["MOEPT_V050__REMOTE_TOKENIZE_ENABLED"] = "false"
 
     try:
         proc = subprocess.Popen(
@@ -203,6 +215,32 @@ def _byte_diff(prev_blob: str, cur_blob: str) -> dict[str, Any]:
     return result
 
 
+def _quality_issues(
+    raw_tokens: int | None,
+    optimized_tokens: int | None,
+    previous_raw_tokens: int | None,
+    previous_optimized_tokens: int | None,
+) -> list[str]:
+    """Flag prompt inflation and abrupt savings loss in one turn."""
+    if raw_tokens is None or optimized_tokens is None:
+        return []
+    issues: list[str] = []
+    saved = raw_tokens - optimized_tokens
+    if saved < 0:
+        issues.append("INFLATION")
+    elif raw_tokens >= 4000 and saved == 0:
+        issues.append("NO SAVINGS")
+    if previous_raw_tokens and previous_optimized_tokens:
+        previous_saved = previous_raw_tokens - previous_optimized_tokens
+        raw_growth = raw_tokens / previous_raw_tokens
+        optimized_growth = optimized_tokens / previous_optimized_tokens
+        if previous_saved >= 0 and saved < 0:
+            issues.append("SAVINGS CLIFF")
+        elif raw_growth <= 1.2 and optimized_growth >= 1.35:
+            issues.append("OPTIMIZED CLIFF")
+    return issues
+
+
 def _dump_messages(msgs: list[dict[str, Any]], label: str = "messages") -> str:
     """Return a formatted string showing role, content length, and summary markers."""
     lines = [f"  {label}:"]
@@ -224,6 +262,13 @@ def main() -> int:
         description="Replay opencode scenario through proxy dry-run to detect local prefix breaks."
     )
     parser.add_argument("--turns", type=int, default=30, help="Number of turns to replay (default: 30)")
+    parser.add_argument("--profile", type=str, default="balanced",
+                        choices=["quality", "balanced", "aggressive"],
+                        help="Benchmark context profile (default: balanced)")
+    parser.add_argument("--budget", type=int, default=None,
+                        help="Override the benchmark character budget")
+    parser.add_argument("--port", type=int, default=18080,
+                        help="Dedicated local proxy port (default: 18080)")
     parser.add_argument("--max-tokens", type=int, default=None, help="Override max_tokens per request")
     parser.add_argument("--no-stream", action="store_true", help="Disable streaming in dry-run requests")
     parser.add_argument("--unique-session", action="store_true", default=True,
@@ -255,6 +300,8 @@ def main() -> int:
                              "unreachable; set this to the expected fold-break count (plus a little "
                              "headroom) to catch regressions like the every-turn eviction cliff "
                              "(which broke ~18 turns). Default: strict (any break exits 2).")
+    parser.add_argument("--allow-quality-regressions", action="store_true",
+                        help="Report but do not fail on prompt inflation or savings cliffs.")
     parser.add_argument("--json", action="store_true", dest="json_output",
                         help="Output machine-readable JSON summary (to stdout)")
     args = parser.parse_args()
@@ -271,13 +318,20 @@ def main() -> int:
         env_stream = os.environ.get("DIAG_STREAM", "1")
         if env_stream == "0":
             stream = False
-    max_tokens = args.max_tokens or int(os.environ.get("DIAG_MAX_TOKENS", "16"))
+    max_tokens = args.max_tokens or int(os.environ.get("DIAG_MAX_TOKENS", "8192"))
+    global PROXY
+    PROXY = f"http://127.0.0.1:{args.port}/v1/chat/completions"
 
     # Clear stale bytecode and start the proxy so every run is fresh.
     _clear_pycache()
-    _start_proxy()
-    if not _proxy_is_running(8080):
-        print("  ERROR: proxy is not running on port 8080", file=sys.stderr)
+    if args.budget is not None:
+        os.environ["MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS"] = str(args.budget)
+    # Reuse the benchmark's exact profile defaults so dry-run and live runs
+    # exercise the same optimizer configuration.
+    bench._apply_profile_overrides(argparse.Namespace(profile=args.profile, budget=args.budget))
+    _start_proxy(args.port)
+    if not _proxy_is_running(args.port):
+        print(f"  ERROR: proxy is not running on port {args.port}", file=sys.stderr)
         return 1
 
     try:
@@ -296,6 +350,9 @@ def main() -> int:
         breaks: list[int] = []
         report: list[dict[str, Any]] = []
         turn_times: list[float] = []
+        quality_regressions: list[int] = []
+        previous_raw_tokens: int | None = None
+        previous_optimized_tokens: int | None = None
         dump_turns = set(args.dump_turn)
 
         for local_turn in range(args.turns):
@@ -328,6 +385,16 @@ def main() -> int:
             data = resp.json()
             opt_msgs = data.get("optimized_messages", [])
             tokens = data.get("tokens", {})
+            raw_tokens = tokens.get("original")
+            optimized_tokens = tokens.get("optimized")
+            quality_issues = _quality_issues(
+                raw_tokens,
+                optimized_tokens,
+                previous_raw_tokens,
+                previous_optimized_tokens,
+            )
+            if quality_issues:
+                quality_regressions.append(local_turn + 1)
             cache_key_prefix = data.get("cache_key_prefix", "")
             est_cache_hit = data.get("est_cache_hit", False)
 
@@ -338,8 +405,8 @@ def main() -> int:
             })
             opt_msgs = shaped["messages"]
 
-            # Capture detailed dumps for turns 11 and 12 (the cliff region).
-            if local_turn + 1 in (11, 12):
+            # Capture detailed dumps for requested turns and the default cliff pair.
+            if local_turn + 1 in dump_turns or local_turn + 1 in (11, 12):
                 with open(f"/tmp/diag_opt_t{local_turn + 1}.json", "w") as _f:
                     json.dump(opt_msgs, _f, indent=2)
                 seq = " ".join(
@@ -395,6 +462,12 @@ def main() -> int:
                 "status": status,
                 "reuse_ratio": round(reuse_ratio, 4),
                 "tokens": tokens,
+                "saved_tokens": (
+                    raw_tokens - optimized_tokens
+                    if raw_tokens is not None and optimized_tokens is not None
+                    else None
+                ),
+                "quality_issues": quality_issues,
                 "cache_key_prefix": cache_key_prefix,
                 "est_cache_hit": est_cache_hit,
                 "msg_diffs": msg_diffs,
@@ -423,6 +496,8 @@ def main() -> int:
                       f"hit={est_cache_hit} "
                       f"{status} "
                       f"({turn_elapsed * 1000:.0f}ms)")
+                if quality_issues:
+                    print(f"{prefix}  QUALITY: {', '.join(quality_issues)}")
                 if args.verbose or status != "STABLE" or (local_turn + 1) in dump_turns:
                     print(f"{prefix}  roles: {' -> '.join(_role_sequence(opt_msgs))}")
                     print(f"{prefix}  lengths: {_content_lengths(opt_msgs)}")
@@ -456,6 +531,8 @@ def main() -> int:
 
             prev_blob = blob
             prev_opt = opt_msgs
+            previous_raw_tokens = raw_tokens
+            previous_optimized_tokens = optimized_tokens
 
         # ── Summary ──────────────────────────────────────────────
         if args.json_output:
@@ -469,6 +546,7 @@ def main() -> int:
                 },
                 "turns": report,
                 "breaks": breaks,
+                "quality_regressions": quality_regressions,
                 "stats": {
                     "total_turns": args.turns,
                     "n_breaks": len(breaks),
@@ -486,6 +564,7 @@ def main() -> int:
             print("\n=== local prefix dry-run summary ===")
             print(f"  turns: {args.turns}")
             print(f"  breaks: {breaks if breaks else 'none'}")
+            print(f"  quality regressions: {quality_regressions if quality_regressions else 'none'}")
             print(f"  model: {model}")
             print(f"  session: {'unique per turn' if use_unique_session else 'persistent'}")
             print(f"  stream: {stream}")
@@ -508,15 +587,24 @@ def main() -> int:
                     },
                     "turns": report,
                     "breaks": breaks,
+                    "quality_regressions": quality_regressions,
                 }, f, indent=2, default=str)
             print(f"  report written to {out_path}")
 
         # CI gate (review §4.12.2): with --max-breaks, pass when the break count is
         # within the expected fold-break budget; otherwise require zero breaks.
         allowed = args.max_breaks if args.max_breaks is not None else 0
+        if len(breaks) > allowed:
+            print(f"  GATE FAIL: {len(breaks)} breaks > allowed {allowed}")
+            return 2
+        if quality_regressions and not args.allow_quality_regressions:
+            print(
+                f"  GATE FAIL: quality regressions on turns {quality_regressions} "
+                "(use --allow-quality-regressions to report only)"
+            )
+            return 2
         if len(breaks) <= allowed:
             return 0
-        print(f"  GATE FAIL: {len(breaks)} breaks > allowed {allowed}")
         return 2
     finally:
         _stop_proxy()

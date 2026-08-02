@@ -202,6 +202,8 @@ class AgentContextOptimizer(
             tokenizer=self._config.server.tokenizer,
             capability_probe=capability_probe,
         )
+        if self.hierarchical_summarizer is not None:
+            self.hierarchical_summarizer.set_token_counter(self.token_counter)
         self.compactor = ScratchpadCompactor(
             keep_full=self._config.agentic.keep_full_steps,
             cache_stable_mode=self._config.v050.cache_stable_mode,
@@ -431,6 +433,26 @@ class AgentContextOptimizer(
         # this, leaving the summary at the tail where its changing content
         # defeated the backend's prefix cache.
         optimized = self._stabilize_summary_position(optimized)
+        previous = self._last_optimized
+        previous_tokens = self.budget.last_optimized_token_count
+        if (
+            self._cache_stable_summary
+            and previous
+            and previous_tokens is not None
+            and self.token_counter.count_messages(optimized)
+            < previous_tokens - self._effective_shrink_cap()
+        ):
+            previous_keys = [
+                (message.get("role"), message.get("content")) for message in previous
+            ]
+            suffix_start = -1
+            for index in range(len(messages) - 1, -1, -1):
+                key = (messages[index].get("role"), messages[index].get("content"))
+                if key in previous_keys:
+                    suffix_start = index + 1
+                    break
+            if suffix_start >= 0:
+                optimized = [*previous, *messages[suffix_start:]]
         self._last_optimized = optimized
         try:
             self.budget.set_last_optimized_token_count(self.token_counter.count_messages(optimized))
@@ -1165,39 +1187,21 @@ class AgentContextOptimizer(
                 frozen_end = self.context_aligner.frozen_prefix_end(
                     optimized, self._config.v050.frozen_prefix_turns
                 )
-                # Pressure target = the compaction threshold derived from the
-                # FULL (static) budget — max_tokens here, since the growth
-                # ceiling is bypassed while the summary governs sizing. The
-                # summarizer measures pressure on its EMITTED size (frozen +
-                # summary + unfolded live turns) and folds only once it
-                # crosses this target, then down to target minus a hysteresis
-                # margin: one fold turn drops the context well under it, and
-                # the following turns are pure tail appends (fully prefix-
-                # cached) until the live zone grows back over the target.
-                # (Targeting the growth-chasing ceiling instead folded EVERY
-                # turn — its slack is one turn's growth by construction.)
-                #
-                # Space-based folding (review §4.7): when fold_window_fraction > 0
-                # the pressure target becomes a fraction of the LIVE WINDOW (not the
-                # small budget) and the turn-count DRIFT trigger is disabled, so the
-                # conversation is near append-only and folds — which break the prefix
-                # cache — fire only on real space pressure near the window.
-                fold_window_fraction = self._config.v050.fold_window_fraction
-                window = self._backend_context_window()
-                if fold_window_fraction > 0 and window and window > 0:
-                    pressure_target = int(window * fold_window_fraction)
-                    disable_drift = True
-                else:
-                    pressure_target = int(
-                        max_tokens * self._config.agentic.compaction_trigger_ratio
-                    )
-                    disable_drift = False
+                # Append-first memory keeps historical prompt bytes unchanged, so
+                # defer the rewrite until the effective hard budget is reached.
+                # Using the static budget here caused periodic low-pressure folds
+                # and expensive backend re-prefills before the context was unsafe.
+                pressure_target = max_tokens
+                # Drift folds rewrite the live-zone prefix every few turns even
+                # when the emitted prompt is well below its hard budget. In
+                # cache-stable mode, only real pressure may trigger a fold.
+                disable_drift = True
                 optimized = self.hierarchical_summarizer.summarize_turns_cache_stable(
                     optimized,
                     frozen_end,
                     pressure_target_tokens=pressure_target,
                     disable_drift=disable_drift,
-                    fold_max_growth_per_turn=self._config.v050.fold_max_growth_per_turn,
+                    minimum_emitted_tokens=self._effective_shrink_floor(),
                 )
                 current_tokens = self.token_counter.count_messages(optimized)
                 self._diag_sys("after-7-summary", optimized)
@@ -1307,7 +1311,13 @@ class AgentContextOptimizer(
                         tool_name=None,
                         metadata=last_assistant.get("metadata", {}),
                     )
-                    rag_context = self.state_rag.get_context_for_step(current_step) or ""
+                    graph_context = self.state_rag.get_context_for_step(current_step) or ""
+                    query_context = self.state_rag.get_context_for_query(
+                        current_step.content,
+                        exclude_step_id=current_step.step_id,
+                        exclude_content=current_step.content,
+                    )
+                    rag_context = query_context or graph_context
         except Exception as e:
             logger.warning("RAG/loop warning computation failed: %s", e)
             self._record_degradation("rag_loop_warning", e)
@@ -1716,6 +1726,19 @@ class AgentContextOptimizer(
         except Exception as e:
             logger.warning("Volatile context append failed: %s", e)
             self._record_degradation("volatile_context_append", e)
+
+        # Derived context must never make the proxy worse than pass-through.
+        # At fold boundaries the anchor/RAG turn can exceed the space saved by
+        # compaction; discard only that volatile turn when it causes inflation.
+        if any(m.get("_volatile_turn") for m in optimized):
+            try:
+                if (
+                    self.token_counter.count_messages(optimized)
+                    > self.token_counter.count_messages(messages)
+                ):
+                    optimized = [m for m in optimized if not m.get("_volatile_turn")]
+            except Exception as e:
+                logger.debug("Volatile inflation guard failed: %s", e)
 
         # Record the final optimized prompt (with the trailing volatile turn) so
         # the app layer's cache-outcome and token-calibration signals match what
@@ -2425,13 +2448,7 @@ class AgentContextOptimizer(
     def _stabilize_summary_position(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Move any rolling-summary blocks to the stable-prefix boundary.
-
-        The summary must sit immediately after ``system_anchor`` so its position
-        in the serialized prompt is fixed across turns.  Without this, the
-        summary drifts to the tail as new turns are appended and the leading
-        bytes change on every turn, defeating the backend's prefix cache.
-        """
+        """Move any rolling-summary blocks to the stable-prefix boundary."""
         layout = self._partition_for_budget(messages)
         system_anchor = layout.system_anchor
         evictable_body = layout.evictable_body
@@ -2448,7 +2465,7 @@ class AgentContextOptimizer(
         shrink_floor: int | None = None,
     ) -> list[dict[str, Any]]:
         """Proactively trim context while preserving complete recent turns.
-        it becomes a problem. This method evicts complete user-assistant turns
+        This method evicts complete user-assistant turns
         from the front of the evictable body instead of dropping the newest
         dynamic message when it cannot fit. That prevents the optimizer from
         collapsing long conversations down to only the static system/first-user

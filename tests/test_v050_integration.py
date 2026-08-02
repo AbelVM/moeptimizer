@@ -427,12 +427,10 @@ class TestV050Integration:
         self.config.agentic.proactive_trim_ratio = 0.01
         self.config.agentic.code_skeleton_enabled = False
         self.config.v050.hierarchical_summary_max_full_turns = 5
-        # The summarizer is a process-wide singleton whose keep window and fold
-        # margin are fixed at first construction — another test file may have
-        # constructed it with a different config (e.g. max_full_turns=8), which
-        # would stop the batch fold from firing here. Pin both deterministically
-        # so the fold trigger (live > keep + margin) is test-controlled.
-        _summarizer = get_hierarchical_summarizer()
+        # Pin the optimizer's summarizer so the fold trigger (live > keep +
+        # margin) is deterministic regardless of its configured defaults.
+        _summarizer = self.optimizer.hierarchical_summarizer
+        assert _summarizer is not None
         _summarizer._max_full_turns = 5
         _summarizer._fold_margin = 5
 

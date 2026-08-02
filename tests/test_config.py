@@ -71,7 +71,7 @@ class TestQualityProfile:
         # front-evict the live zone every turn, breaking backend prefix-cache
         # reuse (the turn-12 cliff). 6 keep turns + summary fit the 12000 budget.
         assert config.agentic.keep_full_steps == 6
-        assert config.agentic.max_optimized_tokens == 12000
+        assert config.agentic.max_optimized_tokens == 100000
         # Re-tuned (review P0.1): balanced no longer skeletonizes all code.
         assert config.agentic.code_skeleton_enabled is False
 
@@ -99,7 +99,7 @@ class TestQualityProfile:
         config.agentic.quality_profile = "bogus"
         apply_quality_profile(config)
         assert config.agentic.quality_profile == "balanced"
-        assert config.agentic.max_optimized_tokens == 12000
+        assert config.agentic.max_optimized_tokens == 100000
 
     def test_explicit_env_wins_over_profile(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Review §4.8.4: an explicitly-set field is NOT clobbered by the profile."""

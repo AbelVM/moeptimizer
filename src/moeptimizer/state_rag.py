@@ -134,6 +134,54 @@ class StateBasedRAG:
 
         return "\n".join(lines)
 
+    def get_context_for_query(
+        self,
+        query: str,
+        *,
+        exclude_step_id: str | None = None,
+        exclude_content: str | None = None,
+        max_results: int = 6,
+        max_chars: int = 2400,
+    ) -> str:
+        """Retrieve bounded session memory without rewriting conversation history.
+
+        Records stay in the per-session store; only this compact projection is
+        appended to the current prompt tail. Tokenization is deliberately local
+        and deterministic so retrieval remains available when embeddings are down.
+        """
+        query_terms = set(re.findall(r"[a-zA-Z0-9_]{3,}", query.lower()))
+        candidates = [
+            step for step in self.store.steps
+            if (
+                step.step_id != exclude_step_id
+                and step.content.strip()
+                and step.content != exclude_content
+            )
+        ]
+        if not candidates:
+            return ""
+
+        def score(step: AgentStep) -> tuple[int, int]:
+            terms = set(re.findall(r"[a-zA-Z0-9_]{3,}", step.content.lower()))
+            overlap = len(query_terms & terms)
+            return overlap, step.step_index
+
+        ranked = sorted(candidates, key=score, reverse=True)
+        selected = [step for step in ranked if score(step)[0] > 0][:max_results]
+        if not selected:
+            selected = candidates[-max_results:]
+
+        lines: list[str] = []
+        used = 0
+        for step in sorted(selected, key=lambda item: item.step_index):
+            content = _strip_reasoning(step.outcome_summary or step.content).strip()
+            line = f"step {step.step_index}: {step.role} - {content[:400]}"
+            if used + len(line) + 1 > max_chars:
+                break
+            lines.append(line)
+            used += len(line) + 1
+        return "\n".join(lines)
+
     def get_dependency_context(
         self,
         file_path: str,

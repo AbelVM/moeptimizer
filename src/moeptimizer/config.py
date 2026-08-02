@@ -675,21 +675,6 @@ class V050Config(BaseModel):
                     "the context stays ~5% of a 262K window, with folds still kicking in near ~65K for "
                     "genuinely long sessions. Set 0 to restore turn-count DRIFT + budget-pressure folding.",
     )
-    fold_max_growth_per_turn: int = Field(
-        default=0,
-        description="Adaptive growth-cap fold (CLIF_RESEARCH.md 2026-08-01). When > 0, after the "
-                    "normal pressure/drift fold, the rolling summary keeps folding older turns into "
-                    "the lossy summary until the EMITTED context is within the previous turn's "
-                    "emitted size + this many tokens. Bounds the per-turn append so a verbose model "
-                    "response cannot overflow the backend's prompt-cache eviction threshold: the "
-                    "turn-12 cliff is a backend eviction triggered by a +5,626-tok single-turn "
-                    "append, while phaseA (appends < ~3K tok) never cliffs. Unlike the space-based "
-                    "pressure fold (a window fraction that never fires at low utilization), this "
-                    "fires ADAPTIVELY only when a turn would grow too fast, so it stays quiet on "
-                    "short-response trajectories (phaseA-like) and engages on verbose ones. "
-                    "Cache-safe (folds into the append-only summary). 0 = disabled (default). "
-                    "Suggested starting point ~3000-4000 (just under the observed eviction threshold).",
-    )
     persist_state_to_disk: bool = Field(
         default=False,
         description=(
@@ -845,18 +830,17 @@ QUALITY_PROFILES: dict[str, dict[str, object]] = {
         "rag_enabled": True,
         "reasoning_preseed_enabled": False,
         "code_skeleton_enabled": False,
-        "cache_stable_summary_enabled": True,
+        "cache_stable_summary_enabled": False,
         # keep_full_steps raised 6 -> 8 (review: deep-context turns 19-30 were
         # over-compressed 15-29x because the protected tail + summary floor
         # plateaued at ~2.1K tok while direct grew to 59K tok). The token budget is
         # now DYNAMIC (dynamic_budget_enabled): derived from the live backend window
-        # (budget_window_fraction=0.025) and floored by max_optimized_tokens, so on a
-        # 262K window the effective cap is ~6.5K rather than a fixed 12K. The 12000
-        # here is the floor, not the effective cap. hierarchical_summary_max_full_turns
-        # tracks keep_full_steps so the rolling summary protects the same window.
+        # (budget_window_fraction=0.025) and floored by max_optimized_tokens. The
+        # 100000 floor prevents unknown-capability paths from forcing recurring
+        # mid-history rewrites before the real backend window is known.
         "keep_full_steps": 6,
-        "max_optimized_tokens": 12000,
-        "max_optimized_chars": 48000,
+        "max_optimized_tokens": 100000,
+        "max_optimized_chars": 400000,
         "hierarchical_summary_max_full_turns": 6,
         "proactive_trim_ratio": 0.6,
         "compaction_trigger_ratio": 0.88,
