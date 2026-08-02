@@ -7,6 +7,7 @@ Version-by-version feature history for MOE-ptimizer.
 
 ### Current
 
+- **Graph and AST-Aware RAG** — Combines goal/subtask/tool/outcome graph traversal with Tree-Sitter code structure, symbol indexing, and dependency relationships for precise code-context retrieval. Bounded deterministic query retrieval remains available when embeddings are unavailable.
 - **Bounded Session Memory Retrieval** — Ranks prior per-session steps by deterministic query-term overlap and appends a bounded retrieval projection at the prompt tail, preserving historical prompt bytes while retaining structural RAG fallback.
 - **Cache-Cliff Investigation** — Confirmed that the former every-turn front-eviction cliff is fixed: non-fold turns remain append-only, while the remaining low-reuse turns are expected rolling-summary folds. A tagged live 30-turn replay (`cachefix_30turn`) recorded 49.01% prompt-token savings, 35.6% lower mean latency, and TTFT improvement from 15,517 ms to 8,238 ms. The run also reported three lost-code-block warnings, so this is positive cache/efficiency evidence, not a complete quality sign-off.
 
