@@ -113,7 +113,7 @@ pytest tests/ -v                    # tests only
 ruff check src/ tests/              # lint
 mypy src/moeptimizer/               # type-check
 python -m moeptimizer --check-config  # validate resolved config
-python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 --max-breaks 0 2>&1  # dry-run prefix-stability gate (exits non-zero on any break)
+python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 --max-breaks 7 2>&1  # expected-fold gate; fails on excess/non-fold breaks
 python benchmark/benchmark.py --scenario opencode --turns 30 --json > report.json 2> run.log
 ```
 
@@ -130,9 +130,16 @@ quality metrics did not regress (see `README.md` "Benchmarking" for the regressi
 
 If you touched prefix-reuse / context-mutation logic (anything marked ⚠ cache in
 `REVIEW.md`), also run the dry-run gate
-(`python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 --max-breaks 0`)
-and keep it at 0 breaks. Remember it proves local prefix stability only, not backend KV
-retention — a green dry-run is necessary but not sufficient.
+(`python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 --max-breaks 7`)
+The current 30-turn opencode replay permits seven known summary-fold breaks; any
+additional break or any non-fold prefix mutation fails the gate. Remember it proves
+local prefix stability only, not backend KV retention — a green dry-run is necessary
+but not sufficient.
+
+The latest tagged live replay (`cachefix_30turn`) measured 49.01% prompt-token
+savings and 35.6% lower mean latency, with TTFT improving from 15,517 ms to 8,238 ms.
+It completed without an obvious catastrophic cliff but produced three lost-code-block
+warnings; do not treat it as complete quality sign-off.
 
 ### Commit conventions
 

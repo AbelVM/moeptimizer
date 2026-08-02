@@ -270,7 +270,7 @@ un-proxified baseline. Set `MOEPT_AGENTIC__QUALITY_PROFILE` (or
 - **`quality`** — no middle-history mutation; only lossless boundary compression
   of oversized tool/assistant output. Maximizes similarity to the direct
   baseline (highest token cost).
-- **`balanced`** (default) — the preset applied at app-build time: 12000-token / 48000-char cap, keep 8 full steps, RAG + cache-stable summary on, code skeletonization off. This is the effective default (the base `AgenticConfig` field defaults are overridden by this profile).
+- **`balanced`** (default) — the preset applied at app-build time: 100000-token / 400000-char fallback cap, keep 6 full steps, RAG + append-only session memory on, code skeletonization off. The live backend window still determines the effective dynamic budget when capability probing succeeds.
 - **`aggressive`** — lower token cap, earlier compaction, more top-only
   eviction. Maximum token savings (lowest fidelity).
 
@@ -326,8 +326,16 @@ and the local prefix-cache cliff gate are:
 ```bash
 python benchmark/benchmark.py --scenario opencode --turns 30 --rounds 5 --tag baseline
 python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 \
-  --max-breaks 0
+  --max-breaks 7
 ```
+
+The dry-run gate allows the seven summary-fold breaks expected in this 30-turn
+scenario and fails on additional or non-fold breaks. It measures serialized-prefix
+reuse, not the backend's internal KV-retention policy. The latest tagged live replay
+(`cachefix_30turn`, one round) reported 49.01% prompt-token savings, 35.6% lower mean
+latency, and TTFT improvement from 15,517 ms to 8,238 ms. It also reported three
+lost-code-block warnings, so the result is positive efficiency/cache evidence rather
+than complete quality sign-off.
 
 This writes auto-named files to `benchmark/results/` by default:
 `{timestamp}_{scenario}_{rounds}_{turns}_{tag}.json` and the matching `.log`.

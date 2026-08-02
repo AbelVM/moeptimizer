@@ -5,6 +5,11 @@ Version-by-version feature history for MOE-ptimizer.
 
 ## Feature History
 
+### Current
+
+- **Bounded Session Memory Retrieval** — Ranks prior per-session steps by deterministic query-term overlap and appends a bounded retrieval projection at the prompt tail, preserving historical prompt bytes while retaining structural RAG fallback.
+- **Cache-Cliff Investigation** — Confirmed that the former every-turn front-eviction cliff is fixed: non-fold turns remain append-only, while the remaining low-reuse turns are expected rolling-summary folds. A tagged live 30-turn replay (`cachefix_30turn`) recorded 49.01% prompt-token savings, 35.6% lower mean latency, and TTFT improvement from 15,517 ms to 8,238 ms. The run also reported three lost-code-block warnings, so this is positive cache/efficiency evidence, not a complete quality sign-off.
+
 ### First version (v0.1.0)
 
 - **Scratchpad Compaction** — Front-Loading Eviction for MTP head protection.
