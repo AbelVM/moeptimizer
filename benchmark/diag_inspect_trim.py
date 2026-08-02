@@ -1,18 +1,13 @@
 """Inspect message list before token_aware_truncator at turn 16."""
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 from contextlib import suppress
+
+from benchmark import benchmark as bench
+
 from moeptimizer import ROLLING_SUMMARY_MARKER
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer
-
-import benchmark as bench  # noqa: E402
 
 
 class _FakeCaps:

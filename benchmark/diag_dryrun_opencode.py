@@ -17,8 +17,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import benchmark as bench
 import requests
+
+from benchmark import benchmark as bench
 
 from moeptimizer.output_shaper import OutputShaper
 

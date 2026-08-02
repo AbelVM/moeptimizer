@@ -12,7 +12,214 @@ Always stop stale proxy and clear pycache before running the dryrun or benchmark
 - Cache breaks occur when the optimized output is neither byte-identical nor append-only compared to the previous turn
 - The improved dryrun script (`scripts/diag_dryrun_opencode.py`) manages the proxy lifecycle itself and replays the opencode scenario through the proxy's dry-run endpoint. Command: `python scripts/diag_dryrun_opencode.py --persistent-session --turns 30 2>&1`
 
-## Latest (0.7.27 live benchmark): proxy-side cliff FIXED; the residual turn-12 cliff is BACKEND-SIDE (proven)
+## Latest (2026-08-01, backend-log analysis): the turn-12 cliff is a PROMPT-CACHE RAM EVICTION — proxy-MITIGABLE, not purely backend-side
+
+The 0.7.27 benchmark JSON embeds the Lemonade backend logs (`backend_logs.events`, 1310
+events). Reading them **directly identifies the cliff mechanism** and revises the prior
+"backend-side, NOT proxy-fixable" conclusion below (which was correct that the *proxy prefix
+did not break*, but wrong that nothing proxy-side can help).
+
+### Mechanism, from the backend's own log lines
+
+Per-turn new-prefill cost (backend `prompt eval time = X ms / N tokens`; the slot stays
+`id 0` for the whole run — this is **not** slot contention or context-shift):
+
+| turn | new tokens prefilled | prefill time | backend event |
+|---|---|---|---|
+| stable (T10, T11, T13, T15-20, T22-30) | 321-1,607 | 2-13 s | slot KV retained; `n_tokens` grows monotonically 1,431 → 32,434 |
+| **T12 (cliff)** | **13,055** | **74.9 s** | `W srv alloc: making room for prompt cache entry, removing oldest entry (size = 457.788 MiB)` (×2: 127.8 + 457.8 MiB) |
+| T14 | 3,315 | 16.4 s | elevated partial re-prefill, **no** eviction warning |
+| **T21 (dip)** | **5,892** | **33.6 s** | prompt processing starts at progress **0.84** (vs 0.98 on stable turns) — tail ~16% re-prefilled, **no** eviction warning |
+
+- **Turn 12 = prompt-cache RAM LRU eviction.** The folded prompt's KV entry (~458 MiB) did not
+  fit in the bounded prompt cache (`--cache-ram`), so the backend evicted the oldest cached
+  entry ("removing oldest entry, size = 457.788 MiB") and re-prefilled all 13,055 tokens from
+  scratch (74.9 s). Only the frozen prefix (862 tok) survived. This is the literal log line
+  backing the hypothesis the prior section only inferred.
+- **Turn 21 = fold-turn partial re-prefill (no eviction).** The backend reused the first ~84%
+  of the cached prefix and re-prefilled the tail 5,892 tokens (33.6 s) — the rolling-summary
+  regrowth shifted the live zone, so KV is reused only up to the summary boundary. Milder than
+  T12 (78% reuse vs 6%); recovers at T22 (progress 0.98, 1,388 new tokens).
+
+### The cliff is systematic across runs — and trajectory-dependent
+
+Parsing every former log for true backend cache loss (absolute `cached` dropping vs the prior
+turn) shows the collapse **always lands on ~862-882 tokens = the frozen-prefix size**:
+
+| run | cache-collapse turns (cached → frozen prefix) |
+|---|---|
+| 0.7.26_fix | T14, T17, T20, T22, T25, T28 → 882 (every-turn-eviction era) |
+| 0.7.26_fix2 | T13, T16, T21, T25, T27 → 864 |
+| chunkfix | T13, T15, T18, T21, T29 → 863 |
+| validate | T12, T16 → 862; T14, T21 partial |
+| 0.7.27 | T12 → 862; T21 partial |
+| **phaseA** | **(none) — zero collapses, zero large prefills in 30 turns** |
+
+`phaseA`/`chunkfix` ran with `MOEPT vars: 0` and the `balanced` profile — the **same default
+config** as 0.7.27. The difference is the conversation **trajectory**: phaseA's context reached
+only ~7.8K tokens at T13, while 0.7.27 reached 13.6K. The cliff fires when the first fold
+produces a prompt whose KV entry overflows the prompt-cache RAM headroom; phaseA stayed under
+the threshold, 0.7.27 crossed it. So the cliff is **not** a once-in-a-blue-moon event — any
+trajectory that grows fast enough cliffs at the first fold — but it is **avoidable by keeping
+the per-turn prompt growth small**.
+
+### Revised conclusion: proxy-MITIGABLE (two levers)
+
+The eviction decision is the backend's, but it is **triggered by the proxy's large fold append**
+(+5,626 tokens at T12 → a ~458 MiB KV entry that did not fit). phaseA is the existence proof:
+modest appends never evict. Two levers:
+
+1. **Proxy-side:** keep the per-turn optimized-prompt growth small/smooth around the first fold
+   so no single append overflows the prompt-cache RAM headroom (the "fold rarely / fold
+   gradually" direction the adaptive budget points to). This is what the prototype below tests.
+2. **Backend-side:** raise `--cache-ram` (so the ~458 MiB entry fits without eviction) or tune
+   the prompt-cache LRU. Lemonade config, not proxy code.
+
+This does **not** contradict "the proxy prefix stayed append-only" (it did — the fingerprint
+table below still holds). It refines it: a byte-stable prefix is necessary but not sufficient;
+the prompt's *size trajectory* must also stay within the backend's prompt-cache RAM, or the
+backend evicts the very entry the stable prefix would have reused.
+
+### Prototype tested (2026-08-01): gradual-first-fold via a fold-growth guardrail — NEGATIVE
+
+Prototyped a config-gated guardrail (`fold_max_growth_per_turn`, default off): after the batch
+fold, keep folding older turns into the append-only summary until the EMITTED context is within
+`prev_turn_emitted + cap`, bounding the first-fold rebound. **Result: negative — reverted.**
+
+- **Folding conserves content.** It moves turns from the live zone INTO the rolling summary,
+  with lossy compression capped by the summary budget. Measured directly: for large turns the
+  emitted size is *identical* guarded vs unguarded (12,194 tok both ways) — folding down to the
+  keep floor produced **zero** size reduction. For small turns folding can even *increase* the
+  emitted size (the extracted summary is barely smaller than the original).
+- **The approach targets the wrong tokens.** The turn-12 rebound (+5,626 tok) is a large NEW
+  turn entering the verbatim **keep window** (fresh tool-output content). Folding only sheds
+  OLDER turns; the keep window is verbatim by design and is exactly what folding cannot touch.
+  So no amount of gradual folding bounds the append that overflows the prompt-cache RAM.
+
+**Correct lever (not yet implemented):** shrink the large turn BEFORE it enters the keep window
+— i.e. fresh-turn **tool-output compression** (the A4 stage) aggressive enough that the prompt's
+KV entry fits the prompt-cache RAM headroom. phaseA stayed under the threshold because its
+per-turn content was smaller, not because it folded. The complementary backend-side lever is
+raising `--cache-ram`. A follow-up prototype should measure the A4 compression ratio on the
+turn-12 tool outputs specifically, not the fold geometry.
+
+### `--cache-ram`=16384 (16 GiB) is NOT the lever — the cache is not full (2026-08-01)
+
+Measured `--cache-ram` is **16384 MiB = 16 GiB**. Scanning the backend logs for ALL prompt-cache
+evictions ("making room for prompt cache entry, removing oldest entry") across the whole
+benchmark finds only **3 events**:
+
+- proxy **T12**: removed 127.8 MiB + 457.8 MiB (the cliff)
+- **direct T1**: removed 736.2 MiB (the direct conversation starting, clearing proxy leftovers)
+- **proxy T13-T30: ZERO evictions** — even though those prompts grow to **31,984 tok**, larger
+  than T12's 13,639.
+
+So the cache is **not chronically full**: 16 GiB easily holds the larger T13-T30 prompts without
+evicting. The T12 eviction is therefore **not global RAM pressure**, and **raising `--cache-ram`
+will NOT fix the cliff** (this revises the backend-side lever above). The eviction is specific to
+the first fold: it removed T11's 457.8 MiB KV, and T12 reused only **862 tokens despite a
+38,035-char (≈9,500-tok) append-only common prefix** with T11 — the fold perturbed the backend's
+prefix-chain continuity, forcing a fresh entry + full 13K re-prefill. T13+ extend the settled
+chain, reuse ~97%, and never evict.
+
+**RESOLVED (2026-08-01 dry-run experiment): space-based folding engages; the cliff is a
+large-append-triggered backend eviction, not a fold.** A 40-turn dry-run
+(`diag_dryrun_opencode.py --persistent-session --turns 40`) grew the optimized context to
+**13,954 tok — past the ~13.8K budget-pressure threshold — with ZERO folds** (all APPEND-ONLY,
+no `[S]` summary block, 0 breaks). If the window probe had failed and budget-pressure folding
+(~13.8K target) were active, a fold would have fired near T28-T30 when the context crossed
+13.8K; it did not. So **space-based folding IS engaged** (probe works, ~65K target), and the
+live turn-12 event (at 13.6K) is **not** the rolling-summary fold — hypothesis (a) probe-timing
+and the "fold" explanation are both ruled out.
+
+The distinguishing factor is the **per-turn append size**. The dry-run prompt grows smoothly
+(+206 tok at T11→T12, `max_tokens=16`), but the live benchmark's optimized prompt **jumped
++5,626 tok at T12** — a large turn's content (model response + tool outputs) entering the
+context. The proxy stays append-only either way (proven), but the live run hands the backend a
+large single-turn append, and THAT trips the backend's prompt-cache eviction (457.8 MiB dropped
+→ 862 reuse → 75 s re-prefill). T13-T30 extend the settled entry incrementally and never evict.
+This confirms the original "backend-side" framing while pinpointing the trigger: **a large
+single-turn append growing the backend's prompt-cache entry past its eviction threshold.**
+
+**Mitigation, refined — and the A4 lever is also dead (2026-08-01 fixture measurement).**
+Measured the real fixture tool outputs (`build_fixture_agentic_tasks`, used by BOTH the live
+benchmark and the dry-run): the `run_command` result is `agent_log_output(True)` = **4,998 chars
+(~1,249 tok), repeated identically every turn from T11+**; the T12 exchange is 86% this one tool
+output. BUT the dry-run's *optimized* T11/T12 messages show this log already compressed to
+**~15 chars (`[pytest result]`)** by the boundary tool-output compressor — so **A4 tool-output
+dedup would add almost nothing** (the tool outputs are already ~15 chars in the optimized
+prompt). The dry-run (same 4,998-char tool outputs, `max_tokens=16`) grows smoothly
+**+206 tok/turn**, while the live 0.7.27 run (`max_tokens=8192`) jumps **+5,626 tok at T12** —
+so the append size tracks the model's generated responses. A4 still won't help (tool outputs
+already ~15 chars), but the responses are NOT off-limits in the way the prior draft claimed.
+
+**CORRECTION (2026-08-01, phaseA_run.log): the cliff IS proxy-mitigable — it is a per-turn-append
+THRESHOLD, not a backend inevitability.** `phaseA_run.log` is a LIVE run with large model
+responses (proxy responses up to 8,227 chars) yet **no cliff**: its cache grows monotonically
+(0 → 24,254, min reuse 0.79, never collapses). Comparing per-turn appends:
+
+| run | largest append | result |
+|---|---|---|
+| phaseA T14 | **+2,936** | reuse 0.79, cached *grew* — no eviction |
+| 0.7.27 T14 | +2,437 | reuse 0.84, no eviction |
+| 0.7.27 T12 | **+5,626** | reuse 0.06, cached → 862 — **eviction** |
+
+The catastrophic eviction fires between **+2,936 and +5,626 tok/turn**. phaseA stays under it
+(shorter responses, by trajectory luck); 0.7.27 crosses it at T12. So the cliff is
+**trajectory-dependent** (driven by response length) and **proxy-mitigable**: the proxy cannot
+tune the *current* response's verbosity (forbidden), but it CAN compress *past* responses by
+folding them into the lossy rolling summary — that is the summary's whole purpose, not
+response-verbosity tuning. The fix is a **growth-cap fold**: fold the response history into the
+summary when the per-turn optimized-prompt growth would exceed the eviction threshold
+(~3,000-4,000 tok), keeping the append under it regardless of response length.
+
+**Trade-off (the original question, now precise):** such a fold re-introduces fold-turn cache
+breaks WHEN it fires, so it must be **adaptive** — fire only when the append would cross the
+threshold. phaseA proves it is unnecessary for short-response trajectories (folding there would
+only add breaks); 0.7.27 proves it IS necessary for long-response trajectories (no fold → cliff).
+"Is the folding trade-off worth it?" → **only conditionally: fold adaptively when a large append
+would trip the backend eviction, not on a fixed window fraction.** Note the earlier growth-guardrail
+prototype tested this on SMALL fixture turns (where the summary barely compresses) and wrongly
+read it as ineffective; for LARGE model responses the lossy summary compresses substantially, so
+the growth-cap fold should be re-tested against a long-response trajectory. Remaining backend-side
+lever: the prompt-cache policy for large appends (not `--cache-ram`, already 16 GiB and not full).
+
+**Live validation of the growth-cap fold (2026-08-01, `fold_max_growth_per_turn=3500`, opencode
+30 turns × 1 round) — MIXED, not a clean win.** Implemented the adaptive growth-cap fold
+(config-gated, default off; `summarize_turns_cache_stable` folds older turns into the lossy
+summary when the emitted context would grow more than the cap past the previous turn). Unit test
+confirms it bounds verbose-turn growth (+2,227 tok/turn → +29-59); dry-run confirms it is
+cache-safe when quiescent (0 breaks, small appends never trigger it). But the live run shows the
+trade-off is real:
+
+| turn | growth-cap run (cap=3500) | 0.7.27 baseline |
+|---|---|---|
+| T12 | append **+6,206**, reuse **97.2%** — **no cliff** | append +5,626, reuse **6.3%** — **cliff** |
+| T14 | append +1,620, reuse **6.2%** — **cache drop** | reuse 84% (ok) |
+| T17 | append +1,588, reuse **5.2%** — **cache drop** | reuse 95% (ok) |
+| T21 | reuse 94.6% (ok) | reuse 78% (partial dip) |
+| T27 | prompt **shrinks −5,570**, reuse **5.1%** — **cache drop** | reuse 98% (ok) |
+| T28 | prompt **shrinks −6,744** | grows to 31,984 |
+
+The cap **avoided the T12 large-append cliff** (the prompt grew +6,206 yet the cache held at
+97.2%, vs the baseline's collapse at +5,626) — but it **introduced three fold-turn cache drops**
+(T14, T17, T27, each collapsing to the 863-token frozen prefix) and **dramatic prompt shrinks**
+at T27-T28 (the cap folding aggressively). Net: it trades one cliff for three fold-turn breaks
+plus aggressive context loss. This **confirms the original trade-off**: any folding re-introduces
+fold-turn cache breaks, because folding regrows the summary and shifts the live zone. Cap 3500
+fires too often; a higher cap (e.g. 5000-6000, firing only on the largest appends) might avoid
+T12 without the T14/T17 breaks, but the fundamental tension (folding breaks the cache) remains.
+Caveat: single round, so the T12 "no cliff" may be partly trajectory luck; the T14/T17/T27 breaks
+are clearly cap-induced (small appends that nonetheless collapsed). The growth-cap code is kept
+(config-gated, default off) as a tunable lever, NOT enabled by default.
+
+---
+
+## (superseded in part) 0.7.27 live benchmark: proxy-side cliff FIXED; the residual turn-12 cliff is BACKEND-SIDE (proven)
+
+> **Note:** the "NOT proxy-fixable" framing in this section is superseded by the 2026-08-01
+> backend-log analysis above. The proxy prefix indeed did not break (correct), but the cliff is
+> still proxy-*mitigable* via smaller per-turn prompt growth.
 
 ### Proxy-side eviction cliff: resolved
 The every-turn front-eviction cliff documented below is fixed (A1-lite space-based folding

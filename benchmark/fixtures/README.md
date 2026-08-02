@@ -1,7 +1,7 @@
 # Benchmark fixtures: a real use case
 
 These files are a small but **real, runnable** Python project that the
-`scripts/benchmark.py` `fixtures` scenario replays as a 30-turn agentic-coding
+`benchmark/benchmark.py` `fixtures` scenario replays as a 30-turn agentic-coding
 session. They are the concrete "real use case" the synthetic `*_long` scenarios
 approximate: a JSONL-backed user-analytics service that grows from a single
 module into a typed, tested, packaged, dockerized service.
@@ -24,7 +24,7 @@ module into a typed, tested, packaged, dockerized service.
 
 ## How the benchmark uses them
 
-`scripts/fixtures/loader.py` discovers these files in build order and builds a
+`benchmark/fixtures/loader.py` discovers these files in build order and builds a
 cumulative multi-turn scenario: each turn pastes the **current project state**
 (all files added so far) and asks the agent to add the next real file or
 refinement. Because the pasted context genuinely grows turn-over-turn from real
@@ -34,5 +34,5 @@ they would in production.
 Run it with:
 
 ```bash
-python scripts/benchmark.py --scenario fixtures --turns 30
+python benchmark/benchmark.py --scenario fixtures --turns 30
 ```

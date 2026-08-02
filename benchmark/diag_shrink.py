@@ -1,13 +1,14 @@
 """Diagnostic: trace per-turn optimized token counts and per-stage deltas."""
 
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "src")
-sys.path.insert(0, "scripts/fixtures")
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer
-from loader import build_fixture_agentic_tasks
+from benchmark.fixtures.loader import build_fixture_agentic_tasks
 
 
 def make_opt() -> AgentContextOptimizer:

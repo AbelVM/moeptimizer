@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
@@ -134,6 +135,12 @@ class HierarchicalSummarizer:
         # context has grown a growth budget past this). None until the first
         # pressure fold; reset whenever the rolling state resets.
         self._last_fold_emitted_tokens: int | None = None
+        # Previous turn's EMITTED size, tracked every turn the pressure block
+        # runs (not just fold turns). Baseline for the adaptive growth-cap fold
+        # (fold_max_growth_per_turn): bounds the per-turn emitted growth so a
+        # large single-turn append cannot overflow the backend's prompt-cache
+        # eviction threshold (the turn-12 cliff). Reset with the rolling state.
+        self._last_emitted_tokens: int | None = None
         # REVIEW §6: pin the original request's anchor facts (the task's
         # must-remember constants: API keys, base URLs, fixed constraints) into
         # the rolling summary's leading, byte-stable section. Front-eviction
@@ -276,6 +283,7 @@ class HierarchicalSummarizer:
         frozen_prefix_end: int,
         pressure_target_tokens: int | None = None,
         disable_drift: bool = False,
+        fold_max_growth_per_turn: int = 0,
     ) -> list[dict[str, Any]]:
         """Cache-stable BATCH rolling-summary compaction (review §1/§3/§5, #7).
 
@@ -329,6 +337,7 @@ class HierarchicalSummarizer:
             self._summarized_turn_count = 0
             self._rolling_summary_texts = []
             self._last_fold_emitted_tokens = None
+            self._last_emitted_tokens = None
             return messages
 
         # Group the dynamic layer into user-led turns.
@@ -339,6 +348,7 @@ class HierarchicalSummarizer:
             self._summarized_turn_count = 0
             self._rolling_summary_texts = []
             self._last_fold_emitted_tokens = None
+            self._last_emitted_tokens = None
             return messages
 
         # Batch fold. Two triggers, both folding by appending to the rolling
@@ -417,6 +427,9 @@ class HierarchicalSummarizer:
         # as many append-only turns as the growth budget covers.
         if pressure_target_tokens is not None and live_count > keep:
             growth_budget = max(2048, pressure_target_tokens // 3)
+            # Previous turn's emitted size: baseline for the adaptive growth-cap
+            # fold below (None until the second turn the pressure block runs).
+            prev_emitted = self._last_emitted_tokens
 
             def emitted_tokens() -> int:
                 # Measure the EMITTED list with count_messages — the SAME
@@ -457,6 +470,47 @@ class HierarchicalSummarizer:
                 # the verbatim window); record the actual post-fold size so
                 # the next trigger is relative to reality, not the wish.
                 self._last_fold_emitted_tokens = emitted_tokens()
+
+            # Adaptive growth-cap fold (CLIF_RESEARCH.md 2026-08-01). Independent
+            # of the pressure trigger: even on a non-fold turn, if the EMITTED
+            # context would grow more than fold_max_growth_per_turn past the
+            # previous turn, fold older turns into the lossy rolling summary
+            # until it is back within the ceiling (or the keep floor). This
+            # bounds the per-turn append so a verbose model response cannot
+            # overflow the backend's prompt-cache eviction threshold (the
+            # turn-12 cliff: a +5,626-tok append -> eviction; phaseA proves
+            # appends under ~3K tok never evict). It can create the FIRST
+            # summary even when the space-based pressure target (a window
+            # fraction) has not fired. Cache-safe: folds into the append-only
+            # summary, never front-evicts. Default 0 = disabled.
+            if (
+                fold_max_growth_per_turn > 0
+                and prev_emitted is not None
+                and live_count > keep
+                and emitted_tokens() > prev_emitted + fold_max_growth_per_turn
+            ):
+                growth_ceiling = prev_emitted + fold_max_growth_per_turn
+                _emitted_before = emitted_tokens()
+                _n_folds = 0
+                while live_count > keep and emitted_tokens() > growth_ceiling:
+                    if not self._fold_one_turn(turns[self._summarized_turn_count]):
+                        break
+                    self._summarized_turn_count += 1
+                    live_count -= 1
+                    _n_folds += 1
+                self._last_fold_emitted_tokens = emitted_tokens()
+                if os.environ.get("MOEPT_DIAG_GROWTH_CAP"):
+                    with open("/tmp/growthcap_fires.log", "a") as _f:
+                        _f.write(json.dumps({
+                            "prev_emitted": prev_emitted,
+                            "emitted_before": _emitted_before,
+                            "growth": _emitted_before - prev_emitted,
+                            "emitted_after": emitted_tokens(),
+                            "cap": fold_max_growth_per_turn,
+                            "folds": _n_folds,
+                        }) + "\n")
+            # Track this turn's emitted size as next turn's growth baseline.
+            self._last_emitted_tokens = emitted_tokens()
 
         if not self._rolling_summary_texts:
             # Nothing folded yet: emit the messages unchanged. The block
@@ -935,6 +989,7 @@ class HierarchicalSummarizer:
         self._rolling_summary_texts = []
         self._summarized_turn_count = 0
         self._last_fold_emitted_tokens = None
+        self._last_emitted_tokens = None
 
     def save_to_disk(self, force: bool = False) -> None:
         """Persist summaries to disk."""

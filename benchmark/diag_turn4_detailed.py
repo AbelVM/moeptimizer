@@ -3,11 +3,6 @@ Traces each stage of the pipeline to find where the stable prefix changes.
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from moeptimizer import ROLLING_SUMMARY_MARKER
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer

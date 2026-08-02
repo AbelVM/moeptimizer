@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("scripts.benchmark")
+pytest.importorskip("benchmark.benchmark")
 
 
 def _args(min_similarity: float | None) -> SimpleNamespace:
@@ -14,25 +14,25 @@ def _args(min_similarity: float | None) -> SimpleNamespace:
 
 
 def test_gate_passes_when_above_threshold() -> None:
-    from scripts.benchmark import _check_similarity_gate
+    from benchmark.benchmark import _check_similarity_gate
 
     assert _check_similarity_gate(_args(0.7), 0.85) == 0
 
 
 def test_gate_fails_when_below_threshold() -> None:
-    from scripts.benchmark import _check_similarity_gate
+    from benchmark.benchmark import _check_similarity_gate
 
     assert _check_similarity_gate(_args(0.8), 0.70) == 2
 
 
 def test_gate_disabled_when_none() -> None:
-    from scripts.benchmark import _check_similarity_gate
+    from benchmark.benchmark import _check_similarity_gate
 
     assert _check_similarity_gate(_args(None), 0.0) == 0
 
 
 def test_backend_log_health_url_and_bounded_events() -> None:
-    from scripts.benchmark import BackendLogCollector, _health_url_for_lemonade
+    from benchmark.benchmark import BackendLogCollector, _health_url_for_lemonade
 
     assert _health_url_for_lemonade("http://localhost:13305/api/v1") == "http://localhost:13305/v1/health"
     collector = BackendLogCollector("http://localhost:13305/v1/health", cap=1)
@@ -49,7 +49,7 @@ def test_backend_log_health_url_and_bounded_events() -> None:
 
 
 def test_backend_log_discovery_reports_missing_optional_port(monkeypatch) -> None:
-    from scripts import benchmark as bm
+    from benchmark import benchmark as bm
 
     class Response:
         def __enter__(self):
@@ -68,7 +68,7 @@ def test_backend_log_discovery_reports_missing_optional_port(monkeypatch) -> Non
 
 
 def test_backend_log_snapshot_uses_untyped_entries_envelope() -> None:
-    from scripts.benchmark import BackendLogCollector
+    from benchmark.benchmark import BackendLogCollector
 
     collector = BackendLogCollector("http://localhost:13305/v1/health")
     snapshot = {
@@ -87,7 +87,7 @@ def test_backend_log_snapshot_uses_untyped_entries_envelope() -> None:
 
 def test_fixtures_scenario_builds_and_grows() -> None:
     """The real-use-case fixture scenario is agentic and accumulates context."""
-    from scripts.benchmark import SCENARIOS
+    from benchmark.benchmark import SCENARIOS
 
     tasks = SCENARIOS["fixtures"]["tasks"]
     assert len(tasks) == 30
@@ -127,7 +127,7 @@ def test_opencode_scenario_builds() -> None:
     """The OpenCode-harness scenario must ship full agentic tool exchanges."""
     import json
 
-    from scripts.benchmark import SCENARIOS
+    from benchmark.benchmark import SCENARIOS
 
     tasks = SCENARIOS["opencode"]["tasks"]
     assert len(tasks) == 30
@@ -166,7 +166,7 @@ def test_synthetic_agentic_exchange_fires_compression() -> None:
     """
     import json
 
-    from scripts.benchmark import _agentic_exchange
+    from benchmark.benchmark import _agentic_exchange
 
     msgs = _agentic_exchange("Refactor calculate_stats for performance.", 0)
     roles = [m["role"] for m in msgs]
@@ -197,7 +197,7 @@ def test_synthetic_agentic_exchange_fires_compression() -> None:
 
 
 def test_fixture_replay_builds_direct_proxy_quality_comparison() -> None:
-    from scripts.benchmark import TurnMetrics, _build_turn_comparisons
+    from benchmark.benchmark import TurnMetrics, _build_turn_comparisons
 
     direct = [TurnMetrics(turn_index=1)]
     proxy = [
@@ -217,7 +217,7 @@ def test_fixture_replay_builds_direct_proxy_quality_comparison() -> None:
 
 
 def test_report_aggregates_backend_mtp_metrics() -> None:
-    from scripts.benchmark import BenchmarkReport, TurnComparison
+    from benchmark.benchmark import BenchmarkReport, TurnComparison
 
     report = BenchmarkReport(
         turns=[TurnComparison(turn_index=1)],
@@ -236,7 +236,7 @@ def test_report_aggregates_backend_mtp_metrics() -> None:
 
 
 def test_report_aggregates_mtp_from_backend_logs_when_metrics_are_empty() -> None:
-    from scripts.benchmark import BenchmarkReport, TurnComparison
+    from benchmark.benchmark import BenchmarkReport, TurnComparison
 
     report = BenchmarkReport(
         turns=[TurnComparison(turn_index=1)],
@@ -258,7 +258,7 @@ def test_report_aggregates_mtp_from_backend_logs_when_metrics_are_empty() -> Non
 
 
 def test_report_aggregates_proxy_observability_metrics() -> None:
-    from scripts.benchmark import BenchmarkReport, TurnComparison
+    from benchmark.benchmark import BenchmarkReport, TurnComparison
 
     report = BenchmarkReport(
         turns=[TurnComparison(turn_index=1)],
@@ -288,7 +288,7 @@ def test_report_aggregates_proxy_observability_metrics() -> None:
 
 
 def test_report_derives_backend_independent_performance_metrics() -> None:
-    from scripts.benchmark import BenchmarkReport, TurnComparison, TurnMetrics
+    from benchmark.benchmark import BenchmarkReport, TurnComparison, TurnMetrics
 
     report = BenchmarkReport(
         turns=[TurnComparison(

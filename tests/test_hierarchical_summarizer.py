@@ -332,6 +332,73 @@ class TestHierarchicalSummarizer:
         # The summary id is stable across turns.
         assert block1["_summary_id"] == block2["_summary_id"]
 
+    def test_fold_growth_cap_bounds_per_turn_emitted_growth(self) -> None:
+        """Adaptive growth-cap fold (CLIF_RESEARCH.md 2026-08-01).
+
+        With ``fold_max_growth_per_turn > 0``, a turn whose EMITTED context would
+        grow more than the cap past the previous turn folds older turns into the
+        lossy rolling summary until it is back within the ceiling. For VERBOSE
+        turns the lossy summary compresses substantially, so the per-turn emitted
+        growth stays bounded — this keeps a large single-turn append (a verbose
+        model response) under the backend's prompt-cache eviction threshold (the
+        turn-12 cliff: a +5,626-tok append evicted; phaseA appends <~3K never did).
+        Without the cap the same turns accumulate unbounded. A fake counter
+        (1 tok/char) makes the size deterministic; the pressure target is huge and
+        drift is disabled so ONLY the growth cap can fold (mirrors space-based
+        folding at low utilization, where the pressure trigger never fires).
+        """
+
+        class _FakeCounter:
+            def count_messages(self, msgs: list[dict]) -> int:
+                return sum(len(str(m.get("content") or "")) + 4 for m in msgs)
+
+            def count_tokens_precise(self, text: str) -> int:
+                return len(text)
+
+        def conv(n: int) -> list[dict]:
+            msgs = [
+                {"role": "system", "content": "System prompt"},
+                {"role": "user", "content": "First user request"},
+                {"role": "assistant", "content": "Initial response"},
+            ]
+            for i in range(n):
+                # A verbose turn: one extractable constraint + lots of filler.
+                msgs.append(
+                    {"role": "user", "content": f"Task {i}: add feature {i}. "
+                     + "Please implement this carefully. " * 20}
+                )
+                msgs.append(
+                    {"role": "assistant", "content": f"Done {i}. Don't break the public API. "
+                     + "x" * 1500}
+                )
+            return msgs
+
+        def max_growth(cap: int) -> int:
+            s = HierarchicalSummarizer(max_full_turns=3)
+            s.set_token_counter(_FakeCounter())
+            prev: int | None = None
+            growths: list[int] = []
+            for n in range(4, 13):
+                r = s.summarize_turns_cache_stable(
+                    conv(n), frozen_prefix_end=3,
+                    pressure_target_tokens=10_000_000,  # never trips the pressure fold
+                    disable_drift=True,                  # only the growth cap may fold
+                    fold_max_growth_per_turn=cap,
+                )
+                e = _FakeCounter().count_messages(r)
+                if prev is not None:
+                    growths.append(e - prev)
+                prev = e
+            return max(growths)
+
+        cap = 400
+        unguarded = max_growth(0)
+        guarded = max_growth(cap)
+        # The scenario must overflow the cap without the guardrail...
+        assert unguarded > cap, f"scenario must overflow cap={cap}, got {unguarded}"
+        # ...and the guardrail bounds the per-turn emitted growth to the cap.
+        assert guarded <= cap, f"growth cap did not bound growth: {guarded} > {cap}"
+
     def test_rolling_summary_is_append_only_and_budget_capped(self) -> None:
         """Cache-stable summary: leading bytes never change; budget capped at append.
 

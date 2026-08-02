@@ -18,37 +18,37 @@ The proxy is auto-started if not already running on the target port (checked via
 
 Usage:
     # Run with defaults (proxy on 8080, lemonade on localhost:13305)
-    python scripts/benchmark.py
+    python benchmark/benchmark.py
 
     # Custom ports / turns / rounds
-    python scripts/benchmark.py --port 9090 --turns 20 --rounds 3
+    python benchmark/benchmark.py --port 9090 --turns 20 --rounds 3
 
     # JSON output for downstream analysis
-    python scripts/benchmark.py --json > report.json
+    python benchmark/benchmark.py --json > report.json
 
     # Dump full response pairs with all quality metrics
-    python scripts/benchmark.py --dump-responses
+    python benchmark/benchmark.py --dump-responses
 
     # Real-life coding scenarios (all agentic / OpenCode-harness by default)
-    python scripts/benchmark.py --scenario debug --turns 15
-    python scripts/benchmark.py --scenario debug_long --turns 30
-    python scripts/benchmark.py --scenario refactor_long --turns 30
-    python scripts/benchmark.py --scenario feature_long --turns 30
-    python scripts/benchmark.py --scenario default_long --turns 30
+    python benchmark/benchmark.py --scenario debug --turns 15
+    python benchmark/benchmark.py --scenario debug_long --turns 30
+    python benchmark/benchmark.py --scenario refactor_long --turns 30
+    python benchmark/benchmark.py --scenario feature_long --turns 30
+    python benchmark/benchmark.py --scenario default_long --turns 30
 
     # OpenCode-harness replay of the real fixture project (user task + tool
-    # calls + real tool outputs read from scripts/fixtures/)
-    python scripts/benchmark.py --scenario fixtures --turns 30
-    python scripts/benchmark.py --scenario opencode --turns 30
+    # calls + real tool outputs read from benchmark/fixtures/)
+    python benchmark/benchmark.py --scenario fixtures --turns 30
+    python benchmark/benchmark.py --scenario opencode --turns 30
 
     # Plain user messages instead of agent payloads
-    python scripts/benchmark.py --scenario debug_long --turns 30 --no-agentic
+    python benchmark/benchmark.py --scenario debug_long --turns 30 --no-agentic
 
     # Run all scenarios
-    python scripts/benchmark.py --scenario all --turns 10
+    python benchmark/benchmark.py --scenario all --turns 10
 
     # Stress test with large context
-    python scripts/benchmark.py --turns 50 --budget 8000
+    python benchmark/benchmark.py --turns 50 --budget 8000
 """
 
 from __future__ import annotations
@@ -1702,7 +1702,7 @@ def _build_opencode_scenario_tasks() -> list[list[dict]]:
 
     Each turn is a realistic agent payload — user task plus assistant tool_calls
     and the real tool outputs (file contents, test results) read from
-    scripts/fixtures/. The `fixtures` scenario key is an alias of this builder.
+    benchmark/fixtures/. The `fixtures` scenario key is an alias of this builder.
     """
     loader = _get_fixture_loader()
     if loader is not None:
@@ -1856,11 +1856,11 @@ SCENARIOS = {
         "tasks": [("user", task) for task in DEFAULT_LONG_TASKS],
     },
     "fixtures": {
-        "description": "OpenCode-harness replay from scripts/fixtures/ (alias of opencode: user task + tool calls + real tool outputs)",
+        "description": "OpenCode-harness replay from benchmark/fixtures/ (alias of opencode: user task + tool calls + real tool outputs)",
         "tasks": _OPENCODE_SCENARIO_TASKS,
     },
     "opencode": {
-        "description": "OpenCode-harness replay from scripts/fixtures/ (user task + tool calls + real tool outputs)",
+        "description": "OpenCode-harness replay from benchmark/fixtures/ (user task + tool calls + real tool outputs)",
         "tasks": _OPENCODE_SCENARIO_TASKS,
     },
 }
@@ -5004,7 +5004,24 @@ def _fmt_table(headers: list[str], rows: list[list[str]]) -> str:
 
 def _status(args: argparse.Namespace, *parts: object) -> None:
     """Print human status output without polluting JSON stdout."""
-    print(*parts, file=sys.stderr if getattr(args, "json_output", False) else sys.stdout)
+    to_stderr = getattr(args, "json_output", False) or getattr(args, "tag", None)
+    print(*parts, file=sys.stderr if to_stderr else sys.stdout)
+
+
+class _Tee:
+    """Fan a stream out to multiple underlying streams (console + log file)."""
+
+    def __init__(self, *streams: Any) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for s in self._streams:
+            s.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self._streams:
+            s.flush()
 
 
 def print_report(report: BenchmarkReport) -> None:
@@ -5448,6 +5465,11 @@ def run_all_scenarios(args) -> int:
         # Aggregate all reports
         aggregated = _aggregate_reports(all_reports)
 
+        with open(args._out_json, "w") as f:
+            json.dump(aggregated, f, indent=2)
+        _status(args, f"\n  Report JSON written to: {args._out_json}")
+        _status(args, f"  Progress log written to: {args._out_log}")
+
         if args.json_output:
             json.dump(aggregated, sys.stdout, indent=2)
             print()
@@ -5768,14 +5790,55 @@ def main() -> None:
              "conversations stay contiguous (full multi-turn sessions), only the "
              "transport switches to SSE. Pass this to fall back to non-streaming.",
     )
+    parser.add_argument(
+        "--tag", type=str, default=None,
+        help="Optional descriptive tag for auto-named output files. The report JSON is "
+             "written to {outdir}/{timestamp}_{scenario}_{rounds}_{turns}_{tag}.json and the "
+             "human-readable progress log to the matching .log file (in addition to "
+             "stdout/stderr). Without --tag, the tag portion is empty. "
+             "Example: --scenario opencode --rounds 1 --turns 30 --tag cap5500 "
+             "-> 20260802_013000_opencode_1_30_cap5500.json",
+    )
+    parser.add_argument(
+        "--outdir", type=str, default=None,
+        help="Directory for the auto-named output files. Default: benchmark/results/ "
+             "(resolved relative to the benchmark script, independent of the CWD).",
+    )
     args = parser.parse_args()
-
-    # Handle "all" scenario - run all individual scenarios
-    if args.scenario == "all":
-        return run_all_scenarios(args)
 
     global _HUMAN_OUTPUT_TO_STDERR
     _HUMAN_OUTPUT_TO_STDERR = args.json_output
+
+    # Auto-named outputs: write the report JSON to
+    # {outdir}/{timestamp}_{rounds}_{turns}_{tag}.json and tee the human-readable
+    # progress to the matching .log, so runs are self-naming and never clobber
+    # each other (no more manual `> report.json 2> run.log`).
+    from datetime import datetime
+    from pathlib import Path as _Path
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = f"{ts}_{args.scenario}_{args.rounds}_{args.turns}_{args.tag or ''}"
+    outdir = (
+        args.outdir if args.outdir is not None
+        else str(_Path(__file__).resolve().parent / "results")
+    )
+    os.makedirs(outdir, exist_ok=True)
+    args._out_json = os.path.join(outdir, base + ".json")
+    args._out_log = os.path.join(outdir, base + ".log")
+    args._log_fh = open(args._out_log, "w")  # noqa: SIM115  (kept open for the tee; closed in finally)
+    # Route human progress to stderr and tee it to the .log so the console
+    # still shows live progress while the file captures it all.
+    _HUMAN_OUTPUT_TO_STDERR = True
+    sys.stderr = _Tee(sys.__stderr__, args._log_fh)
+    _status(args, f"  Auto-named outputs: {args._out_json} + {args._out_log}")
+
+    # Handle "all" scenario - run all individual scenarios
+    if args.scenario == "all":
+        try:
+            return run_all_scenarios(args)
+        finally:
+            if getattr(args, "_log_fh", None):
+                sys.stderr = sys.__stderr__
+                args._log_fh.close()
 
     # Get scenario tasks
     scenario = SCENARIOS.get(args.scenario, SCENARIOS["default"])
@@ -5819,6 +5882,12 @@ def main() -> None:
                 print()
             else:
                 print_report(report)
+
+        # Auto-named report file: always written, independent of --json.
+        with open(args._out_json, "w") as f:
+            json.dump(report.summary(), f, indent=2)
+        _status(args, f"\n  Report JSON written to: {args._out_json}")
+        _status(args, f"  Progress log written to: {args._out_log}")
 
         # Regression gate (review03.md §10): fail the run if semantic
         # similarity drops below the requested threshold. Intended for CI.
@@ -5893,6 +5962,12 @@ def main() -> None:
 
     finally:
         _stop_proxy()
+        if getattr(args, "_log_fh", None):
+            try:
+                sys.stderr = sys.__stderr__
+                args._log_fh.close()
+            except Exception:
+                pass
 
 
 def _select_quality_gate(summary: dict[str, Any]) -> tuple[float, str]:

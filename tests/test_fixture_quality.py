@@ -5,11 +5,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-import benchmark as bm
+from benchmark import benchmark as bm
 
 
 def test_fixture_project_quality_gate() -> None:
-    fixture_root = Path(__file__).parents[1] / "scripts" / "fixtures"
+    fixture_root = Path(__file__).parents[1] / "benchmark" / "fixtures"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(fixture_root)
     result = subprocess.run(
@@ -51,7 +51,7 @@ def test_fixture_replay_preserves_task_contract() -> None:
 
 
 def test_fixture_cli_smoke_gate(tmp_path: Path) -> None:
-    fixture_root = Path(__file__).parents[1] / "scripts" / "fixtures"
+    fixture_root = Path(__file__).parents[1] / "benchmark" / "fixtures"
     input_path = tmp_path / "users.jsonl"
     input_path.write_text("{\"id\": 1, \"name\": \"ada\"}\n")
     env = os.environ.copy()

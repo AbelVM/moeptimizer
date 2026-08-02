@@ -30,7 +30,7 @@ CACHE_GATE_URL="${MOEPT_SERVER__URL:-http://localhost:13305/api/v1}"
 CACHE_GATE_MAX_BREAKS="${CACHE_GATE_MAX_BREAKS:-12}"
 if curl -sf -m 3 "${CACHE_GATE_URL%/}/health" >/dev/null 2>&1; then
     echo "Running cache-stability gate (dry-run, max-breaks=${CACHE_GATE_MAX_BREAKS})..."
-    python scripts/diag_dryrun_opencode.py --persistent-session --turns 30 \
+    python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 \
         --max-breaks "${CACHE_GATE_MAX_BREAKS}"
 else
     echo "Skipping cache-stability gate (no backend at ${CACHE_GATE_URL})."

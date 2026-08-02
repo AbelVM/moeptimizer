@@ -1,14 +1,8 @@
 """Diagnostic: compare actual optimized prompt text between turns via the live proxy."""
 from __future__ import annotations
 
-import sys
 import json
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import benchmark as bench
+from benchmark import benchmark as bench
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer
 

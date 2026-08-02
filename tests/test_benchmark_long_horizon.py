@@ -1,6 +1,6 @@
 """Unit tests for the long-horizon benchmark metrics.
 
-Covers the three cross-turn signals added to scripts/benchmark.py:
+Covers the three cross-turn signals added to benchmark/benchmark.py:
   - fact recall (drift): _grade_fact_recall + _inject_drift_probe
   - contradiction rate:  _count_contradictions
   - context-window wall: _context_window_wall
@@ -11,8 +11,8 @@ where explicitly mocked.
 
 from unittest import mock
 
-# scripts/ is on sys.path via tests/conftest.py
-import benchmark as bm
+# benchmark/ is importable via tests/conftest.py (repo root on sys.path)
+from benchmark import benchmark as bm
 
 # ---------------------------------------------------------------------------
 # _inject_drift_probe

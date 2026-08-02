@@ -197,7 +197,7 @@ alone.
 - **Cache stability.** Keep the system prompt and early turns byte-stable (frozen
   prefix) so the backend's native prefix cache is reused. Never mutate the middle of
   cached context; only append (incremental update) or front-evict.
-- **Benchmark integrity.** `scripts/benchmark.py` runs each round as a complete proxy
+- **Benchmark integrity.** `benchmark/benchmark.py` runs each round as a complete proxy
   conversation followed by a complete direct conversation — never interleave the two.
   Only the new benchmark format is supported (no legacy logs).
 - **No model-visible markers.** Internal cache hints (attention sinks, pattern
@@ -235,17 +235,17 @@ and compare against a baseline:
 
 ```bash
 # Baseline
-python scripts/benchmark.py --scenario opencode --turns 30 --json > before.json 2> before.log
+python benchmark/benchmark.py --scenario opencode --turns 30 --json > before.json 2> before.log
 
 # After your change
-python scripts/benchmark.py --scenario opencode --turns 30 --json > after.json 2> after.log
+python benchmark/benchmark.py --scenario opencode --turns 30 --json > after.json 2> after.log
 
 # Regression gate (fails with exit 2 if mean semantic similarity < 0.85)
-python scripts/benchmark.py --scenario all --turns 10 --min-similarity 0.85
+python benchmark/benchmark.py --scenario all --turns 10 --min-similarity 0.85
 ```
 
 Long runs may need to be launched as a background task to avoid command timeouts;
-progress is written to stderr. The report UI is `scripts/benchmark_dashboard.html`.
+  progress is written to stderr. The report UI is `benchmark/dashboard.html`.
 
 ## Reporting bugs
 

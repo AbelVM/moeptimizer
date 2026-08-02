@@ -1,6 +1,6 @@
 """Faithful replay of the opencode benchmark through the optimizer.
 
-Mirrors scripts/benchmark.py's _collect_proxy_conversation message-building
+Mirrors benchmark/benchmark.py's _collect_proxy_conversation message-building
 exactly: proxy_system_prompt (with cache-bust marker), drift probe injected
 into the first user turn, and cumulative turn_exchanges accumulation. Dumps the
 serialized optimized prompt bytes per turn and flags where the stable prefix
@@ -9,17 +9,10 @@ reuse, which the live log shows as cached=724 at turns 4 and 10).
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
+from benchmark import benchmark as bench
 from moeptimizer import ROLLING_SUMMARY_MARKER
 from moeptimizer.config import AppConfig
 from moeptimizer.optimizer import AgentContextOptimizer
-
-import benchmark as bench  # noqa: E402
 
 
 class _FakeCaps:

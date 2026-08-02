@@ -10,7 +10,7 @@ detects unfenced code, and `_code_block_preservation` now sees tool-emitted code
 
 import json
 
-import benchmark as bm
+from benchmark import benchmark as bm
 
 
 def test_tool_calls_text_surfaces_code_in_arguments():

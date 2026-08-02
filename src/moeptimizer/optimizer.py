@@ -1197,6 +1197,7 @@ class AgentContextOptimizer(
                     frozen_end,
                     pressure_target_tokens=pressure_target,
                     disable_drift=disable_drift,
+                    fold_max_growth_per_turn=self._config.v050.fold_max_growth_per_turn,
                 )
                 current_tokens = self.token_counter.count_messages(optimized)
                 self._diag_sys("after-7-summary", optimized)

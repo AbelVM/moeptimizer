@@ -2,7 +2,7 @@
 """CI benchmark regression gate for MOE-ptimizer.
 
 Compares a freshly produced benchmark JSON report (from
-``python scripts/benchmark.py --json``) against a committed baseline report and
+``python benchmark/benchmark.py --json``) against a committed baseline report and
 fails (exit code 2) when proxy quality or token savings regress beyond a
 tolerance. This is the automated quality guardrail described in REVIEW.md §11.6
 ("Benchmark regression gate in CI").
@@ -122,7 +122,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict | None:
     """Run the benchmark inline and return its parsed --json report."""
     cmd = [
         sys.executable,
-        str(Path(__file__).with_name("benchmark.py")),
+        str(Path(__file__).resolve().parents[1] / "benchmark" / "benchmark.py"),
         "--json",
         "--scenario",
         args.scenario,

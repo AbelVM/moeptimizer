@@ -675,6 +675,21 @@ class V050Config(BaseModel):
                     "the context stays ~5% of a 262K window, with folds still kicking in near ~65K for "
                     "genuinely long sessions. Set 0 to restore turn-count DRIFT + budget-pressure folding.",
     )
+    fold_max_growth_per_turn: int = Field(
+        default=0,
+        description="Adaptive growth-cap fold (CLIF_RESEARCH.md 2026-08-01). When > 0, after the "
+                    "normal pressure/drift fold, the rolling summary keeps folding older turns into "
+                    "the lossy summary until the EMITTED context is within the previous turn's "
+                    "emitted size + this many tokens. Bounds the per-turn append so a verbose model "
+                    "response cannot overflow the backend's prompt-cache eviction threshold: the "
+                    "turn-12 cliff is a backend eviction triggered by a +5,626-tok single-turn "
+                    "append, while phaseA (appends < ~3K tok) never cliffs. Unlike the space-based "
+                    "pressure fold (a window fraction that never fires at low utilization), this "
+                    "fires ADAPTIVELY only when a turn would grow too fast, so it stays quiet on "
+                    "short-response trajectories (phaseA-like) and engages on verbose ones. "
+                    "Cache-safe (folds into the append-only summary). 0 = disabled (default). "
+                    "Suggested starting point ~3000-4000 (just under the observed eviction threshold).",
+    )
     persist_state_to_disk: bool = Field(
         default=False,
         description=(

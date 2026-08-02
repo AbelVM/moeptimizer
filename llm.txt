@@ -47,11 +47,11 @@ request context on the way in and passes the response straight through.
   `tests/conftest.py`.
 - **Lint / types**: `ruff check src/ tests/`; `mypy --strict src/moeptimizer/`.
   Full suite: `bash scripts/dev.sh`.
-- **Benchmark**: `python scripts/benchmark.py` compares direct vs proxy (agentic
+- **Benchmark**: `python benchmark/benchmark.py` compares direct vs proxy (agentic
   OpenCode-harness by default). Scenarios: `debug`, `refactor`, `feature`, `default`,
   `*_long` variants, `opencode`/`fixtures`. Flags: `--turns`, `--rounds` (default 3),
   `--profile`, `--min-similarity` (regression gate, exit 2), `--json`, `--no-agentic`,
-  `--no-measure-ttft`. Report UI: `scripts/benchmark_dashboard.html`.
+  `--no-measure-ttft`. Report UI: `benchmark/dashboard.html`.
 
 ## Repository layout
 
@@ -83,9 +83,9 @@ moeptimizer/
 │   ├── run.sh              # start proxy on :8080
 │   ├── dev.sh              # install + pytest + ruff + mypy
 │   ├── benchmark.py        # direct-vs-proxy benchmark
-│   ├── benchmark_dashboard.html  # report UI
+│   ├── dashboard.html      # report UI
 │   ├── diag_dryrun_opencode.py  # local prefix-stability dry-run gate (--max-breaks)
-│   ├── benchmark_all.sh
+│   ├── all.sh
 │   └── fixtures/           # real project replayed by opencode/fixtures scenario
 ├── CHANGELOG.md            # version-by-version feature history
 ├── README.md               # concise overview + configuration reference
@@ -139,7 +139,7 @@ moeptimizer/
 
 - Proxy scope = input compaction only; never compress response verbosity.
 - Keep cached prefixes byte-stable; never mutate the middle of cached context. The
-  dry-run (`scripts/diag_dryrun_opencode.py --max-breaks`) is the local prefix-stability
+  dry-run (`benchmark/diag_dryrun_opencode.py --max-breaks`) is the local prefix-stability
   gate for cache-touching changes — but it proves LOCAL prefix stability only, not
   backend KV retention.
 - Bounded diagnostics: never put the full session state / optimized prompt in a normal
@@ -163,8 +163,8 @@ pytest tests/ -v                    # tests only
 ruff check src/ tests/              # lint
 mypy src/moeptimizer/               # type-check
 python -m moeptimizer --check-config  # validate resolved config
-python scripts/diag_dryrun_opencode.py --persistent-session --turns 30 --max-breaks 0 2>&1  # dry-run prefix-stability gate
-python scripts/benchmark.py --scenario opencode --turns 30 --json > report.json 2> run.log
+python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 --max-breaks 0 2>&1  # dry-run prefix-stability gate
+python benchmark/benchmark.py --scenario opencode --turns 30 --json > report.json 2> run.log
 ```
 
 ## Where to look for common tasks
@@ -176,8 +176,8 @@ python scripts/benchmark.py --scenario opencode --turns 30 --json > report.json 
 - **Change an endpoint**: `src/moeptimizer/app.py` (`create_app`).
 - **Change backend communication**: `src/moeptimizer/backend_client.py` /
   `backend_capabilities.py`.
-- **Change benchmark**: `scripts/benchmark.py` (keep no-legacy / no-interleave
-  invariants) and `scripts/benchmark_dashboard.html`.
+- **Change benchmark**: `benchmark/benchmark.py` (keep no-legacy / no-interleave
+  invariants) and `benchmark/dashboard.html`.
 
 ## License
 

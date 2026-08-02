@@ -320,58 +320,75 @@ file dumps) via `ToolOutputCompressor` before they enter the stable prefix, so
 the benchmark exercises that path too. Pass `--no-agentic` to fall back to plain
 user messages.
 
+Run benchmark commands from the repository root. The canonical 30-turn replay
+and the local prefix-cache cliff gate are:
+
+```bash
+python benchmark/benchmark.py --scenario opencode --turns 30 --rounds 5 --tag baseline
+python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 \
+  --max-breaks 0
+```
+
+This writes auto-named files to `benchmark/results/` by default:
+`{timestamp}_{scenario}_{rounds}_{turns}_{tag}.json` and the matching `.log`.
+`--tag` is optional; when omitted, the tag portion is an empty string. Use
+`--outdir path/to/results` to choose another target folder. Open
+`benchmark/dashboard.html` to inspect the JSON report. The benchmark requires
+Lemonade at `http://localhost:13305`; start the proxy separately with
+`bash scripts/run.sh` when it is not already running.
+
 ```bash
 # Run with defaults (proxy on 8080, lemonade on localhost:13305)
-python scripts/benchmark.py
+python benchmark/benchmark.py
 
 # Real-life coding scenarios (all agentic / OpenCode-harness by default)
-python scripts/benchmark.py --scenario debug --turns 15
-python scripts/benchmark.py --scenario debug_long --turns 30
-python scripts/benchmark.py --scenario refactor_long --turns 30
-python scripts/benchmark.py --scenario feature_long --turns 30
-python scripts/benchmark.py --scenario default_long --turns 30
-python scripts/benchmark.py --scenario feature --turns 20
+python benchmark/benchmark.py --scenario debug --turns 15 --tag debug
+python benchmark/benchmark.py --scenario debug_long --turns 30 --tag debug-long
+python benchmark/benchmark.py --scenario refactor_long --turns 30 --tag refactor-long
+python benchmark/benchmark.py --scenario feature_long --turns 30 --tag feature-long
+python benchmark/benchmark.py --scenario default_long --turns 30 --tag default-long
+python benchmark/benchmark.py --scenario feature --turns 20 --tag feature
 
 # OpenCode-harness replay of the real fixture project (user task + tool calls +
-# real tool outputs read from scripts/fixtures/). The run_command log is >4k
+# real tool outputs read from benchmark/fixtures/). The run_command log is >4k
 # chars, so the proxy's ToolOutputCompressor fires on it.
-python scripts/benchmark.py --scenario fixtures --turns 30
-python scripts/benchmark.py --scenario opencode --turns 30
+python benchmark/benchmark.py --scenario fixtures --turns 30 --tag fixtures
+python benchmark/benchmark.py --scenario opencode --turns 30 --tag opencode
 
 # Plain user messages instead of agent payloads
-python scripts/benchmark.py --scenario debug_long --turns 30 --no-agentic
+python benchmark/benchmark.py --scenario debug_long --turns 30 --no-agentic --tag debug-plain
 
 # Stress test with context eviction
-python scripts/benchmark.py --turns 50 --budget 8000
+python benchmark/benchmark.py --turns 50 --budget 8000 --tag budget-8000
 
 # Aggressive token-savings profile (top-only eviction, 4000-token cap)
-python scripts/benchmark.py --scenario refactor_long --turns 30 --profile aggressive --json > report.json
+python benchmark/benchmark.py --scenario refactor_long --turns 30 --profile aggressive --tag aggressive
 
 # Quality-fidelity profile (maximize similarity to the direct baseline)
-python scripts/benchmark.py --scenario refactor_long --turns 30 --profile quality --json > report.json
+python benchmark/benchmark.py --scenario refactor_long --turns 30 --profile quality --tag quality
 
 # Regression gate: fail (exit 2) if mean semantic similarity drops below 0.85
-python scripts/benchmark.py --scenario all --turns 10 --min-similarity 0.85
-python scripts/benchmark.py --scenario refactor_long --turns 30 --min-similarity 0.80 --json > report.json
+python benchmark/benchmark.py --scenario all --turns 10 --min-similarity 0.85
+python benchmark/benchmark.py --scenario refactor_long --turns 30 --min-similarity 0.80 --tag similarity-gate
 
-# JSON output for analysis
-python scripts/benchmark.py --turns 20 --json > report.json 2> benchmark.log
+# Tagged report for analysis
+python benchmark/benchmark.py --turns 20 --tag analysis
 
 # Dump full response pairs
-python scripts/benchmark.py --turns 10 --dump-responses
+python benchmark/benchmark.py --turns 10 --dump-responses --tag responses
 
 # TTFT measurement and per-turn prefix-cache hit capture are ON by default
 # (the benchmark streams responses via SSE but keeps each side's multi-turn
 # conversation fully contiguous; only the transport changes). Per-round
 # /v1/metrics snapshots are recorded for cache-reuse trend analysis.
 # Disable with --no-measure-ttft if you must use the non-streaming path.
-python scripts/benchmark.py --scenario refactor_long --turns 30 --no-measure-ttft
+python benchmark/benchmark.py --scenario refactor_long --turns 30 --no-measure-ttft --tag no-ttft
 
-# Complete example 
-python scripts/benchmark.py --scenario opencode --json > benchmark_opencode_10_5.json 2> benchmark_opencode_10_5.log
+# Complete example with auto-named output files
+python benchmark/benchmark.py --scenario opencode --rounds 5 --turns 30 --tag baseline
 ```
 
-> **Rounds default is 3** (was 1). Run at least 3 rounds so per-round variance
+> **Rounds default is 5**. Run at least 5 rounds so per-round variance
 > is observable and the regression gate can use the robust round-mean-of-means
 > instead of a single noisy sample. Override with `--rounds N`.
 
@@ -380,7 +397,7 @@ python scripts/benchmark.py --scenario opencode --json > benchmark_opencode_10_5
 | Parameter | Default | Description |
 |---|---|---|
 | `--turns` | `10` | Number of conversation turns per round. |
-| `--rounds` | `3` | Number of full conversation rounds (run ≥3 so per-round variance is observable and the regression gate can use the robust round-mean-of-means). |
+| `--rounds` | `5` | Number of full conversation rounds (run ≥5 so per-round variance is observable and bootstrap confidence intervals are stable). |
 | `--max-tokens` | `8192` | Max tokens per response; large agentic tool-call arguments may contain complete source files. |
 | `--port` | `8080` | Proxy server port. |
 | `--json` | off | Output the report as JSON to stdout. |
@@ -392,6 +409,8 @@ python scripts/benchmark.py --scenario opencode --json > benchmark_opencode_10_5
 | `--temperature` | `0.0` | Sampling temperature for both direct and proxy runs. `0` is deterministic so quality metrics are reproducible; raise only to stress-test nondeterminism. |
 | `--no-agentic` | off (agentic on) | Send plain user messages instead of OpenCode-style agent payloads (user task + `tool_calls` + tool outputs). Agentic mode is the default for every scenario. |
 | `--no-measure-ttft` | off (TTFT on) | Disable TTFT measurement and per-turn prefix-cache hit capture. By default the benchmark streams responses (SSE) to measure time-to-first-token and record per-round `/v1/metrics` snapshots; conversations stay contiguous, only the transport changes. |
+| `--tag` | empty | Optional descriptive tag in the auto-named `.json` and `.log` filenames. |
+| `--outdir` | `benchmark/results/` | Target folder for auto-named output files. |
 
 You might need to run the benchmark as background task to avoid hitting command timeouts. Progress and per-turn information is dumped to stderr.
 
@@ -408,8 +427,8 @@ You might need to run the benchmark as background task to avoid hitting command 
 | `feature_long` | 30-turn real-life feature conversation with evolving code blocks and context growth beyond 32k tokens |
 | `default` | General coding conversation (Fibonacci example) |
 | `default_long` | 30-turn general coding conversation with evolving code blocks and context growth beyond 32k tokens |
-| `fixtures` | **Alias of `opencode`** — OpenCode-harness replay of the real `scripts/fixtures/` project: each turn reads a real fixture file and runs a realistic test/lint/build log. |
-| `opencode` | OpenCode-harness replay of the real `scripts/fixtures/` project (user task + `tool_calls` + real tool outputs). Always agentic. `fixtures` is an alias of this scenario. |
+| `fixtures` | **Alias of `opencode`** — OpenCode-harness replay of the real `benchmark/fixtures/` project: each turn reads a real fixture file and runs a realistic test/lint/build log. |
+| `opencode` | OpenCode-harness replay of the real `benchmark/fixtures/` project (user task + `tool_calls` + real tool outputs). Always agentic. `fixtures` is an alias of this scenario. |
 
 All scenarios are agentic by default. `--no-agentic` sends plain user messages
 instead of agent payloads. `--profile` selects the optimization preset

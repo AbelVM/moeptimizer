@@ -28,10 +28,10 @@ prefix cache is reused.
 - `tests/` — pytest suite, one `test_*.py` per module. `asyncio_mode = "auto"`.
   `conftest.py` holds shared fixtures. `test_e2e.py` and `test_optimizer.py` are the
   integration-level tests.
-- `scripts/` — `run.sh` (start proxy), `dev.sh` (install + test + lint + type-check),
-  `benchmark.py` (direct-vs-proxy benchmark), `benchmark_dashboard.html` (report UI),
-  `diag_dryrun_opencode.py` (local prefix-stability dry-run gate), `benchmark_all.sh`,
-  `fixtures/` (real project replayed by the `opencode`/`fixtures` benchmark scenario).
+- `scripts/` — `run.sh` (start proxy), `dev.sh` (install + test + lint + type-check).
+- `benchmark/` — `benchmark.py` (direct-vs-proxy benchmark), `dashboard.html` (report UI),
+  diagnostic scripts, `all.sh`, and `fixtures/` (real project replayed by the
+  `opencode`/`fixtures` benchmark scenario).
 - **Observability endpoints** (in `app.py`): `GET /v1/metrics` (process-wide aggregate),
   `GET /v1/debug/requests` (bounded per-request trace: prompt hash, slot, prompt/cache/
   fresh-prefill tokens, TTFT — no prompt contents by default), `POST /v1/metrics/reset`,
@@ -75,8 +75,8 @@ reuse or response quality and will not be caught by tests alone.
 - **Proxy scope = input compaction only.** The proxy compacts ONLY the input context
   sent to the backend. The backend/model fully controls response size — the proxy
   must NOT try to tune/compress response verbosity.
-- **No legacy benchmark support.** `scripts/benchmark.py` and
-  `benchmark_dashboard.html` support only the new benchmark format (changed quality
+- **No legacy benchmark support.** `benchmark/benchmark.py` and
+  `benchmark/dashboard.html` support only the new benchmark format (changed quality
   metrics). Do not add legacy/old-format log handling.
 - **Benchmark invariant**: never interleave direct and proxified requests. Each round
   runs the COMPLETE proxy conversation (all turns) first, then the COMPLETE direct
@@ -87,7 +87,7 @@ reuse or response quality and will not be caught by tests alone.
   reference for KV-cache stability when interfacing with a Qwen MoE-MTP model on
   llama.cpp lives in `cache_preservation_guide.md` — consult it before changing any
   prefix-reuse or context-mutation logic. The local dry-run
-  (`scripts/diag_dryrun_opencode.py --max-breaks`) is the prefix-stability gate for
+  (`benchmark/diag_dryrun_opencode.py --max-breaks`) is the prefix-stability gate for
   any cache-touching change — but it proves only **local serialized-prefix** stability,
   NOT backend KV retention; the backend's authoritative cache state is third-party and
   is not observable without Lemonade slot/cache events. Do not claim a cache regression
@@ -101,7 +101,7 @@ reuse or response quality and will not be caught by tests alone.
   markers, reasoning preseed) are stripped before the model sees the prompt. The
   `ATTENTION_SINKS_ENABLED` / `REASONING_PRESEED_ENABLED` flags are WARN-level config
   issues for this reason.
-- **Dashboard charts**: when adding charts to `benchmark_dashboard.html`, choose chart
+- **Dashboard charts**: when adding charts to `benchmark/dashboard.html`, choose chart
   types per the FT Visual Vocabulary (https://github.com/ft-interactive/visual-vocabulary).
 
 ## Common commands
@@ -113,8 +113,8 @@ pytest tests/ -v                    # tests only
 ruff check src/ tests/              # lint
 mypy src/moeptimizer/               # type-check
 python -m moeptimizer --check-config  # validate resolved config
-python scripts/diag_dryrun_opencode.py --persistent-session --turns 30 --max-breaks 0 2>&1  # dry-run prefix-stability gate (exits non-zero on any break)
-python scripts/benchmark.py --scenario opencode --turns 30 --json > report.json 2> run.log
+python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 --max-breaks 0 2>&1  # dry-run prefix-stability gate (exits non-zero on any break)
+python benchmark/benchmark.py --scenario opencode --turns 30 --json > report.json 2> run.log
 ```
 
 ## Before committing
@@ -130,7 +130,7 @@ quality metrics did not regress (see `README.md` "Benchmarking" for the regressi
 
 If you touched prefix-reuse / context-mutation logic (anything marked ⚠ cache in
 `REVIEW.md`), also run the dry-run gate
-(`python scripts/diag_dryrun_opencode.py --persistent-session --turns 30 --max-breaks 0`)
+(`python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 --max-breaks 0`)
 and keep it at 0 breaks. Remember it proves local prefix stability only, not backend KV
 retention — a green dry-run is necessary but not sufficient.
 
@@ -179,5 +179,5 @@ logic — those need maintainer discussion first.
 - **Change an endpoint**: `src/moeptimizer/app.py` (`create_app`).
 - **Change backend communication**: `src/moeptimizer/backend_client.py` and
   `backend_capabilities.py`.
-- **Change benchmark**: `scripts/benchmark.py` (keep the no-legacy / no-interleave
-  invariants) and `scripts/benchmark_dashboard.html`.
+- **Change benchmark**: `benchmark/benchmark.py` (keep the no-legacy / no-interleave
+  invariants) and `benchmark/dashboard.html`.
