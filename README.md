@@ -86,7 +86,9 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | Variable | Default | Description |
 |---|---|---|
 | `MOEPT_SERVER__URL` | `http://localhost:13305/api/v1` | Base URL of the Lemonade chat-completions server API |
+| `MOEPT_SERVER__LLM_API_KEY` | `lemonade` | API key forwarded to the LLM server |
 | `MOEPT_SERVER__EMBED_URL` | `http://localhost:13305/api/v1` | Base URL of the OpenAI-compatible embedding server; set separately when embeddings are hosted elsewhere |
+| `MOEPT_SERVER__EMBED_API_KEY` | `lemonade` | API key forwarded to the embeddings server |
 | `MOEPT_SERVER__LLM_MODEL` | `Qwen3.6-35B-A3B-MTP-GGUF` | LLM model identifier for chat completions |
 | `MOEPT_SERVER__EMBED_MODEL` | `embed-gemma-300m-FLM` | Embedding model identifier |
 | `MOEPT_SERVER__TOKENIZER` | `auto` | Tokenizer for budget/counting. `auto` tries a local Qwen HF tokenizer, else falls back to tiktoken `cl100k_base` (GPT-4 BPE, approximate for Qwen). Set to a HuggingFace repo id or a local `tokenizer.json` path for exact Qwen counts. Runtime calibration from the backend's real `prompt_tokens` corrects the residual ratio each turn regardless. |

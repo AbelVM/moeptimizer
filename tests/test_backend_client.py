@@ -74,8 +74,12 @@ class _FakeClient:
 class TestLemonadeClient:
     def test_client_creation(self) -> None:
         """Client can be created with base URL."""
-        client = LemonadeClient(base_url="http://localhost:13305/api/v1")
+        client = LemonadeClient(
+            base_url="http://localhost:13305/api/v1",
+            api_key="llm-secret",
+        )
         assert client is not None
+        assert client._client.api_key == "llm-secret"
 
     async def test_chat_completions_create_forwards_standard_extra_body(self) -> None:
         """Chat completion requests forward standard OpenAI-compatible extra_body."""

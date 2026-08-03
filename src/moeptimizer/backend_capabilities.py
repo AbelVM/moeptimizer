@@ -97,6 +97,7 @@ class BackendCapabilityProbe:
         base_url: str,
         model: str,
         *,
+        api_key: str = "lemonade",
         ttl_seconds: float = 30.0,
         probe_timeout: float = 4.0,
     ) -> None:
@@ -105,6 +106,7 @@ class BackendCapabilityProbe:
         # (/api/v1/health, /api/v1/slots, /api/v1/tokenize, /api/v1/models).
         self._base = base_url.rstrip("/")
         self._model = model
+        self._api_key = api_key
         self._ttl = max(1.0, ttl_seconds)
         self._probe_timeout = probe_timeout
         self._lock = threading.Lock()
@@ -167,7 +169,10 @@ class BackendCapabilityProbe:
     def _get_client(self) -> httpx.AsyncClient:
         """Lazily create and return the long-lived probe HTTP client (§4.9.5)."""
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self._probe_timeout)
+            self._client = httpx.AsyncClient(
+                timeout=self._probe_timeout,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+            )
         return self._client
 
     async def aclose(self) -> None:

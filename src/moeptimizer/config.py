@@ -35,9 +35,17 @@ class ServerConfig(BaseModel):
     """Lemonade server connection settings."""
 
     url: str = Field(default="http://localhost:13305/api/v1")
+    llm_api_key: str = Field(
+        default="lemonade",
+        description="API key forwarded to the LLM server.",
+    )
     embed_url: str = Field(
         default="http://localhost:13305/api/v1",
         description="Base URL for the OpenAI-compatible embedding server.",
+    )
+    embed_api_key: str = Field(
+        default="lemonade",
+        description="API key forwarded to the embeddings server.",
     )
     llm_model: str = Field(default="Qwen3.6-35B-A3B-MTP-GGUF")
     embed_model: str = Field(default="embed-gemma-300m-FLM")

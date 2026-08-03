@@ -80,6 +80,7 @@ class EmbeddingService:
         )
         self._http_client = httpx2.AsyncClient(
             base_url=self._config.server.embed_url,
+            headers={"Authorization": f"Bearer {self._config.server.embed_api_key}"},
             limits=limits,
             timeout=httpx2.Timeout(30.0, connect=10.0),
             transport=httpx2.AsyncHTTPTransport(retries=2),

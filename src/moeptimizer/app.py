@@ -1592,6 +1592,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     capability_probe = BackendCapabilityProbe(
         base_url=cfg.server.url,
         model=cfg.server.llm_model,
+        api_key=cfg.server.llm_api_key,
         ttl_seconds=cfg.v050.capability_probe_ttl_seconds,
     )
     # Created before the SessionManager so the one initialized instance can be
@@ -1606,7 +1607,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     )
     backend_client = LemonadeClient(
         base_url=cfg.server.url,
-        api_key="lemonade",
+        api_key=cfg.server.llm_api_key,
         timeout=cfg.server.timeout,
         native_mtp_passthrough=cfg.v050.native_mtp_passthrough,
     )
@@ -1622,7 +1623,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     output_shaper = OutputShaper(enabled=False)
     embed_client = AsyncOpenAI(
         base_url=cfg.server.embed_url,
-        api_key="lemonade",
+        api_key=cfg.server.embed_api_key,
         timeout=cfg.server.timeout,
     )
 

@@ -232,6 +232,17 @@ async def test_probe_ttl_caches() -> None:
     assert len(probe._fake.calls) == 4
 
 
+async def test_probe_forwards_llm_api_key() -> None:
+    probe = BackendCapabilityProbe(
+        base_url="http://localhost:13305/api/v1",
+        model="M",
+        api_key="llm-secret",
+    )
+    client = probe._get_client()
+    assert client.headers["authorization"] == "Bearer llm-secret"
+    await probe.aclose()
+
+
 # --- failure handling -----------------------------------------------------
 
 
