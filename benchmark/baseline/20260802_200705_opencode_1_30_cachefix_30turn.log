@@ -1,0 +1,166 @@
+  Auto-named outputs: /data/projects/moeptimizer/benchmark/results/20260802_200705_opencode_1_30_cachefix_30turn.json + /data/projects/moeptimizer/benchmark/results/20260802_200705_opencode_1_30_cachefix_30turn.log
+
+  Starting benchmark: 30 turns x 1 round(s)
+  Scenario: opencode - OpenCode-harness replay from benchmark/fixtures/ (user task + tool calls + real tool outputs)
+  Model: Qwen3.6-35B-A3B-MTP-GGUF
+  Lemonade: http://localhost:13305/api/v1
+  Proxy: http://127.0.0.1:8080/v1
+  Context profile: balanced
+  Starting moeptimizer proxy on port 8080 ...
+  Proxy ready on port 8080
+  Round 1/1: proxy conversation
+  Proxy turn 01/30: raw 6 msgs/2,174 chars/~535 tok (pre-optimization)
+    → backend-facing: 535 tok (source=optimized_header, cached=0, prefix_hits=0, raw=2,174 chars)
+  Proxy turn 02/30: raw 13 msgs/4,776 chars/~1,166 tok (pre-optimization)
+    → backend-facing: 1,166 tok (source=optimized_header, cached=1,376, prefix_hits=1,376, raw=4,776 chars)
+  Proxy turn 03/30: raw 20 msgs/7,413 chars/~1,802 tok (pre-optimization)
+    → backend-facing: 1,802 tok (source=optimized_header, cached=2,124, prefix_hits=2,124, raw=7,413 chars)
+  Proxy turn 04/30: raw 26 msgs/9,798 chars/~2,363 tok (pre-optimization)
+    → backend-facing: 2,363 tok (source=optimized_header, cached=2,878, prefix_hits=2,878, raw=9,798 chars)
+  Proxy turn 05/30: raw 33 msgs/11,257 chars/~2,714 tok (pre-optimization)
+    → backend-facing: 2,714 tok (source=optimized_header, cached=3,631, prefix_hits=3,631, raw=11,257 chars)
+  Proxy turn 06/30: raw 39 msgs/13,560 chars/~3,231 tok (pre-optimization)
+    → backend-facing: 3,231 tok (source=optimized_header, cached=4,664, prefix_hits=4,664, raw=13,560 chars)
+  Proxy turn 07/30: raw 45 msgs/15,698 chars/~3,750 tok (pre-optimization)
+    → backend-facing: 3,750 tok (source=optimized_header, cached=5,331, prefix_hits=5,331, raw=15,698 chars)
+  Proxy turn 08/30: raw 51 msgs/19,039 chars/~4,529 tok (pre-optimization)
+    → backend-facing: 4,529 tok (source=optimized_header, cached=6,018, prefix_hits=6,018, raw=19,039 chars)
+  Proxy turn 09/30: raw 58 msgs/21,139 chars/~5,043 tok (pre-optimization)
+    → backend-facing: 5,043 tok (source=optimized_header, cached=6,716, prefix_hits=6,716, raw=21,139 chars)
+  Proxy turn 10/30: raw 64 msgs/23,088 chars/~5,507 tok (pre-optimization)
+    → backend-facing: 5,507 tok (source=optimized_header, cached=8,336, prefix_hits=8,336, raw=23,088 chars)
+  Proxy turn 11/30: raw 70 msgs/31,246 chars/~8,075 tok (pre-optimization)
+    → backend-facing: 6,343 tok (source=optimized_header, cached=8,907, prefix_hits=8,907, raw=31,246 chars)
+  Proxy turn 12/30: raw 76 msgs/38,056 chars/~10,234 tok (pre-optimization)
+    → backend-facing: 6,770 tok (source=optimized_header, cached=10,033, prefix_hits=10,033, raw=38,056 chars)
+  Proxy turn 13/30: raw 82 msgs/44,605 chars/~12,345 tok (pre-optimization)
+    → backend-facing: 7,149 tok (source=optimized_header, cached=10,616, prefix_hits=10,616, raw=44,605 chars)
+  Proxy turn 14/30: raw 88 msgs/55,771 chars/~16,512 tok (pre-optimization)
+    → backend-facing: 9,584 tok (source=optimized_header, cached=11,207, prefix_hits=11,207, raw=55,771 chars)
+  Proxy turn 15/30: raw 94 msgs/62,883 chars/~18,746 tok (pre-optimization)
+    → backend-facing: 10,086 tok (source=optimized_header, cached=13,826, prefix_hits=13,826, raw=62,883 chars)
+  Proxy turn 16/30: raw 101 msgs/69,849 chars/~20,957 tok (pre-optimization)
+    → backend-facing: 10,565 tok (source=optimized_header, cached=14,206, prefix_hits=14,206, raw=69,849 chars)
+  Proxy turn 17/30: raw 107 msgs/77,969 chars/~23,436 tok (pre-optimization)
+    → backend-facing: 11,553 tok (source=optimized_header, cached=14,805, prefix_hits=14,805, raw=77,969 chars)
+  Proxy turn 18/30: raw 114 msgs/84,268 chars/~25,495 tok (pre-optimization)
+    → backend-facing: 16,997 tok (source=optimized_header, cached=15,803, prefix_hits=15,803, raw=84,268 chars)
+  Proxy turn 19/30: raw 121 msgs/90,503 chars/~27,537 tok (pre-optimization)
+    → backend-facing: 17,674 tok (source=optimized_header, cached=16,493, prefix_hits=16,493, raw=90,503 chars)
+  Proxy turn 20/30: raw 128 msgs/96,820 chars/~29,583 tok (pre-optimization)
+    → backend-facing: 18,382 tok (source=optimized_header, cached=17,212, prefix_hits=17,212, raw=96,820 chars)
+  Proxy turn 21/30: raw 135 msgs/104,319 chars/~31,995 tok (pre-optimization)
+    → backend-facing: 19,547 tok (source=optimized_header, cached=18,015, prefix_hits=18,015, raw=104,319 chars)
+  Proxy turn 22/30: raw 142 msgs/111,260 chars/~34,201 tok (pre-optimization)
+    → backend-facing: 20,371 tok (source=optimized_header, cached=19,045, prefix_hits=19,045, raw=111,260 chars)
+  Proxy turn 23/30: raw 149 msgs/118,709 chars/~36,525 tok (pre-optimization)
+    → backend-facing: 21,491 tok (source=optimized_header, cached=20,040, prefix_hits=20,040, raw=118,709 chars)
+  Proxy turn 24/30: raw 156 msgs/125,033 chars/~38,572 tok (pre-optimization)
+    → backend-facing: 22,287 tok (source=optimized_header, cached=21,114, prefix_hits=21,114, raw=125,033 chars)
+  Proxy turn 25/30: raw 163 msgs/130,847 chars/~40,523 tok (pre-optimization)
+    → backend-facing: 23,405 tok (source=optimized_header, cached=22,311, prefix_hits=22,311, raw=130,847 chars)
+  Proxy turn 26/30: raw 170 msgs/136,559 chars/~42,446 tok (pre-optimization)
+    → backend-facing: 23,904 tok (source=optimized_header, cached=22,848, prefix_hits=22,848, raw=136,559 chars)
+  Proxy turn 27/30: raw 177 msgs/142,419 chars/~44,397 tok (pre-optimization)
+    → backend-facing: 24,394 tok (source=optimized_header, cached=23,310, prefix_hits=23,310, raw=142,419 chars)
+  Proxy turn 28/30: raw 184 msgs/149,914 chars/~46,812 tok (pre-optimization)
+    → backend-facing: 25,396 tok (source=optimized_header, cached=23,838, prefix_hits=23,838, raw=149,914 chars)
+  Proxy turn 29/30: raw 191 msgs/156,045 chars/~48,816 tok (pre-optimization)
+    → backend-facing: 26,045 tok (source=optimized_header, cached=24,916, prefix_hits=24,916, raw=156,045 chars)
+  Proxy turn 30/30: raw 194 msgs/156,301 chars/~48,874 tok (pre-optimization)
+    → backend-facing: 26,908 tok (source=optimized_header, cached=26,156, prefix_hits=26,156, raw=156,301 chars)
+  Round 1/1: direct conversation
+  Direct turn 01/30: backend-facing ~535 tok (raw 6 msgs/2,175 chars, no proxy)
+    → backend-facing: 1,380 tok (source=usage, cached=0)
+  Direct turn 02/30: backend-facing ~1,166 tok (raw 13 msgs/4,777 chars, no proxy)
+    → backend-facing: 2,128 tok (source=usage, cached=1,376)
+  Direct turn 03/30: backend-facing ~1,802 tok (raw 20 msgs/7,414 chars, no proxy)
+    → backend-facing: 2,882 tok (source=usage, cached=2,124)
+  Direct turn 04/30: backend-facing ~2,163 tok (raw 27 msgs/8,869 chars, no proxy)
+    → backend-facing: 3,360 tok (source=usage, cached=2,878)
+  Direct turn 05/30: backend-facing ~2,514 tok (raw 34 msgs/10,328 chars, no proxy)
+    → backend-facing: 3,831 tok (source=usage, cached=3,356)
+  Direct turn 06/30: backend-facing ~2,855 tok (raw 41 msgs/11,749 chars, no proxy)
+    → backend-facing: 4,289 tok (source=usage, cached=3,827)
+  Direct turn 07/30: backend-facing ~3,198 tok (raw 48 msgs/13,129 chars, no proxy)
+    → backend-facing: 4,764 tok (source=usage, cached=4,285)
+  Direct turn 08/30: backend-facing ~4,022 tok (raw 54 msgs/16,612 chars, no proxy)
+    → backend-facing: 5,673 tok (source=usage, cached=4,760)
+  Direct turn 09/30: backend-facing ~4,536 tok (raw 61 msgs/18,712 chars, no proxy)
+    → backend-facing: 7,182 tok (source=usage, cached=5,669)
+  Direct turn 10/30: backend-facing ~4,783 tok (raw 68 msgs/19,677 chars, no proxy)
+    → backend-facing: 7,571 tok (source=usage, cached=7,178)
+  Direct turn 11/30: backend-facing ~7,451 tok (raw 74 msgs/28,229 chars, no proxy)
+    → backend-facing: 10,324 tok (source=usage, cached=7,567)
+  Direct turn 12/30: backend-facing ~9,719 tok (raw 80 msgs/35,324 chars, no proxy)
+    → backend-facing: 12,676 tok (source=usage, cached=10,320)
+  Direct turn 13/30: backend-facing ~11,644 tok (raw 87 msgs/41,062 chars, no proxy)
+    → backend-facing: 14,721 tok (source=usage, cached=12,672)
+  Direct turn 14/30: backend-facing ~16,039 tok (raw 93 msgs/53,014 chars, no proxy)
+    → backend-facing: 19,199 tok (source=usage, cached=14,717)
+  Direct turn 15/30: backend-facing ~18,086 tok (raw 100 msgs/59,321 chars, no proxy)
+    → backend-facing: 21,373 tok (source=usage, cached=19,195)
+  Direct turn 16/30: backend-facing ~20,297 tok (raw 107 msgs/66,287 chars, no proxy)
+    → backend-facing: 23,892 tok (source=usage, cached=21,369)
+  Direct turn 17/30: backend-facing ~22,627 tok (raw 114 msgs/73,765 chars, no proxy)
+    → backend-facing: 26,361 tok (source=usage, cached=23,888)
+  Direct turn 18/30: backend-facing ~24,686 tok (raw 121 msgs/80,064 chars, no proxy)
+    → backend-facing: 28,805 tok (source=usage, cached=26,357)
+  Direct turn 19/30: backend-facing ~26,728 tok (raw 128 msgs/86,299 chars, no proxy)
+    → backend-facing: 30,967 tok (source=usage, cached=28,801)
+  Direct turn 20/30: backend-facing ~28,774 tok (raw 135 msgs/92,616 chars, no proxy)
+    → backend-facing: 33,515 tok (source=usage, cached=30,963)
+  Direct turn 21/30: backend-facing ~31,186 tok (raw 142 msgs/100,115 chars, no proxy)
+    → backend-facing: 36,328 tok (source=usage, cached=33,511)
+  Direct turn 22/30: backend-facing ~33,392 tok (raw 149 msgs/107,056 chars, no proxy)
+    → backend-facing: 39,050 tok (source=usage, cached=36,324)
+  Direct turn 23/30: backend-facing ~35,716 tok (raw 156 msgs/114,505 chars, no proxy)
+    → backend-facing: 42,084 tok (source=usage, cached=39,046)
+  Direct turn 24/30: backend-facing ~37,763 tok (raw 163 msgs/120,829 chars, no proxy)
+    → backend-facing: 45,090 tok (source=usage, cached=42,080)
+  Direct turn 25/30: backend-facing ~39,714 tok (raw 170 msgs/126,643 chars, no proxy)
+    → backend-facing: 47,160 tok (source=usage, cached=45,086)
+  Direct turn 26/30: backend-facing ~41,637 tok (raw 177 msgs/132,355 chars, no proxy)
+    → backend-facing: 49,283 tok (source=usage, cached=47,156)
+  Direct turn 27/30: backend-facing ~43,588 tok (raw 184 msgs/138,215 chars, no proxy)
+    → backend-facing: 51,638 tok (source=usage, cached=49,279)
+  Direct turn 28/30: backend-facing ~46,035 tok (raw 193 msgs/145,834 chars, no proxy)
+    → backend-facing: 54,256 tok (source=usage, cached=51,634)
+  Direct turn 29/30: backend-facing ~48,039 tok (raw 200 msgs/151,965 chars, no proxy)
+    → backend-facing: 57,078 tok (source=usage, cached=54,252)
+  Direct turn 30/30: backend-facing ~48,193 tok (raw 209 msgs/152,593 chars, no proxy)
+    → backend-facing: 57,435 tok (source=usage, cached=57,074)
+  Turn 01: direct=12327ms/1,380tok/105chars proxy=9346ms/535tok/2,174chars_raw/107chars raw_input=535tok ttft(d/p)=9042ms/7497ms delta=-2981ms/-845tok cache=0/n/a quality_sem=0.974 jaccard=0.357 rouge=0.537 faith=0.991 evict=0.993
+  Turn 02: direct=13581ms/2,128tok/388chars proxy=6036ms/1,166tok/4,776chars_raw/206chars raw_input=1,166tok ttft(d/p)=5477ms/3401ms delta=-7544ms/-962tok cache=1,376/1.18 quality_sem=0.954 jaccard=0.288 rouge=0.385 faith=0.994 evict=0.996
+  Turn 03: direct=26640ms/2,882tok/968chars proxy=17201ms/1,802tok/7,413chars_raw/1,476chars raw_input=1,802tok ttft(d/p)=5448ms/3541ms delta=-9439ms/-1,080tok cache=2,124/1.18 quality_sem=-0.052 jaccard=0.294 rouge=0.242 faith=0.994 evict=0.997
+  Turn 04: direct=19664ms/3,360tok/759chars proxy=19661ms/2,363tok/9,798chars_raw/712chars raw_input=2,363tok ttft(d/p)=4141ms/3414ms delta=-3ms/-997tok cache=2,878/1.22 quality_sem=0.023 jaccard=0.229 rouge=0.194 faith=0.998 evict=0.997
+  Turn 05: direct=10239ms/3,831tok/282chars proxy=15224ms/2,714tok/11,257chars_raw/1,331chars raw_input=2,714tok ttft(d/p)=3860ms/3831ms delta=+4984ms/-1,117tok cache=3,631/1.34 quality_sem=0.088 jaccard=0.094 rouge=0.128 faith=0.998 evict=0.997
+  Turn 06: direct=101418ms/4,289tok/5,015chars proxy=11255ms/3,231tok/13,560chars_raw/1,131chars raw_input=3,231tok ttft(d/p)=3747ms/2032ms delta=-90163ms/-1,058tok cache=4,664/1.44 quality_sem=-0.041 jaccard=0.212 rouge=0.156 faith=0.998 evict=0.998
+  Turn 07: direct=35407ms/4,764tok/1,781chars proxy=14028ms/3,750tok/15,698chars_raw/1,285chars raw_input=3,750tok ttft(d/p)=3955ms/2063ms delta=-21379ms/-1,014tok cache=5,331/1.42 quality_sem=0.007 jaccard=0.272 rouge=0.269 faith=0.998 evict=0.998
+  Turn 08: direct=76913ms/5,673tok/1,150chars proxy=29429ms/4,529tok/19,039chars_raw/579chars raw_input=4,529tok ttft(d/p)=6832ms/3400ms delta=-47484ms/-1,144tok cache=6,018/1.33 quality_sem=-0.038 jaccard=0.429 rouge=0.594 faith=0.999 evict=0.998
+  Turn 09: direct=20852ms/7,182tok/359chars proxy=18318ms/5,043tok/21,139chars_raw/1,372chars raw_input=5,043tok ttft(d/p)=11103ms/6117ms delta=-2534ms/-2,139tok cache=6,716/1.33 quality_sem=-0.014 jaccard=0.127 rouge=0.144 faith=0.999 evict=0.998
+  Turn 10: direct=51665ms/7,571tok/2,780chars proxy=20639ms/5,507tok/23,088chars_raw/1,057chars raw_input=5,507tok ttft(d/p)=3513ms/2313ms delta=-31026ms/-2,064tok cache=8,336/1.51 quality_sem=-0.028 jaccard=0.223 rouge=0.208 faith=0.999 evict=0.998
+  Turn 11: direct=64057ms/10,324tok/2,192chars proxy=32191ms/6,343tok/31,246chars_raw/1,647chars raw_input=8,075tok ttft(d/p)=19884ms/6252ms delta=-31865ms/-3,981tok cache=8,907/1.4 quality_sem=-0.005 jaccard=0.249 rouge=0.212 faith=0.800 evict=0.999
+  Turn 12: direct=28294ms/12,676tok/1,196chars proxy=24333ms/6,770tok/38,056chars_raw/1,268chars raw_input=10,234tok ttft(d/p)=15380ms/2314ms delta=-3961ms/-5,906tok cache=10,033/1.48 quality_sem=0.568 jaccard=0.133 rouge=0.156 faith=0.815 evict=0.999
+  Turn 13: direct=73152ms/14,721tok/2,762chars proxy=24671ms/7,149tok/44,605chars_raw/1,306chars raw_input=12,345tok ttft(d/p)=16148ms/2533ms delta=-48481ms/-7,572tok cache=10,616/1.48 quality_sem=0.035 jaccard=0.151 rouge=0.161 faith=0.833 evict=0.999
+  Turn 14: direct=34743ms/19,199tok/224chars proxy=23703ms/9,584tok/55,771chars_raw/1,214chars raw_input=16,512tok ttft(d/p)=29427ms/11982ms delta=-11039ms/-9,615tok cache=11,207/1.17 quality_sem=0.030 jaccard=0.098 rouge=0.111 faith=0.857 evict=0.826
+  Turn 15: direct=60249ms/21,373tok/1,647chars proxy=7123ms/10,086tok/62,883chars_raw/148chars raw_input=18,746tok ttft(d/p)=13140ms/2856ms delta=-53126ms/-11,287tok cache=13,826/1.37 quality_sem=0.074 jaccard=0.101 rouge=0.076 faith=0.860 evict=0.829
+  Turn 16: direct=21212ms/23,892tok/184chars proxy=22766ms/10,565tok/69,849chars_raw/1,022chars raw_input=20,957tok ttft(d/p)=17934ms/5798ms delta=+1555ms/-13,327tok cache=14,206/1.34 quality_sem=0.090 jaccard=0.165 rouge=0.191 faith=0.861 evict=0.836
+  Turn 17: direct=41112ms/26,361tok/353chars proxy=30002ms/11,553tok/77,969chars_raw/319chars raw_input=23,436tok ttft(d/p)=15900ms/8860ms delta=-11110ms/-14,808tok cache=14,805/1.28 quality_sem=0.045 jaccard=0.602 rouge=0.766 faith=0.858 evict=0.842
+  Turn 18: direct=21700ms/28,805tok/339chars proxy=37167ms/16,997tok/84,268chars_raw/810chars raw_input=25,495tok ttft(d/p)=16605ms/13710ms delta=+15467ms/-11,808tok cache=15,803/0.93 quality_sem=0.015 jaccard=0.270 rouge=0.215 faith=0.854 evict=0.867
+  Turn 19: direct=33943ms/30,967tok/160chars proxy=42284ms/17,674tok/90,503chars_raw/197chars raw_input=27,537tok ttft(d/p)=15494ms/13881ms delta=+8341ms/-13,293tok cache=16,493/0.93 quality_sem=0.842 jaccard=0.707 rouge=0.888 faith=0.854 evict=0.872
+  Turn 20: direct=41284ms/33,515tok/696chars proxy=40641ms/18,382tok/96,820chars_raw/1,091chars raw_input=29,583tok ttft(d/p)=21443ms/13516ms delta=-643ms/-15,133tok cache=17,212/0.94 quality_sem=0.405 jaccard=0.381 rouge=0.410 faith=0.854 evict=0.872
+  Turn 21: direct=47186ms/36,328tok/269chars proxy=26656ms/19,547tok/104,319chars_raw/213chars raw_input=31,995tok ttft(d/p)=29482ms/10677ms delta=-20530ms/-16,781tok cache=18,015/0.92 quality_sem=0.802 jaccard=0.698 rouge=0.831 faith=0.855 evict=0.875
+  Turn 22: direct=86562ms/39,050tok/690chars proxy=39495ms/20,371tok/111,260chars_raw/404chars raw_input=34,201tok ttft(d/p)=28986ms/14334ms delta=-47067ms/-18,679tok cache=19,045/0.93 quality_sem=0.032 jaccard=0.379 rouge=0.541 faith=0.856 evict=0.876
+  Turn 23: direct=59676ms/42,084tok/353chars proxy=42182ms/21,491tok/118,709chars_raw/325chars raw_input=36,525tok ttft(d/p)=24305ms/11661ms delta=-17494ms/-20,593tok cache=20,040/0.93 quality_sem=0.395 jaccard=0.550 rouge=0.766 faith=0.855 evict=0.876
+  Turn 24: direct=37209ms/45,090tok/438chars proxy=45918ms/22,287tok/125,033chars_raw/528chars raw_input=38,572tok ttft(d/p)=31120ms/18806ms delta=+8709ms/-22,803tok cache=21,114/0.95 quality_sem=0.036 jaccard=0.192 rouge=0.241 faith=0.856 evict=0.878
+  Turn 25: direct=25063ms/47,160tok/149chars proxy=16762ms/23,405tok/130,847chars_raw/190chars raw_input=40,523tok ttft(d/p)=18665ms/9181ms delta=-8301ms/-23,755tok cache=22,311/0.95 quality_sem=0.801 jaccard=0.145 rouge=0.220 faith=0.857 evict=0.879
+  Turn 26: direct=36387ms/49,283tok/210chars proxy=17668ms/23,904tok/136,559chars_raw/104chars raw_input=42,446tok ttft(d/p)=18708ms/8691ms delta=-18719ms/-25,379tok cache=22,848/0.96 quality_sem=-0.019 jaccard=0.388 rouge=0.452 faith=0.859 evict=0.879
+  Turn 27: direct=30029ms/51,638tok/539chars proxy=40939ms/24,394tok/142,419chars_raw/663chars raw_input=44,397tok ttft(d/p)=20533ms/11044ms delta=+10911ms/-27,244tok cache=23,310/0.96 quality_sem=0.000 jaccard=0.237 rouge=0.257 faith=0.859 evict=0.879
+  Turn 28: direct=81254ms/54,256tok/239chars proxy=52187ms/25,396tok/149,914chars_raw/364chars raw_input=46,812tok ttft(d/p)=24383ms/12655ms delta=-29067ms/-28,860tok cache=23,838/0.94 quality_sem=-0.065 jaccard=0.324 rouge=0.458 faith=0.859 evict=0.880
+  Turn 29: direct=35902ms/57,078tok/201chars proxy=52808ms/26,045tok/156,045chars_raw/537chars raw_input=48,816tok ttft(d/p)=26880ms/20053ms delta=+16906ms/-31,033tok cache=24,916/0.96 quality_sem=-0.037 jaccard=0.110 rouge=0.064 faith=0.861 evict=0.880
+  Turn 30: direct=14516ms/57,435tok/870chars proxy=19036ms/26,908tok/156,301chars_raw/415chars raw_input=48,874tok ttft(d/p)=3967ms/10716ms delta=+4520ms/-30,527tok cache=26,156/0.97 quality_sem=-0.048 jaccard=0.327 rouge=0.391 faith=0.862 evict=0.880
+
+  Report JSON written to: /data/projects/moeptimizer/benchmark/results/20260802_200705_opencode_1_30_cachefix_30turn.json
+  Progress log written to: /data/projects/moeptimizer/benchmark/results/20260802_200705_opencode_1_30_cachefix_30turn.log
+  Stopping benchmark proxy ...

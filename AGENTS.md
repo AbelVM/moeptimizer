@@ -6,11 +6,12 @@ commands that must pass before any change is considered done.
 
 ## Project
 
-MOE-ptimizer is a transparent OpenAI-compatible API proxy that optimizes context
-for MoE + MTP models in multi-turn agentic tasks. It sits between a client (OpenAI
-SDK) and a backend (Lemonade server) and compresses/compacts the **input** context
-sent to the backend while keeping byte-stable prefixes so the backend's native
-prefix cache is reused.
+MOE-ptimizer is a transparent OpenAI-compatible API proxy that optimizes the
+accumulated context of complete multi-turn agentic tasks, rather than isolated
+prompts, for MoE + MTP models. It sits between a client (OpenAI SDK) and a
+backend (Lemonade server) and compresses/compacts the **input** context sent to
+the backend while keeping byte-stable prefixes so the backend's native prefix
+cache is reused.
 
 - Proxy listens on `:8080` (start with `bash scripts/run.sh`).
 - Backend (Lemonade) listens on `:13305` (`MOEPT_SERVER__URL`).
@@ -35,10 +36,11 @@ prefix cache is reused.
 - **Observability endpoints** (in `app.py`): `GET /v1/metrics` (process-wide aggregate),
   `GET /v1/debug/requests` (bounded per-request trace: prompt hash, slot, prompt/cache/
   fresh-prefill tokens, TTFT — no prompt contents by default), `POST /v1/metrics/reset`,
-  `GET /v1/metrics/ui`. Per-stage swallowed-failure counts carry structured reason codes
+  `GET /v1/metrics/ui`, `POST /v1/config/reload`. Per-stage swallowed-failure counts carry structured reason codes
   (e.g. `code_slicing:parser_unavailable:lang=…:size=…:failed_open`).
 - `CHANGELOG.md` — version-by-version feature history (NOT README).
-- `README.md` — concise overview + config tables; links to CHANGELOG.
+- `README.md` — problem statement, benchmark evidence, usage, and config tables;
+  links to CHANGELOG.
 - `AGENTS.md` — this file. `CONTRIBUTING.md` — human contributor guide.
   `llm.txt` — LLM-oriented project map.
 
@@ -136,10 +138,11 @@ additional break or any non-fold prefix mutation fails the gate. Remember it pro
 local prefix stability only, not backend KV retention — a green dry-run is necessary
 but not sufficient.
 
-The latest tagged live replay (`cachefix_30turn`) measured 49.01% prompt-token
-savings and 35.6% lower mean latency, with TTFT improving from 15,517 ms to 8,238 ms.
-It completed without an obvious catastrophic cliff but produced three lost-code-block
-warnings; do not treat it as complete quality sign-off.
+The tagged `cachefix_30turn` replay is documented in the README's Benchmark evidence
+table. It was one 30-turn round: 49.01% prompt-token savings, 35.6% lower mean latency,
+46.9% lower mean TTFT, 94.23% proxy cache reuse, and 71.8% lower fresh prefill. It also
+had eight slower proxy turns, three lost-code-block turns, and mean semantic similarity
+of 0.1956; treat it as efficiency/cache evidence, not complete quality sign-off.
 
 ### Commit conventions
 

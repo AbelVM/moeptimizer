@@ -4,9 +4,60 @@ Transparent OpenAI API proxy that optimizes context for MoE + MTP models in mult
 
 ![img](moe2.jpg)
 
-## Features
+## Problem And Approach
 
-MOE-ptimizer is a transparent OpenAI API proxy that optimizes context for MoE + MTP models in multi-turn agentic tasks — large token savings with byte-stable prefixes so the backend's native prefix cache is reused.
+Multi-turn coding agents resend a growing transcript on every request. Verbatim
+replay increases prefill work and time-to-first-token; naive compaction can also
+rewrite cached prefixes or discard code and task state.
+
+MOE-ptimizer sits between the OpenAI-compatible client and the backend. It
+compacts only the **input** context, keeps the system prompt and stable early
+turns byte-identical, and uses bounded eviction, summaries, retrieval, and
+boundary compression for older or noisy content. The backend still generates
+the response and controls response length.
+
+The core targets are:
+
+- **Lean context:** reduce prompt tokens, prefill work, and operating cost while
+  retaining the context most relevant to the current task.
+- **Avoid KV-cache refills:** preserve the cached prefix so time-to-first-token
+  and latency stay low, improving the interactive user experience.
+- **Transparent quality:** ensure proxy optimization does not degrade response
+  quality, code correctness, or task continuity compared with the unproxied
+  backend experience.
+- **Multi-turn continuity:** optimize the accumulated conversation as a whole,
+  preserving useful history across turns instead of optimizing individual
+  prompts in isolation.
+
+### Benchmark evidence
+
+This is one tagged 30-turn OpenCode replay, not a production guarantee. It ran
+one round against Qwen3.6-35B-A3B-MTP-GGUF with a 262,144-token backend window;
+direct and proxied conversations ran as separate complete sessions. Sources:
+[`JSON report`](benchmark/baseline/20260802_200705_opencode_1_30_cachefix_30turn.json)
+and [`run log`](benchmark/baseline/20260802_200705_opencode_1_30_cachefix_30turn.log).
+
+| Metric | Observed result |
+|---|---:|
+| Prompt-token savings | **49.01%** (379,491 vs 744,295 tokens) |
+| Mean latency reduction | **35.6%** (41,407.86 ms to 26,655.65 ms) |
+| Mean TTFT reduction | **46.9%** (15,516.59 ms to 8,237.61 ms) |
+| Proxy cache reuse | **94.23%** (direct: 85.34%) |
+| Fresh-prefill reduction | **71.8%** (1,918.37 to 541.17 tokens/turn) |
+| Fresh-prefill / TTFT correlation | **0.8066** |
+| Prompt-source token recall | **0.9108** mean |
+| Evicted-content recall | **0.9232** mean |
+| Code-block preservation | **0.9083** mean |
+| Code syntax validity | **1.00** |
+| Final-turn fact recall | **1.00** |
+
+The run had 22 faster and 8 slower proxy turns, 25 low-semantic-similarity
+turns, 25 low-token-overlap turns, five truncation turns, and three code-block-
+loss turns. Mean semantic similarity was only 0.1956, despite 1.00 final-turn
+fact recall; the proxy and direct paths both hit the context-window wall at turn
+5, while the proxy made fewer assertion contradictions (30 vs 44). Treat these
+as active quality risks, not production guarantees: run multiple rounds and
+inspect per-turn metrics before relying on the optimization.
 
 The full version-by-version feature history through v0.7.27 lives in [CHANGELOG.md](CHANGELOG.md).
 
@@ -14,49 +65,43 @@ The full version-by-version feature history through v0.7.27 lives in [CHANGELOG.
 ## Architecture
 
 ```
-Client (OpenAI SDK) → moeptimizer:8080 → Lemonade Server:13305
-                                 │
-                                 ├── SessionManager (per-session isolation)
-                                 │   └── Stable Anonymous Session Resolver
-                                 ├── AgentContextOptimizer (cache-stability policy)
-                                 │   ├── Immutable Static Layer Guard
-                                 │   ├── Reasoning Content Preserver
-                                 │   ├── Stable Turn Structure Normalizer
-                                 │   ├── Top-Only Eviction Policy
-                                 │   ├── ToolOutputFilter (declarative regex filter for tool outputs)
-                                 │   ├── ToolOutputCompressor (boundary-compress large tool outputs)
-                                 │   └── OutputShaper (cache-safe terse instruction + turn-class max_tokens/reasoning_effort clamping)
-                                 ├── AgentStateStore (KV graph)
-                                 ├── ScratchpadCompactor
-                                 │   └── HierarchicalSummarizer (cache-stable rolling-summary compaction)
-                                 ├── ThinkingPreserver (no-op; preserves <think> blocks verbatim)
-                                 ├── StateBasedRAG
-                                 │   └── SymbolIndex (fuzzy symbol lookup)
-                                 ├── LoopDetector
-                                 ├── ProgressTracker
-                                 ├── PromptTemplateManager (task classification)
-                                 │   └── ContextTemplateMatcher (template matching)
-                                 ├── AttentionSinkManager (internal cache hint only; no model-visible markers)
-                                 ├── ExpertRoutingCache (placeholder; fabricated expert masks)
-                                 ├── CacheKeyRegistry (hit prediction)
-                                 │   └── HitPredictionModel (XGBoost early-exit)
-                                 ├── KVSlotTracker (explicit cache control)
-                                 ├── StaticPrefixKVCache (text memo; not real KV tensors)
-                                 ├── ContextAligner (internal alignment; no prompt padding)
-                                 ├── ContextCanonicalizer (newest-user-turn only)
-                                 ├── SelectiveTruncator (no-op; returns unchanged)
-                                 ├── PatternInjector (section markers; stripped before model input)
-                                 ├── DependencyOrderer (no-op; import ordering not applied)
-                                 ├── IncrementalUpdater (cache preservation)
-                                 ├── CacheAwareChunker (aligned chunking)
-                                 ├── ContextCompressor (newest-user-turn only)
-                                 ├── CodeBlockOptimizer (tree-sitter code optimization)
-                                 ├── ChunkFingerprintCache (SHA-256 chunk reuse)
-                                 ├── DeltaEncoder (code delta compression)
-                                 ├── TokenAwareTruncator (whole-message top-only fallback)
-                                 ├── AsyncIOStage (async heavy stage offloading)
-                                 └── EmbeddingService (LanceDB + embeddings model)
+Client
+  │
+  ▼
+MOE-ptimizer
+  ├── LemonadeClient ───────────────► backend
+  ├── BackendCapabilityProbe          device, slots, MTP, tokenizer
+  ├── shared EmbeddingService         initialized once for sessions
+  └── SessionManager
+    │ creates one isolated optimizer per session
+    ▼
+  AgentContextOptimizer (input context only)
+    ├── BudgetGovernor + TokenCounter
+    ├── ContextAligner + stable-prefix/live-zone tracking
+    ├── ContextCanonicalizer + ContextCompressor
+    ├── ThinkingPreserver + LoopDetector + ProgressTracker
+    ├── AgentStateStore + GoalDecomposer + StateBasedRAG
+    │       └── SymbolIndex
+    ├── ToolOutputFilter + ToolOutputCompressor
+    ├── optional user-paste compression, output deduplication,
+    │   reversible ContentStore handles, and code slicing
+    ├── optional HierarchicalSummarizer / ScratchpadCompactor
+    ├── optional CodeBlockOptimizer + CacheAwareChunker
+    │       └── chunk fingerprints and DeltaEncoder
+    ├── SelectiveTruncator (duplicate-code removal)
+    ├── TokenAwareTruncator (budget fallback)
+    ├── StaticPrefixKVCache (text memo; not backend KV tensors)
+    ├── HitPredictionModel + CacheRegistry
+    └── AsyncIOStage (optional heavy-stage offloading)
+        │
+        ▼
+     optimized input forwarded to backend
 ```
+
+Stages described as optional run only when enabled and/or when context pressure
+requires them. The proxy does not control response verbosity: `OutputShaper`
+is retained as disabled compatibility wiring, and native MTP passthrough is
+handled by the backend client after capability detection.
 
 ## Installation
 
@@ -135,7 +180,7 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 | `MOEPT_AGENTIC__OPTIMIZE_CODE_BLOCKS` | `true` | Run tree-sitter code-block optimization (chunk dedup). Budget-gated: only fires when the context exceeds the proactive trim threshold, so lean contexts keep exact code and avoid proxy latency. |
 | `MOEPT_AGENTIC__CODE_SKELETON_ENABLED` | `false` | Compress large code blocks to skeletons under context pressure. Base default is `true`, but the `balanced` quality profile (the default) sets it `false` so the model keeps full code to edit/extend; only the `aggressive` profile enables skeletonization. |
 | `MOEPT_AGENTIC__CODE_LEDGER_MAX_SIGS` | `40` | Max code-signature lines carried forward into the evicted-turn code ledger. When front-eviction drops a code-bearing turn, its function/class signatures are accumulated into a compact `[Evicted-turn code index]` system message appended to the protected tail, so the model keeps awareness of code that lived in dropped turns (fixes `has_code_proxy=0` / `code_block_loss`). Capped to bound the ledger's own size. |
-| `MOEPT_AGENTIC__PROMPT_TEMPLATE_ENABLED` | `false` | Apply task-template specialization to rewrite the user prompt. OFF by default: for agentic coding the client's exact wording matters and template rewrites risk changing it (cache guide DONT #4). Gated behind the proactive threshold. |
+| `MOEPT_AGENTIC__PROMPT_TEMPLATE_ENABLED` | `false` | Apply task-template specialization to rewrite the user prompt. OFF by default: for agentic coding the client's exact wording matters and template rewrites risk c### Metrics Collectedhanging it (cache guide DONT #4). Gated behind the proactive threshold. |
 | `MOEPT_AGENTIC__DELTA_ENCODE_INJECT` | `true` | When a file is re-read after an edit, replace the full re-read file body with a compact unified diff against the prior snapshot (review §3.4). ON by default, but injection is decided **dynamically per re-read**: it only fires when the prior version of the file is already present in the context (verified by substring), so the model can apply the diff to a file it already sees. On a first read, or when the prior version was evicted/summarized out of context, the full current code is kept verbatim so edits stay correct. Set to `false` to always forward the full re-read body. |
 | `MOEPT_AGENTIC__STATIC_LAYER_ALIGNMENT_ENABLED` | `false` | Pad static layer to cache-block boundaries |
 | `MOEPT_AGENTIC__REASONING_PRESEED_ENABLED` | `false` | Inject reasoning scaffolding into user messages |
@@ -153,7 +198,7 @@ For example, `server.url` maps to `MOEPT_SERVER__URL`.
 |---|---|---|
 | `MOEPT_CODE_CHUNKING__CHUNK_MAX_CHARS` | `1500` | Hard floor (chars) for a single tree-sitter code chunk during RAG retrieval. When the live backend window is known, the effective chunk size is derived from `CHUNK_BUDGET_FRACTION * dynamic budget`; this value is the floor. |
 | `MOEPT_CODE_CHUNKING__TOP_K_CHUNKS` | `5` | Number of top relevant chunks to retrieve |
-| `MOEPT_CODE_CHUNKING__MIN_CHUNK_SCORE` | `0.05` | Minimum embedding similarity score |
+| `MOEPT_CODE_CHUNKING__MIN_CHUNK_SCORE` | `0.2` | Minimum embedding similarity score |
 | `MOEPT_CODE_CHUNKING__EMBEDDING_DIM` | `384` | Embedding vector dimension |
 
 ### Cache
@@ -233,6 +278,7 @@ Conversation continuity is OpenAI-compatible by default. Clients can set the sta
 | `POST` | `/v1/agent/state/reset` | Reset agent session |
 | `GET` | `/v1/agent/sessions` | List active sessions |
 | `GET` | `/v1/agent/sessions/{id}/debug` | Per-session debug snapshot: live-zone boundary, real prefix-cache outcome + token savings, embedding circuit-breaker state, and per-session metrics (review §11.6) |
+| `GET` | `/v1/agent/sessions/{id}/content/{handle}` | Retrieve content stored by reversible compression |
 | `GET` | `/v1/debug/requests` | Bounded process-wide request traces keyed by request id, including prompt hash, backend slot, prompt/cache/fresh-prefill tokens, TTFT, and latency |
 | `DELETE` | `/v1/agent/session/{id}` | Delete a session |
 | `POST` | `/v1/cache/clear` | Clear caches |
@@ -472,8 +518,13 @@ baseline falls below the threshold (regression gate).
 - **Latency**: Direct vs proxy response times (mean, median, p95). **TTFT**
   (time to first token, ms) is captured per turn via the streaming path by
   default (disable with `--no-measure-ttft`).
-- **Token Usage**: Prompt tokens, cached tokens, token savings percentage
-- **Context Window**: Final utilization percentage
+- **Token Usage**: Direct and proxy prompt tokens, cached tokens, fresh-prefill
+  tokens, and token-savings percentages. The report also records
+  `prompt_source_token_recall` and `evicted_content_recall` to show how much
+  source context remains represented after optimization.
+- **Context Window**: Final utilization percentage and the first
+  `context_window_wall` turn where response quality falls below the configured
+  thresholds.
 - **Prefix-cache reuse**: The proxy's authoritative prefix-cache hit count per
   turn (`X-Prefix-Cache-Hit-Tokens`, surfaced as a response header in
   non-streaming and an SSE comment when streaming). By default the benchmark
@@ -492,7 +543,8 @@ baseline falls below the threshold (regression gate).
   is weak on code, so it must not sit in the headline block.
 
   - **Headline**: `rouge_l_f1`, `token_jaccard`, `code_block_ratio`,
-    `edit_similarity`, `length_ratio`, `code_syntax_validity`.
+    `edit_similarity`, `length_ratio`, `code_syntax_validity`,
+    `prompt_source_token_recall`, and `evicted_content_recall`.
   - **Secondary**: `trigram_overlap`, `markdown_structure_similarity`,
     `vocabulary_richness_delta`, `rouge_l_precision`, `rouge_l_recall`,
     `response_stability`, `code_structure_consistency`, `has_code_direct`,
@@ -505,6 +557,8 @@ baseline falls below the threshold (regression gate).
   - **Edit similarity**: Normalized longest-common-subsequence edit similarity. Higher is better; it means fewer insertions, deletions, or rewrites are needed to transform one response into the other.
   - **Code block ratio**: Fraction of baseline code blocks preserved by the proxy response. Higher is better; 1.0 means all baseline code blocks were preserved or no baseline code blocks existed.
   - **Code syntax validity**: Fraction of fenced `python` code blocks in the proxy response that parse with `ast.parse`. Higher is better; `1.0` means no syntactically broken code was emitted as a side effect of optimization (boundary compression, summarization, eviction). This is a hard correctness signal the embedding/lexical metrics cannot catch.
+  - **Prompt-source token recall**: Fraction of source prompt tokens still represented in the optimized context. Higher is better; it measures retained context coverage, not response quality.
+  - **Evicted-content recall**: Fraction of content selected for eviction that remains recoverable or represented through summaries, retrieval, or other preserved state. Higher is better.
   - **Markdown structure similarity**: Jaccard similarity of markdown structural elements such as headings, lists, code fences, and blockquotes. Higher is better.
   - **Length ratio**: Proxy response length divided by baseline response length. Closer to 1.0 is better; `<0.5` flags severe truncation and `>2.0` flags verbosity inflation.
   - **Vocabulary richness delta**: Absolute difference in type-token ratio between proxy and baseline. Lower is better; 0 means identical vocabulary diversity.

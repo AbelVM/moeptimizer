@@ -5,12 +5,13 @@ Read this first when asked to navigate, modify, or extend the codebase.
 
 ## One-paragraph summary
 
-MOE-ptimizer is a transparent OpenAI-compatible API proxy that optimizes context for
-MoE + MTP models in multi-turn agentic tasks. It sits between an OpenAI-SDK client and
-a backend (Lemonade server), compacting the **input** context sent to the backend while
-keeping byte-stable prefixes so the backend's native prefix cache is reused. It does
-NOT generate responses and does NOT tune response verbosity — it only transforms the
-request context on the way in and passes the response straight through.
+MOE-ptimizer is a transparent OpenAI-compatible input-context proxy for long-running
+agentic workloads on MoE + MTP models. It addresses growing multi-turn transcripts:
+verbatim replay raises prefill/TTFT, while careless compaction breaks prefix reuse or
+loses task/code state. It preserves byte-stable prefixes, compacts only the request
+context, and passes the backend-generated response through unchanged. It optimizes
+the accumulated conversation as a whole rather than treating each prompt in
+isolation. It does NOT compress response verbosity or generate responses.
 
 ## Key facts
 
@@ -49,7 +50,7 @@ request context on the way in and passes the response straight through.
   Full suite: `bash scripts/dev.sh`.
 - **Benchmark**: `python benchmark/benchmark.py` compares direct vs proxy (agentic
   OpenCode-harness by default). Scenarios: `debug`, `refactor`, `feature`, `default`,
-  `*_long` variants, `opencode`/`fixtures`. Flags: `--turns`, `--rounds` (default 3),
+  `*_long` variants, `opencode`/`fixtures`. Flags: `--turns`, `--rounds` (default 5),
   `--profile`, `--min-similarity` (regression gate, exit 2), `--json`, `--no-agentic`,
   `--no-measure-ttft`. Report UI: `benchmark/dashboard.html`.
 
@@ -81,7 +82,8 @@ moeptimizer/
 ├── tests/                  # pytest suite (test_<module>.py per module)
 ├── scripts/
 │   ├── run.sh              # start proxy on :8080
-│   ├── dev.sh              # install + pytest + ruff + mypy
+│   └── dev.sh              # install + pytest + ruff + mypy
+├── benchmark/
 │   ├── benchmark.py        # direct-vs-proxy benchmark
 │   ├── dashboard.html      # report UI
 │   ├── diag_dryrun_opencode.py  # local prefix-stability dry-run gate (--max-breaks)
@@ -94,6 +96,13 @@ moeptimizer/
 ├── llm.txt                 # this file
 └── pyproject.toml          # build + tool config (ruff, mypy, pytest)
 ```
+
+The tagged 30-turn `cachefix_30turn` replay is summarized in the README's
+Benchmark evidence table. It reported 49.01% prompt-token savings, 35.6% lower
+mean latency, 46.9% lower mean TTFT, 94.23% proxy cache reuse, and 71.8% lower
+fresh prefill in one round. It also reported three code-block-loss turns and
+mean semantic similarity of 0.1956; treat it as a performance signal, not
+response-quality sign-off.
 
 ## Pipeline stages (src/moeptimizer/optimizer.py)
 
@@ -163,7 +172,7 @@ pytest tests/ -v                    # tests only
 ruff check src/ tests/              # lint
 mypy src/moeptimizer/               # type-check
 python -m moeptimizer --check-config  # validate resolved config
-python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 --max-breaks 0 2>&1  # dry-run prefix-stability gate
+python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 --max-breaks 7 2>&1  # expected-fold gate; fails on excess/non-fold breaks
 python benchmark/benchmark.py --scenario opencode --turns 30 --json > report.json 2> run.log
 ```
 
