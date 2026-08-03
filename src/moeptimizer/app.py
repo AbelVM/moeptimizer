@@ -394,98 +394,164 @@ class _ProxyMetrics:
 PROXY_METRICS = _ProxyMetrics()
 
 # Self-contained live dashboard HTML (review §11 / P4c). No framework, no external
-# assets — it polls /v1/metrics and renders the proxy's effectiveness with plain
-# SVG (FT Visual Vocabulary: magic-stat headline, bar chart for per-session savings,
-# line for cache-reuse ratio). Kept as a module constant so the route is a one-liner.
+# assets. Browser-side history powers the trend chart because the live API exposes
+# aggregate snapshots, not benchmark-style per-turn time series.
 _METRICS_DASHBOARD_HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MOEptimizer — Proxy Effectiveness</title>
+<title>MOEptimizer - Live Operations</title>
 <style>
-  :root { --bg:#0d1117; --card:#161b22; --ink:#e6edf3; --muted:#8b949e;
-          --accent:#3fb950; --accent2:#58a6ff; --warn:#d29922; --line:#30363d; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink);
-         font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
-  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex;
-           align-items:baseline; gap:12px; }
-  header h1 { font-size:18px; margin:0; }
-  header .sub { color:var(--muted); font-size:12px; }
-  main { padding:24px; display:grid; gap:20px;
-         grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
-  .stat { background:var(--card); border:1px solid var(--line); border-radius:10px;
-          padding:18px 20px; }
-  .stat .v { font-size:30px; font-weight:700; }
-  .stat .k { color:var(--muted); font-size:12px; text-transform:uppercase;
-             letter-spacing:.04em; margin-top:4px; }
-  .stat.good .v { color:var(--accent); }
-  .stat.info .v { color:var(--accent2); }
-  .stat.warn .v { color:var(--warn); }
-  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px;
-           padding:18px 20px; grid-column:1/-1; }
-  .panel h2 { font-size:14px; margin:0 0 12px; color:var(--muted);
-              text-transform:uppercase; letter-spacing:.04em; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { text-align:right; padding:6px 10px; border-bottom:1px solid var(--line); }
-  th:first-child, td:first-child { text-align:left; font-family:ui-monospace,Menlo,monospace; }
-  .bar { height:8px; border-radius:4px; background:var(--accent2); }
-  .barwrap { background:var(--line); border-radius:4px; min-width:80px; }
-  .empty { color:var(--muted); font-style:italic; }
-  footer { padding:12px 24px; color:var(--muted); font-size:12px; border-top:1px solid var(--line); }
+    :root { --bg:#101316; --panel:#181d21; --panel2:#20272b; --ink:#edf1ed;
+                    --muted:#96a19d; --line:#303a3d; --mint:#a7e8c0; --blue:#8fc7ff;
+                    --amber:#f2c879; --red:#ff8d7a; --shadow:0 16px 40px rgba(0,0,0,.18); }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(circle at 85% 0%,#25322d 0,#101316 38%);
+                 color:var(--ink); font:14px/1.5 ui-sans-serif,system-ui,sans-serif; }
+    header { max-width:1440px; margin:auto; padding:22px clamp(18px,4vw,52px) 18px;
+                     display:flex; justify-content:space-between; align-items:flex-end; gap:18px; }
+    .brand { display:flex; align-items:center; gap:12px; }
+    .mark { width:12px; height:42px; background:var(--mint); transform:skew(-14deg); }
+    h1,h2,p { margin:0; }
+    h1 { font:700 clamp(20px,3vw,30px)/1.05 Georgia,serif; letter-spacing:0; }
+    .sub { color:var(--muted); margin-top:5px; font-size:12px; }
+    .live { display:flex; align-items:center; gap:8px; color:var(--mint); font-size:12px; }
+    .dot { width:8px; height:8px; border-radius:50%; background:currentColor; }
+    .live.stale { color:var(--amber); }
+    .live.down { color:var(--red); }
+    button { border:1px solid var(--line); background:transparent; color:var(--muted); padding:7px 10px;
+                     font:12px inherit; cursor:pointer; }
+    button:hover { color:var(--ink); border-color:var(--mint); }
+    main { max-width:1440px; margin:auto; padding:10px clamp(18px,4vw,52px) 36px; }
+    .hero { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(280px,.65fr); gap:18px;
+                    padding:26px 0 30px; }
+    .hero h2 { font:400 clamp(28px,5vw,56px)/.98 Georgia,serif; max-width:720px; }
+    .hero p { color:var(--muted); max-width:560px; margin-top:14px; }
+    .hero-note { border-left:2px solid var(--mint); padding:8px 0 8px 18px; align-self:end; }
+    .hero-note strong { display:block; color:var(--mint); font-size:26px; font-weight:500; }
+    .hero-note span { color:var(--muted); font-size:12px; }
+    .section { color:var(--mint); font-size:11px; font-weight:700; letter-spacing:.12em;
+                         text-transform:uppercase; border-bottom:1px solid var(--line); padding-bottom:8px; margin:4px 0 12px; }
+    .cards { display:grid; grid-template-columns:repeat(6,minmax(125px,1fr)); gap:10px; }
+    .stat { background:var(--panel); border:1px solid var(--line); padding:15px 14px; min-height:108px; box-shadow:var(--shadow); }
+    .stat .v { font:500 clamp(22px,3vw,32px)/1.05 Georgia,serif; margin-bottom:9px; }
+    .stat .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+    .stat.mint .v { color:var(--mint); } .stat.blue .v { color:var(--blue); }
+    .stat.amber .v { color:var(--amber); } .stat.red .v { color:var(--red); }
+    .layout { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(300px,.6fr); gap:18px; margin-top:18px; }
+    .panel { background:rgba(24,29,33,.9); border:1px solid var(--line); padding:18px; min-width:0; }
+    .panel h2 { font:500 20px/1.1 Georgia,serif; }
+    .hint { color:var(--muted); font-size:12px; margin:5px 0 14px; }
+    #trend { width:100%; height:250px; display:block; overflow:visible; }
+    .legend { display:flex; gap:15px; color:var(--muted); font-size:11px; margin-top:5px; }
+    .legend i { display:inline-block; width:9px; height:9px; margin-right:5px; background:var(--mint); }
+    .legend i.blue { background:var(--blue); }
+    .ops { display:grid; gap:12px; }
+    .op { border-top:1px solid var(--line); padding-top:10px; }
+    .op:first-child { border-top:0; padding-top:0; }
+    .op-label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+    .op-value { font-size:18px; margin-top:2px; }
+    .op-detail { color:var(--muted); font-size:12px; }
+    .wide { grid-column:1/-1; }
+    .tablewrap { overflow:auto; max-height:390px; }
+    table { width:100%; border-collapse:collapse; font-size:12px; }
+    th,td { text-align:right; padding:8px 9px; border-bottom:1px solid var(--line); white-space:nowrap; }
+    th { color:var(--muted); font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; }
+    th:first-child,td:first-child { text-align:left; }
+    td:first-child { color:var(--ink); font-family:ui-monospace,SFMono-Regular,monospace; }
+    tr:hover { background:var(--panel2); }
+    .barwrap { display:inline-block; width:90px; height:6px; background:var(--line); vertical-align:middle; }
+    .bar { height:100%; background:var(--mint); }
+    .empty { color:var(--muted); font-style:italic; padding:18px 0; }
+    .degradation { color:var(--amber); font-family:ui-monospace,SFMono-Regular,monospace; font-size:12px; }
+    footer { max-width:1440px; margin:auto; padding:12px clamp(18px,4vw,52px) 24px; color:var(--muted); font-size:11px; }
+    code { color:var(--blue); }
+    @media (max-width:900px) { .cards { grid-template-columns:repeat(3,1fr); } .hero,.layout { grid-template-columns:1fr; } }
+    @media (max-width:540px) { .cards { grid-template-columns:repeat(2,1fr); } header { align-items:flex-start; flex-direction:column; } }
+    @media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto !important; } }
 </style>
 </head>
 <body>
 <header>
-  <h1>MOEptimizer</h1>
-  <span class="sub">Proxy effectiveness &middot; live prefix-cache reuse &amp; token savings</span>
+    <div class="brand"><span class="mark" aria-hidden="true"></span><div><h1>MOEptimizer</h1><div class="sub">Live inference operations</div></div></div>
+    <div class="live"><div id="status" class="live"><span class="dot" aria-hidden="true"></span><span>Connecting</span></div><button id="reset" type="button">Reset metrics</button></div>
 </header>
-<main id="stats">
-  <div class="stat good"><div class="v" id="s-reuse">—</div><div class="k">Prefix cache reuse</div></div>
-  <div class="stat info"><div class="v" id="s-saved">—</div><div class="k">Tokens saved (total)</div></div>
-  <div class="stat"><div class="v" id="s-hitrate">—</div><div class="k">Cache hit rate</div></div>
-  <div class="stat warn"><div class="v" id="s-ttft">—</div><div class="k">Avg TTFT (ms)</div></div>
-  <div class="stat"><div class="v" id="s-latency">—</div><div class="k">Avg latency (ms)</div></div>
-  <div class="stat"><div class="v" id="s-err">—</div><div class="k">Backend errors</div></div>
-  <div class="panel">
-    <h2>Per-session token savings</h2>
-    <div id="sess"><p class="empty">No sessions recorded yet.</p></div>
-  </div>
+<main>
+    <section class="hero"><div><h2 id="headline">Watching the prefix hold.</h2><p id="summary">Waiting for the first metrics snapshot.</p></div><div class="hero-note"><strong id="s-requests">0</strong><span>completed requests in this process</span></div></section>
+    <div class="section">Core signal</div>
+    <section class="cards">
+        <div class="stat mint"><div class="v" id="s-reuse">—</div><div class="k">Prefix reuse</div></div>
+        <div class="stat blue"><div class="v" id="s-saved">—</div><div class="k">Tokens saved</div></div>
+        <div class="stat"><div class="v" id="s-hitrate">—</div><div class="k">Cache hit rate</div></div>
+        <div class="stat amber"><div class="v" id="s-ttft">—</div><div class="k">Average TTFT</div></div>
+        <div class="stat"><div class="v" id="s-prefill">—</div><div class="k">Fresh prefill</div></div>
+        <div class="stat red"><div class="v" id="s-err">—</div><div class="k">Backend errors</div></div>
+    </section>
+    <section class="layout">
+        <div class="panel"><h2>Cache pressure over time</h2><p class="hint">Browser history of the last 30 snapshots. Fresh prefill rising while reuse falls is the early warning for a cache cliff.</p><svg id="trend" viewBox="0 0 760 250" role="img" aria-label="Cache reuse and fresh prefill trend"></svg><div class="legend"><span><i></i>prefix reuse</span><span><i class="blue"></i>fresh prefill, normalized</span></div></div>
+        <div class="panel"><h2>Runtime pulse</h2><p class="hint">Only signals emitted by the live proxy are shown.</p><div class="ops"><div class="op"><div class="op-label">Average latency</div><div class="op-value" id="s-latency">—</div><div class="op-detail">full request duration</div></div><div class="op"><div class="op-label">Optimizer overhead</div><div class="op-value" id="s-optimizer">—</div><div class="op-detail">average proxy-side optimization</div></div><div class="op"><div class="op-label">Token counting</div><div class="op-value" id="s-token-count">—</div><div class="op-detail">average counting cost</div></div><div class="op"><div class="op-label">MTP</div><div class="op-value" id="s-mtp">—</div><div class="op-detail" id="s-mtp-detail">No MTP usage reported yet.</div></div><div class="op"><div class="op-label">Degraded stages</div><div class="op-value degradation" id="s-degraded">None</div></div></div></div>
+        <div class="panel wide"><h2>Active sessions</h2><p class="hint">Bounded process-local view, sorted by most recently active. Session IDs are intentionally shortened.</p><div id="sess"><p class="empty">No sessions recorded yet.</p></div></div>
+    </section>
 </main>
-<footer>Auto-refresh every 3s &middot; source: <code>GET /v1/metrics</code></footer>
+<footer>Auto-refresh every 3s &middot; updated <span id="updated">never</span> &middot; source: <code>GET /v1/metrics</code></footer>
 <script>
-const fmt = n => (n==null? "—" : n.toLocaleString());
-const pct = n => (n==null? "—" : (n*100).toFixed(1) + "%");
+const fmt = n => (n==null ? "—" : Number(n).toLocaleString());
+const pct = n => (n==null ? "—" : (Number(n)*100).toFixed(1) + "%");
+const ms = n => (n==null ? "—" : Number(n).toLocaleString(undefined,{maximumFractionDigits:1}) + " ms");
+const history = [];
+const esc = value => String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+function setStatus(kind, text) { const e=document.getElementById("status"); e.className="live " + kind; e.lastElementChild.textContent=text; }
+function drawTrend() {
+    const svg=document.getElementById("trend"), width=760, height=250, pad={l:38,r:12,t:14,b:26};
+    const innerW=width-pad.l-pad.r, innerH=height-pad.t-pad.b;
+    svg.innerHTML="";
+    if(history.length < 2) { svg.innerHTML='<text x="38" y="125" fill="#96a19d" font-size="12">Collecting snapshots...</text>'; return; }
+    const maxFresh=Math.max(1,...history.map(x=>x.fresh));
+    const x=i=>pad.l+(i/(history.length-1))*innerW, y=v=>pad.t+(1-v)*innerH;
+    const path=key=>history.map((item,i)=>(i?"L":"M")+x(i).toFixed(1)+","+y(key==="reuse"?item.reuse:item.fresh/maxFresh).toFixed(1)).join(" ");
+    const grid=[0,.5,1].map(v=>'<line x1="'+pad.l+'" x2="'+(width-pad.r)+'" y1="'+y(v)+'" y2="'+y(v)+'" stroke="#303a3d"/><text x="4" y="'+(y(v)+4)+'" fill="#96a19d" font-size="10">'+Math.round(v*100)+'%</text>').join("");
+    svg.innerHTML=grid+'<path d="'+path("reuse")+'" fill="none" stroke="#a7e8c0" stroke-width="2.5"/><path d="'+path("fresh")+'" fill="none" stroke="#8fc7ff" stroke-width="2" stroke-dasharray="5 4"/>';
+}
+function renderSessions(sessions) {
+    const ids=Object.keys(sessions||{}), box=document.getElementById("sess");
+    if(!ids.length) { box.innerHTML='<p class="empty">No sessions recorded yet.</p>'; return; }
+    const maxSaved=Math.max(1,...ids.map(id=>sessions[id].total_saved_tokens||0));
+    let rows='<div class="tablewrap"><table><thead><tr><th>session</th><th>requests</th><th>reuse</th><th>fresh prefill</th><th>saved</th><th>latency</th><th>errors</th><th></th></tr></thead><tbody>';
+    for(const id of ids.slice().reverse().slice(0,64)) { const s=sessions[id], w=Math.round(100*(s.total_saved_tokens||0)/maxSaved); rows+='<tr><td title="'+esc(id)+'">'+esc(id.slice(0,14))+'</td><td>'+fmt(s.requests)+'</td><td>'+pct(s.prefix_cache_reuse_ratio)+'</td><td>'+fmt(s.avg_fresh_prefill_tokens)+'</td><td>'+fmt(s.total_saved_tokens)+'</td><td>'+ms(s.avg_latency_ms)+'</td><td>'+fmt(s.backend_errors)+'</td><td><span class="barwrap"><span class="bar" style="display:block;width:'+w+'%"></span></span></td></tr>'; }
+    box.innerHTML=rows+'</tbody></table></div>';
+}
+function render(d) {
+    const fresh=Number(d.avg_fresh_prefill_tokens||0), reuse=Number(d.prefix_cache_reuse_ratio||0);
+    history.push({reuse,fresh}); if(history.length>30) history.shift();
+    document.getElementById("s-requests").textContent=fmt(d.requests);
+    document.getElementById("s-reuse").textContent=pct(d.prefix_cache_reuse_ratio);
+    document.getElementById("s-saved").textContent=fmt(d.total_saved_tokens);
+    document.getElementById("s-hitrate").textContent=pct(d.cache_hit_rate);
+    document.getElementById("s-ttft").textContent=ms(d.avg_ttft_ms);
+    document.getElementById("s-prefill").textContent=fmt(d.avg_fresh_prefill_tokens);
+    document.getElementById("s-err").textContent=fmt(d.backend_errors);
+    document.getElementById("s-latency").textContent=ms(d.avg_latency_ms);
+    document.getElementById("s-optimizer").textContent=ms(d.avg_optimizer_ms);
+    document.getElementById("s-token-count").textContent=ms(d.avg_token_count_ms);
+    document.getElementById("s-mtp").textContent=d.mtp_samples?pct(d.mtp_acceptance_rate):"—";
+    document.getElementById("s-mtp-detail").textContent=d.mtp_samples?(fmt(d.avg_mtp_accepted_tokens)+" accepted / "+fmt(d.avg_mtp_draft_tokens)+" drafted; "+pct(d.mtp_fallback_rate)+" fallback") : "No MTP usage reported yet.";
+    const degraded=Object.entries(d.degradation_counts||{}); document.getElementById("s-degraded").textContent=degraded.length?degraded.map(x=>x[0]+" ("+x[1]+")").join(", "):"None";
+    document.getElementById("headline").textContent=d.backend_errors?"The backend needs attention.":(reuse>=.7?"The prefix is holding.":"Watching the prefix hold.");
+    document.getElementById("summary").textContent=d.backend_errors?"Backend errors are present; treat latency and cache movement as diagnostic signals.":(fresh>0?"Fresh prefill is the work the model had to repeat on this process.":"No fresh-prefill sample has arrived yet.");
+    document.getElementById("updated").textContent=new Date().toLocaleTimeString();
+    renderSessions(d.sessions); drawTrend(); setStatus("","Live");
+}
+async function resetMetrics() {
+    const button=document.getElementById("reset"); button.disabled=true;
+    try { const r=await fetch("/v1/metrics/reset",{method:"POST"}); if(!r.ok) throw Error(r.status); history.length=0; document.getElementById("summary").textContent="Metrics reset. Waiting for the next snapshot."; drawTrend(); setStatus("","Reset"); }
+    catch (e) { setStatus("down","Reset failed"); }
+    finally { button.disabled=false; }
+}
+document.getElementById("reset").addEventListener("click", resetMetrics);
 async function refresh() {
-  let d;
-  try { const r = await fetch("/v1/metrics"); d = await r.json(); }
-  catch (e) { return; }
-  document.getElementById("s-reuse").textContent = pct(d.prefix_cache_reuse_ratio);
-  document.getElementById("s-saved").textContent = fmt(d.total_saved_tokens);
-  document.getElementById("s-hitrate").textContent = pct(d.cache_hit_rate);
-  document.getElementById("s-ttft").textContent = fmt(d.avg_ttft_ms);
-  document.getElementById("s-latency").textContent = fmt(d.avg_latency_ms);
-  document.getElementById("s-err").textContent = fmt(d.backend_errors);
-  const sess = d.sessions || {};
-  const ids = Object.keys(sess);
-  const box = document.getElementById("sess");
-  if (!ids.length) { box.innerHTML = '<p class="empty">No sessions recorded yet.</p>'; return; }
-  const maxSaved = Math.max(1, ...ids.map(id => sess[id].total_saved_tokens || 0));
-  let rows = '<table><thead><tr><th>session</th><th>reqs</th><th>reuse</th>'
-           + '<th>saved</th><th>avg TTFT</th><th></th></tr></thead><tbody>';
-  for (const id of ids.slice(0, 64)) {
-    const s = sess[id];
-    const w = Math.round(100 * (s.total_saved_tokens || 0) / maxSaved);
-    rows += '<tr><td>' + id.slice(0,12) + '</td>'
-          + '<td>' + fmt(s.requests) + '</td>'
-          + '<td>' + pct(s.prefix_cache_reuse_ratio) + '</td>'
-          + '<td>' + fmt(s.total_saved_tokens) + '</td>'
-          + '<td>' + fmt(s.avg_ttft_ms) + '</td>'
-          + '<td><div class="barwrap"><div class="bar" style="width:' + w + '%"></div></div></td></tr>';
-  }
-  rows += '</tbody></table>';
-  box.innerHTML = rows;
+    try { const r=await fetch("/v1/metrics",{cache:"no-store"}); if(!r.ok) throw Error(r.status); render(await r.json()); }
+    catch (e) { setStatus("down","Metrics unavailable"); document.getElementById("summary").textContent="Could not read /v1/metrics. The dashboard will retry automatically."; }
 }
 refresh();
 setInterval(refresh, 3000);

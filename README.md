@@ -237,6 +237,7 @@ Conversation continuity is OpenAI-compatible by default. Clients can set the sta
 | `DELETE` | `/v1/agent/session/{id}` | Delete a session |
 | `POST` | `/v1/cache/clear` | Clear caches |
 | `GET` | `/v1/metrics` | Proxy metrics: per-turn `cached_tokens`, `prompt_tokens`, `saved_tokens`, `latency_ms`, aggregate token savings / latency, a `backend_errors` count (turns the backend failed to serve, e.g. a truncated tool call), plus a per-session breakdown under `sessions{}` (review03.md §10) |
+| `GET` | `/v1/metrics/ui` | Self-contained live dashboard for cache reuse, token savings, latency, and per-session metrics |
 | `POST` | `/v1/metrics/reset` | Reset the process-wide metrics counters |
 
 ## Observability & Operations (review03.md §10)
@@ -262,6 +263,26 @@ curl -s http://127.0.0.1:8080/v1/metrics | jq
 
 curl -s -X POST http://127.0.0.1:8080/v1/metrics/reset   # reset counters
 ```
+
+### Live dashboard
+
+Open `http://127.0.0.1:8080/v1/metrics/ui` in a browser to monitor the proxy
+without installing a separate dashboard. The page is self-contained and polls
+`GET /v1/metrics` every three seconds. It shows:
+
+- connection and data-freshness status, including an unavailable-backend state;
+- prefix-cache reuse, cache-hit rate, tokens saved, average TTFT, fresh prefill,
+  and backend errors;
+- a rolling browser-side trend of prefix reuse and normalized fresh prefill;
+- live latency, optimizer/token-counting overhead, native MTP usage, and
+  degraded pipeline stages when those signals are available;
+- a bounded, recently active session table with reuse, fresh prefill, savings,
+  latency, and error counts.
+
+Use **Reset metrics** in the dashboard, or `POST /v1/metrics/reset`, to start a
+fresh process-wide measurement window. The live dashboard reports only metrics
+available from the running proxy; benchmark-only direct-vs-proxy quality,
+similarity, and per-turn comparison charts remain in `benchmark/dashboard.html`.
 
 ### Quality profiles
 

@@ -1029,6 +1029,10 @@ class TestMetricsDashboard:
         body = resp.text
         assert "<html" in body
         assert "/v1/metrics" in body
+        assert "/v1/metrics/reset" in body
+        assert 'id="trend"' in body
+        assert 'id="status"' in body
+        assert 'id="sess"' in body
         # No external assets — fully self-contained.
         assert "src=" not in body
         assert "http://" not in body and "https://" not in body
