@@ -39,23 +39,23 @@ and [`run log`](benchmark/baseline/20260803_130915_opencode_1_30_baseline.log).
 
 | Metric | Observed result |
 |---|---:|
-| Prompt-token savings | **49.01%** (379,491 vs 744,295 tokens) |
-| Mean latency reduction | **35.6%** (41,407.86 ms to 26,655.65 ms) |
-| Mean TTFT reduction | **46.9%** (15,516.59 ms to 8,237.61 ms) |
-| Proxy cache reuse | **94.23%** (direct: 85.34%) |
-| Fresh-prefill reduction | **71.8%** (1,918.37 to 541.17 tokens/turn) |
-| Fresh-prefill / TTFT correlation | **0.8066** |
-| Prompt-source token recall | **0.9108** mean |
-| Evicted-content recall | **0.9232** mean |
-| Code-block preservation | **0.9083** mean |
+| Prompt-token savings | **55.34%** (339,066 vs 759,214 tokens) |
+| Mean latency reduction | **32.8%** (32,081.65 ms to 21,561.27 ms) |
+| Mean TTFT reduction | **46.1%** (12,749.78 ms to 6,865.81 ms) |
+| Proxy cache reuse | **97.06%** (direct: 88.25%) |
+| Fresh-prefill reduction | **70.9%** (1,938.77 to 564.17 tokens/turn) |
+| Fresh-prefill / TTFT correlation | **0.7852** |
+| Prompt-source token recall | **0.8868** mean |
+| Evicted-content recall | **0.9025** mean |
+| Code-block preservation | **1.00** mean |
 | Code syntax validity | **1.00** |
 | Final-turn fact recall | **1.00** |
 
-The run had 22 faster and 8 slower proxy turns, 25 low-semantic-similarity
-turns, 25 low-token-overlap turns, five truncation turns, and three code-block-
-loss turns. Mean semantic similarity was only 0.1956, despite 1.00 final-turn
-fact recall; the proxy and direct paths both hit the context-window wall at turn
-5, while the proxy made fewer assertion contradictions (30 vs 44). Treat these
+The run had 26 faster and 4 slower proxy turns, 26 low-semantic-similarity
+turns, 27 low-token-overlap turns, eight truncation turns, and no code-block-loss
+turns. Mean semantic similarity was only 0.1851, despite 1.00 final-turn fact
+recall; the proxy and direct paths both hit the context-window wall at turn 6,
+while the proxy made fewer assertion contradictions (10 vs 32). Treat these
 as active quality risks, not production guarantees: run multiple rounds and
 inspect per-turn metrics before relying on the optimization.
 
