@@ -6,6 +6,12 @@ benchmark module stays importable even if a fixture file is missing.
 
 from __future__ import annotations
 
-from .loader import available_files, build_fixture_tasks, fixture_root
-
 __all__ = ["available_files", "build_fixture_tasks", "fixture_root"]
+
+
+def __getattr__(name: str):
+    if name in __all__:
+        from . import loader
+
+        return getattr(loader, name)
+    raise AttributeError(name)

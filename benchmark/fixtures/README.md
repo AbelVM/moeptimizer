@@ -36,3 +36,19 @@ Run it with:
 ```bash
 python benchmark/benchmark.py --scenario fixtures --turns 30
 ```
+
+Run isolated workspace acceptance independently of a benchmark round:
+
+```bash
+python -m benchmark.fixtures.loader --turns 10 --seed 1
+```
+
+The command prints bounded per-turn results and exits nonzero when a
+test-bearing intermediate state fails; use `--turns 30` to inspect the full
+failure and recovery trace.
+
+Supply model-generated unified patches as `turn-N.patch` files:
+
+```bash
+python -m benchmark.fixtures.loader --turns 30 --patch-dir /path/to/patches
+```

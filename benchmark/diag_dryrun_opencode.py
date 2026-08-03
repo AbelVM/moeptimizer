@@ -215,6 +215,40 @@ def _byte_diff(prev_blob: str, cur_blob: str) -> dict[str, Any]:
     return result
 
 
+def _classify_prefix(
+    previous: str | None,
+    current: str,
+    reuse_threshold: float,
+) -> tuple[str, float]:
+    if previous is None:
+        return "(first)", 1.0
+    if current == previous:
+        return "STABLE", 1.0
+    if current.startswith(previous) or previous.startswith(current):
+        return "APPEND-ONLY", 1.0
+
+    common = 0
+    limit = min(len(previous), len(current))
+    while common < limit and previous[common] == current[common]:
+        common += 1
+    reuse_ratio = common / len(previous) if previous else 0.0
+    return ("REUSED" if reuse_ratio >= reuse_threshold else "*** BREAK ***"), reuse_ratio
+
+
+def _parse_dry_run_response(response: requests.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError("response was not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("response JSON must be an object")
+    if not isinstance(payload.get("optimized_messages"), list):
+        raise ValueError("response optimized_messages must be a list")
+    if not isinstance(payload.get("tokens", {}), dict):
+        raise ValueError("response tokens must be an object")
+    return payload
+
+
 def _quality_issues(
     raw_tokens: int | None,
     optimized_tokens: int | None,
@@ -228,8 +262,10 @@ def _quality_issues(
     saved = raw_tokens - optimized_tokens
     if saved < 0:
         issues.append("INFLATION")
-    elif raw_tokens >= 4000 and saved == 0:
-        issues.append("NO SAVINGS")
+    elif raw_tokens >= 4000 and saved == 0 and previous_raw_tokens and previous_optimized_tokens:
+        previous_saved = previous_raw_tokens - previous_optimized_tokens
+        if previous_saved > 0:
+            issues.append("NO SAVINGS")
     if previous_raw_tokens and previous_optimized_tokens:
         previous_saved = previous_raw_tokens - previous_optimized_tokens
         raw_growth = raw_tokens / previous_raw_tokens
@@ -257,6 +293,27 @@ def _dump_messages(msgs: list[dict[str, Any]], label: str = "messages") -> str:
     return "\n".join(lines)
 
 
+def _dry_run_tasks(turns: int, include_memory_probe: bool) -> list[Any]:
+    tasks = list(bench._OPENCODE_SCENARIO_TASKS)
+    if include_memory_probe:
+        tasks = bench._inject_drift_probe(tasks, turns)
+    return tasks
+
+
+def _dry_run_gate_code(
+    break_count: int,
+    max_breaks: int | None,
+    quality_regressions: list[int],
+    allow_quality_regressions: bool,
+) -> int:
+    allowed = max_breaks if max_breaks is not None else 0
+    if break_count > allowed:
+        return 2
+    if quality_regressions and not allow_quality_regressions:
+        return 2
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Replay opencode scenario through proxy dry-run to detect local prefix breaks."
@@ -279,6 +336,8 @@ def main() -> int:
                         help="Write JSON report to this path")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-turn details even when stable")
+    parser.add_argument("--memory-probe", action="store_true",
+                        help="Add long-horizon fact recall probes to the replay")
     parser.add_argument("--dump-turn", type=int, nargs="+", default=[],
                         help="Dump full message content for specified turn numbers")
     parser.add_argument("--dump-all", action="store_true",
@@ -305,6 +364,9 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", dest="json_output",
                         help="Output machine-readable JSON summary (to stdout)")
     args = parser.parse_args()
+    json_stdout = sys.stdout
+    if args.json_output:
+        sys.stdout = sys.stderr
 
     use_unique_session = not args.persistent_session
     if not args.persistent_session:
@@ -335,8 +397,7 @@ def main() -> int:
         return 1
 
     try:
-        base_tasks = list(bench._OPENCODE_SCENARIO_TASKS)
-        base_tasks = bench._inject_drift_probe(base_tasks, args.turns)
+        base_tasks = _dry_run_tasks(args.turns, args.memory_probe)
         turn_exchanges = [t for t in base_tasks if isinstance(t, list)]
 
         proxy_marker = "P{diag dryrun proxy session}\n"
@@ -382,7 +443,11 @@ def main() -> int:
             turn_elapsed = time.monotonic() - turn_start
             turn_times.append(turn_elapsed)
 
-            data = resp.json()
+            try:
+                data = _parse_dry_run_response(resp)
+            except ValueError as exc:
+                print(f"   [ERROR] turn {local_turn + 1}: {exc}", file=sys.stderr)
+                return 1
             opt_msgs = data.get("optimized_messages", [])
             tokens = data.get("tokens", {})
             raw_tokens = tokens.get("original")
@@ -429,30 +494,15 @@ def main() -> int:
                 has_terse = "Be concise" in c
                 print(f"   [turn {local_turn + 1}] system len={len(c)} has_terse={has_terse}")
 
-            reuse_ratio = 1.0
-            if prev_blob is None:
-                status = "(first)"
-            elif blob == prev_blob:
-                status = "STABLE"
-            elif blob.startswith(prev_blob) or prev_blob.startswith(blob):
-                status = "APPEND-ONLY"
-            else:
+            status, reuse_ratio = _classify_prefix(prev_blob, blob, args.reuse_threshold)
+            if status == "*** BREAK ***":
                 # Not byte-identical nor a strict prefix extension. The backend
                 # still reuses the longest common PREFIX, and the volatile
                 # trailing anchor differs every turn by design without breaking
                 # that reuse — so classify by common-prefix reuse ratio rather
                 # than failing the strict append-only check (a high ratio is
                 # cache-stable; a low ratio is a real prefix-cache break).
-                limit = min(len(prev_blob), len(blob))
-                common = 0
-                while common < limit and prev_blob[common] == blob[common]:
-                    common += 1
-                reuse_ratio = common / len(prev_blob) if prev_blob else 0.0
-                if reuse_ratio >= args.reuse_threshold:
-                    status = "REUSED"
-                else:
-                    status = "*** BREAK ***"
-                    breaks.append(local_turn + 1)
+                breaks.append(local_turn + 1)
 
             msg_diffs = _diff_messages(prev_opt, opt_msgs) if prev_opt else []
             byte_diff = _byte_diff(prev_blob, blob) if prev_blob is not None and status == "*** BREAK ***" else None
@@ -559,7 +609,7 @@ def main() -> int:
                     "break_turns": breaks,
                 },
             }
-            print(json.dumps(summary, indent=2, default=str))
+            print(json.dumps(summary, indent=2, default=str), file=json_stdout)
         else:
             print("\n=== local prefix dry-run summary ===")
             print(f"  turns: {args.turns}")
@@ -596,18 +646,22 @@ def main() -> int:
         allowed = args.max_breaks if args.max_breaks is not None else 0
         if len(breaks) > allowed:
             print(f"  GATE FAIL: {len(breaks)} breaks > allowed {allowed}")
-            return 2
-        if quality_regressions and not args.allow_quality_regressions:
+        gate_code = _dry_run_gate_code(
+            len(breaks),
+            args.max_breaks,
+            quality_regressions,
+            args.allow_quality_regressions,
+        )
+        if gate_code and quality_regressions and len(breaks) <= allowed:
             print(
                 f"  GATE FAIL: quality regressions on turns {quality_regressions} "
                 "(use --allow-quality-regressions to report only)"
             )
-            return 2
-        if len(breaks) <= allowed:
-            return 0
-        return 2
+        return gate_code
     finally:
         _stop_proxy()
+        if args.json_output:
+            sys.stdout = json_stdout
 
 
 if __name__ == "__main__":

@@ -34,8 +34,8 @@ The core targets are:
 This is one tagged 30-turn OpenCode replay, not a production guarantee. It ran
 one round against Qwen3.6-35B-A3B-MTP-GGUF with a 262,144-token backend window;
 direct and proxied conversations ran as separate complete sessions. Sources:
-[`JSON report`](benchmark/baseline/20260802_200705_opencode_1_30_cachefix_30turn.json)
-and [`run log`](benchmark/baseline/20260802_200705_opencode_1_30_cachefix_30turn.log).
+[`JSON report`](benchmark/baseline/20260803_130915_opencode_1_30_baseline.json)
+and [`run log`](benchmark/baseline/20260803_130915_opencode_1_30_baseline.log).
 
 | Metric | Observed result |
 |---|---:|
@@ -293,9 +293,16 @@ Conversation continuity is OpenAI-compatible by default. Clients can set the sta
 The proxy exposes a process-wide metrics aggregate (lock-protected) fed from
 both the streaming and non-streaming completion paths. Each turn records
 `cached_tokens`, `prompt_tokens`, `saved_tokens`, and `latency_ms` against the
-backend. A per-session breakdown (bounded by an internal LRU) is also returned
-under `sessions{}` so you can see cache-hit rate and prefix-cache reuse per
-conversation, not just in aggregate.
+backend. Streaming TTFT and backend-reported completion usage add
+`avg_ttft_ms`/`ttft_samples` and `avg_completion_tps`/`completion_tps_samples`;
+TPS remains `null` when the backend does not report completion tokens. The
+snapshot also includes `metrics_window_started_at`, `last_activity_at`,
+`uptime_seconds`, and `last_activity_age_seconds` so operators can distinguish
+an idle proxy from stale metrics. A per-session breakdown (bounded by an
+internal LRU) is also returned under `sessions{}` so you can see cache-hit rate
+and prefix-cache reuse per conversation, not just in aggregate.
+Derived `requests_per_minute`, `input_savings_ratio`, and `backend_error_rate`
+summarize traffic, measured input reduction, and backend health for dashboards.
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/metrics | jq
@@ -318,10 +325,13 @@ without installing a separate dashboard. The page is self-contained and polls
 
 - connection and data-freshness status, including an unavailable-backend state;
 - prefix-cache reuse, cache-hit rate, tokens saved, average TTFT, fresh prefill,
-  and backend errors;
+  decode TPS, and backend errors;
 - a rolling browser-side trend of prefix reuse and normalized fresh prefill;
-- live latency, optimizer/token-counting overhead, native MTP usage, and
-  degraded pipeline stages when those signals are available;
+- rolling saved-token, TTFT, and decode-throughput trends, with explicit
+  unavailable states when the backend has not emitted the required usage;
+- live latency, metrics-window age, last backend activity, optimizer/token-counting
+  overhead, native MTP usage, and degraded pipeline stages when available;
+- proxy version, configured LLM model, and embedding model identity;
 - a bounded, recently active session table with reuse, fresh prefill, savings,
   latency, and error counts.
 
@@ -396,6 +406,7 @@ and the local prefix-cache cliff gate are:
 python benchmark/benchmark.py --scenario opencode --turns 30 --rounds 5 --tag baseline
 python -m benchmark.diag_dryrun_opencode --persistent-session --turns 30 \
   --max-breaks 7
+# Add --memory-probe separately when testing long-horizon fact recall.
 ```
 
 The dry-run gate allows the seven summary-fold breaks expected in this 30-turn
@@ -407,7 +418,9 @@ lost-code-block warnings, so the result is positive efficiency/cache evidence ra
 than complete quality sign-off.
 
 This writes auto-named files to `benchmark/results/` by default:
-`{timestamp}_{scenario}_{rounds}_{turns}_{tag}.json` and the matching `.log`.
+`{timestamp}_{scenario}_{rounds}_{turns}_{tag}.json`, a matching
+`{timestamp}_{scenario}_{rounds}_{turns}_{tag}_baseline.json` containing only
+realistic scenarios, and the matching `.log`
 `--tag` is optional; when omitted, the tag portion is an empty string. Use
 `--outdir path/to/results` to choose another target folder. Open
 `benchmark/dashboard.html` to inspect the JSON report. The benchmark requires
@@ -425,6 +438,10 @@ python benchmark/benchmark.py --scenario refactor_long --turns 30 --tag refactor
 python benchmark/benchmark.py --scenario feature_long --turns 30 --tag feature-long
 python benchmark/benchmark.py --scenario default_long --turns 30 --tag default-long
 python benchmark/benchmark.py --scenario feature --turns 20 --tag feature
+python benchmark/benchmark.py --scenario cross_file --turns 10 --tag cross-file
+python benchmark/benchmark.py --scenario review --turns 10 --tag review
+python benchmark/benchmark.py --scenario incident --turns 10 --tag incident
+python benchmark/benchmark.py --scenario topic_switch --turns 10 --tag topic-switch
 
 # OpenCode-harness replay of the real fixture project (user task + tool calls +
 # real tool outputs read from benchmark/fixtures/). The run_command log is >4k
@@ -462,7 +479,7 @@ python benchmark/benchmark.py --turns 10 --dump-responses --tag responses
 python benchmark/benchmark.py --scenario refactor_long --turns 30 --no-measure-ttft --tag no-ttft
 
 # Complete example with auto-named output files
-python benchmark/benchmark.py --scenario opencode --rounds 5 --turns 30 --tag baseline
+python benchmark/benchmark.py --scenario opencode --rounds 1 --turns 30 --tag baseline
 ```
 
 > **Rounds default is 5**. Run at least 5 rounds so per-round variance
@@ -482,7 +499,7 @@ python benchmark/benchmark.py --scenario opencode --rounds 5 --turns 30 --tag ba
 | `--budget` | unset | Override `MOEPT_AGENTIC__MAX_OPTIMIZED_CHARS` (char budget); eviction triggers when context exceeds this. |
 | `--profile` | `balanced` | Context optimization profile: `quality` (max fidelity, no summarization/RAG), `balanced` (default), `aggressive` (max token savings, top-only eviction). |
 | `--min-similarity` | unset | Regression gate (review03.md §10): exit `2` if the mean semantic similarity (proxy vs direct) falls below this threshold. Use in CI to block quality regressions. |
-| `--scenario` | `default` | Real-life coding scenario: `debug`, `debug_long`, `refactor`, `refactor_long`, `feature`, `feature_long`, `default`, `default_long`, `fixtures`, `opencode`, or `all`. |
+| `--scenario` | `default` | Real-life coding scenario: `debug`, `debug_long`, `refactor`, `refactor_long`, `feature`, `feature_long`, `cross_file`, `review`, `incident`, `topic_switch`, `default`, `default_long`, `fixtures`, `opencode`, or `all`. |
 | `--temperature` | `0.0` | Sampling temperature for both direct and proxy runs. `0` is deterministic so quality metrics are reproducible; raise only to stress-test nondeterminism. |
 | `--no-agentic` | off (agentic on) | Send plain user messages instead of OpenCode-style agent payloads (user task + `tool_calls` + tool outputs). Agentic mode is the default for every scenario. |
 | `--no-measure-ttft` | off (TTFT on) | Disable TTFT measurement and per-turn prefix-cache hit capture. By default the benchmark streams responses (SSE) to measure time-to-first-token and record per-round `/v1/metrics` snapshots; conversations stay contiguous, only the transport changes. |
@@ -502,10 +519,15 @@ You might need to run the benchmark as background task to avoid hitting command 
 | `refactor_long` | 30-turn real-life refactor conversation with evolving code blocks and context growth beyond 32k tokens |
 | `feature` | Feature implementation with API design and testing |
 | `feature_long` | 30-turn real-life feature conversation with evolving code blocks and context growth beyond 32k tokens |
+| `cross_file` | Cross-file feature workflow spanning implementation, tests, config, public API, and documentation |
+| `review` | Review workflow that identifies confirmed correctness/security risks, adds a regression test, and verifies the diff |
+| `incident` | Production incident workflow covering noisy logs, partial backend failures, timeout/retry configuration, and recovery |
+| `topic_switch` | Context-switch workflow moving from authentication feature work to timeout debugging and security review |
 | `default` | General coding conversation (Fibonacci example) |
 | `default_long` | 30-turn general coding conversation with evolving code blocks and context growth beyond 32k tokens |
 | `fixtures` | **Alias of `opencode`** — OpenCode-harness replay of the real `benchmark/fixtures/` project: each turn reads a real fixture file and runs a realistic test/lint/build log. |
 | `opencode` | OpenCode-harness replay of the real `benchmark/fixtures/` project (user task + `tool_calls` + real tool outputs). Always agentic. `fixtures` is an alias of this scenario. |
+| `compression_stress` | Synthetic oversized tool-output replay for measuring compressor behavior separately from realistic quality aggregates. |
 
 All scenarios are agentic by default. `--no-agentic` sends plain user messages
 instead of agent payloads. `--profile` selects the optimization preset

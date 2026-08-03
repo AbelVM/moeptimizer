@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import socket
+import sys
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 pytest.importorskip("benchmark.benchmark")
 
@@ -29,6 +33,50 @@ def test_gate_disabled_when_none() -> None:
     from benchmark.benchmark import _check_similarity_gate
 
     assert _check_similarity_gate(_args(None), 0.0) == 0
+
+
+def test_regression_gate_includes_headline_retention_metrics() -> None:
+    from benchmark.gate import QUALITY_METRICS, _normalize
+
+    report = {
+        "quality": {
+            "prompt_source_token_recall": {"mean": 0.9},
+            "evicted_content_recall": {"mean": 0.8},
+            "code_syntax_validity": {"mean": 1.0},
+        }
+    }
+    normalized = _normalize(report)
+    assert "prompt_source_token_recall" in QUALITY_METRICS
+    assert "code_syntax_validity" in QUALITY_METRICS
+    assert normalized["prompt_source_token_recall"] == 0.9
+    assert normalized["code_syntax_validity"] == 1.0
+
+
+def test_regression_gate_preserves_zero_and_missing_task_anchor_recall() -> None:
+    from benchmark.gate import _normalize
+
+    zero = _normalize({"quality": {"task_anchor_recall": {"mean": 0.0}}})
+    missing = _normalize({"quality": {"code_block_ratio": {"mean": 1.0}}})
+
+    assert zero["task_anchor_recall"] == 0.0
+    assert "task_anchor_recall" not in missing
+
+
+def test_regression_gate_rejects_hard_quality_failures() -> None:
+    from benchmark.gate import _hard_failures
+
+    failures = _hard_failures({
+        "quality": {
+            "prompt_source_token_recall": {"mean": 0.7},
+            "evicted_content_recall": {"mean": 0.8},
+            "code_syntax_validity": {"mean": 1.0},
+            "quality_skipped_turns": 1,
+        },
+        "turns": [{"quality": {"code_syntax_validity": 0.0}}],
+    })
+    assert any("prompt_source_token_recall below hard floor" in failure for failure in failures)
+    assert any("quality_skipped_turns exceeded" in failure for failure in failures)
+    assert any("turn 1 code_syntax_validity" in failure for failure in failures)
 
 
 def test_backend_log_health_url_and_bounded_events() -> None:
@@ -309,3 +357,248 @@ def test_report_derives_backend_independent_performance_metrics() -> None:
     assert performance["approximate_decode_tps"]["proxy"]["mean"] == 15
     assert len(performance["per_turn"][0]["direct_prompt_sha256"]) == 16
     assert len(performance["per_turn"][0]["proxy_prompt_sha256"]) == 16
+
+
+def test_report_excludes_only_turn_zero_from_cache_aggregates() -> None:
+    from benchmark.benchmark import BenchmarkReport, TurnComparison, TurnMetrics
+
+    report = BenchmarkReport(turns=[
+        TurnComparison(
+            turn_index=0,
+            direct=TurnMetrics(prompt_tokens=100, cached_tokens=100),
+            proxy=TurnMetrics(prompt_tokens=100, cached_tokens=100, prefix_cache_hit_tokens=999),
+        ),
+        TurnComparison(
+            turn_index=1,
+            direct=TurnMetrics(prompt_tokens=100, cached_tokens=0),
+            proxy=TurnMetrics(prompt_tokens=100, cached_tokens=0, prefix_cache_hit_tokens=0),
+        ),
+        TurnComparison(
+            turn_index=2,
+            direct=TurnMetrics(prompt_tokens=100, cached_tokens=50),
+            proxy=TurnMetrics(prompt_tokens=100, cached_tokens=50, prefix_cache_hit_tokens=10),
+        ),
+    ])
+
+    summary = report.summary()
+    assert summary["cache_reuse"]["total_prefix_cache_hit_tokens"] == 10
+    assert summary["cache_reuse"]["per_turn_prefix_cache_hit_tokens"]["mean"] == 5
+    assert summary["performance"]["cache_reuse_pct"]["proxy"]["mean"] == 25
+
+
+def test_dry_run_prefix_classifier_respects_threshold_boundaries() -> None:
+    from benchmark.diag_dryrun_opencode import _classify_prefix
+
+    assert _classify_prefix(None, "abc", 0.9) == ("(first)", 1.0)
+    assert _classify_prefix("abc", "abc", 0.9) == ("STABLE", 1.0)
+    assert _classify_prefix("abc", "abcdef", 0.9) == ("APPEND-ONLY", 1.0)
+    assert _classify_prefix("abcdef", "abcXYZ", 0.5) == ("REUSED", 0.5)
+    assert _classify_prefix("abcdef", "abcXYZ", 0.51) == ("*** BREAK ***", 0.5)
+
+
+def test_dry_run_parser_rejects_malformed_payloads() -> None:
+    from benchmark.diag_dryrun_opencode import _parse_dry_run_response
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            if isinstance(self.payload, Exception):
+                raise self.payload
+            return self.payload
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        _parse_dry_run_response(Response(ValueError("bad json")))
+    with pytest.raises(ValueError, match="optimized_messages"):
+        _parse_dry_run_response(Response({"tokens": {}}))
+    with pytest.raises(ValueError, match="tokens"):
+        _parse_dry_run_response(Response({"optimized_messages": [], "tokens": []}))
+
+
+def test_dry_run_memory_probe_is_opt_in() -> None:
+    from benchmark import benchmark as bm
+    from benchmark.diag_dryrun_opencode import _dry_run_tasks
+
+    plain = _dry_run_tasks(3, include_memory_probe=False)
+    probed = _dry_run_tasks(3, include_memory_probe=True)
+    assert plain == bm._OPENCODE_SCENARIO_TASKS
+    assert probed != plain
+
+
+def test_dry_run_gate_code_covers_break_and_quality_boundaries() -> None:
+    from benchmark.diag_dryrun_opencode import _dry_run_gate_code
+
+    assert _dry_run_gate_code(0, None, [], False) == 0
+    assert _dry_run_gate_code(1, 1, [], False) == 0
+    assert _dry_run_gate_code(2, 1, [], False) == 2
+    assert _dry_run_gate_code(0, 1, [3], False) == 2
+    assert _dry_run_gate_code(0, 1, [3], True) == 0
+
+
+def test_dry_run_main_returns_success_for_valid_proxy_response(monkeypatch) -> None:
+    from benchmark import diag_dryrun_opencode as diagnostic
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "optimized_messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "task"},
+                ],
+                "tokens": {"original": 10, "optimized": 8},
+                "cache_key_prefix": "prefix",
+                "est_cache_hit": False,
+            }
+
+    monkeypatch.setattr(sys, "argv", ["diag_dryrun_opencode", "--turns", "1", "--no-stream"])
+    monkeypatch.setattr(diagnostic, "_clear_pycache", lambda: None)
+    monkeypatch.setattr(diagnostic, "_start_proxy", lambda port: None)
+    monkeypatch.setattr(diagnostic, "_proxy_is_running", lambda port: True)
+    monkeypatch.setattr(diagnostic, "_stop_proxy", lambda: None)
+    monkeypatch.setattr(diagnostic.requests, "post", lambda *args, **kwargs: Response())
+
+    assert diagnostic.main() == 0
+
+
+def test_dry_run_main_returns_failure_for_malformed_proxy_response(monkeypatch) -> None:
+    from benchmark import diag_dryrun_opencode as diagnostic
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            raise ValueError("bad json")
+
+    monkeypatch.setattr(sys, "argv", ["diag_dryrun_opencode", "--turns", "1", "--no-stream"])
+    monkeypatch.setattr(diagnostic, "_clear_pycache", lambda: None)
+    monkeypatch.setattr(diagnostic, "_start_proxy", lambda port: None)
+    monkeypatch.setattr(diagnostic, "_proxy_is_running", lambda port: True)
+    monkeypatch.setattr(diagnostic, "_stop_proxy", lambda: None)
+    monkeypatch.setattr(diagnostic.requests, "post", lambda *args, **kwargs: Response())
+
+    assert diagnostic.main() == 1
+
+
+def test_dry_run_live_proxy_subprocess() -> None:
+    if os.environ.get("MOEPT_RUN_LIVE_DRYRUN") != "1":
+        pytest.skip("set MOEPT_RUN_LIVE_DRYRUN=1 to run the live proxy check")
+
+    from benchmark import diag_dryrun_opencode as diagnostic
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+
+    process = diagnostic._start_proxy(port, wait=15)
+    assert process is not None
+    try:
+        response = requests.post(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            json={"model": "dry-run", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-MOEPT-Dry-Run": "true"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = diagnostic._parse_dry_run_response(response)
+        assert payload["tokens"]["optimized"] <= payload["tokens"]["original"]
+    finally:
+        diagnostic._stop_proxy()
+
+
+def test_aggregate_reports_excludes_compression_stress_from_default_metrics() -> None:
+    from benchmark.benchmark import _aggregate_reports
+
+    class Report:
+        def __init__(self, scenario_kind: str, similarity: float) -> None:
+            self.config = {"scenario_kind": scenario_kind}
+            self.similarity = similarity
+
+        def summary(self) -> dict[str, object]:
+            return {
+                "num_turns": 1,
+                "latency_ms": {"proxy": {"mean": 1.0}},
+                "quality": {
+                    "semantic_similarity": {"mean": self.similarity},
+                    "rouge_l_f1": {"mean": self.similarity},
+                    "token_jaccard": {"mean": self.similarity},
+                    "code_block_ratio": {"mean": self.similarity},
+                    "edit_similarity": {"mean": self.similarity},
+                    "quality_skipped_turns": 0,
+                },
+                "tokens": {"token_savings_pct": 1.0},
+            }
+
+    result = _aggregate_reports({
+        "real": Report("realistic", 0.9),
+        "compression_stress": Report("compression_stress", 0.1),
+    })
+
+    assert result["aggregated"]["semantic_similarity"]["mean"] == 0.9
+    assert result["per_scenario"]["compression_stress"]["scenario_kind"] == "compression_stress"
+    assert result["stress"]["aggregated"]["semantic_similarity"]["mean"] == 0.1
+    assert result["quality"]["code_block_ratio"]["mean"] == 0.9
+    assert result["secondary_quality"]["rouge_l_f1"]["mean"] == 0.9
+
+
+def test_gate_normalizes_flattened_aggregate_quality_metrics() -> None:
+    from benchmark.gate import _normalize
+
+    normalized = _normalize({
+        "aggregated": {
+            "prompt_source_token_recall": {"mean": 0.9},
+            "code_syntax_validity": {"mean": 1.0},
+        }
+    })
+
+    assert normalized["prompt_source_token_recall"] == 0.9
+    assert normalized["code_syntax_validity"] == 1.0
+
+
+def test_baseline_quality_report_removes_stress_scenarios() -> None:
+    from benchmark.benchmark import _baseline_quality_report
+
+    report = _baseline_quality_report({
+        "scenarios": ["real", "compression_stress"],
+        "per_scenario": {
+            "real": {"scenario_kind": "realistic"},
+            "compression_stress": {"scenario_kind": "compression_stress"},
+        },
+        "aggregated": {"semantic_similarity": {"mean": 0.9}},
+        "stress": {"aggregated": {"semantic_similarity": {"mean": 0.1}}},
+    })
+
+    assert report["report_scope"] == "realistic_baseline"
+    assert report["scenarios"] == ["real"]
+    assert list(report["per_scenario"]) == ["real"]
+    assert "stress" not in report
+
+
+def test_aggregate_reports_preserves_zero_quality_metrics() -> None:
+    from benchmark.benchmark import _aggregate_reports
+
+    class ZeroReport:
+        def summary(self) -> dict:
+            return {
+                "num_turns": 1,
+                "quality": {
+                    "semantic_similarity": {"mean": 0.0},
+                    "rouge_l_f1": {"mean": 0.0},
+                    "token_jaccard": {"mean": 0.0},
+                    "code_block_ratio": {"mean": 0.0},
+                    "edit_similarity": {"mean": 0.0},
+                },
+                "tokens": {"token_savings_pct": 0.0},
+                "latency_ms": {"proxy": {"mean": 0.0}},
+                "ttft_ms": {"proxy": {"mean": 0.0}},
+                "proxy_overhead_ms": {"mean": 0.0},
+                "cost_usd": {"savings_pct": 0.0},
+            }
+
+    aggregated = _aggregate_reports({"zero": ZeroReport()})["aggregated"]
+    assert aggregated["semantic_similarity"] == {"mean": 0.0, "min": 0.0, "max": 0.0}
+    assert aggregated["token_savings_pct"] == {"mean": 0.0, "min": 0.0, "max": 0.0}

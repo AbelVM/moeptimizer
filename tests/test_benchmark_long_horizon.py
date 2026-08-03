@@ -14,6 +14,100 @@ from unittest import mock
 # benchmark/ is importable via tests/conftest.py (repo root on sys.path)
 from benchmark import benchmark as bm
 
+
+def test_task_anchor_recall_weights_structured_task_signals() -> None:
+    full = (
+        "Edit users/service.py and preserve def summarize.\n"
+        "The failed assertion must remain visible.\n"
+    )
+    optimized = "Edit users/service.py and preserve def summarize."
+
+    assert bm._task_anchor_recall(full, optimized) == 0.7
+
+
+def test_task_anchor_recall_counts_retained_code_fences() -> None:
+    full = "Update users/service.py.\n```python\ndef summarize():\n    pass\n```"
+    optimized = "Update users/service.py.\n```python\ndef summarize():\n    pass\n```"
+
+    assert bm._task_anchor_recall(full, optimized) == 1.0
+
+
+def test_task_anchor_recall_uses_explicit_scenario_anchors() -> None:
+    assert bm._task_anchor_recall(
+        "The prompt mentions users/service.py and pytest.",
+        "Keep users/service.py.",
+        ["users/service.py", "pytest"],
+    ) == 0.5
+
+
+def test_backend_log_collector_correlates_mtp_events_by_turn() -> None:
+    collector = bm.BackendLogCollector("http://127.0.0.1:13305", cap=1)
+    collector.set_round(2)
+    collector.set_context("proxy", 7)
+    collector._append({"seq": 1, "line": "draft acceptance = 0.5 (3 accepted / 6 generated)"})
+    collector.set_context("direct", 7)
+    collector._append({"seq": 2, "line": "draft acceptance = 0.8 (4 accepted / 5 generated)"})
+
+    summary = collector.summary()
+
+    assert summary["event_count"] == 1
+    assert summary["dropped_events"] == 1
+    assert summary["mtp_per_turn"] == [
+        {
+            "round": 2,
+            "phase": "direct",
+            "turn": 7,
+            "samples": 1,
+            "accepted_tokens": 4,
+            "draft_tokens": 5,
+            "acceptance_rate": 0.8,
+        }
+    ]
+
+
+def test_cross_file_scenario_covers_required_workflow_surfaces() -> None:
+    tasks = [message for role, message in bm.SCENARIOS["cross_file"]["tasks"] if role == "user"]
+    joined = "\n".join(tasks)
+
+    assert len(tasks) >= 5
+    assert all(surface in joined for surface in ("config", "tests", "public", "documentation"))
+    assert set(("app.py", "config.py", "tests", "__init__.py", "README.md")) <= set(
+        bm.SCENARIO_TASK_ANCHORS["cross_file"]
+    )
+
+
+def test_review_scenario_requires_confirmed_findings_and_verification() -> None:
+    tasks = [message for role, message in bm.SCENARIOS["review"]["tasks"] if role == "user"]
+    joined = "\n".join(tasks).lower()
+
+    assert len(tasks) >= 4
+    assert all(term in joined for term in ("confirmed", "security", "pytest", "regression"))
+    assert set(("patch", "security", "pytest", "public API", "regression")) <= set(
+        bm.SCENARIO_TASK_ANCHORS["review"]
+    )
+
+
+def test_incident_scenario_covers_failure_recovery_workflow() -> None:
+    tasks = [message for role, message in bm.SCENARIOS["incident"]["tasks"] if role == "user"]
+    joined = "\n".join(tasks).lower()
+
+    assert len(tasks) >= 4
+    assert all(term in joined for term in ("logs", "backend", "timeout", "retry", "request id"))
+    assert set(("logs", "backend", "timeout", "retry", "request ID")) <= set(
+        bm.SCENARIO_TASK_ANCHORS["incident"]
+    )
+
+
+def test_topic_switch_scenario_preserves_both_workstreams() -> None:
+    tasks = [message for role, message in bm.SCENARIOS["topic_switch"]["tasks"] if role == "user"]
+    joined = "\n".join(tasks).lower()
+
+    assert len(tasks) >= 4
+    assert all(term in joined for term in ("authentication", "timeout", "review", "pytest"))
+    assert set(("authentication", "timeout", "review", "pytest", "original scope")) <= set(
+        bm.SCENARIO_TASK_ANCHORS["topic_switch"]
+    )
+
 # ---------------------------------------------------------------------------
 # _inject_drift_probe
 # ---------------------------------------------------------------------------
@@ -36,6 +130,16 @@ def test_inject_opencode_exchange_prepends_anchor():
     assert len(out) == 5
     assert out[0][0]["content"].startswith(bm._DRIFT_PLANT)
     assert out[-1][0]["content"] == bm._DRIFT_PROBE
+
+
+def test_inject_drift_probe_does_not_mutate_shared_tasks():
+    tasks = [[{"role": "user", "content": "Build X"}]]
+    first = bm._inject_drift_probe(tasks, 3)
+    second = bm._inject_drift_probe(tasks, 3)
+
+    assert tasks[0][0]["content"] == "Build X"
+    assert first[0][0]["content"].count(bm._DRIFT_PLANT) == 1
+    assert second[0][0]["content"].count(bm._DRIFT_PLANT) == 1
 
 
 def test_inject_long_scenario_replaces_final_turn_with_probe():
@@ -185,3 +289,19 @@ def test_fact_recall_uses_embedding_only_as_fallback():
         # "ATLAS" and "Postgres" are lexical matches; "Python 3.11", "retry 3",
         # "platform-infra" are not stated -> 0.4, not an error.
         assert bm._grade_fact_recall(paraphrased, bm._DRIFT_FACTS) == 0.4
+
+
+def test_report_preserves_fact_recall_by_round():
+    report = bm.BenchmarkReport(
+        turns=[bm.TurnComparison(turn_index=1)],
+        fact_recall={"proxy": 1.0, "direct": 0.8},
+        fact_recall_by_round=[
+            {"round": 0, "proxy": 0.6, "direct": 0.8},
+            {"round": 1, "proxy": 1.0, "direct": 0.8},
+        ],
+    )
+    summary = report.summary()
+    assert summary["long_horizon"]["fact_recall_by_round"] == [
+        {"round": 0, "proxy": 0.6, "direct": 0.8},
+        {"round": 1, "proxy": 1.0, "direct": 0.8},
+    ]

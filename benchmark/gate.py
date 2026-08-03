@@ -49,12 +49,24 @@ from pathlib import Path
 # the lexical battery is secondary for this use case. Lower is a regression.
 QUALITY_METRICS: tuple[str, ...] = (
     "prompt_faithfulness",
+    "prompt_source_token_recall",
+    "task_anchor_recall",
     "evicted_content_recall",
     "code_block_ratio",
+    "code_syntax_validity",
     "rouge_l_f1",
     "token_jaccard",
     "edit_similarity",
 )
+
+QUALITY_FLOORS: dict[str, float] = {
+    "prompt_source_token_recall": 0.75,
+    "task_anchor_recall": 0.75,
+    "evicted_content_recall": 0.75,
+    "code_syntax_validity": 1.0,
+}
+MAX_QUALITY_SKIPPED_TURNS = 0
+MAX_CODE_BLOCK_LOSS_TURNS = 3
 
 
 def _drill(data: object, *keys: str) -> object | None:
@@ -99,6 +111,8 @@ def _normalize(report: dict) -> dict[str, float]:
         val = _mean_of(_drill(report, "quality", qm))
         if val is None:
             val = _mean_of(_drill(report, "aggregated", "quality", qm))
+        if val is None:
+            val = _mean_of(_drill(report, "aggregated", qm))
         if val is not None:
             out[qm] = val
 
@@ -207,6 +221,52 @@ def _check_gate(current: dict[str, float], baseline: dict[str, float], tol: floa
     return failures
 
 
+def _hard_failures(report: dict) -> list[str]:
+    """Return failures that means and tolerance comparisons can hide."""
+    failures: list[str] = []
+    for metric, floor in QUALITY_FLOORS.items():
+        value = _mean_of(_drill(report, "quality", metric))
+        if value is None:
+            value = _mean_of(_drill(report, "aggregated", "quality", metric))
+        if value is None:
+            failures.append(f"missing required quality metric: {metric}")
+        elif value < floor:
+            failures.append(f"{metric} below hard floor {floor:.2f}: {value:.4f}")
+
+    quality = report.get("quality")
+    if not isinstance(quality, dict):
+        quality = {}
+    aggregate = report.get("aggregated")
+    if not isinstance(aggregate, dict):
+        aggregate = {}
+    skipped = quality.get("quality_skipped_turns", aggregate.get("quality_skipped_turns", 0))
+    if isinstance(skipped, (int, float)) and skipped > MAX_QUALITY_SKIPPED_TURNS:
+        failures.append(f"quality_skipped_turns exceeded {MAX_QUALITY_SKIPPED_TURNS}: {skipped}")
+    code_loss = quality.get(
+        "code_block_loss_turns",
+        aggregate.get("code_block_loss_turns", 0),
+    )
+    if isinstance(code_loss, (int, float)) and code_loss > MAX_CODE_BLOCK_LOSS_TURNS:
+        failures.append(f"code_block_loss_turns exceeded {MAX_CODE_BLOCK_LOSS_TURNS}: {code_loss}")
+
+    turns = report.get("turns")
+    if isinstance(turns, list):
+        for index, turn in enumerate(turns, 1):
+            if not isinstance(turn, dict):
+                continue
+            quality_data = turn.get("quality")
+            if not isinstance(quality_data, dict):
+                continue
+            syntax = quality_data.get("code_syntax_validity")
+            if isinstance(syntax, (int, float)) and syntax < 1.0:
+                failures.append(f"turn {index} code_syntax_validity below 1.00: {syntax:.4f}")
+            for metric, floor in QUALITY_FLOORS.items():
+                value = quality_data.get(metric)
+                if metric != "code_syntax_validity" and isinstance(value, (int, float)) and value < floor:
+                    failures.append(f"turn {index} {metric} below hard floor {floor:.2f}: {value:.4f}")
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MOE-ptimizer CI benchmark regression gate")
     parser.add_argument("--baseline", required=True, help="Path to committed baseline JSON report")
@@ -244,6 +304,7 @@ def main() -> int:
 
     _print_diff(current, baseline, args.tolerance)
     failures = _check_gate(current, baseline, args.tolerance)
+    failures.extend(_hard_failures(current_raw))
 
     if failures:
         print("\n  ❌ BENCHMARK REGRESSION GATE FAILED:")

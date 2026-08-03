@@ -2,14 +2,12 @@
 
 Version-by-version feature history for MOE-ptimizer.
 
+## Unreleased
+
+- **Live metrics dashboard** — Add request rate, measured input-savings rate,
+  backend error rate, and clearer operational health context.
 
 ## Feature History
-
-### Current
-
-- **Graph and AST-Aware RAG** — Combines goal/subtask/tool/outcome graph traversal with Tree-Sitter code structure, symbol indexing, and dependency relationships for precise code-context retrieval. Bounded deterministic query retrieval remains available when embeddings are unavailable.
-- **Bounded Session Memory Retrieval** — Ranks prior per-session steps by deterministic query-term overlap and appends a bounded retrieval projection at the prompt tail, preserving historical prompt bytes while retaining structural RAG fallback.
-- **Cache-Cliff Investigation** — Confirmed that the former every-turn front-eviction cliff is fixed: non-fold turns remain append-only, while the remaining low-reuse turns are expected rolling-summary folds. A tagged live 30-turn replay (`cachefix_30turn`) recorded 49.01% prompt-token savings, 35.6% lower mean latency, and TTFT improvement from 15,517 ms to 8,238 ms. The run also reported three lost-code-block warnings, so this is positive cache/efficiency evidence, not a complete quality sign-off.
 
 ### First version (v0.1.0)
 
@@ -482,7 +480,7 @@ C9, C10). Full test suite after changes: **417 passed, 2 skipped**.
     `cache_hit_rate` 0.9667 (unchanged); `code_syntax_validity` 1.0.
   - **TTFT measurement fixed.** Proxy TTFT now captured (mean 7,315 ms vs direct
     13,379 ms); previously `{}` due to the streaming-clock bug.
-   - **Open item.** `has_code_proxy` remains 0.0 — the ledger carries code
+  - **Open item.** `has_code_proxy` remains 0.0 — the ledger carries code
      *signatures*, not full bodies, so the proxy does not reproduce code blocks.
      Extending the ledger to carry short code bodies is the next step if proxy
      code reproduction is required.
@@ -888,6 +886,7 @@ code and `has_code_proxy` collapsed to 0.0 across all 30 turns.
   `_code_block_preservation` path.
 
 **Benchmark result (`benchmark_opencode_30_1_0.7.20_baseline`):**
+
 - `has_code_proxy` **0.0 → 0.9333** (median 1.0) — P2 fix confirmed; the false
   zero was a grader blind spot for tool-call-emitted code. `has_code_direct`
   0.367 → 0.1667.
@@ -1230,3 +1229,35 @@ contention).
 - **Release status.** Proxy-owned review work is implemented and validated. Release
   remains held pending Lemonade-authoritative cache/slot events, authoritative MTP
   throughput fields, repeated cold/warm backend rounds, and live task-success evidence.
+
+### v0.7.2 — Cliff fixing, better benchmark and documentation
+
+- **Graph and AST-Aware RAG** — Combines goal/subtask/tool/outcome graph traversal with Tree-Sitter code structure, symbol indexing, and dependency relationships for precise code-context retrieval. Bounded deterministic query retrieval remains available when embeddings are unavailable.
+- **Bounded Session Memory Retrieval** — Ranks prior per-session steps by deterministic query-term overlap and appends a bounded retrieval projection at the prompt tail, preserving historical prompt bytes while retaining structural RAG fallback.
+- **Cache-Cliff Investigation** — Confirmed that the former every-turn front-eviction cliff is fixed: non-fold turns remain append-only, while the remaining low-reuse turns are expected rolling-summary folds. A tagged live 30-turn replay (`cachefix_30turn`) recorded 49.01% prompt-token savings, 35.6% lower mean latency, and TTFT improvement from 15,517 ms to 8,238 ms. The run also reported three lost-code-block warnings, so this is positive cache/efficiency evidence, not a complete quality sign-off.
+- **Improved readme** — Aligned with current code and more descriptive
+- **Reworked benchmark**
+  - Preserved contiguous full-conversation ordering: proxy and direct sessions
+    run independently, with the complete proxy session followed by the complete
+    direct session.
+  - Added realistic `cross_file`, `review`, `incident`, and `topic_switch`
+    scenarios, seeded variants, independent workspace states, and a separate
+    `compression_stress` scenario excluded from realistic quality aggregates.
+  - Rebuilt fixture replay around isolated temporary workspaces with evolving
+    file state, zero-fuzz patch application, pytest acceptance, repair retries,
+    bounded tool output, and failure records.
+  - Added weighted task-native anchor recall, per-round long-horizon records,
+    prompt savings, TTFT, fresh-prefill, cache-reuse, and optional third-party
+    backend/MTP event correlation to the report.
+  - Strengthened regression gates with shared metric normalization, quality
+    floors, per-turn failure budgets, code-loss limits, and quality-skip limits;
+    all-scenario runs also emit a realistic baseline report.
+  - Hardened dry-run prefix checks so `NO SAVINGS` requires a prior savings
+    baseline, and moved memory recall checks behind the explicit `--memory-probe`
+    diagnostic instead of contaminating normal scenarios.
+  - Updated the dashboard for task-anchor recall, zero-safe radar and cache
+    charts, long-horizon and MTP/backend telemetry, seeded run metadata, actual
+    proxy-process overhead, and bounded per-turn diagnostics.
+- **Live metrics dashboard**
+  - Add benchmark-aligned operational styling, runtime identity, saved-token/TTFT/decode-throughput trends, and real metrics-window freshness indicators.
+  - Add request rate, measured input-savings rate, backend error rate, and clearer operational health context.

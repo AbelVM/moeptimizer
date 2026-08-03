@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -1701,7 +1702,7 @@ def _get_fixture_loader() -> Any:
     return _FIXTURE_LOADER
 
 
-def _build_opencode_scenario_tasks() -> list[list[dict]]:
+def _build_opencode_scenario_tasks(seed: int | None = None) -> list[list[dict]]:
     """Build the `opencode` (and `fixtures`) scenario: OpenCode-style replay.
 
     Each turn is a realistic agent payload — user task plus assistant tool_calls
@@ -1711,7 +1712,7 @@ def _build_opencode_scenario_tasks() -> list[list[dict]]:
     loader = _get_fixture_loader()
     if loader is not None:
         try:
-            return loader.build_fixture_agentic_tasks()
+            return loader.build_fixture_agentic_tasks(seed=seed)
         except Exception:
             pass
     return [
@@ -1783,6 +1784,10 @@ def _inject_drift_probe(tasks: list, num_turns: int) -> list:
     if not tasks:
         return tasks
 
+    # Scenario definitions are shared across benchmark rounds; do not let the
+    # measurement probe accumulate in the imported task template.
+    tasks = copy.deepcopy(tasks)
+
     # ── Prepend the anchor to the first user turn ────────────────────────
     first = tasks[0]
     if isinstance(first, tuple):
@@ -1846,6 +1851,43 @@ SCENARIOS = {
         "description": "Long real-life feature conversation with 30 unique turns and code blocks",
         "tasks": [("user", task) for task in FEATURE_LONG_TASKS],
     },
+    "cross_file": {
+        "description": "Cross-file feature workflow spanning implementation, tests, config, API, and docs",
+        "tasks": [
+            ("user", "Add request tracing to the proxy. First inspect the app, config, and package exports."),
+            ("user", "Implement a request ID in the FastAPI response headers and keep the existing API behavior."),
+            ("user", "Add a config setting for the tracing header and write focused endpoint tests."),
+            ("user", "Re-export the setting or helper from the public package API if callers need it, then update the documentation."),
+            ("user", "Run the focused tests and lint, inspect the complete diff, and fix any regression before reporting done."),
+        ],
+    },
+    "review": {
+        "description": "Code review workflow for a deliberately flawed patch",
+        "tasks": [
+            ("user", "Review the patch and identify only confirmed correctness, security, and regression risks."),
+            ("user", "Inspect the diff and surrounding callers before proposing changes; do not rewrite unrelated code."),
+            ("user", "Fix the confirmed issue and add a focused pytest regression test for the failure."),
+            ("user", "Run pytest and lint on the touched files, then verify the public API and report remaining risks."),
+        ],
+    },
+    "incident": {
+        "description": "Production incident workflow for noisy logs and partial failures",
+        "tasks": [
+            ("user", "Diagnose the incident from the noisy logs and identify the first failing request without guessing."),
+            ("user", "Separate the partial backend failure from proxy errors, then check timeout and retry configuration."),
+            ("user", "Reproduce the failure with a focused test and preserve the original request ID in the logs."),
+            ("user", "Apply the smallest retry or configuration fix, verify recovery, and report residual production risks."),
+        ],
+    },
+    "topic_switch": {
+        "description": "Context-switch workflow moving from feature work to debugging and review",
+        "tasks": [
+            ("user", "Finish the authentication feature without changing its original scope or public API."),
+            ("user", "Switch context: diagnose a timeout failure in the same service and identify the responsible caller."),
+            ("user", "Switch context again: review the proposed fix for correctness and security before merging."),
+            ("user", "Run the focused pytest checks, preserve the original authentication requirements, and summarize both workstreams."),
+        ],
+    },
     "default": {
         "description": "General coding conversation",
         "tasks": [
@@ -1867,6 +1909,28 @@ SCENARIOS = {
         "description": "OpenCode-harness replay from benchmark/fixtures/ (user task + tool calls + real tool outputs)",
         "tasks": _OPENCODE_SCENARIO_TASKS,
     },
+    "compression_stress": {
+        "description": "Synthetic oversized tool-output compression stress test",
+        "tasks": [("user", "Exercise compression across repeated tool-output-heavy turns.")],
+    },
+}
+
+# Stable, task-native signals used by the context-retention quality metric.
+SCENARIO_TASK_ANCHORS: dict[str, list[str]] = {
+    "default": ["fibonacci", "generator", "--count"],
+    "default_long": ["fibonacci", "generator", "pytest"],
+    "debug": ["app/items.py", "ValueError", "pytest"],
+    "debug_long": ["app/items.py", "ValueError", "pytest"],
+    "refactor": ["calculate_stats", "variance", "type hints"],
+    "refactor_long": ["calculate_stats", "variance", "pytest"],
+    "feature": ["FastAPI", "JWT", "rate limiting"],
+    "feature_long": ["FastAPI", "JWT", "pytest"],
+    "cross_file": ["app.py", "config.py", "tests", "__init__.py", "README.md"],
+    "review": ["patch", "security", "pytest", "public API", "regression"],
+    "incident": ["logs", "backend", "timeout", "retry", "request ID"],
+    "topic_switch": ["authentication", "timeout", "review", "pytest", "original scope"],
+    "fixtures": ["users/", "test_users.py", "read_file", "run_command"],
+    "opencode": ["users/", "test_users.py", "read_file", "run_command"],
 }
 
 # "all" scenario is handled specially - runs all individual scenarios
@@ -3018,6 +3082,40 @@ def _prompt_source_token_recall(full_prompt: str, optimized_prompt: str) -> floa
     return round(len(full_tokens & opt_tokens) / len(full_tokens), 6)
 
 
+def _task_anchor_recall(
+    full_prompt: str,
+    optimized_prompt: str,
+    task_anchors: list[str] | None = None,
+) -> float | None:
+    """Weighted retention of task-specific paths, symbols, failures, and rules."""
+    if not full_prompt or not optimized_prompt:
+        return None
+    if task_anchors:
+        anchors = {anchor.lower() for anchor in task_anchors if anchor.strip()}
+        if anchors:
+            optimized_lower = optimized_prompt.lower()
+            return round(sum(anchor in optimized_lower for anchor in anchors) / len(anchors), 6)
+    categories = (
+        (0.4, re.findall(r"\b[\w.-]+(?:/[\w.-]+)+\b", full_prompt)),
+        (0.3, re.findall(r"\b(?:def|class|function|method|symbol)\s+([A-Za-z_]\w*)", full_prompt)),
+        (0.2, [line.strip() for line in full_prompt.splitlines()
+                if re.search(r"\b(?:error|failed|assert|exception)\b", line, re.I)]),
+        (0.1, [line.strip() for line in full_prompt.splitlines()
+                if re.search(r"\b(?:must|should|required|ensure|acceptance)\b", line, re.I)]),
+        (0.1, re.findall(r"```[^\n]*\n", full_prompt)),
+    )
+    optimized_lower = optimized_prompt.lower()
+    weighted_total = 0.0
+    weighted_retained = 0.0
+    for weight, anchors in categories:
+        unique_anchors = {anchor.lower() for anchor in anchors if anchor.strip()}
+        if unique_anchors:
+            weighted_total += weight
+            if all(anchor in optimized_lower for anchor in unique_anchors):
+                weighted_retained += weight
+    return round(weighted_retained / weighted_total, 6) if weighted_total else None
+
+
 def _evicted_content_recall(full_prompt: str, optimized_prompt: str) -> float | None:
     """Recall of content that lived ONLY in the evicted (early) part of the prompt.
 
@@ -3278,6 +3376,7 @@ def _compute_quality_metrics(
     proxy_content: str,
     full_prompt: str = "",
     optimized_prompt: str = "",
+    task_anchors: list[str] | None = None,
 ) -> dict[str, float]:
     """Compute quality comparison metrics between two responses."""
     metrics = {}
@@ -3346,6 +3445,9 @@ def _compute_quality_metrics(
     # response overlap scores above are only informational for this use case.
     metrics["prompt_faithfulness"] = _prompt_faithfulness(full_prompt, optimized_prompt)
     metrics["prompt_source_token_recall"] = _prompt_source_token_recall(full_prompt, optimized_prompt)
+    metrics["task_anchor_recall"] = _task_anchor_recall(
+        full_prompt, optimized_prompt, task_anchors
+    )
     metrics["evicted_content_recall"] = _evicted_content_recall(full_prompt, optimized_prompt)
 
     return metrics
@@ -3484,6 +3586,7 @@ class BenchmarkReport:
     # Long-horizon cross-turn signals (computed post-hoc, not per-turn).
     contradictions: dict[str, int] = field(default_factory=dict)  # {"proxy": int, "direct": int}
     fact_recall: dict[str, float | None] = field(default_factory=dict)  # {"proxy": float|None, "direct": float|None}
+    fact_recall_by_round: list[dict[str, float | int | None]] = field(default_factory=list)
     context_window_wall: dict[str, int | None] = field(default_factory=dict)  # {"proxy": int|None, "direct": int|None}
 
     def summary(self) -> dict[str, Any]:
@@ -3579,7 +3682,7 @@ class BenchmarkReport:
         #   response verbosity, so its verbosity_count is mis-attributed and is
         #   reported only as an informational "model verbosity delta".
         headline_quality_metrics = [
-            "prompt_source_token_recall", "evicted_content_recall",
+            "prompt_source_token_recall", "task_anchor_recall", "evicted_content_recall",
             "code_syntax_validity", "code_block_ratio",
         ]
         secondary_quality_metrics = [
@@ -3735,7 +3838,10 @@ class BenchmarkReport:
             ]
 
         # ── Cache-reuse trend (proxy prefix-cache hits) ────────────────
-        prefix_hits = [t.proxy.prefix_cache_hit_tokens for t in self.turns]
+        # Turn 0 is the cold-start request: no prior prompt can be cached, so
+        # exclude it from cache-hit aggregates. Preserve valid zeroes later.
+        measured_cache_turns = [t for t in self.turns if t.turn_index != 0]
+        prefix_hits = [t.proxy.prefix_cache_hit_tokens for t in measured_cache_turns]
         cache_reuse_trend: dict[str, Any] = {
             "per_turn_prefix_cache_hit_tokens": _stats(prefix_hits) if prefix_hits else {},
             "total_prefix_cache_hit_tokens": sum(prefix_hits),
@@ -3919,13 +4025,13 @@ class BenchmarkReport:
                 previous_prompt_text[label] = prompt_text
                 if label == "direct":
                     direct_fresh_prefill.append(fresh)
-                    if reuse_pct is not None and comparison.turn_index > 0:
+                    if reuse_pct is not None and comparison.turn_index != 0:
                         direct_cache_reuse_pct.append(reuse_pct)
                     if decode_tps is not None:
                         direct_decode_tps.append(decode_tps)
                 else:
                     proxy_fresh_prefill.append(fresh)
-                    if reuse_pct is not None and comparison.turn_index > 0:
+                    if reuse_pct is not None and comparison.turn_index != 0:
                         proxy_cache_reuse_pct.append(reuse_pct)
                     if decode_tps is not None:
                         proxy_decode_tps.append(decode_tps)
@@ -4067,6 +4173,7 @@ class BenchmarkReport:
             "long_horizon": {
                 "contradictions": self.contradictions or None,
                 "fact_recall_turn30": self.fact_recall or None,
+                "fact_recall_by_round": self.fact_recall_by_round or None,
                 "context_window_wall": self.context_window_wall or None,
             },
         }
@@ -4554,6 +4661,7 @@ def _build_turn_comparisons(
     proxy_metrics: list[TurnMetrics],
     direct_contents: list[str],
     proxy_contents: list[str],
+    task_anchors: list[str] | None = None,
 ) -> list[TurnComparison]:
     """Build per-turn comparisons after both full conversations complete."""
     comparisons: list[TurnComparison] = []
@@ -4566,7 +4674,13 @@ def _build_turn_comparisons(
     ):
         quality: dict[str, float | None] = {}
         if d_content and p_content:
-            quality.update(_compute_quality_metrics(d_content, p_content, proxy.full_prompt_text, proxy.optimized_prompt_text))
+            quality.update(_compute_quality_metrics(
+                d_content,
+                p_content,
+                proxy.full_prompt_text,
+                proxy.optimized_prompt_text,
+                task_anchors,
+            ))
             # Prefer the proxy-side faithfulness scalars when the text-based metrics
             # are None — i.e. the optimized-prompt text was capped at 8 KB and could
             # not be shipped (#7). Keeps the per-turn faithfulness chart populated
@@ -4648,6 +4762,7 @@ def run_benchmark(
     price_in: float = 0.0,
     price_out: float = 0.0,
     max_wall_seconds: float | None = None,
+    seed: int | None = None,
 ) -> BenchmarkReport:
     """Run the multi-turn benchmark and collect metrics.
 
@@ -4681,6 +4796,7 @@ def run_benchmark(
         "proxy_port": proxy_port,
         "char_budget": char_budget,
         "scenario": scenario,
+        "scenario_kind": "compression_stress" if scenario == "compression_stress" else "realistic",
         "request_timeout": request_timeout,
         "execution_order": "direct_full_conversation_then_proxy_full_conversation",
         "measure_ttft": measure_ttft,
@@ -4688,6 +4804,7 @@ def run_benchmark(
         "price_in_usd_per_1m": price_in,
         "price_out_usd_per_1m": price_out,
         "max_wall_seconds": max_wall_seconds,
+        "seed": seed,
     }
 
     report = BenchmarkReport(config=config)
@@ -4701,7 +4818,10 @@ def run_benchmark(
     # recall probe lands exactly on the final turn; other scenarios ship a static
     # list. Support both shapes here.
     _raw_tasks = scenario_data["tasks"]
-    base_tasks = _raw_tasks(num_turns) if callable(_raw_tasks) else _raw_tasks
+    if seed is not None and scenario in ("fixtures", "opencode"):
+        base_tasks = _build_opencode_scenario_tasks(seed)
+    else:
+        base_tasks = _raw_tasks(num_turns) if callable(_raw_tasks) else _raw_tasks
     # Inject the long-horizon drift probe (plant facts in Turn 1, recall probe
     # on the final turn) into every scenario so drift is measured on the real
     # benchmark conversation, not a synthetic one.
@@ -4855,6 +4975,15 @@ def run_benchmark(
         proxy_system_prompt = proxy_marker + system_prompt
         direct_system_prompt = direct_marker + system_prompt
 
+        round_turn_exchanges = turn_exchanges
+        if seed is not None and scenario in ("fixtures", "opencode"):
+            round_tasks = _inject_drift_probe(
+                _build_opencode_scenario_tasks(seed + round_num), num_turns
+            )
+            round_turn_exchanges = [
+                item for item in round_tasks if isinstance(item, list)
+            ]
+
         # Run the PROXY conversation first against a cold backend so its
         # prefix-cache hits (turns 2..N) reflect the proxy's own stable
         # prefix rather than a warm cache left by a prior direct run. The
@@ -4879,7 +5008,7 @@ def run_benchmark(
             request_timeout,
             max_tokens,
             turn_offset=round_num * num_turns,
-            turn_exchanges=turn_exchanges or None,
+            turn_exchanges=round_turn_exchanges or None,
             tools=tools,
             temperature=temperature,
             stream=measure_ttft,
@@ -4902,7 +5031,7 @@ def run_benchmark(
             request_timeout,
             max_tokens,
             turn_offset=round_num * num_turns,
-            turn_exchanges=turn_exchanges or None,
+            turn_exchanges=round_turn_exchanges or None,
             tools=tools,
             temperature=temperature,
             stream=measure_ttft,
@@ -4920,6 +5049,13 @@ def run_benchmark(
         if proxy_contents:
             _fact_recall_proxy = _grade_fact_recall(proxy_contents[-1], _DRIFT_FACTS)
             _fact_recall_direct = _grade_fact_recall(direct_contents[-1], _DRIFT_FACTS)
+            report.fact_recall_by_round.append(
+                {
+                    "round": round_num,
+                    "proxy": _fact_recall_proxy,
+                    "direct": _fact_recall_direct,
+                }
+            )
 
         # Enforce the non-interleaving invariant: each side is a complete,
         # sorted, non-interleaved multi-turn conversation (proxy fully before
@@ -4933,6 +5069,7 @@ def run_benchmark(
             proxy_metrics,
             direct_contents,
             proxy_contents,
+            SCENARIO_TASK_ANCHORS.get(scenario),
         )
         for _c in comparisons:
             _c.round_index = round_num
@@ -5463,6 +5600,7 @@ def run_all_scenarios(args) -> int:
                 price_in=args.price_in,
                 price_out=args.price_out,
                 max_wall_seconds=args.max_wall_seconds,
+                seed=args.seed,
             )
             all_reports[scenario_name] = report
 
@@ -5472,6 +5610,12 @@ def run_all_scenarios(args) -> int:
         with open(args._out_json, "w") as f:
             json.dump(aggregated, f, indent=2)
         _status(args, f"\n  Report JSON written to: {args._out_json}")
+        baseline_path = str(Path(args._out_json).with_name(
+            f"{Path(args._out_json).stem}_baseline.json"
+        ))
+        with open(baseline_path, "w") as f:
+            json.dump(_baseline_quality_report(aggregated), f, indent=2)
+        _status(args, f"  Baseline-quality JSON written to: {baseline_path}")
         _status(args, f"  Progress log written to: {args._out_log}")
 
         if args.json_output:
@@ -5519,7 +5663,11 @@ def run_all_scenarios(args) -> int:
         _stop_proxy()
 
 
-def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
+def _aggregate_reports(
+    reports: dict[str, BenchmarkReport],
+    *,
+    stress_only: bool = False,
+) -> dict[str, Any]:
     """Aggregate metrics from all scenario reports."""
     aggregated: dict[str, Any] = {
         "scenarios": list(reports.keys()),
@@ -5545,8 +5693,11 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
     all_edit_sim: list[float] = []
 
     for name, report in reports.items():
+        report_config = getattr(report, "config", {})
+        is_stress = report_config.get("scenario_kind") == "compression_stress"
         summary = report.summary()
         aggregated["per_scenario"][name] = {
+            "scenario_kind": "compression_stress" if is_stress else "realistic",
             "num_turns": summary.get("num_turns", 0),
             "latency_mean_ms": summary.get("latency_ms", {}).get("proxy", {}).get("mean", 0),
             "semantic_similarity_mean": summary.get("semantic_similarity", {}).get("mean", 0),
@@ -5561,44 +5712,48 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
             "quality_skipped_turns": summary.get("quality", {}).get("quality_skipped_turns", 0),
         }
 
+        if is_stress and not stress_only:
+            continue
+
         # Collect for aggregation
-        lat = summary.get("latency_ms", {}).get("proxy", {}).get("mean", 0)
-        if lat:
+        lat = summary.get("latency_ms", {}).get("proxy", {}).get("mean")
+        if lat is not None:
             all_latencies.append(lat)
 
-        sem = summary.get("quality", {}).get("semantic_similarity", {}).get("mean", 0)
-        if sem:
+        sem = summary.get("quality", {}).get("semantic_similarity", {}).get("mean")
+        if sem is not None:
             all_semantic.append(sem)
 
-        rg = summary.get("quality", {}).get("rouge_l_f1", {}).get("mean", 0)
-        if rg:
+        rg = summary.get("quality", {}).get("rouge_l_f1", {}).get("mean")
+        if rg is not None:
             all_rouge.append(rg)
 
-        jc = summary.get("quality", {}).get("token_jaccard", {}).get("mean", 0)
-        if jc:
+        jc = summary.get("quality", {}).get("token_jaccard", {}).get("mean")
+        if jc is not None:
             all_jaccard.append(jc)
 
-        cb = summary.get("quality", {}).get("code_block_ratio", {}).get("mean", 0)
-        if cb:
+        cb = summary.get("quality", {}).get("code_block_ratio", {}).get("mean")
+        if cb is not None:
             all_code_block.append(cb)
 
-        es = summary.get("quality", {}).get("edit_similarity", {}).get("mean", 0)
-        if es:
+        es = summary.get("quality", {}).get("edit_similarity", {}).get("mean")
+        if es is not None:
             all_edit_sim.append(es)
 
-        ts = summary.get("tokens", {}).get("token_savings_pct", 0)
-        all_token_savings.append(ts)
+        ts = summary.get("tokens", {}).get("token_savings_pct")
+        if ts is not None:
+            all_token_savings.append(ts)
 
-        ttft = summary.get("ttft_ms", {}).get("proxy", {}).get("mean", 0)
-        if ttft:
+        ttft = summary.get("ttft_ms", {}).get("proxy", {}).get("mean")
+        if ttft is not None:
             all_ttft.append(ttft)
 
-        pov = summary.get("proxy_overhead_ms", {}).get("mean", 0)
-        if pov:
+        pov = summary.get("proxy_overhead_ms", {}).get("mean")
+        if pov is not None:
             all_proxy_overhead.append(pov)
 
-        cs = summary.get("cost_usd", {}).get("savings_pct", 0)
-        if cs:
+        cs = summary.get("cost_usd", {}).get("savings_pct")
+        if cs is not None:
             all_cost_savings.append(cs)
 
         qs = summary.get("quality", {}).get("quality_skipped_turns", 0)
@@ -5647,11 +5802,12 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
             "max": round(max(all_edit_sim), 4),
         }
 
-    aggregated["aggregated"]["token_savings_pct"] = {
-        "mean": round(statistics.mean(all_token_savings), 2),
-        "min": round(min(all_token_savings), 2),
-        "max": round(max(all_token_savings), 2),
-    }
+    if all_token_savings:
+        aggregated["aggregated"]["token_savings_pct"] = {
+            "mean": round(statistics.mean(all_token_savings), 2),
+            "min": round(min(all_token_savings), 2),
+            "max": round(max(all_token_savings), 2),
+        }
 
     if all_ttft:
         aggregated["aggregated"]["ttft_ms"] = {
@@ -5679,7 +5835,56 @@ def _aggregate_reports(reports: dict[str, BenchmarkReport]) -> dict[str, Any]:
         "mean": round(statistics.mean(all_quality_skipped), 2),
     }
 
+    headline_metrics = (
+        "prompt_source_token_recall",
+        "evicted_content_recall",
+        "code_syntax_validity",
+        "code_block_ratio",
+    )
+    secondary_metrics = (
+        "rouge_l_f1",
+        "token_jaccard",
+        "edit_similarity",
+    )
+    aggregated["quality"] = {
+        metric: aggregated["aggregated"][metric]
+        for metric in headline_metrics
+        if metric in aggregated["aggregated"]
+    }
+    aggregated["secondary_quality"] = {
+        metric: aggregated["aggregated"][metric]
+        for metric in secondary_metrics
+        if metric in aggregated["aggregated"]
+    }
+
+    if not stress_only:
+        stress_reports = {
+            name: report
+            for name, report in reports.items()
+            if getattr(report, "config", {}).get("scenario_kind") == "compression_stress"
+        }
+        if stress_reports:
+            aggregated["stress"] = _aggregate_reports(stress_reports, stress_only=True)
+
     return aggregated
+
+
+def _baseline_quality_report(aggregated: dict[str, Any]) -> dict[str, Any]:
+    """Return an all-scenario report containing only realistic scenarios."""
+    baseline = dict(aggregated)
+    baseline["report_scope"] = "realistic_baseline"
+    baseline["scenarios"] = [
+        name
+        for name, data in aggregated.get("per_scenario", {}).items()
+        if data.get("scenario_kind") != "compression_stress"
+    ]
+    baseline["per_scenario"] = {
+        name: data
+        for name, data in aggregated.get("per_scenario", {}).items()
+        if data.get("scenario_kind") != "compression_stress"
+    }
+    baseline.pop("stress", None)
+    return baseline
 
 
 def _print_aggregated(aggregated: dict[str, Any]) -> None:
@@ -5728,6 +5933,7 @@ def main() -> None:
     )
     parser.add_argument("--turns", type=int, default=10, help="Number of conversation turns")
     parser.add_argument("--rounds", type=int, default=5, help="Number of full conversation rounds (default 5; run >=5 so per-round variance and bootstrap CIs are stable)")
+    parser.add_argument("--seed", type=int, default=None, help="Deterministic fixture scenario variant seed")
     parser.add_argument("--context-window", type=int, default=262144, help="Model context-window size in tokens (used for utilization %%). Defaults to 262144 (Qwen3.6-35B-MTP).")
     parser.add_argument("--price-in", type=float, default=0.0, dest="price_in", help="Input token price in USD per 1M tokens. Enables the estimated-cost section.")
     parser.add_argument("--price-out", type=float, default=0.0, dest="price_out", help="Output token price in USD per 1M tokens. Enables the estimated-cost section.")
@@ -5877,6 +6083,7 @@ def main() -> None:
             price_in=args.price_in,
             price_out=args.price_out,
             max_wall_seconds=args.max_wall_seconds,
+            seed=args.seed,
         )
 
         if args.json_output or not args.dump_responses:
@@ -6194,14 +6401,36 @@ def _check_baseline_gate(
     # metric from whichever section holds it (quality vs secondary_quality —
     # REVIEW.md §4.12.6; reading all from "quality" silently zeroed the lexical
     # metrics so those checks never fired).
-    for qm in ("prompt_faithfulness", "evicted_content_recall", "code_block_ratio", "code_syntax_validity", "rouge_l_f1", "token_jaccard", "edit_similarity"):
-        cur = _quality_metric(current, qm) or 0.0
-        base = _quality_metric(baseline, qm) or 0.0
+    for qm in ("prompt_faithfulness", "prompt_source_token_recall", "evicted_content_recall", "code_block_ratio", "code_syntax_validity", "rouge_l_f1", "token_jaccard", "edit_similarity"):
+        cur_value = _quality_metric(current, qm)
+        base_value = _quality_metric(baseline, qm)
+        cur = cur_value if cur_value is not None else 0.0
+        base = base_value if base_value is not None else 0.0
         drop = base - cur
         if drop > tol:
             failures.append(
                 f"{qm} regressed {drop:.4f} (baseline {base:.4f} -> {cur:.4f}, tol {tol:.4f})"
             )
+
+    for qm, floor in (
+        ("prompt_source_token_recall", 0.75),
+        ("evicted_content_recall", 0.75),
+        ("code_syntax_validity", 1.0),
+    ):
+        value = _quality_metric(current, qm)
+        if value is None:
+            failures.append(f"missing required quality metric: {qm}")
+        elif value < floor:
+            failures.append(f"{qm} below hard floor {floor:.2f}: {value:.4f}")
+
+    current_quality = current.get("quality")
+    if isinstance(current_quality, dict):
+        skipped = current_quality.get("quality_skipped_turns", 0)
+        code_loss = current_quality.get("code_block_loss_turns", 0)
+        if isinstance(skipped, (int, float)) and skipped > 0:
+            failures.append(f"quality_skipped_turns exceeded 0: {skipped}")
+        if isinstance(code_loss, (int, float)) and code_loss > 3:
+            failures.append(f"code_block_loss_turns exceeded 3: {code_loss}")
 
     # length_ratio should stay near 1.0 (proxy response length vs direct). The
     # proxy cannot control response length (it compacts INPUT only), so an

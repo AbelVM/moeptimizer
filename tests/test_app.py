@@ -85,6 +85,25 @@ def test_metrics_snapshot_records_optional_mtp_usage() -> None:
     assert snap["avg_mtp_decode_ms"] == 42.5
 
 
+def test_metrics_snapshot_reports_completion_throughput_when_usage_is_available() -> None:
+    metrics = _ProxyMetrics()
+    metrics.record_turn(completion_tokens=120, completion_duration_ms=4000)
+    snap = metrics.snapshot()
+    assert snap["avg_completion_tps"] == 30.0
+    assert snap["completion_tps_samples"] == 1
+
+
+def test_metrics_snapshot_reports_operational_rates() -> None:
+    metrics = _ProxyMetrics()
+    metrics.record_turn(prompt_tokens=75, saved_tokens=25, cached_tokens=20)
+    metrics.record_turn(prompt_tokens=25, saved_tokens=0, cached_tokens=0)
+    metrics.record_backend_error()
+    snap = metrics.snapshot()
+    assert snap["input_savings_ratio"] == 0.2
+    assert snap["backend_error_rate"] == 0.5
+    assert snap["requests_per_minute"] == 2.0
+
+
 def test_metrics_request_trace_is_bounded_and_keeps_mtp_context() -> None:
     metrics = _ProxyMetrics()
     metrics.record_mtp_usage(
@@ -752,6 +771,11 @@ class TestMetricsSmoke:
         metrics = _ProxyMetrics()
         snap = metrics.snapshot()
         expected_keys = {
+            "metrics_window_started_at",
+            "last_activity_at",
+            "uptime_seconds",
+            "requests_per_minute",
+            "last_activity_age_seconds",
             "requests",
             "cache_hits",
             "cache_misses",
@@ -760,9 +784,14 @@ class TestMetricsSmoke:
             "total_prompt_tokens",
             "prefix_cache_reuse_ratio",
             "total_saved_tokens",
+            "total_raw_input_tokens",
+            "input_savings_ratio",
             "total_latency_ms",
             "avg_latency_ms",
             "backend_errors",
+            "backend_error_rate",
+            "avg_completion_tps",
+            "completion_tps_samples",
             "avg_optimizer_ms",
             "avg_token_count_ms",
             "token_count_samples",
@@ -775,6 +804,11 @@ class TestMetricsSmoke:
         metrics.record_optimizer_duration(12.5)
         metrics.record_optimizer_duration(7.5)
         assert metrics.snapshot()["avg_optimizer_ms"] == 10.0
+
+    def test_metrics_reuse_ratio_is_bounded(self) -> None:
+        metrics = _ProxyMetrics()
+        metrics.record_turn(cached_tokens=900, prompt_tokens=500)
+        assert metrics.snapshot()["prefix_cache_reuse_ratio"] == 1.0
 
     def test_metrics_records_token_count_duration(self) -> None:
         metrics = _ProxyMetrics()
@@ -1033,6 +1067,16 @@ class TestMetricsDashboard:
         assert 'id="trend"' in body
         assert 'id="status"' in body
         assert 'id="sess"' in body
+        assert 'id="meta-version"' in body
+        assert MODEL_ID in body
+        assert "embed-gemma-300m-FLM" in body
+        assert 'id="saved-trend"' in body
+        assert 'id="saved-ratio-trend"' in body
+        assert 'id="ttft-trend"' in body
+        assert 'id="tps-trend"' in body
+        assert ">Performance</div>" in body
+        assert "Tokens saved - absolute" in body
+        assert "Tokens saved - ratio" in body
         # No external assets — fully self-contained.
         assert "src=" not in body
         assert "http://" not in body and "https://" not in body

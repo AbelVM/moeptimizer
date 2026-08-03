@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import signal
@@ -20,6 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from openai import APIError, APIStatusError, AsyncOpenAI
 
+from moeptimizer import __version__
 from moeptimizer.backend_client import LemonadeClient
 from moeptimizer.config import AppConfig, get_config
 from moeptimizer.content_store import EXPAND_TOOL_NAME, expand_content_tool
@@ -48,6 +50,8 @@ class _ProxyMetrics:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._started_at = time.time()
+        self._last_activity_at: float | None = None
         self.requests = 0
         self.cache_hits = 0
         self.cache_misses = 0
@@ -62,6 +66,9 @@ class _ProxyMetrics:
         # so avg_ttft_ms averages over those, not over non-streaming turns.
         self.total_ttft_ms = 0.0
         self.ttft_samples = 0
+        self.total_completion_tokens = 0
+        self.total_completion_duration_ms = 0.0
+        self.completion_tps_samples = 0
         # Fresh prefill (review §4.11.2 / Forward plan D1): prompt_tokens -
         # cached_tokens, the tokens the backend re-prefilled this turn. Averaged
         # alongside TTFT so operators see the cache -> TTFT link directly (a rising
@@ -188,11 +195,14 @@ class _ProxyMetrics:
         saved_tokens: int | None = None,
         latency_ms: float | None = None,
         ttft_ms: float | None = None,
+        completion_tokens: int | None = None,
+        completion_duration_ms: float | None = None,
         request_id: str | None = None,
         prompt_hash: str | None = None,
         slot: int | None = None,
     ) -> None:
         with self._lock:
+            self._last_activity_at = time.time()
             self.requests += 1
             if cached_tokens is not None:
                 if cached_tokens > 0:
@@ -209,6 +219,10 @@ class _ProxyMetrics:
             if ttft_ms is not None:
                 self.total_ttft_ms += max(0.0, ttft_ms)
                 self.ttft_samples += 1
+            if completion_tokens is not None and completion_duration_ms is not None and completion_duration_ms > 0:
+                self.total_completion_tokens += max(0, completion_tokens)
+                self.total_completion_duration_ms += completion_duration_ms
+                self.completion_tps_samples += 1
             if prompt_tokens is not None and cached_tokens is not None:
                 self.total_fresh_prefill_tokens += max(0, prompt_tokens - cached_tokens)
                 self.fresh_prefill_samples += 1
@@ -301,7 +315,10 @@ class _ProxyMetrics:
             requests = self.requests
             hits = self.cache_hits
             cached = self.total_cached_tokens
-            reuse_ratio = (cached / max(1, self.total_prompt_tokens)) if self.total_prompt_tokens else 0.0
+            prefill_tokens = cached + self.total_fresh_prefill_tokens
+            reuse_ratio = (cached / prefill_tokens) if prefill_tokens else 0.0
+            uptime_seconds = max(0.0, time.time() - self._started_at)
+            saved_basis_tokens = self.total_prompt_tokens + self.total_saved_tokens
             sessions: dict[str, Any] = {}
             for sid, e in self._per_session.items():
                 s_req = e["requests"]
@@ -316,7 +333,13 @@ class _ProxyMetrics:
                     "total_cached_tokens": s_cached,
                     "total_prompt_tokens": s_prompt,
                     "prefix_cache_reuse_ratio": round(
-                        (s_cached / s_prompt) if s_prompt else 0.0, 4
+                        (
+                            s_cached
+                            / max(1, s_cached + e.get("total_fresh_prefill_tokens", 0))
+                        )
+                        if s_cached or e.get("total_fresh_prefill_tokens", 0)
+                        else 0.0,
+                        4,
                     ),
                     "total_saved_tokens": e["total_saved_tokens"],
                     "avg_latency_ms": round(e["total_latency_ms"] / max(1, s_req), 1),
@@ -331,6 +354,15 @@ class _ProxyMetrics:
                     "backend_errors": e.get("backend_errors", 0),
                 }
             return {
+                "metrics_window_started_at": self._started_at,
+                "last_activity_at": self._last_activity_at,
+                "uptime_seconds": round(uptime_seconds, 1),
+                "requests_per_minute": round(requests / max(1.0, uptime_seconds / 60.0), 2),
+                "last_activity_age_seconds": (
+                    round(max(0.0, time.time() - self._last_activity_at), 1)
+                    if self._last_activity_at is not None
+                    else None
+                ),
                 "requests": requests,
                 "cache_hits": hits,
                 "cache_misses": self.cache_misses,
@@ -339,13 +371,25 @@ class _ProxyMetrics:
                 "total_prompt_tokens": self.total_prompt_tokens,
                 "prefix_cache_reuse_ratio": round(reuse_ratio, 4),
                 "total_saved_tokens": self.total_saved_tokens,
+                "total_raw_input_tokens": saved_basis_tokens,
+                "input_savings_ratio": round(
+                    self.total_saved_tokens / saved_basis_tokens, 4
+                ) if saved_basis_tokens else 0.0,
                 "total_latency_ms": round(self.total_latency_ms, 1),
+                "backend_error_rate": round(self.backend_errors / max(1, requests), 4),
                 "avg_latency_ms": round(self.total_latency_ms / max(1, requests), 1),
                 # Real time-to-first-token averaged over streaming turns that
                 # measured it (review §4.12.1); avg_latency_ms is the full turn time.
                 "avg_ttft_ms": round(
                     self.total_ttft_ms / max(1, self.ttft_samples), 1
                 ),
+                "ttft_samples": self.ttft_samples,
+                "avg_completion_tps": round(
+                    self.total_completion_tokens
+                    / max(0.001, self.total_completion_duration_ms / 1000.0),
+                    2,
+                ) if self.completion_tps_samples else None,
+                "completion_tps_samples": self.completion_tps_samples,
                 # Fresh prefill (prompt - cached) averaged over turns that reported
                 # both; read next to avg_ttft_ms to see the cache -> TTFT link.
                 "avg_fresh_prefill_tokens": round(
@@ -403,18 +447,18 @@ _METRICS_DASHBOARD_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MOEptimizer - Live Operations</title>
 <style>
-    :root { --bg:#101316; --panel:#181d21; --panel2:#20272b; --ink:#edf1ed;
-                    --muted:#96a19d; --line:#303a3d; --mint:#a7e8c0; --blue:#8fc7ff;
-                    --amber:#f2c879; --red:#ff8d7a; --shadow:0 16px 40px rgba(0,0,0,.18); }
+    :root { --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --ink:#c9d1d9;
+                    --muted:#8b949e; --line:#30363d; --mint:#3fb950; --blue:#58a6ff;
+                    --amber:#e3b341; --red:#f85149; --shadow:0 12px 30px rgba(0,0,0,.2); }
     * { box-sizing:border-box; }
-    body { margin:0; background:radial-gradient(circle at 85% 0%,#25322d 0,#101316 38%);
-                 color:var(--ink); font:14px/1.5 ui-sans-serif,system-ui,sans-serif; }
+    body { margin:0; background:radial-gradient(circle at 85% 0%,#182b35 0,#0d1117 38%);
+                 color:var(--ink); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
     header { max-width:1440px; margin:auto; padding:22px clamp(18px,4vw,52px) 18px;
                      display:flex; justify-content:space-between; align-items:flex-end; gap:18px; }
     .brand { display:flex; align-items:center; gap:12px; }
-    .mark { width:12px; height:42px; background:var(--mint); transform:skew(-14deg); }
+    .mark { width:12px; height:42px; background:var(--blue); transform:skew(-14deg); }
     h1,h2,p { margin:0; }
-    h1 { font:700 clamp(20px,3vw,30px)/1.05 Georgia,serif; letter-spacing:0; }
+    h1 { font-size:18px; line-height:1.05; font-weight:600; letter-spacing:.2px; }
     .sub { color:var(--muted); margin-top:5px; font-size:12px; }
     .live { display:flex; align-items:center; gap:8px; color:var(--mint); font-size:12px; }
     .dot { width:8px; height:8px; border-radius:50%; background:currentColor; }
@@ -426,24 +470,26 @@ _METRICS_DASHBOARD_HTML = """<!doctype html>
     main { max-width:1440px; margin:auto; padding:10px clamp(18px,4vw,52px) 36px; }
     .hero { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(280px,.65fr); gap:18px;
                     padding:26px 0 30px; }
-    .hero h2 { font:400 clamp(28px,5vw,56px)/.98 Georgia,serif; max-width:720px; }
+    .hero h2 { font-size:clamp(28px,5vw,48px); line-height:1.02; font-weight:600; max-width:720px; }
     .hero p { color:var(--muted); max-width:560px; margin-top:14px; }
-    .hero-note { border-left:2px solid var(--mint); padding:8px 0 8px 18px; align-self:end; }
-    .hero-note strong { display:block; color:var(--mint); font-size:26px; font-weight:500; }
+    .hero-note { border-left:2px solid var(--blue); padding:8px 0 8px 18px; align-self:end; }
+    .hero-note strong { display:block; color:var(--blue); font-size:26px; font-weight:500; }
     .hero-note span { color:var(--muted); font-size:12px; }
-    .section { color:var(--mint); font-size:11px; font-weight:700; letter-spacing:.12em;
+    .hero-meta { color:var(--muted); font-size:11px; margin-top:5px; }
+    .section { color:var(--blue); font-size:11px; font-weight:700; letter-spacing:.12em;
                          text-transform:uppercase; border-bottom:1px solid var(--line); padding-bottom:8px; margin:4px 0 12px; }
-    .cards { display:grid; grid-template-columns:repeat(6,minmax(125px,1fr)); gap:10px; }
+    .cards { display:grid; grid-template-columns:repeat(7,minmax(110px,1fr)); gap:10px; }
     .stat { background:var(--panel); border:1px solid var(--line); padding:15px 14px; min-height:108px; box-shadow:var(--shadow); }
-    .stat .v { font:500 clamp(22px,3vw,32px)/1.05 Georgia,serif; margin-bottom:9px; }
+    .stat .v { font-size:clamp(22px,3vw,30px); line-height:1.05; font-weight:600; margin-bottom:9px; }
     .stat .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+    .stat-detail { color:var(--muted); font-size:11px; margin-top:5px; }
     .stat.mint .v { color:var(--mint); } .stat.blue .v { color:var(--blue); }
     .stat.amber .v { color:var(--amber); } .stat.red .v { color:var(--red); }
     .layout { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(300px,.6fr); gap:18px; margin-top:18px; }
-    .panel { background:rgba(24,29,33,.9); border:1px solid var(--line); padding:18px; min-width:0; }
-    .panel h2 { font:500 20px/1.1 Georgia,serif; }
+    .panel { background:var(--panel); border:1px solid var(--line); padding:18px; min-width:0; }
+    .panel h2 { font-size:16px; line-height:1.2; font-weight:600; }
     .hint { color:var(--muted); font-size:12px; margin:5px 0 14px; }
-    #trend { width:100%; height:250px; display:block; overflow:visible; }
+    #trend,.evolution-chart { width:100%; height:250px; display:block; overflow:visible; }
     .legend { display:flex; gap:15px; color:var(--muted); font-size:11px; margin-top:5px; }
     .legend i { display:inline-block; width:9px; height:9px; margin-right:5px; background:var(--mint); }
     .legend i.blue { background:var(--blue); }
@@ -454,6 +500,14 @@ _METRICS_DASHBOARD_HTML = """<!doctype html>
     .op-value { font-size:18px; margin-top:2px; }
     .op-detail { color:var(--muted); font-size:12px; }
     .wide { grid-column:1/-1; }
+    .meta-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin:0 0 18px; }
+    .meta-item { background:var(--panel); border:1px solid var(--line); padding:11px 13px; min-width:0; }
+    .meta-item .k { color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.06em; }
+    .meta-item .v { margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .chart-stack { display:grid; gap:10px; }
+    .chart-stack h3 { font-size:12px; font-weight:600; margin:4px 0 -4px; }
+    .evolution { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; margin-top:18px; }
+    .chart-note { color:var(--muted); font-size:11px; margin-top:4px; }
     .tablewrap { overflow:auto; max-height:390px; }
     table { width:100%; border-collapse:collapse; font-size:12px; }
     th,td { text-align:right; padding:8px 9px; border-bottom:1px solid var(--line); white-space:nowrap; }
@@ -467,7 +521,8 @@ _METRICS_DASHBOARD_HTML = """<!doctype html>
     .degradation { color:var(--amber); font-family:ui-monospace,SFMono-Regular,monospace; font-size:12px; }
     footer { max-width:1440px; margin:auto; padding:12px clamp(18px,4vw,52px) 24px; color:var(--muted); font-size:11px; }
     code { color:var(--blue); }
-    @media (max-width:900px) { .cards { grid-template-columns:repeat(3,1fr); } .hero,.layout { grid-template-columns:1fr; } }
+    @media (max-width:1100px) { .evolution { grid-template-columns:1fr; } }
+    @media (max-width:900px) { .cards { grid-template-columns:repeat(3,1fr); } .hero,.layout { grid-template-columns:1fr; } .meta-grid { grid-template-columns:repeat(2,1fr); } }
     @media (max-width:540px) { .cards { grid-template-columns:repeat(2,1fr); } header { align-items:flex-start; flex-direction:column; } }
     @media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto !important; } }
 </style>
@@ -478,20 +533,33 @@ _METRICS_DASHBOARD_HTML = """<!doctype html>
     <div class="live"><div id="status" class="live"><span class="dot" aria-hidden="true"></span><span>Connecting</span></div><button id="reset" type="button">Reset metrics</button></div>
 </header>
 <main>
-    <section class="hero"><div><h2 id="headline">Watching the prefix hold.</h2><p id="summary">Waiting for the first metrics snapshot.</p></div><div class="hero-note"><strong id="s-requests">0</strong><span>completed requests in this process</span></div></section>
+    <section class="hero"><div><h2 id="headline">Watching the prefix hold.</h2><p id="summary">Waiting for the first metrics snapshot.</p></div><div class="hero-note"><strong id="s-requests">0</strong><span>completed requests in this process</span><div class="hero-meta"><span id="s-rate">—</span> requests/min</div></div></section>
     <div class="section">Core signal</div>
     <section class="cards">
         <div class="stat mint"><div class="v" id="s-reuse">—</div><div class="k">Prefix reuse</div></div>
-        <div class="stat blue"><div class="v" id="s-saved">—</div><div class="k">Tokens saved</div></div>
+        <div class="stat blue"><div class="v" id="s-saved">—</div><div class="k">Tokens saved</div><div class="stat-detail" id="s-saved-rate">— of raw input</div></div>
         <div class="stat"><div class="v" id="s-hitrate">—</div><div class="k">Cache hit rate</div></div>
         <div class="stat amber"><div class="v" id="s-ttft">—</div><div class="k">Average TTFT</div></div>
+        <div class="stat mint"><div class="v" id="s-tps">—</div><div class="k">Decode TPS</div></div>
         <div class="stat"><div class="v" id="s-prefill">—</div><div class="k">Fresh prefill</div></div>
         <div class="stat red"><div class="v" id="s-err">—</div><div class="k">Backend errors</div></div>
     </section>
+    <div class="section">Runtime identity</div>
+    <section class="meta-grid">
+        <div class="meta-item"><div class="k">Proxy version</div><div class="v" id="meta-version">—</div></div>
+        <div class="meta-item"><div class="k">LLM model</div><div class="v" id="meta-llm">—</div></div>
+        <div class="meta-item"><div class="k">Embedding model</div><div class="v" id="meta-embed">—</div></div>
+        <div class="meta-item"><div class="k">Metrics cadence</div><div class="v">3 seconds</div></div>
+    </section>
     <section class="layout">
-        <div class="panel"><h2>Cache pressure over time</h2><p class="hint">Browser history of the last 30 snapshots. Fresh prefill rising while reuse falls is the early warning for a cache cliff.</p><svg id="trend" viewBox="0 0 760 250" role="img" aria-label="Cache reuse and fresh prefill trend"></svg><div class="legend"><span><i></i>prefix reuse</span><span><i class="blue"></i>fresh prefill, normalized</span></div></div>
-        <div class="panel"><h2>Runtime pulse</h2><p class="hint">Only signals emitted by the live proxy are shown.</p><div class="ops"><div class="op"><div class="op-label">Average latency</div><div class="op-value" id="s-latency">—</div><div class="op-detail">full request duration</div></div><div class="op"><div class="op-label">Optimizer overhead</div><div class="op-value" id="s-optimizer">—</div><div class="op-detail">average proxy-side optimization</div></div><div class="op"><div class="op-label">Token counting</div><div class="op-value" id="s-token-count">—</div><div class="op-detail">average counting cost</div></div><div class="op"><div class="op-label">MTP</div><div class="op-value" id="s-mtp">—</div><div class="op-detail" id="s-mtp-detail">No MTP usage reported yet.</div></div><div class="op"><div class="op-label">Degraded stages</div><div class="op-value degradation" id="s-degraded">None</div></div></div></div>
+        <div class="panel"><h2>Cache pressure over time</h2><p class="hint">Browser history of the last 30 snapshots. The three charts share the same snapshot timeline.</p><div class="chart-stack"><h3>Cache pressure</h3><svg id="trend" viewBox="0 0 520 250" role="img" aria-label="Cache reuse and fresh prefill trend"></svg><div class="legend"><span><i></i>prefix reuse</span><span><i class="blue"></i>fresh prefill, normalized</span></div><h3>Tokens saved - absolute</h3><svg id="saved-trend" class="evolution-chart" viewBox="0 0 520 250" role="img" aria-label="Cumulative tokens saved in absolute tokens"></svg><div class="chart-note" id="saved-note">Higher is better</div><h3>Tokens saved - ratio</h3><svg id="saved-ratio-trend" class="evolution-chart" viewBox="0 0 520 250" role="img" aria-label="Token savings percentage of raw input trend"></svg><div class="chart-note">Saved as a percentage of raw input</div></div></div>
+        <div class="panel"><h2>Runtime pulse</h2><p class="hint">Only signals emitted by the live proxy are shown.</p><div class="ops"><div class="op"><div class="op-label">Average latency</div><div class="op-value" id="s-latency">—</div><div class="op-detail">full request duration</div></div><div class="op"><div class="op-label">Input savings</div><div class="op-value" id="s-savings">—</div><div class="op-detail">saved tokens / original input estimate</div></div><div class="op"><div class="op-label">Backend error rate</div><div class="op-value" id="s-error-rate">—</div><div class="op-detail">failed turns / completed requests</div></div><div class="op"><div class="op-label">Metrics window</div><div class="op-value" id="s-window-age">—</div><div class="op-detail">time since reset or process start</div></div><div class="op"><div class="op-label">Last backend turn</div><div class="op-value" id="s-last-activity">—</div><div class="op-detail">actual successful proxy activity</div></div><div class="op"><div class="op-label">Optimizer overhead</div><div class="op-value" id="s-optimizer">—</div><div class="op-detail">average proxy-side optimization</div></div><div class="op"><div class="op-label">Token counting</div><div class="op-value" id="s-token-count">—</div><div class="op-detail">average counting cost</div></div><div class="op"><div class="op-label">MTP</div><div class="op-value" id="s-mtp">—</div><div class="op-detail" id="s-mtp-detail">No MTP usage reported yet.</div></div><div class="op"><div class="op-label">Degraded stages</div><div class="op-value degradation" id="s-degraded">None</div></div></div></div>
         <div class="panel wide"><h2>Active sessions</h2><p class="hint">Bounded process-local view, sorted by most recently active. Session IDs are intentionally shortened.</p><div id="sess"><p class="empty">No sessions recorded yet.</p></div></div>
+    </section>
+    <div class="section" style="margin-top:24px">Performance</div>
+    <section class="evolution">
+        <div class="panel"><h2>TTFT</h2><p class="hint">Average time to first content token across completed streams.</p><svg id="ttft-trend" class="evolution-chart" viewBox="0 0 520 250" role="img" aria-label="Average time to first token trend"></svg><div class="chart-note">Lower is better</div></div>
+        <div class="panel"><h2>Decode throughput</h2><p class="hint">Completion tokens per second when backend usage reports completion tokens.</p><svg id="tps-trend" class="evolution-chart" viewBox="0 0 520 250" role="img" aria-label="Completion tokens per second trend"></svg><div class="chart-note" id="tps-note">Waiting for completion-token usage.</div></div>
     </section>
 </main>
 <footer>Auto-refresh every 3s &middot; updated <span id="updated">never</span> &middot; source: <code>GET /v1/metrics</code></footer>
@@ -499,19 +567,38 @@ _METRICS_DASHBOARD_HTML = """<!doctype html>
 const fmt = n => (n==null ? "—" : Number(n).toLocaleString());
 const pct = n => (n==null ? "—" : (Number(n)*100).toFixed(1) + "%");
 const ms = n => (n==null ? "—" : Number(n).toLocaleString(undefined,{maximumFractionDigits:1}) + " ms");
+const age = n => (n==null ? "—" : n < 60 ? Math.round(n) + " s" : n < 3600 ? Math.floor(n/60) + "m " + Math.floor(n%60) + "s" : Math.floor(n/3600) + "h " + Math.floor((n%3600)/60) + "m");
 const history = [];
-const esc = value => String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+const esc = value => String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 function setStatus(kind, text) { const e=document.getElementById("status"); e.className="live " + kind; e.lastElementChild.textContent=text; }
+function drawSeries(id, key, color, format, emptyText, axisFontSize=10) {
+    const svg=document.getElementById(id), width=520, height=250, pad={l:42,r:12,t:16,b:28};
+    const values=history.map(x=>x[key]).filter(v=>Number.isFinite(v));
+    svg.innerHTML="";
+    if(values.length < 2) { svg.innerHTML='<text x="42" y="125" fill="#8b949e" font-size="12">'+emptyText+'</text>'; return; }
+    const min=Math.min(...values), max=Math.max(...values), span=Math.max(1e-9,max-min);
+    const innerW=width-pad.l-pad.r, innerH=height-pad.t-pad.b;
+    const x=i=>pad.l+(i/(Math.max(1,history.length-1)))*innerW;
+    const y=v=>pad.t+(1-(v-min)/span)*innerH;
+    const points=history.map((item,i)=>Number.isFinite(item[key]) ? [x(i),y(item[key])] : null).filter(Boolean);
+    const path=points.map((p,i)=>(i?"L":"M")+p[0].toFixed(1)+","+p[1].toFixed(1)).join(" ");
+    const grid=[0,.5,1].map(v=>'<line x1="'+pad.l+'" x2="'+(width-pad.r)+'" y1="'+(pad.t+v*innerH)+'" y2="'+(pad.t+v*innerH)+'" stroke="#30363d"/><text x="4" y="'+(pad.t+v*innerH+4)+'" fill="#8b949e" font-size="'+axisFontSize+'">'+format(max-v*span)+'</text>').join("");
+    svg.innerHTML=grid+'<path d="'+path+'" fill="none" stroke="'+color+'" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>';
+}
 function drawTrend() {
-    const svg=document.getElementById("trend"), width=760, height=250, pad={l:38,r:12,t:14,b:26};
+    const svg=document.getElementById("trend"), width=520, height=250, pad={l:42,r:12,t:16,b:28};
     const innerW=width-pad.l-pad.r, innerH=height-pad.t-pad.b;
     svg.innerHTML="";
-    if(history.length < 2) { svg.innerHTML='<text x="38" y="125" fill="#96a19d" font-size="12">Collecting snapshots...</text>'; return; }
+    if(history.length < 2) { svg.innerHTML='<text x="42" y="125" fill="#96a19d" font-size="12">Collecting snapshots...</text>'; return; }
     const maxFresh=Math.max(1,...history.map(x=>x.fresh));
     const x=i=>pad.l+(i/(history.length-1))*innerW, y=v=>pad.t+(1-v)*innerH;
     const path=key=>history.map((item,i)=>(i?"L":"M")+x(i).toFixed(1)+","+y(key==="reuse"?item.reuse:item.fresh/maxFresh).toFixed(1)).join(" ");
     const grid=[0,.5,1].map(v=>'<line x1="'+pad.l+'" x2="'+(width-pad.r)+'" y1="'+y(v)+'" y2="'+y(v)+'" stroke="#303a3d"/><text x="4" y="'+(y(v)+4)+'" fill="#96a19d" font-size="10">'+Math.round(v*100)+'%</text>').join("");
     svg.innerHTML=grid+'<path d="'+path("reuse")+'" fill="none" stroke="#a7e8c0" stroke-width="2.5"/><path d="'+path("fresh")+'" fill="none" stroke="#8fc7ff" stroke-width="2" stroke-dasharray="5 4"/>';
+    drawSeries("saved-trend","saved","#58a6ff",fmt,"Collecting snapshots...");
+    drawSeries("saved-ratio-trend","savedPct","#a7e8c0",pct,"Collecting savings percentage...");
+    drawSeries("ttft-trend","ttft","#e3b341",ms,"Waiting for streamed TTFT...",12);
+    drawSeries("tps-trend","tps","#3fb950",n=>Number(n).toFixed(1),"TPS unavailable",12);
 }
 function renderSessions(sessions) {
     const ids=Object.keys(sessions||{}), box=document.getElementById("sess");
@@ -523,24 +610,36 @@ function renderSessions(sessions) {
 }
 function render(d) {
     const fresh=Number(d.avg_fresh_prefill_tokens||0), reuse=Number(d.prefix_cache_reuse_ratio||0);
-    history.push({reuse,fresh}); if(history.length>30) history.shift();
+    history.push({reuse,fresh,saved:Number(d.total_saved_tokens||0),savedPct:Number(d.input_savings_ratio||0),ttft:Number.isFinite(Number(d.avg_ttft_ms))&&d.ttft_samples?Number(d.avg_ttft_ms):null,tps:d.avg_completion_tps==null?null:Number(d.avg_completion_tps)}); if(history.length>30) history.shift();
     document.getElementById("s-requests").textContent=fmt(d.requests);
+    document.getElementById("s-rate").textContent=fmt(d.requests_per_minute);
     document.getElementById("s-reuse").textContent=pct(d.prefix_cache_reuse_ratio);
     document.getElementById("s-saved").textContent=fmt(d.total_saved_tokens);
+    document.getElementById("s-saved-rate").textContent=pct(d.input_savings_ratio)+" of raw input";
     document.getElementById("s-hitrate").textContent=pct(d.cache_hit_rate);
     document.getElementById("s-ttft").textContent=ms(d.avg_ttft_ms);
+    document.getElementById("s-tps").textContent=d.avg_completion_tps==null?"—":Number(d.avg_completion_tps).toFixed(1);
+    document.getElementById("tps-note").textContent=d.completion_tps_samples?"Aggregate completion tokens / measured decode time.":"Waiting for completion-token usage.";
     document.getElementById("s-prefill").textContent=fmt(d.avg_fresh_prefill_tokens);
     document.getElementById("s-err").textContent=fmt(d.backend_errors);
+    document.getElementById("s-savings").textContent=pct(d.input_savings_ratio);
+    document.getElementById("s-error-rate").textContent=pct(d.backend_error_rate);
     document.getElementById("s-latency").textContent=ms(d.avg_latency_ms);
+    document.getElementById("s-window-age").textContent=age(d.uptime_seconds);
+    document.getElementById("s-last-activity").textContent=age(d.last_activity_age_seconds);
     document.getElementById("s-optimizer").textContent=ms(d.avg_optimizer_ms);
     document.getElementById("s-token-count").textContent=ms(d.avg_token_count_ms);
+    document.getElementById("saved-note").textContent=fmt(d.total_saved_tokens)+" tokens / "+pct(d.input_savings_ratio)+" of raw input";
     document.getElementById("s-mtp").textContent=d.mtp_samples?pct(d.mtp_acceptance_rate):"—";
     document.getElementById("s-mtp-detail").textContent=d.mtp_samples?(fmt(d.avg_mtp_accepted_tokens)+" accepted / "+fmt(d.avg_mtp_draft_tokens)+" drafted; "+pct(d.mtp_fallback_rate)+" fallback") : "No MTP usage reported yet.";
     const degraded=Object.entries(d.degradation_counts||{}); document.getElementById("s-degraded").textContent=degraded.length?degraded.map(x=>x[0]+" ("+x[1]+")").join(", "):"None";
+    document.getElementById("meta-version").textContent="v"+"__PROXY_VERSION__";
+    document.getElementById("meta-llm").textContent="__LLM_MODEL__";
+    document.getElementById("meta-embed").textContent="__EMBED_MODEL__";
     document.getElementById("headline").textContent=d.backend_errors?"The backend needs attention.":(reuse>=.7?"The prefix is holding.":"Watching the prefix hold.");
     document.getElementById("summary").textContent=d.backend_errors?"Backend errors are present; treat latency and cache movement as diagnostic signals.":(fresh>0?"Fresh prefill is the work the model had to repeat on this process.":"No fresh-prefill sample has arrived yet.");
     document.getElementById("updated").textContent=new Date().toLocaleTimeString();
-    renderSessions(d.sessions); drawTrend(); setStatus("","Live");
+    renderSessions(d.sessions); drawTrend(); setStatus(d.last_activity_age_seconds!=null&&d.last_activity_age_seconds>15?"stale":"",d.last_activity_age_seconds!=null&&d.last_activity_age_seconds>15?"Idle":"Live");
 }
 async function resetMetrics() {
     const button=document.getElementById("reset"); button.disabled=true;
@@ -1332,6 +1431,17 @@ def _make_streaming_generator(
                 saved_tokens=(optimizer.last_saved_token_count if optimizer is not None else None),
                 latency_ms=((time.time() - turn_start) * 1000.0 if turn_start is not None else None),
                 ttft_ms=_ttft_ms,
+                completion_tokens=(
+                    final_usage.get("completion_tokens")
+                    if isinstance(final_usage, dict)
+                    and isinstance(final_usage.get("completion_tokens"), int)
+                    else None
+                ),
+                completion_duration_ms=(
+                    ((time.time() - turn_start) * 1000.0 - _ttft_ms)
+                    if turn_start is not None and _ttft_ms is not None
+                    else None
+                ),
                 request_id=request_id,
                 prompt_hash=prompt_hash,
                 slot=id_slot,
@@ -1539,6 +1649,14 @@ async def _do_non_streaming(
             prompt_tokens=(optimizer.last_optimized_token_count if optimizer is not None else None),
             saved_tokens=(optimizer.last_saved_token_count if optimizer is not None else None),
             latency_ms=((time.time() - turn_start) * 1000.0 if turn_start is not None else None),
+            completion_tokens=(
+                usage_dict.get("completion_tokens")
+                if isinstance(usage_dict.get("completion_tokens"), int)
+                else None
+            ),
+            completion_duration_ms=(
+                (time.time() - turn_start) * 1000.0 if turn_start is not None else None
+            ),
             request_id=request_id,
             prompt_hash=prompt_hash,
             slot=id_slot,
@@ -2268,7 +2386,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         "magic stat" for the headline, bar chart for per-session savings, line
         for cache-reuse ratio over the session list).
         """
-        return HTMLResponse(content=_METRICS_DASHBOARD_HTML, status_code=200)
+        dashboard = _METRICS_DASHBOARD_HTML
+        dashboard = dashboard.replace("__PROXY_VERSION__", html.escape(__version__))
+        dashboard = dashboard.replace("__LLM_MODEL__", html.escape(cfg.server.llm_model))
+        dashboard = dashboard.replace("__EMBED_MODEL__", html.escape(cfg.server.embed_model))
+        return HTMLResponse(content=dashboard, status_code=200)
 
     @app.post("/v1/embeddings")
     async def create_embeddings(request: Request):

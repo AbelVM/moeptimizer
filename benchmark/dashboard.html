@@ -136,6 +136,7 @@ function parseJSON(text){
   const d = JSON.parse(text);
   const out = { raw:d, config:d.config||{}, meta:{} };
   const get = (path)=>{ let c=d; for(const k of path){ if(c==null) return undefined; c=c[k]; } return c; };
+  out.num_turns = get(['num_turns']);
   out.latency = get(['latency_ms'])||{};
   out.ttft = get(['ttft_ms'])||{};
   out.tokens = get(['tokens'])||{};
@@ -147,6 +148,7 @@ function parseJSON(text){
   out.cache = get(['cache_reuse'])||{};
   out.mtp = get(['mtp'])||{};
   out.observability = get(['proxy_observability'])||{};
+  out.proxyOverhead = get(['proxy_overhead_ms'])||{};
   out.correctness = get(['correctness'])||{};
   out.cost = get(['cost_usd'])||{};
   out.perRound = get(['per_round'])||{};
@@ -790,8 +792,9 @@ function render(){
 }
 
 function renderJSONView(root,J,L,ri){
-  const c=J.config, tok=J.tokens, lat=J.latency, ttft=J.ttft, mtp=J.mtp, obs=J.observability, q=J.quality, sem=J.semantic, sec=J.secondary, ctxw=J.context, cache=J.cache, ev=J.eviction, pr=J.perRound, perf=J.performance||{};
+  const c=J.config, tok=J.tokens, lat=J.latency, ttft=J.ttft, mtp=J.mtp, obs=J.observability, proxyOverhead=J.proxyOverhead, q=J.quality, sem=J.semantic, sec=J.secondary, ctxw=J.context, cache=J.cache, ev=J.eviction, pr=J.perRound, perf=J.performance||{};
   const faith=q.prompt_source_token_recall!=null?q.prompt_source_token_recall:(q.prompt_faithfulness!=null?q.prompt_faithfulness:null);
+  const anchors=q.task_anchor_recall!=null?q.task_anchor_recall:null;
   const evict=q.evicted_content_recall!=null?q.evicted_content_recall:null;
 
   // ---- summary cards ----
@@ -841,9 +844,9 @@ function renderJSONView(root,J,L,ri){
   const obsErrors = obs && isNum(obs.backend_errors) ? obs.backend_errors : NaN;
   const obsDegradations = obs && isNum(obs.degradation_events) ? obs.degradation_events : NaN;
   cards.appendChild(card('Proxy overhead / failures',
-    isNum(obs.avg_optimizer_ms) ? `${fmtMs(obs.avg_optimizer_ms)} / ${isNum(obs.avg_token_count_ms)?fmtMs(obs.avg_token_count_ms):'—'}` : '—',
-    (obsErrors>0||obsDegradations>0)?'bad':(isNum(obs.avg_optimizer_ms)?'':'info'),
-    `optimizer / token count · ${isNum(obsErrors)?obsErrors:'—'} backend errors · ${isNum(obsDegradations)?obsDegradations:'—'} degradation events`));
+    isNum(proxyOverhead.mean) ? fmtMs(proxyOverhead.mean) : '—',
+    (obsErrors>0||obsDegradations>0)?'bad':(isNum(proxyOverhead.mean)?'':'info'),
+    `proxy process · optimizer ${fmtMs(obs.avg_optimizer_ms)} · token count ${fmtMs(obs.avg_token_count_ms)} · ${isNum(obsErrors)?obsErrors:'—'} backend errors · ${isNum(obsDegradations)?obsDegradations:'—'} degradation events`));
   const tpsD = perf.approximate_decode_tps && perf.approximate_decode_tps.direct;
   const tpsP = perf.approximate_decode_tps && perf.approximate_decode_tps.proxy;
   cards.appendChild(card('Request-level throughput estimate',
@@ -1008,12 +1011,10 @@ function renderJSONView(root,J,L,ri){
   }
 
   if(perf.cache_reuse_pct && (perf.cache_reuse_pct.direct||perf.cache_reuse_pct.proxy)){
-    // Exclude the cold first turn (always 0% reuse — nothing cached yet) so it
-    // does not contaminate the min/whisker of the distribution (#2). Turns are
-    // 1-indexed, so drop the minimum turn number rather than filtering on > 0.
+    // The first turn of each round is a cold start and always has 0% reuse.
+    // Keep later 0% values: they are valid measured results.
     const reuseTurns=(perf.per_turn||[]);
-    const minTurn=reuseTurns.length?Math.min(...reuseTurns.map(r=>Number(r.turn))):0;
-    const measuredTurns=reuseTurns.filter(r=>Number(r.turn)>minTurn);
+    const measuredTurns=reuseTurns.filter(r=>Number(r.turn)!==1);
     const d=statsFromValues(measuredTurns.map(r=>isNum(r.direct_cache_reuse_pct)?Math.min(100,Math.max(0,r.direct_cache_reuse_pct)):NaN));
     const p=statsFromValues(measuredTurns.map(r=>isNum(r.proxy_cache_reuse_pct)?Math.min(100,Math.max(0,r.proxy_cache_reuse_pct)):NaN));
     const summaryD=boundedPctStats(perf.cache_reuse_pct.direct), summaryP=boundedPctStats(perf.cache_reuse_pct.proxy);
@@ -1023,7 +1024,7 @@ function renderJSONView(root,J,L,ri){
       {type:'boxplot',labels:['Direct','Proxy'],datasets:[
         {label:'Direct',color:PALETTE.direct,data:[d,null]},
         {label:'Proxy',color:PALETTE.proxy,data:[null,p]}
-      ],yFmt:v=>isNum(v)?v.toFixed(1)+'%':'—',yMin:0,yMax:100},
+      ],yFmt:v=>isNum(v)?v.toFixed(1)+'%':'—'},
       'Cached prompt tokens divided by total prompt tokens. Box = q1..q3, center line = median, ✕ = mean, whiskers = min..max.'));
   }
 
@@ -1070,8 +1071,8 @@ function renderJSONView(root,J,L,ri){
   // Response-vs-response overlap scores (ROUGE/Jaccard/edit) and Semantic sim
   // are now secondary (see the secondary radar + quality detail below).
   const semRadar = sem&&isNum(sem.mean) ? (sem.mean+1)/2 : NaN;
-  if(faith||evict||q.code_syntax_validity||q.code_block_ratio||isNum(semRadar)){
-    const labels=['Source recall','Evicted recall','Syntax valid','Code blocks','Semantic sim*'];
+  if(isNum(faith)||isNum(anchors)||isNum(evict)||isNum(q.code_syntax_validity)||isNum(q.code_block_ratio)||isNum(semRadar)){
+    const labels=['Source recall','Task anchors','Evicted recall','Syntax valid','Code blocks','Semantic sim*'];
     // Radar axes are 0..1. Code struct is a 0..1 consistency score, so no
     // clamping needed. (Semantic sim was moved to the secondary radar because
     // it is a cosine in [-1,1] and the noisiest of the metrics.)
@@ -1079,7 +1080,7 @@ function renderJSONView(root,J,L,ri){
     grid.appendChild(panel('Optimizer quality (mean, 0–1)','score',
       {type:'radar', labels,
         datasets:[
-          {label:'Input, correctness + response diagnostic',color:PALETTE.sem,data:[mk(faith),mk(evict),mk(q.code_syntax_validity),mk(q.code_block_ratio),semRadar]}
+          {label:'Input, correctness + response diagnostic',color:PALETTE.sem,data:[mk(faith),mk(anchors),mk(evict),mk(q.code_syntax_validity),mk(q.code_block_ratio),semRadar]}
         ], yFmt:fmt2, yMin:0, yMax:1},
       'Mean scores across measured turns. Source recall and evicted recall measure input preservation; syntax validity and code-block ratio are diagnostics. Semantic sim* is response cosine normalized from −1..1 to 0..1 for this radar only; see the signed chart below.'));
   }
@@ -1119,6 +1120,9 @@ function renderJSONView(root,J,L,ri){
   // proxy metrics snapshot is unavailable or the run contains one round.
   const cacheByRound=new Map();
   for(const r of (perf.per_turn||[])){
+    // Cache-hit rate has no meaningful denominator for the cold-start turn.
+    // Keep later zero-hit turns: zero is a measured miss, not missing data.
+    if(Number(r.turn)===0) continue;
     const key=Number(r.round); const entry=cacheByRound.get(key)||{hits:0,total:0,reuse:[]};
     entry.total++;
     if(isNum(r.proxy_prefix_cache_hit_tokens)&&r.proxy_prefix_cache_hit_tokens>0) entry.hits++;
@@ -1159,7 +1163,7 @@ function renderJSONView(root,J,L,ri){
     const byRound=new Map();
     for(const r of (mtp.per_turn||[])){const a=byRound.get(Number(r.round))||[];if(isNum(r.acceptance_rate))a.push(r.acceptance_rate*100);byRound.set(Number(r.round),a);}
     grid.appendChild(panel('MTP acceptance per round','%',
-      {type:'boxplot',labels,datasets:[{label:'Accepted / drafted',color:PALETTE.sem,data:mtp.per_round.map(r=>boxStats(byRound.get(Number(r.round))||[]))}],yFmt:v=>isNum(v)?v.toFixed(0)+'%':'—',yMin:0,yMax:100},
+      {type:'boxplot',labels,datasets:[{label:'Accepted / drafted',color:PALETTE.sem,data:mtp.per_round.map(r=>boxStats(byRound.get(Number(r.round))||[]))}],yFmt:v=>isNum(v)?v.toFixed(0)+'%':'—'},
       'Backend-reported per-turn acceptance distribution by round: box = q1..q3, center line = median, ✕ = mean, whiskers = min..max. Acceptance does not by itself prove faster generation.'));
   }
 
@@ -1173,7 +1177,7 @@ function renderJSONView(root,J,L,ri){
       lineBarCfg(turns,[
         {label:'Direct',color:PALETTE.direct,type:'line',data:values('direct')},
         {label:'Proxy',color:PALETTE.proxy,type:'line',data:values('proxy')}
-      ], v=>isNum(v)?v.toFixed(0)+'%':'—', 0, 100),
+      ], v=>isNum(v)?v.toFixed(0)+'%':'—'),
       'Draft acceptance parsed from streaming backend logs. Values compare direct and proxy requests by benchmark turn.'));
     if(perf.per_turn && perf.per_turn.length){
       const perfByTurn=new Map(perf.per_turn.map(r=>[`${r.round}:${r.turn}`,r]));
@@ -1296,7 +1300,13 @@ function renderJSONView(root,J,L,ri){
     ]));
   }
   tables.appendChild(sectionTitle('Run configuration'));
-  tables.appendChild(kvTable('Config', Object.entries(c).map(([k,v])=>[k, typeof v==='object'?JSON.stringify(v):String(v)])));
+  const runConfig = [
+    ['Scenario kind', c.scenario_kind],
+    ['Seed', c.seed],
+    ['Execution order', c.execution_order],
+    ...Object.entries(c).filter(([k])=>!['scenario_kind','seed','execution_order'].includes(k))
+  ];
+  tables.appendChild(kvTable('Config', runConfig.map(([k,v])=>[k, v==null?'—':typeof v==='object'?JSON.stringify(v):String(v)])));
 
   if(pr && Object.keys(pr).length){
     tables.appendChild(sectionTitle('Per-round summary'));
@@ -1315,7 +1325,7 @@ function renderJSONView(root,J,L,ri){
   tables.appendChild(sectionTitle('Optimizer quality (headline — context retention + correctness)'));
   const qrows=[];
   const addQ=(name,o)=>{ if(o&&o.mean!=null) qrows.push({Metric:name,'Mean':fmt2(o.mean),'Median':fmt2(o.median),'Min':fmt2(o.min),'Max':fmt2(o.max)}); };
-  addQ('Source-token recall',q.prompt_source_token_recall); addQ('Legacy prompt Jaccard',q.prompt_faithfulness); addQ('Evicted-content recall',q.evicted_content_recall);
+  addQ('Source-token recall',q.prompt_source_token_recall); addQ('Task-anchor recall',q.task_anchor_recall); addQ('Legacy prompt Jaccard',q.prompt_faithfulness); addQ('Evicted-content recall',q.evicted_content_recall);
   addQ('Code syntax validity',q.code_syntax_validity); addQ('Code block ratio',q.code_block_ratio);
   if(qrows.length) tables.appendChild(dataTable(qrows));
 

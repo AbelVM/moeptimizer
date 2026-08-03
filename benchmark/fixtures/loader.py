@@ -12,6 +12,12 @@ instead of against a synthetic static snippet.
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -103,7 +109,26 @@ def _format_project(files: list[tuple[str, str]]) -> str:
     return "\n\n".join(blocks)
 
 
-def build_fixture_tasks(max_turns: int | None = None) -> list[tuple[str, str]]:
+def _apply_refinement(rel: str, content: str, instruction: str, turn: int) -> str:
+    """Carry a deterministic working-tree change into the next replay turn."""
+    return f"{content.rstrip()}\n# benchmark refinement {turn}: {instruction}\n"
+
+
+def _variant_suffix(seed: int | None, turn: int) -> str:
+    if seed is None:
+        return ""
+    variants = (
+        "Keep the implementation incremental and favor explicit error handling.",
+        "Prioritize compatibility with the existing public surface and tests.",
+        "Call out any behavior change that could affect operational reliability.",
+    )
+    return f"\n\nScenario variant {seed} (turn {turn}): {variants[(seed + turn) % len(variants)]}"
+
+
+def build_fixture_tasks(
+    max_turns: int | None = None,
+    seed: int | None = None,
+) -> list[tuple[str, str]]:
     """Return (role, content) tasks replaying the fixture project build.
 
     Each turn pastes the cumulative project and asks for the next real change.
@@ -113,12 +138,20 @@ def build_fixture_tasks(max_turns: int | None = None) -> list[tuple[str, str]]:
     try:
         tasks: list[tuple[str, str]] = []
         current: list[tuple[str, str]] = []
-        for entry in _MANIFEST:
-            instruction = entry["instruction"]
+        for turn, entry in enumerate(_MANIFEST, 1):
+            instruction = entry["instruction"] + _variant_suffix(seed, turn)
             if "add" in entry:
                 rel = entry["add"]
                 current.append((rel, _read(rel)))
-            # 'refine' entries keep `current` unchanged that turn.
+            elif "refine" in entry:
+                rel = entry["refine"]
+                files = dict(current)
+                current = [
+                    (path, _apply_refinement(path, files[path], instruction, turn))
+                    if path == rel
+                    else (path, content)
+                    for path, content in current
+                ]
             project = _format_project(current)
             tasks.append((
                 "user",
@@ -162,7 +195,7 @@ def read_fixture_file(rel: str) -> str | None:
         return None
 
 
-def agent_log_output(has_tests: bool) -> str:
+def agent_log_output(has_tests: bool, seed: int | None = None, turn: int = 0) -> str:
     """Realistic agent ``run_command`` output (verbose test + lint + build log).
 
     When the suite exists this is a long multi-tool log (>4k chars) so the
@@ -176,6 +209,17 @@ def agent_log_output(has_tests: bool) -> str:
             "collected 0 items / 1 error\n"
             "ERROR tests/test_users.py: No module named 'users'\n"
             "(run `pip install -e .` then retry)\n"
+        )
+    seeded_failure = seed is not None and (seed + turn) % 5 == 0
+    if seeded_failure:
+        return (
+            "============================= test session starts ==============================\n"
+            "collected 5 items\n\n"
+            "tests/test_users.py::test_service_summarize FAILED\n\n"
+            "E   AssertionError: expected active user count to remain stable\n"
+            "=========================== short test summary info ============================\n"
+            "FAILED tests/test_users.py::test_service_summarize - AssertionError\n"
+            "========================= 1 failed, 4 passed in 0.41s =========================\n"
         )
     lines: list[str] = []
     lines.append("======================== test session starts ========================")
@@ -300,7 +344,10 @@ def agent_log_output(has_tests: bool) -> str:
     return "\n".join(lines)
 
 
-def build_fixture_agentic_tasks(max_turns: int | None = None) -> list[list[dict]]:
+def build_fixture_agentic_tasks(
+    max_turns: int | None = None,
+    seed: int | None = None,
+) -> list[list[dict]]:
     """Return OpenCode-style agentic turns replaying the fixture project build.
 
     Each turn is a realistic agent payload: the user task (no pasted code — the
@@ -315,7 +362,7 @@ def build_fixture_agentic_tasks(max_turns: int | None = None) -> list[list[dict]
         tasks: list[list[dict]] = []
         current: list[tuple[str, str]] = []
         for idx, entry in enumerate(_MANIFEST):
-            instruction = entry["instruction"]
+            instruction = entry["instruction"] + _variant_suffix(seed, idx + 1)
             read_path: str | None = None
             read_content: str | None = None
             if "add" in entry:
@@ -327,7 +374,13 @@ def build_fixture_agentic_tasks(max_turns: int | None = None) -> list[list[dict]
             elif "refine" in entry:
                 rel = entry["refine"]
                 read_path = rel
-                read_content = dict(current).get(rel, _read(rel))
+                files = dict(current)
+                read_content = files.get(rel, _read(rel))
+                updated = _apply_refinement(rel, read_content, instruction, idx + 1)
+                current = [
+                    (path, updated if path == rel else content)
+                    for path, content in current
+                ]
             # A summary-only entry (no add/refine) reads no file; it just runs
             # the suite and asks for a wrap-up, like the end of a real session.
             has_tests = any(r == "tests/test_users.py" for r, _ in current)
@@ -385,7 +438,7 @@ def build_fixture_agentic_tasks(max_turns: int | None = None) -> list[list[dict]
                         "role": "tool",
                         "tool_call_id": f"call_{turn}_1",
                         "name": "run_command",
-                        "content": agent_log_output(has_tests),
+                        "content": agent_log_output(has_tests, seed=seed, turn=turn),
                     },
                 ]
             )
@@ -408,6 +461,113 @@ def fixture_root() -> Path:
     return ROOT
 
 
+def materialize_fixture_workspace(
+    destination: Path,
+    max_turns: int | None = None,
+    seed: int | None = None,
+) -> Path:
+    """Write the manifest's current project state into an isolated workspace."""
+    current: dict[str, str] = {}
+    limit = len(_MANIFEST) if max_turns is None else min(max_turns, len(_MANIFEST))
+    for turn, entry in enumerate(_MANIFEST[:limit], 1):
+        if "add" in entry:
+            rel = entry["add"]
+            current[rel] = _read(rel)
+        elif "refine" in entry:
+            rel = entry["refine"]
+            instruction = entry["instruction"] + _variant_suffix(seed, turn)
+            current[rel] = _apply_refinement(rel, current[rel], instruction, turn)
+    for rel, content in current.items():
+        path = destination / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return destination
+
+
+def apply_fixture_patch(destination: Path, patch_text: str) -> bool:
+    """Apply a unified diff only when it passes a zero-fuzz dry run."""
+    command = ["patch", "--batch", "--forward", "--fuzz=0", "-p0"]
+    check = subprocess.run(
+        [*command, "--dry-run"],
+        cwd=destination,
+        input=patch_text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check.returncode != 0:
+        return False
+    return subprocess.run(
+        command,
+        cwd=destination,
+        input=patch_text,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).returncode == 0
+
+
+def run_fixture_acceptance(
+    destination: Path,
+    max_turns: int | None = None,
+    max_retries: int = 0,
+    generated_patches: dict[int, str] | None = None,
+    repair_patches: dict[int, str] | None = None,
+    seed: int | None = None,
+) -> list[dict[str, object]]:
+    """Materialize each state and run the real fixture tests when available."""
+    def bounded_output(result: object) -> str:
+        output = "\n".join(
+            str(getattr(result, name, "") or "")
+            for name in ("stdout", "stderr")
+        )
+        return output[-2000:]
+
+    records: list[dict[str, object]] = []
+    limit = len(_MANIFEST) if max_turns is None else min(max_turns, len(_MANIFEST))
+    for turn in range(1, limit + 1):
+        materialize_fixture_workspace(destination, turn, seed=seed)
+        generated_patch_applied = False
+        if generated_patches and turn in generated_patches:
+            generated_patch_applied = apply_fixture_patch(destination, generated_patches[turn])
+        has_tests = (destination / "tests" / "test_users.py").exists()
+        if not has_tests:
+            records.append({
+                "turn": turn,
+                "action": "edit",
+                "verified": False,
+                "generated_patch_applied": generated_patch_applied,
+            })
+            continue
+        attempts = 0
+        repair_applied = False
+        while True:
+            attempts += 1
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", "tests"],
+                cwd=destination,
+                env={**os.environ, "PYTHONPATH": str(destination)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0 and not repair_applied and repair_patches and turn in repair_patches:
+                repair_applied = apply_fixture_patch(destination, repair_patches[turn])
+            if result.returncode == 0 or attempts > max_retries:
+                break
+        records.append({
+            "turn": turn,
+            "action": "edit_and_test",
+            "verified": result.returncode == 0,
+            "returncode": result.returncode,
+            "attempts": attempts,
+            "generated_patch_applied": generated_patch_applied,
+            "repair_applied": repair_applied,
+            "output_tail": bounded_output(result),
+        })
+    return records
+
+
 def available_files() -> list[str]:
     """Files the loader would discover, for inspection/tests."""
     out = []
@@ -417,3 +577,41 @@ def available_files() -> list[str]:
             continue
         out.append(rel)
     return out
+
+
+def load_generated_patches(patch_directory: Path, max_turns: int | None = None) -> dict[int, str]:
+    """Load optional per-turn patches named ``turn-N.patch``."""
+    limit = len(_MANIFEST) if max_turns is None else min(max_turns, len(_MANIFEST))
+    return {
+        turn: (patch_directory / f"turn-{turn}.patch").read_text(encoding="utf-8")
+        for turn in range(1, limit + 1)
+        if (patch_directory / f"turn-{turn}.patch").is_file()
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run isolated fixture acceptance tests.")
+    parser.add_argument("--turns", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--max-retries", type=int, default=0)
+    parser.add_argument("--patch-dir", type=Path, default=None)
+    args = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix="moeptimizer-fixture-") as workspace:
+        records = run_fixture_acceptance(
+            Path(workspace),
+            max_turns=args.turns,
+            max_retries=args.max_retries,
+            generated_patches=(
+                load_generated_patches(args.patch_dir, args.turns)
+                if args.patch_dir is not None
+                else None
+            ),
+            seed=args.seed,
+        )
+    print(json.dumps(records, indent=2))
+    return int(any(record.get("action") == "edit_and_test" and not record.get("verified")
+                   for record in records))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
