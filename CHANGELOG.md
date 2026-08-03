@@ -2,11 +2,6 @@
 
 Version-by-version feature history for MOE-ptimizer.
 
-## Unreleased
-
-- **Live metrics dashboard** — Add request rate, measured input-savings rate,
-  backend error rate, and clearer operational health context.
-
 ## Feature History
 
 ### First version (v0.1.0)
@@ -1261,3 +1256,4 @@ contention).
 - **Live metrics dashboard**
   - Add benchmark-aligned operational styling, runtime identity, saved-token/TTFT/decode-throughput trends, and real metrics-window freshness indicators.
   - Add request rate, measured input-savings rate, backend error rate, and clearer operational health context.
+  
